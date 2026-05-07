@@ -2,10 +2,12 @@ package com.balh.oms.tailer;
 
 import com.balh.oms.chronicle.PendingControlEvent;
 import com.balh.oms.config.OmsConfig;
+import com.balh.oms.domain.Order;
 import com.balh.oms.domain.OrderStatus;
 import com.balh.oms.domain.RejectCode;
 import com.balh.oms.events.DomainEventPublisher;
 import com.balh.oms.events.OrderRejectedEvent;
+import com.balh.oms.events.OrderWorkingEvent;
 import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.risk.BuyingPowerAdmission;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -30,6 +32,7 @@ public class ControlTailer {
 
     private static final String METRIC_REJECT_EVENTS = "oms_order_rejected_events_published_total";
     private static final String TAG_REJECT_CODE = "reject_code";
+    private static final String METRIC_WORKING_EVENTS = "oms_order_working_events_published_total";
 
     private final OrdersRepository orders;
     private final StaleJobGuard stale;
@@ -121,6 +124,10 @@ public class ControlTailer {
                     event.orderId(), event.orderVersion());
             return TailResult.SKIPPED_VERSION_MISMATCH;
         }
+        int newSeq = event.orderVersion() + 1;
+        orders.findById(event.orderId()).ifPresentOrElse(
+                o -> publishWorking(event, o, newSeq),
+                () -> log.warn("WORKING CAS succeeded but order {} not found for event publish", event.orderId()));
         return TailResult.APPLIED;
     }
 
@@ -128,6 +135,11 @@ public class ControlTailer {
         int newSeq = event.orderVersion() + 1;
         events.publish(OrderRejectedEvent.afterReject(event, reason, newSeq));
         meterRegistry.counter(METRIC_REJECT_EVENTS, TAG_REJECT_CODE, reason.name()).increment();
+    }
+
+    private void publishWorking(PendingControlEvent event, Order order, int newSeq) {
+        events.publish(OrderWorkingEvent.afterWorking(event, order, newSeq));
+        meterRegistry.counter(METRIC_WORKING_EVENTS).increment();
     }
 
     public enum TailResult {

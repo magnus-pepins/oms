@@ -28,8 +28,9 @@ and the milestone plan it links to.
 - `OutboxReconciler` drains the outbox into Chronicle Queue (engineering
   replay only, NOT a regulatory system of record).
 - `ControlTailer` applies CAS updates on `orders.version` and, on terminal
-  reject paths, publishes **`OrderRejected`** to `DomainEventPublisher` (same
-  fire-and-forget contract as `OrderAccepted`).
+  reject paths, publishes **`OrderRejected`**; after a successful transition to
+  **`WORKING`**, publishes **`OrderWorking`** (same fire-and-forget contract as
+  `OrderAccepted`).
 - Hashed-account-id PII policy enforced by a Micrometer filter and a guard
   test.
 - Optional **Ledger** HTTP client: when `OMS_LEDGER_ENABLED=true`, `ControlTailer`
@@ -76,6 +77,8 @@ connects to when you set `OMS_PG_URL` as above.
 **separate** short-lived Postgres container on an ephemeral port. That only
 requires the Docker daemon (same machine as Gradle); it does not read
 `OMS_PG_URL`. Having Compose Postgres up is fine — both can run at once.
+`BuyingPowerLedgerControlTailerIntegrationTest` also starts an embedded
+**WireMock** Ledger stub (no separate Ledger container).
 
 ```bash
 curl -s http://localhost:8080/internal/v1/orders \

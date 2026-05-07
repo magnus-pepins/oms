@@ -4,8 +4,8 @@ The OMS publishes domain events for downstream consumers — desk live feed,
 internal drop copy, ops dashboards, external drop copy (via FIX, slice 2+).
 
 Slice 1 ships the contract and a no-op publisher. **Slice 1.5** adds an optional
-NATS JetStream publisher plus **`OrderRejected`** emission from `ControlTailer`
-after a successful reject CAS. External FIX drop copy is slice 2+.
+NATS JetStream publisher plus **`OrderRejected`** and **`OrderWorking`** emission
+from `ControlTailer` after successful reject / working CAS. External FIX drop copy is slice 2+.
 
 ## Envelope (wire schema)
 
@@ -39,7 +39,7 @@ after a successful reject CAS. External FIX drop copy is slice 2+.
 |--------------------|-------------------------------------|----------------------------------------------------------|
 | `OrderAccepted`    | `OrdersController.createOrder`      | After Postgres commit, before HTTP response is returned. |
 | `OrderRejected`    | `ControlTailer.apply`               | After successful CAS sets `status=REJECTED` (stale queue, buying power, ledger error). |
-| `OrderWorking`     | `ControlTailer.apply` (follow-up)   | After CAS update sets `status=WORKING` (not emitted yet).                  |
+| `OrderWorking`     | `ControlTailer.apply`               | After successful CAS sets `status=WORKING`.                               |
 | Execution events   | Slice 2+ FIX gateway                | After Ledger settlement leg lands.                       |
 
 ## Mandatory rule

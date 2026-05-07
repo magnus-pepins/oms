@@ -63,6 +63,7 @@ dependencies {
     testImplementation("org.testcontainers:junit-jupiter:1.20.3")
     testImplementation("org.assertj:assertj-core:3.26.3")
     testImplementation("org.awaitility:awaitility:4.2.2")
+    testImplementation("org.wiremock:wiremock:3.9.1")
 }
 
 tasks.withType<Test> {

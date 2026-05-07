@@ -1,7 +1,7 @@
 package com.balh.oms.config;
 
-import com.balh.oms.events.DomainEventPublisher;
-import com.balh.oms.events.NatsDomainEventPublisher;
+import com.balh.oms.events.FanoutClient;
+import com.balh.oms.events.NatsFanoutClient;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.nats.client.Connection;
@@ -28,12 +28,12 @@ public class NatsConfiguration {
         return Nats.connect(opts);
     }
 
-    @Bean(name = "natsDomainEventPublisher")
-    DomainEventPublisher natsDomainEventPublisher(
+    @Bean(name = "natsFanoutClient")
+    FanoutClient natsFanoutClient(
             Connection omsNatsConnection,
             OmsConfig config,
             ObjectMapper objectMapper,
             MeterRegistry meterRegistry) {
-        return new NatsDomainEventPublisher(omsNatsConnection, config, objectMapper, meterRegistry);
+        return new NatsFanoutClient(omsNatsConnection, config, objectMapper, meterRegistry);
     }
 }

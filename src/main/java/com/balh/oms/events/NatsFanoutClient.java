@@ -1,6 +1,7 @@
 package com.balh.oms.events;
 
 import com.balh.oms.config.OmsConfig;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -14,21 +15,22 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 
 /**
- * JetStream-backed {@link DomainEventPublisher}. Invoked only after Postgres commit.
+ * JetStream fanout: publishes the full transactional envelope JSON as the message body.
  */
-public final class NatsDomainEventPublisher implements DomainEventPublisher {
+public final class NatsFanoutClient implements FanoutClient {
 
-    private static final Logger log = LoggerFactory.getLogger(NatsDomainEventPublisher.class);
+    private static final Logger log = LoggerFactory.getLogger(NatsFanoutClient.class);
 
     private final JetStream jetStream;
     private final ObjectMapper objectMapper;
     private final OmsConfig config;
-    private final Counter published;
-    private final Counter publishFailed;
+    private final Counter delivered;
+    private final Counter deliverFailed;
 
-    public NatsDomainEventPublisher(
+    public NatsFanoutClient(
             Connection connection,
             OmsConfig config,
             ObjectMapper objectMapper,
@@ -41,13 +43,13 @@ public final class NatsDomainEventPublisher implements DomainEventPublisher {
         } catch (IOException | JetStreamApiException e) {
             throw new IllegalStateException("NATS JetStream initialisation failed", e);
         }
-        this.published = Counter.builder("oms_events_published_total")
+        this.delivered = Counter.builder("oms_fanout_envelope_delivered_total")
                 .tag("transport", "nats")
-                .description("Domain events published to NATS JetStream")
+                .description("Domain fanout envelopes published to NATS JetStream")
                 .register(registry);
-        this.publishFailed = Counter.builder("oms_events_publish_failed_total")
+        this.deliverFailed = Counter.builder("oms_fanout_envelope_deliver_failed_total")
                 .tag("transport", "nats")
-                .description("Failed NATS JetStream publish attempts")
+                .description("Failed NATS JetStream envelope deliveries")
                 .register(registry);
     }
 
@@ -71,10 +73,6 @@ public final class NatsDomainEventPublisher implements DomainEventPublisher {
         }
     }
 
-    /**
-     * jnats {@link JetStreamApiException} does not expose a stable typed error code across versions;
-     * NATS uses {@code 10058} / "stream name already in use" when {@code addStream} collides.
-     */
     private static final int NATS_JS_ERR_STREAM_NAME_ALREADY_IN_USE = 10058;
 
     private static boolean looksLikeStreamNameAlreadyInUse(JetStreamApiException e) {
@@ -95,15 +93,18 @@ public final class NatsDomainEventPublisher implements DomainEventPublisher {
     }
 
     @Override
-    public void publish(DomainEvent event) {
+    public boolean deliver(String envelopeJson) {
         try {
-            String subject = publishSubject(config.getEvents().getNats().getSubjectPrefix(), event.type());
-            byte[] payload = objectMapper.writeValueAsBytes(event);
-            jetStream.publish(subject, payload);
-            published.increment();
+            JsonNode root = objectMapper.readTree(envelopeJson);
+            String type = root.path("type").asText("unknown");
+            String subject = publishSubject(config.getEvents().getNats().getSubjectPrefix(), type);
+            jetStream.publish(subject, envelopeJson.getBytes(StandardCharsets.UTF_8));
+            delivered.increment();
+            return true;
         } catch (Exception e) {
-            publishFailed.increment();
-            log.error("NATS JetStream publish failed for type={}", event.type(), e);
+            deliverFailed.increment();
+            log.error("NATS JetStream fanout deliver failed", e);
+            return false;
         }
     }
 

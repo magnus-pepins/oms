@@ -5,6 +5,7 @@ import com.balh.oms.domain.Order;
 import com.balh.oms.domain.OrderStatus;
 import com.balh.oms.domain.Side;
 import com.balh.oms.ledger.LedgerBalanceClient;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.ObjectProvider;
 
@@ -26,7 +27,7 @@ class BuyingPowerAdmissionTest {
         ObjectProvider<LedgerBalanceClient> ledger = mock(ObjectProvider.class);
         when(ledger.getIfAvailable()).thenReturn(null);
 
-        BuyingPowerAdmission admission = new BuyingPowerAdmission(cfg, ledger);
+        BuyingPowerAdmission admission = new BuyingPowerAdmission(cfg, ledger, new SimpleMeterRegistry());
         Order order = buyOrder("balance_x", new BigDecimal("10"), new BigDecimal("5"));
         assertThat(admission.evaluate(order)).isEqualTo(BuyingPowerAdmission.Outcome.PROCEED);
     }
@@ -41,7 +42,7 @@ class BuyingPowerAdmissionTest {
         ObjectProvider<LedgerBalanceClient> ledger = mock(ObjectProvider.class);
         when(ledger.getIfAvailable()).thenReturn(client);
 
-        BuyingPowerAdmission admission = new BuyingPowerAdmission(cfg, ledger);
+        BuyingPowerAdmission admission = new BuyingPowerAdmission(cfg, ledger, new SimpleMeterRegistry());
         Order order = buyOrder("balance_x", new BigDecimal("3"), new BigDecimal("5.00"));
         assertThat(admission.evaluate(order)).isEqualTo(BuyingPowerAdmission.Outcome.REJECT_INSUFFICIENT);
     }
@@ -56,9 +57,41 @@ class BuyingPowerAdmissionTest {
         ObjectProvider<LedgerBalanceClient> ledger = mock(ObjectProvider.class);
         when(ledger.getIfAvailable()).thenReturn(client);
 
-        BuyingPowerAdmission admission = new BuyingPowerAdmission(cfg, ledger);
+        BuyingPowerAdmission admission = new BuyingPowerAdmission(cfg, ledger, new SimpleMeterRegistry());
         Order order = buyOrder("balance_x", new BigDecimal("3"), new BigDecimal("5.00"));
         assertThat(admission.evaluate(order)).isEqualTo(BuyingPowerAdmission.Outcome.PROCEED);
+    }
+
+    @Test
+    void sellSkipsLedgerCheckAndIncrementsSkipMetric() {
+        OmsConfig cfg = new OmsConfig();
+        cfg.getLedger().setEnabled(true);
+        @SuppressWarnings("unchecked")
+        ObjectProvider<LedgerBalanceClient> ledger = mock(ObjectProvider.class);
+        when(ledger.getIfAvailable()).thenReturn(mock(LedgerBalanceClient.class));
+        var registry = new SimpleMeterRegistry();
+        BuyingPowerAdmission admission = new BuyingPowerAdmission(cfg, ledger, registry);
+        Instant now = Instant.now();
+        Order sell = new Order(
+                UUID.randomUUID(),
+                UUID.randomUUID(),
+                "k",
+                0,
+                0,
+                OrderStatus.NEW,
+                null,
+                Side.SELL,
+                "AAPL",
+                new BigDecimal("1"),
+                new BigDecimal("10"),
+                "DAY",
+                now,
+                now,
+                null,
+                "hash",
+                "balance_x");
+        assertThat(admission.evaluate(sell)).isEqualTo(BuyingPowerAdmission.Outcome.PROCEED);
+        assertThat(registry.counter("oms_buying_power_sell_ledger_skip_total").count()).isEqualTo(1.0);
     }
 
     private static Order buyOrder(String ledgerBalanceId, BigDecimal qty, BigDecimal limit) {

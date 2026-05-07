@@ -21,6 +21,7 @@ public class OmsConfig {
     private final Chronicle chronicle = new Chronicle();
     private final Events events = new Events();
     private final Ledger ledger = new Ledger();
+    private final DomainEvents domainEvents = new DomainEvents();
     private final Pii pii = new Pii();
 
     public Http getHttp() { return http; }
@@ -30,6 +31,7 @@ public class OmsConfig {
     public Chronicle getChronicle() { return chronicle; }
     public Events getEvents() { return events; }
     public Ledger getLedger() { return ledger; }
+    public DomainEvents getDomainEvents() { return domainEvents; }
     public Pii getPii() { return pii; }
 
     public static class Http {
@@ -111,12 +113,16 @@ public class OmsConfig {
 
     public static class Ledger {
         private boolean enabled = false;
+        /** When true, OMS will POST Ledger sync inflight holds (not implemented in this slice). */
+        private boolean inflightReservationEnabled = false;
         private String baseUrl = "http://localhost:5001";
         private String apiKey = "";
         private long connectTimeoutMs = 2000L;
         private long readTimeoutMs = 5000L;
         public boolean isEnabled() { return enabled; }
         public void setEnabled(boolean v) { this.enabled = v; }
+        public boolean isInflightReservationEnabled() { return inflightReservationEnabled; }
+        public void setInflightReservationEnabled(boolean v) { this.inflightReservationEnabled = v; }
         public String getBaseUrl() { return baseUrl; }
         public void setBaseUrl(String v) { this.baseUrl = v; }
         public String getApiKey() { return apiKey; }
@@ -125,6 +131,18 @@ public class OmsConfig {
         public void setConnectTimeoutMs(long v) { this.connectTimeoutMs = v; }
         public long getReadTimeoutMs() { return readTimeoutMs; }
         public void setReadTimeoutMs(long v) { this.readTimeoutMs = v; }
+    }
+
+    public static class DomainEvents {
+        private long reconcilerAgeMs = 2000L;
+        private int reconcilerBatchSize = 100;
+        private long reconcilerIntervalMs = 500L;
+        public long getReconcilerAgeMs() { return reconcilerAgeMs; }
+        public void setReconcilerAgeMs(long v) { this.reconcilerAgeMs = v; }
+        public int getReconcilerBatchSize() { return reconcilerBatchSize; }
+        public void setReconcilerBatchSize(int v) { this.reconcilerBatchSize = v; }
+        public long getReconcilerIntervalMs() { return reconcilerIntervalMs; }
+        public void setReconcilerIntervalMs(long v) { this.reconcilerIntervalMs = v; }
     }
 
     public static class Pii {

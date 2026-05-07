@@ -5,15 +5,16 @@ import com.balh.oms.config.OmsConfig;
 import com.balh.oms.domain.Order;
 import com.balh.oms.domain.OrderStatus;
 import com.balh.oms.domain.RejectCode;
-import com.balh.oms.events.DomainEventPublisher;
-import com.balh.oms.events.OrderRejectedEvent;
-import com.balh.oms.events.OrderWorkingEvent;
+import com.balh.oms.events.DomainEventEnvelopeCodec;
+import com.balh.oms.persistence.DomainEventOutboxRepository;
 import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.risk.BuyingPowerAdmission;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
 
@@ -38,7 +39,8 @@ public class ControlTailer {
     private final StaleJobGuard stale;
     private final OmsConfig config;
     private final BuyingPowerAdmission buyingPower;
-    private final DomainEventPublisher events;
+    private final DomainEventOutboxRepository domainEventOutbox;
+    private final DomainEventEnvelopeCodec envelopeCodec;
     private final MeterRegistry meterRegistry;
 
     public ControlTailer(
@@ -46,16 +48,19 @@ public class ControlTailer {
             StaleJobGuard stale,
             OmsConfig config,
             BuyingPowerAdmission buyingPower,
-            DomainEventPublisher events,
+            DomainEventOutboxRepository domainEventOutbox,
+            DomainEventEnvelopeCodec envelopeCodec,
             MeterRegistry meterRegistry) {
         this.orders = orders;
         this.stale = stale;
         this.config = config;
         this.buyingPower = buyingPower;
-        this.events = events;
+        this.domainEventOutbox = domainEventOutbox;
+        this.envelopeCodec = envelopeCodec;
         this.meterRegistry = meterRegistry;
     }
 
+    @Transactional
     public TailResult apply(PendingControlEvent event) {
         if (stale.isStale(event.orderTimestamp())) {
             boolean updated = orders.updateWithCas(
@@ -133,13 +138,21 @@ public class ControlTailer {
 
     private void publishRejected(PendingControlEvent event, RejectCode reason) {
         int newSeq = event.orderVersion() + 1;
-        events.publish(OrderRejectedEvent.afterReject(event, reason, newSeq));
-        meterRegistry.counter(METRIC_REJECT_EVENTS, TAG_REJECT_CODE, reason.name()).increment();
+        try {
+            domainEventOutbox.insert(event.orderId(), envelopeCodec.orderRejected(event, reason, newSeq));
+            meterRegistry.counter(METRIC_REJECT_EVENTS, TAG_REJECT_CODE, reason.name()).increment();
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("domain event envelope serialisation failed", e);
+        }
     }
 
     private void publishWorking(PendingControlEvent event, Order order, int newSeq) {
-        events.publish(OrderWorkingEvent.afterWorking(event, order, newSeq));
-        meterRegistry.counter(METRIC_WORKING_EVENTS).increment();
+        try {
+            domainEventOutbox.insert(order.id(), envelopeCodec.orderWorking(event, order, newSeq));
+            meterRegistry.counter(METRIC_WORKING_EVENTS).increment();
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("domain event envelope serialisation failed", e);
+        }
     }
 
     public enum TailResult {

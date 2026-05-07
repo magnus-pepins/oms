@@ -21,6 +21,10 @@ oms:
       enabled: false
   ledger:
     enabled: false
+  domain-events:
+    reconciler-age-ms: 0
+    reconciler-batch-size: 100
+    reconciler-interval-ms: 200
   pii:
     audit-trace-enabled: false
     hash-secret: test-secret

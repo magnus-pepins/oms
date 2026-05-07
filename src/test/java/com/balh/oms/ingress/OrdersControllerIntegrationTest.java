@@ -69,6 +69,10 @@ class OrdersControllerIntegrationTest extends AbstractPostgresIntegrationTest {
         Long outboxCount = jdbc.queryForObject(
                 "SELECT COUNT(*) FROM control_outbox WHERE order_id = ?", Long.class, orderId);
         assertThat(outboxCount).isEqualTo(1L);
+
+        Long domainOutboxCount = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM domain_event_outbox WHERE order_id = ?", Long.class, orderId);
+        assertThat(domainOutboxCount).isEqualTo(1L);
     }
 
     @Test

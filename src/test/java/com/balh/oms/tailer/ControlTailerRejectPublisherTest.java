@@ -6,10 +6,13 @@ import com.balh.oms.domain.Order;
 import com.balh.oms.domain.OrderStatus;
 import com.balh.oms.domain.RejectCode;
 import com.balh.oms.domain.Side;
-import com.balh.oms.events.DomainEventPublisher;
-import com.balh.oms.events.OrderRejectedEvent;
+import com.balh.oms.events.DomainEventEnvelopeCodec;
+import com.balh.oms.persistence.DomainEventOutboxRepository;
 import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.risk.BuyingPowerAdmission;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -38,18 +41,21 @@ class ControlTailerRejectPublisherTest {
     @Mock OmsConfig config;
     @Mock OmsConfig.Ledger ledgerCfg;
     @Mock BuyingPowerAdmission buyingPower;
-    @Mock DomainEventPublisher events;
+    @Mock DomainEventOutboxRepository domainOutbox;
+
+    private final ObjectMapper objectMapper = new ObjectMapper().registerModule(new JavaTimeModule());
+    private final DomainEventEnvelopeCodec codec = new DomainEventEnvelopeCodec(objectMapper);
 
     SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
     ControlTailer tailer;
 
     @BeforeEach
     void setUp() {
-        tailer = new ControlTailer(orders, stale, config, buyingPower, events, meterRegistry);
+        tailer = new ControlTailer(orders, stale, config, buyingPower, domainOutbox, codec, meterRegistry);
     }
 
     @Test
-    void staleRejectPublishesOrderRejectedAfterSuccessfulCas() {
+    void staleRejectInsertsOrderRejectedAfterSuccessfulCas() throws Exception {
         PendingControlEvent ev = sampleEvent();
         when(stale.isStale(ev.orderTimestamp())).thenReturn(true);
         when(orders.updateWithCas(
@@ -62,18 +68,19 @@ class ControlTailerRejectPublisherTest {
 
         assertThat(tailer.apply(ev)).isEqualTo(ControlTailer.TailResult.STALE_REJECTED);
 
-        ArgumentCaptor<OrderRejectedEvent> cap = ArgumentCaptor.forClass(OrderRejectedEvent.class);
-        verify(events).publish(cap.capture());
-        OrderRejectedEvent published = cap.getValue();
-        assertThat(published.orderId()).isEqualTo(ev.orderId());
-        assertThat(published.eventSeq()).isEqualTo(ev.orderVersion() + 1);
-        assertThat(published.rejectCode()).isEqualTo(RejectCode.RISK_STALE_QUEUE.name());
+        ArgumentCaptor<String> cap = ArgumentCaptor.forClass(String.class);
+        verify(domainOutbox).insert(eq(ev.orderId()), cap.capture());
+        JsonNode root = objectMapper.readTree(cap.getValue());
+        assertThat(root.path("type").asText()).isEqualTo("OrderRejected");
+        assertThat(root.path("payload").path("orderId").asText()).isEqualTo(ev.orderId().toString());
+        assertThat(root.path("payload").path("eventSeq").asInt()).isEqualTo(ev.orderVersion() + 1);
+        assertThat(root.path("payload").path("rejectCode").asText()).isEqualTo(RejectCode.RISK_STALE_QUEUE.name());
         assertThat(meterRegistry.counter("oms_order_rejected_events_published_total", "reject_code", "RISK_STALE_QUEUE").count())
                 .isEqualTo(1.0);
     }
 
     @Test
-    void staleRejectSkipsPublishWhenCasDoesNotApply() {
+    void staleRejectSkipsOutboxWhenCasDoesNotApply() {
         PendingControlEvent ev = sampleEvent();
         when(stale.isStale(ev.orderTimestamp())).thenReturn(true);
         when(orders.updateWithCas(
@@ -85,11 +92,11 @@ class ControlTailerRejectPublisherTest {
                 any(Instant.class))).thenReturn(false);
 
         assertThat(tailer.apply(ev)).isEqualTo(ControlTailer.TailResult.SKIPPED_VERSION_MISMATCH);
-        verify(events, never()).publish(any());
+        verify(domainOutbox, never()).insert(any(), any());
     }
 
     @Test
-    void buyingPowerRejectPublishesOrderRejected() {
+    void buyingPowerRejectInsertsOrderRejected() throws Exception {
         when(config.getLedger()).thenReturn(ledgerCfg);
         when(ledgerCfg.isEnabled()).thenReturn(true);
         Order row = sampleOrder(evOrderId());
@@ -107,9 +114,10 @@ class ControlTailerRejectPublisherTest {
 
         assertThat(tailer.apply(ev)).isEqualTo(ControlTailer.TailResult.BUYING_POWER_REJECTED);
 
-        ArgumentCaptor<OrderRejectedEvent> cap = ArgumentCaptor.forClass(OrderRejectedEvent.class);
-        verify(events).publish(cap.capture());
-        assertThat(cap.getValue().rejectCode()).isEqualTo(RejectCode.RISK_BUYING_POWER.name());
+        ArgumentCaptor<String> cap = ArgumentCaptor.forClass(String.class);
+        verify(domainOutbox).insert(eq(ev.orderId()), cap.capture());
+        assertThat(objectMapper.readTree(cap.getValue()).path("payload").path("rejectCode").asText())
+                .isEqualTo(RejectCode.RISK_BUYING_POWER.name());
     }
 
     private static UUID evOrderId() {

@@ -13,20 +13,23 @@ sequenceDiagram
     autonumber
     participant Client as Customer / BFF / FIX-IN
     participant API as OMS HTTP\n(/internal/v1/orders)
-    participant PG as Postgres\n(orders + control_outbox)
+    participant PG as Postgres\n(orders + control_outbox +\ndomain_event_outbox)
     participant REC as OutboxReconciler\n(scheduled)
     participant CHR as Chronicle Queue\n(engineering replay)
     participant TAIL as ChronicleControlTailReader\n(scheduled)
     participant TLR as ControlTailer
-    participant BUS as DomainEventPublisher\n(NATS optional)
+    participant FAN as DomainFanoutReconciler\n+ FanoutClient\n(NATS optional)
 
     Client->>API: POST CreateOrderRequest
     API->>PG: BEGIN
     API->>PG: INSERT INTO orders (...)
     API->>PG: INSERT INTO control_outbox (order_id, version, payload)
+    API->>PG: INSERT INTO domain_event_outbox (order_id, envelope_json)
     API->>PG: COMMIT
     API-->>Client: 201 Created
-    API->>BUS: publish OrderAccepted\n(after commit, fire-and-forget)
+    FAN->>PG: SELECT domain_event_outbox ... pending
+    FAN->>FAN: deliver(envelope JSON)
+    FAN->>PG: UPDATE published_at
     REC->>PG: SELECT ... WHERE chronicle_enqueued_at IS NULL
     REC->>CHR: append(payload)
     REC->>PG: UPDATE control_outbox SET chronicle_enqueued_at = NOW()
@@ -34,19 +37,22 @@ sequenceDiagram
     TAIL->>TLR: apply(PendingControlEvent)
     TLR->>PG: optional Ledger HTTP\n(buying power when enabled)
     TLR->>PG: CAS UPDATE orders\n(WORKING or REJECTED)
-    TLR->>BUS: publish OrderWorking / OrderRejected\n(slice 1.5+, after CAS)
+    TLR->>PG: INSERT INTO domain_event_outbox\n(OrderWorking / OrderRejected envelope)
 ```
 
 The four invariants encoded by this diagram:
 
 1. **Postgres COMMIT happens before any Chronicle append.** Always.
-2. **The outbox row is inside the same transaction** as the orders row, so
+2. **The control outbox row is inside the same transaction** as the orders row, so
    crash recovery is trivial: anything visible in `orders` has a matching
-   outbox row (or a `chronicle_enqueued_at` timestamp).
-3. **Domain events on NATS / drop copy are published only after commit.**
-   `OrderAccepted` fires after the ingress transaction commits; **`OrderWorking`**
-   and **`OrderRejected`** fire after the tailer's successful CAS (slice 1.5+).
-   Slice 1 ships a no-op publisher; enable NATS with `OMS_NATS_ENABLED=true`.
+   `control_outbox` row (or a `chronicle_enqueued_at` timestamp). **`OrderAccepted`**
+   domain fanout uses the same transaction via `domain_event_outbox`.**
+3. **Domain events on NATS / drop copy are delivered only after commit.**
+   `OrderAccepted` is written to `domain_event_outbox` in the ingress transaction;
+   **`DomainFanoutReconciler`** publishes the full JSON envelope after commit.
+   **`OrderWorking`** and **`OrderRejected`** use the same outbox pattern inside
+   the tailer's transaction after successful CAS. Enable NATS with `OMS_NATS_ENABLED=true`;
+   otherwise a no-op `FanoutClient` counts deliveries only.
 4. **Tailer mutations are CAS on `orders.version`.** Re-applying the same
    payload is a no-op.
 
@@ -80,8 +86,7 @@ regulatory system of record."
 
 ## What about NATS losing events?
 
-The `DomainEventPublisher` is a fire-and-forget hook AFTER Postgres commit.
-If NATS is unreachable, downstream consumers (desk UI, drop copy) miss the
-event but the order itself is fully committed. Slice 1.5 adds an
-optional re-emit-from-outbox path to harden this for the external drop
-copy contract.
+Domain fanout uses a **transactional outbox** (`domain_event_outbox`). If NATS is
+unreachable, rows stay pending with `published_at IS NULL` until
+`DomainFanoutReconciler` succeeds; the trading system of record in Postgres is
+unaffected. Tune age, batch, and interval with `OMS_DOMAIN_EVENTS_*`.

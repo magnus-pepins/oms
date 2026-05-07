@@ -43,9 +43,17 @@ new key here when introducing one.
 
 | Key                                   | Default | Meaning                                                                            |
 |---------------------------------------|---------|------------------------------------------------------------------------------------|
-| `OMS_OUTBOX_RECONCILER_AGE_MS`        | `2000`  | Minimum age before an outbox row is eligible for Chronicle append (avoids races).  |
+| `OMS_OUTBOX_RECONCILER_AGE_MS`        | `2000`  | Minimum age before a control outbox row is eligible for Chronicle append (avoids races).  |
 | `OMS_OUTBOX_RECONCILER_BATCH_SIZE`    | `100`   | Rows fetched per reconciler tick.                                                  |
 | `OMS_OUTBOX_RECONCILER_INTERVAL_MS`   | `500`   | Scheduled-task interval. Drives `oms_control_outbox_appended_total` cadence.       |
+
+## Domain fanout outbox
+
+| Key                                      | Default | Meaning                                                                 |
+|------------------------------------------|---------|-------------------------------------------------------------------------|
+| `OMS_DOMAIN_EVENTS_RECONCILER_AGE_MS`    | `2000`  | Minimum age before a `domain_event_outbox` row is eligible for NATS delivery. |
+| `OMS_DOMAIN_EVENTS_RECONCILER_BATCH_SIZE` | `100` | Rows fetched per `DomainFanoutReconciler` tick.                         |
+| `OMS_DOMAIN_EVENTS_RECONCILER_INTERVAL_MS` | `500` | `@Scheduled` fixed delay for domain fanout drain.                       |
 
 ## Chronicle
 
@@ -61,7 +69,7 @@ new key here when introducing one.
 
 | Key                          | Default                | Meaning                                                                   |
 |------------------------------|------------------------|---------------------------------------------------------------------------|
-| `OMS_NATS_ENABLED`           | `false`                | When true, the NATS-backed publisher displaces the no-op (slice 1.5+).    |
+| `OMS_NATS_ENABLED`           | `false`                | When true, wires `NatsFanoutClient` (JetStream) instead of the no-op `FanoutClient`. |
 | `OMS_NATS_URL`               | `nats://localhost:4222`| NATS connection URL.                                                      |
 | `OMS_NATS_SUBJECT_PREFIX`    | `oms.events`           | Subject prefix; events publish to `${prefix}.${type}`.                    |
 | `OMS_NATS_STREAM_NAME`       | `OMS_EVENTS`           | JetStream stream name created on startup (idempotent if it exists).       |
@@ -76,6 +84,7 @@ new key here when introducing one.
 | `OMS_LEDGER_API_KEY`           | (empty)                 | Value for `X-Ledger-Key` on balance reads. Required when enabled.         |
 | `OMS_LEDGER_CONNECT_TIMEOUT_MS`  | `2000`                  | HTTP connect timeout for Ledger calls.                                  |
 | `OMS_LEDGER_READ_TIMEOUT_MS`     | `5000`                  | HTTP read timeout for Ledger calls.                                      |
+| `OMS_LEDGER_INFLIGHT_RESERVATION_ENABLED` | `false`          | Reserved: when true, OMS will POST Ledger sync inflight holds on the hot path (not implemented in this slice). |
 
 ## PII
 

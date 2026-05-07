@@ -1,8 +1,6 @@
 package com.balh.oms.ingress;
 
 import com.balh.oms.domain.Order;
-import com.balh.oms.events.DomainEventPublisher;
-import com.balh.oms.events.OrderAcceptedEvent;
 import com.balh.oms.persistence.OrdersRepository;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -24,9 +22,11 @@ import java.util.UUID;
  * <p>The {@link #createOrder} flow enforces the slice-1 invariant:
  * <ol>
  *   <li>{@link OrderIngressService#persistAccepted} runs the single Postgres
- *       transaction (orders insert + control_outbox insert + COMMIT).</li>
- *   <li>Only AFTER that returns do we publish the {@link OrderAcceptedEvent}
- *       to the fanout bus. The Chronicle append happens asynchronously in
+ *       transaction (orders insert + {@code control_outbox} insert +
+ *       {@code domain_event_outbox} insert + COMMIT).</li>
+ *   <li>{@link com.balh.oms.reconciler.DomainFanoutReconciler} delivers domain
+ *       envelopes to NATS (or no-op) strictly after commit.</li>
+ *   <li>The Chronicle append happens asynchronously in
  *       {@code OutboxReconciler}, also strictly after commit.</li>
  * </ol>
  *
@@ -41,18 +41,15 @@ public class OrdersController {
 
     private final OrderIngressService ingress;
     private final OrdersRepository orders;
-    private final DomainEventPublisher events;
     private final Counter ordersCreatedCounter;
     private final Counter ordersDuplicateCounter;
 
     public OrdersController(
             OrderIngressService ingress,
             OrdersRepository orders,
-            DomainEventPublisher events,
             MeterRegistry registry) {
         this.ingress = ingress;
         this.orders = orders;
-        this.events = events;
         this.ordersCreatedCounter = Counter.builder("oms_orders_created_total")
                 .description("Orders accepted via the internal HTTP ingress")
                 .register(registry);
@@ -70,21 +67,7 @@ public class OrdersController {
             return ResponseEntity.ok(CreateOrderResponse.from(result.order()));
         }
 
-        // Publish the domain event AFTER the @Transactional boundary on
-        // OrderIngressService.persistAccepted has closed.
         Order accepted = result.order();
-        events.publish(new OrderAcceptedEvent(
-                accepted.id(),
-                accepted.version(),
-                accepted.shardId(),
-                accepted.accountIdHash(),
-                accepted.side().name(),
-                accepted.instrumentSymbol(),
-                accepted.quantity(),
-                accepted.limitPrice(),
-                accepted.timeInForce(),
-                accepted.acceptedAt()
-        ));
         ordersCreatedCounter.increment();
 
         return ResponseEntity.status(HttpStatus.CREATED).body(CreateOrderResponse.from(accepted));

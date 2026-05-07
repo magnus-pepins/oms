@@ -23,21 +23,23 @@ and the milestone plan it links to.
 - `POST /internal/v1/orders` and `GET /internal/v1/orders/{id}` (HTTP, internal
   API key auth).
 - Idempotent inserts on `(account_id, client_idempotency_key)`.
-- `control_outbox` table; rows are written inside the same Postgres
-  transaction as the `orders` row.
-- `OutboxReconciler` drains the outbox into Chronicle Queue (engineering
+- `domain_event_outbox` table; canonical JSON **envelopes** are written in the
+  same Postgres transaction as the originating change (`OrderAccepted` on
+  ingress; `OrderWorking` / `OrderRejected` in `ControlTailer` after CAS).
+- `DomainFanoutReconciler` + `FanoutClient` drain `domain_event_outbox` to NATS
+  JetStream (full envelope as message body) or a no-op transport when NATS is off.
+- `OutboxReconciler` drains `control_outbox` into Chronicle Queue (engineering
   replay only, NOT a regulatory system of record).
 - `ControlTailer` applies CAS updates on `orders.version` and, on terminal
-  reject paths, publishes **`OrderRejected`**; after a successful transition to
-  **`WORKING`**, publishes **`OrderWorking`** (same fire-and-forget contract as
-  `OrderAccepted`).
+  reject paths, records **`OrderRejected`** in the domain outbox; after a
+  successful transition to **`WORKING`**, records **`OrderWorking`**.
 - Hashed-account-id PII policy enforced by a Micrometer filter and a guard
   test.
 - Optional **Ledger** HTTP client: when `OMS_LEDGER_ENABLED=true`, `ControlTailer`
   can reject BUY orders (with `ledgerBalanceId` + `limitPrice`) for insufficient
   `availableBalance` (`RISK_BUYING_POWER`) before CAS to `WORKING`.
-- Optional **NATS JetStream** publisher: when `OMS_NATS_ENABLED=true`, domain
-  events publish after Postgres commit (see `NatsDomainEventPublisher`).
+- Optional **NATS JetStream** fanout: when `OMS_NATS_ENABLED=true`, `NatsFanoutClient`
+  publishes envelope JSON after the outbox reconciler sees committed rows.
 - Three operational drill scripts (failover, broken-chronicle,
   reconciler-under-load) — skeletons that document assertions; bodies grow with
   later slices.

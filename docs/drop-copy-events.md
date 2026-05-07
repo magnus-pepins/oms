@@ -3,45 +3,58 @@
 The OMS publishes domain events for downstream consumers — desk live feed,
 internal drop copy, ops dashboards, external drop copy (via FIX, slice 2+).
 
-Slice 1 ships the contract and a no-op publisher. **Slice 1.5** adds an optional
-NATS JetStream publisher plus **`OrderRejected`** and **`OrderWorking`** emission
-from `ControlTailer` after successful reject / working CAS. External FIX drop copy is slice 2+.
+Slice 1 ships the contract and a **transactional outbox** (`domain_event_outbox`)
+drained by `DomainFanoutReconciler`. **NATS JetStream** (`FanoutClient`) is
+optional when `OMS_NATS_ENABLED=true`. **`OrderRejected`** and **`OrderWorking`**
+are written to the same outbox inside `ControlTailer` after successful CAS.
+External FIX drop copy is slice 2+.
 
 ## Envelope (wire schema)
+
+The NATS message body is a **single JSON object** with a nested `payload` for the
+event-specific record:
 
 ```json
 {
   "schemaVersion": 1,
   "type": "OrderAccepted",
-  "orderId": "uuid",
-  "eventSeq": 1,
-  "shardId": 0,
-  "accountIdHash": "hex string",
-  "side": "BUY",
-  "instrumentSymbol": "AAPL",
-  "quantity": "10",
-  "limitPrice": "150.00",
-  "timeInForce": "DAY",
-  "acceptedAt": "ISO-8601 instant"
+  "occurredAt": "2026-05-07T12:00:00Z",
+  "correlationId": "order-uuid",
+  "payload": {
+    "orderId": "uuid",
+    "eventSeq": 0,
+    "shardId": 0,
+    "accountIdHash": "hex string",
+    "side": "BUY",
+    "instrumentSymbol": "AAPL",
+    "quantity": "10",
+    "limitPrice": "150.00",
+    "timeInForce": "DAY",
+    "acceptedAt": "ISO-8601 instant"
+  }
 }
 ```
 
-`OrderWorking` (after successful CAS to `WORKING` in `ControlTailer`; fields mirror accept for desk continuity):
+`OrderWorking` (after successful CAS to `WORKING` in `ControlTailer`; `payload` mirrors accept for desk continuity):
 
 ```json
 {
   "schemaVersion": 1,
   "type": "OrderWorking",
-  "orderId": "uuid",
-  "eventSeq": 1,
-  "shardId": 0,
-  "accountIdHash": "hex string",
-  "side": "BUY",
-  "instrumentSymbol": "AAPL",
-  "quantity": "10",
-  "limitPrice": "150.00",
-  "timeInForce": "DAY",
-  "workingAt": "ISO-8601 instant"
+  "occurredAt": "2026-05-07T12:00:01Z",
+  "correlationId": "order-uuid",
+  "payload": {
+    "orderId": "uuid",
+    "eventSeq": 1,
+    "shardId": 0,
+    "accountIdHash": "hex string",
+    "side": "BUY",
+    "instrumentSymbol": "AAPL",
+    "quantity": "10",
+    "limitPrice": "150.00",
+    "timeInForce": "DAY",
+    "workingAt": "ISO-8601 instant"
+  }
 }
 ```
 
@@ -51,12 +64,16 @@ from `ControlTailer` after successful reject / working CAS. External FIX drop co
 {
   "schemaVersion": 1,
   "type": "OrderRejected",
-  "orderId": "uuid",
-  "eventSeq": 1,
-  "shardId": 0,
-  "accountIdHash": "hex string",
-  "rejectCode": "RISK_BUYING_POWER",
-  "terminalAt": "ISO-8601 instant"
+  "occurredAt": "2026-05-07T12:00:01Z",
+  "correlationId": "order-uuid",
+  "payload": {
+    "orderId": "uuid",
+    "eventSeq": 1,
+    "shardId": 0,
+    "accountIdHash": "hex string",
+    "rejectCode": "RISK_BUYING_POWER",
+    "terminalAt": "ISO-8601 instant"
+  }
 }
 ```
 
@@ -71,16 +88,16 @@ from `ControlTailer` after successful reject / working CAS. External FIX drop co
 
 | Event              | Emitted from                        | Trigger                                                  |
 |--------------------|-------------------------------------|----------------------------------------------------------|
-| `OrderAccepted`    | `OrdersController.createOrder`      | After Postgres commit, before HTTP response is returned. |
-| `OrderRejected`    | `ControlTailer.apply`               | After successful CAS sets `status=REJECTED` (stale queue, buying power, ledger error). |
-| `OrderWorking`     | `ControlTailer.apply`               | After successful CAS sets `status=WORKING`.                               |
+| `OrderAccepted`    | `OrderIngressService.persistAccepted` | Same Postgres transaction as `orders` + `control_outbox` insert; reconciler delivers after commit. |
+| `OrderRejected`    | `ControlTailer.apply`               | Same transaction as successful CAS to `REJECTED` (stale queue, buying power, ledger error). |
+| `OrderWorking`     | `ControlTailer.apply`               | Same transaction as successful CAS to `WORKING`.                               |
 | Execution events   | Slice 2+ FIX gateway                | After Ledger settlement leg lands.                       |
 
 ## Mandatory rule
 
-Domain events MUST be published only after the originating Postgres
-transaction has committed. This is the same invariant that gates
-Chronicle appends.
+Domain events MUST be written to `domain_event_outbox` only inside the
+originating Postgres transaction, and handed to NATS only after commit by
+`DomainFanoutReconciler`. This mirrors the invariant that gates Chronicle appends.
 
 ## Subscriber expectations
 

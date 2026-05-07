@@ -6,7 +6,9 @@ import com.balh.oms.domain.Order;
 import com.balh.oms.domain.OrderStatus;
 import com.balh.oms.domain.ShardKey;
 import com.balh.oms.observability.PiiHash;
+import com.balh.oms.events.DomainEventEnvelopeCodec;
 import com.balh.oms.persistence.ControlOutboxRepository;
+import com.balh.oms.persistence.DomainEventOutboxRepository;
 import com.balh.oms.persistence.OrdersRepository;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -19,8 +21,8 @@ import java.time.Instant;
 import java.util.UUID;
 
 /**
- * Owns the single Postgres transaction that inserts an order and its matching
- * outbox row.
+ * Owns the single Postgres transaction that inserts an order and matching
+ * {@code control_outbox} and {@code domain_event_outbox} rows.
  *
  * <p>This is a separate Spring bean (not a controller method) because Spring's
  * {@code @Transactional} relies on AOP proxies and self-invocation through
@@ -34,6 +36,8 @@ public class OrderIngressService {
 
     private final OrdersRepository orders;
     private final ControlOutboxRepository outbox;
+    private final DomainEventOutboxRepository domainEventOutbox;
+    private final DomainEventEnvelopeCodec domainEventEnvelopeCodec;
     private final OmsConfig config;
     private final ObjectMapper objectMapper;
     private final PiiHash piiHash;
@@ -41,11 +45,15 @@ public class OrderIngressService {
     public OrderIngressService(
             OrdersRepository orders,
             ControlOutboxRepository outbox,
+            DomainEventOutboxRepository domainEventOutbox,
+            DomainEventEnvelopeCodec domainEventEnvelopeCodec,
             OmsConfig config,
             ObjectMapper objectMapper,
             PiiHash piiHash) {
         this.orders = orders;
         this.outbox = outbox;
+        this.domainEventOutbox = domainEventOutbox;
+        this.domainEventEnvelopeCodec = domainEventEnvelopeCodec;
         this.config = config;
         this.objectMapper = objectMapper;
         this.piiHash = piiHash;
@@ -63,7 +71,8 @@ public class OrderIngressService {
      * or — if another concurrent request beat us to the unique constraint —
      * returns the pre-existing row.
      *
-     * <p>Commit happens when this method returns.
+     * <p>Commit happens when this method returns. Domain fanout delivery is
+ * asynchronous via {@link com.balh.oms.reconciler.DomainFanoutReconciler}.
      */
     @Transactional
     public IngressResult persistAccepted(CreateOrderRequest req) {
@@ -111,6 +120,12 @@ public class OrderIngressService {
                         order.accountIdHash(),
                         order.acceptedAt(),
                         Instant.now())));
+        try {
+            domainEventOutbox.insert(id, domainEventEnvelopeCodec.orderAccepted(order));
+        } catch (JsonProcessingException e) {
+            log.error("Failed to serialise domain fanout envelope for orderId={}", id, e);
+            throw new RuntimeException("domain event envelope serialisation failed", e);
+        }
         return new IngressResult(order, true);
     }
 

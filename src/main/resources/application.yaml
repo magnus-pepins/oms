@@ -67,6 +67,11 @@ oms:
     api-key: ${OMS_LEDGER_API_KEY:}
     connect-timeout-ms: ${OMS_LEDGER_CONNECT_TIMEOUT_MS:2000}
     read-timeout-ms: ${OMS_LEDGER_READ_TIMEOUT_MS:5000}
+    inflight-reservation-enabled: ${OMS_LEDGER_INFLIGHT_RESERVATION_ENABLED:false}
+  domain-events:
+    reconciler-age-ms: ${OMS_DOMAIN_EVENTS_RECONCILER_AGE_MS:2000}
+    reconciler-batch-size: ${OMS_DOMAIN_EVENTS_RECONCILER_BATCH_SIZE:100}
+    reconciler-interval-ms: ${OMS_DOMAIN_EVENTS_RECONCILER_INTERVAL_MS:500}
   pii:
     audit-trace-enabled: ${OMS_PII_AUDIT_TRACE_ENABLED:false}
     hash-secret: ${OMS_PII_HASH_SECRET:dev-only-change-me}

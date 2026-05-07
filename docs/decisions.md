@@ -87,5 +87,7 @@ and v1.15 of [plans/oms-fix-gateway-and-settlement.md](../../system-documentatio
 
 - NATS / JetStream is the **fanout bus** (desk live feed, drop copy, ops
   dashboards). It is **not** the authoritative trading command log.
-- Slice 1 ships a no-op `DomainEventPublisher` and a NATS-enabled
-  property. The NATS-backed implementation lands in slice 1.5.
+- Domain fanout uses a **Postgres transactional outbox** (`domain_event_outbox`)
+  plus `DomainFanoutReconciler`; `FanoutClient` is NATS-backed when
+  `OMS_NATS_ENABLED=true`, otherwise a no-op implementation for tests and
+  single-node operation.

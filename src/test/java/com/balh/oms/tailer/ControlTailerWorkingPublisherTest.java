@@ -5,10 +5,13 @@ import com.balh.oms.config.OmsConfig;
 import com.balh.oms.domain.Order;
 import com.balh.oms.domain.OrderStatus;
 import com.balh.oms.domain.Side;
-import com.balh.oms.events.DomainEventPublisher;
-import com.balh.oms.events.OrderWorkingEvent;
+import com.balh.oms.events.DomainEventEnvelopeCodec;
+import com.balh.oms.persistence.DomainEventOutboxRepository;
 import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.risk.BuyingPowerAdmission;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -35,18 +38,21 @@ class ControlTailerWorkingPublisherTest {
     @Mock OmsConfig config;
     @Mock OmsConfig.Ledger ledgerCfg;
     @Mock BuyingPowerAdmission buyingPower;
-    @Mock DomainEventPublisher events;
+    @Mock DomainEventOutboxRepository domainOutbox;
+
+    private final ObjectMapper objectMapper = new ObjectMapper().registerModule(new JavaTimeModule());
+    private final DomainEventEnvelopeCodec codec = new DomainEventEnvelopeCodec(objectMapper);
 
     SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
     ControlTailer tailer;
 
     @BeforeEach
     void setUp() {
-        tailer = new ControlTailer(orders, stale, config, buyingPower, events, meterRegistry);
+        tailer = new ControlTailer(orders, stale, config, buyingPower, domainOutbox, codec, meterRegistry);
     }
 
     @Test
-    void workingTransitionPublishesOrderWorkingAfterSuccessfulCas() {
+    void workingTransitionInsertsOrderWorkingEnvelopeAfterSuccessfulCas() throws Exception {
         when(config.getLedger()).thenReturn(ledgerCfg);
         when(ledgerCfg.isEnabled()).thenReturn(false);
         PendingControlEvent ev = new PendingControlEvent(
@@ -70,12 +76,13 @@ class ControlTailerWorkingPublisherTest {
 
         assertThat(tailer.apply(ev)).isEqualTo(ControlTailer.TailResult.APPLIED);
 
-        ArgumentCaptor<OrderWorkingEvent> cap = ArgumentCaptor.forClass(OrderWorkingEvent.class);
-        verify(events).publish(cap.capture());
-        OrderWorkingEvent published = cap.getValue();
-        assertThat(published.orderId()).isEqualTo(ev.orderId());
-        assertThat(published.eventSeq()).isEqualTo(1);
-        assertThat(published.side()).isEqualTo("BUY");
+        ArgumentCaptor<String> cap = ArgumentCaptor.forClass(String.class);
+        verify(domainOutbox).insert(eq(ev.orderId()), cap.capture());
+        JsonNode root = objectMapper.readTree(cap.getValue());
+        assertThat(root.path("type").asText()).isEqualTo("OrderWorking");
+        assertThat(root.path("payload").path("orderId").asText()).isEqualTo(ev.orderId().toString());
+        assertThat(root.path("payload").path("eventSeq").asInt()).isEqualTo(1);
+        assertThat(root.path("payload").path("side").asText()).isEqualTo("BUY");
         assertThat(meterRegistry.counter("oms_order_working_events_published_total").count()).isEqualTo(1.0);
     }
 

@@ -1,0 +1,30 @@
+spring:
+  flyway:
+    enabled: true
+
+oms:
+  http:
+    internal-api-key: test-key
+  shard:
+    id: 0
+    count: 1
+  control:
+    max-job-age-ms: 60000
+  outbox:
+    reconciler-age-ms: 0
+    reconciler-batch-size: 100
+    reconciler-interval-ms: 200
+  chronicle:
+    queue-dir: ./build/test-queues
+  events:
+    nats:
+      enabled: false
+  pii:
+    audit-trace-enabled: false
+    hash-secret: test-secret
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus

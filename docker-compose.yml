@@ -1,0 +1,31 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: oms-postgres
+    environment:
+      POSTGRES_DB: oms
+      POSTGRES_USER: oms
+      POSTGRES_PASSWORD: oms
+    ports:
+      - "5432:5432"
+    volumes:
+      - oms-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U oms -d oms"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Optional. Off in slice 1; the OMS does not strictly need NATS yet, but enabling
+  # it locally lets you exercise the DomainEventPublisher fanout path.
+  nats:
+    image: nats:2.10-alpine
+    container_name: oms-nats
+    command: ["-js"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    profiles: ["with-nats"]
+
+volumes:
+  oms-postgres-data:

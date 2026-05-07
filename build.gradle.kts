@@ -1,0 +1,73 @@
+plugins {
+    java
+    id("org.springframework.boot") version "3.3.4"
+    id("io.spring.dependency-management") version "1.1.6"
+}
+
+group = "com.balh"
+version = "0.1.0-SNAPSHOT"
+
+java {
+    toolchain {
+        languageVersion.set(JavaLanguageVersion.of(21))
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    // Spring Boot 3 minimal: Web + Actuator + JDBC + Flyway
+    implementation("org.springframework.boot:spring-boot-starter-web")
+    implementation("org.springframework.boot:spring-boot-starter-actuator")
+    implementation("org.springframework.boot:spring-boot-starter-jdbc")
+    implementation("org.springframework.boot:spring-boot-starter-validation")
+
+    // Postgres + Flyway
+    runtimeOnly("org.postgresql:postgresql:42.7.4")
+    implementation("org.flywaydb:flyway-core:10.20.1")
+    implementation("org.flywaydb:flyway-database-postgresql:10.20.1")
+
+    // Micrometer Prometheus
+    implementation("io.micrometer:micrometer-registry-prometheus")
+
+    // Chronicle Queue OSS — durable shard-local journal.
+    // 2026.2 is the latest stable on Maven Central as of this bootstrap.
+    implementation("net.openhft:chronicle-queue:2026.2") {
+        // Avoid the OpenHFT slf4j shim; let Spring Boot's logback own slf4j-api.
+        exclude(group = "org.slf4j", module = "slf4j-api")
+    }
+
+    // LMAX Disruptor — in-process pipelining (used post-PG-commit only)
+    implementation("com.lmax:disruptor:4.0.0")
+
+    // Logging — Spring Boot brings logback-classic by default; OK for slice 1.
+    implementation("org.slf4j:slf4j-api:2.0.16")
+
+    // Hashing for PII-safe metric labels
+    implementation("net.openhft:zero-allocation-hashing:0.16")
+
+    // JSON (Jackson is pulled by spring-web; explicit for outbox payload codec)
+    implementation("com.fasterxml.jackson.module:jackson-module-parameter-names")
+    implementation("com.fasterxml.jackson.datatype:jackson-datatype-jsr310")
+
+    // Test
+    testImplementation("org.springframework.boot:spring-boot-starter-test")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+    testImplementation("org.testcontainers:testcontainers:1.20.3")
+    testImplementation("org.testcontainers:postgresql:1.20.3")
+    testImplementation("org.testcontainers:junit-jupiter:1.20.3")
+    testImplementation("org.assertj:assertj-core:3.26.3")
+    testImplementation("org.awaitility:awaitility:4.2.2")
+}
+
+tasks.withType<Test> {
+    useJUnitPlatform()
+    // Keep test logs deterministic: do not run integration suites in parallel until we enable Postgres pooling.
+    systemProperty("junit.jupiter.execution.parallel.enabled", "false")
+}
+
+tasks.named<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJar") {
+    archiveBaseName.set("oms")
+}

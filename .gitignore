@@ -1,0 +1,38 @@
+# Gradle
+.gradle/
+build/
+out/
+!gradle-wrapper.jar
+
+# IDE
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+.classpath
+.project
+.settings/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env / local config
+.env
+.env.local
+.env.*.local
+
+# Chronicle queue files (if developer points it at the repo by accident)
+/queues/
+*.cq4
+*.cq4t
+metadata.cq4t
+
+# Logs
+logs/
+*.log
+
+# Test artefacts
+/build/test-results/
+/build/reports/

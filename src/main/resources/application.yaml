@@ -1,0 +1,70 @@
+server:
+  port: ${OMS_HTTP_PORT:8080}
+  shutdown: graceful
+
+spring:
+  application:
+    name: oms
+  datasource:
+    url: ${OMS_PG_URL:jdbc:postgresql://localhost:5432/oms}
+    username: ${OMS_PG_USER:oms}
+    password: ${OMS_PG_PASSWORD:oms}
+    hikari:
+      maximum-pool-size: ${OMS_PG_POOL_MAX_SIZE:20}
+      minimum-idle: ${OMS_PG_POOL_MIN_IDLE:5}
+      connection-timeout: ${OMS_PG_CONNECTION_TIMEOUT_MS:2000}
+      pool-name: oms-pg
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: false
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+    prometheus:
+      access: read_only
+  metrics:
+    tags:
+      application: oms
+      shard_id: ${OMS_SHARD_ID:0}
+
+oms:
+  http:
+    internal-api-key: ${OMS_INTERNAL_API_KEY:}
+  shard:
+    id: ${OMS_SHARD_ID:0}
+    count: ${OMS_SHARD_COUNT:1}
+  control:
+    max-job-age-ms: ${OMS_CONTROL_MAX_JOB_AGE_MS:5000}
+    tailer-batch-size: ${OMS_TAILER_BATCH_SIZE:100}
+  outbox:
+    reconciler-age-ms: ${OMS_OUTBOX_RECONCILER_AGE_MS:2000}
+    reconciler-batch-size: ${OMS_OUTBOX_RECONCILER_BATCH_SIZE:100}
+    reconciler-interval-ms: ${OMS_OUTBOX_RECONCILER_INTERVAL_MS:500}
+  chronicle:
+    enabled: ${OMS_CHRONICLE_ENABLED:true}
+    queue-dir: ${OMS_CHRONICLE_QUEUE_DIR:./queues/control}
+    roll-cycle: ${OMS_CHRONICLE_ROLL_CYCLE:DAILY}
+    tail-poll-interval-ms: ${OMS_CHRONICLE_TAIL_POLL_INTERVAL_MS:50}
+    tail-batch-max-messages: ${OMS_CHRONICLE_TAIL_BATCH_MAX_MESSAGES:200}
+  events:
+    nats:
+      enabled: ${OMS_NATS_ENABLED:false}
+      url: ${OMS_NATS_URL:nats://localhost:4222}
+      subject-prefix: ${OMS_NATS_SUBJECT_PREFIX:oms.events}
+  pii:
+    audit-trace-enabled: ${OMS_PII_AUDIT_TRACE_ENABLED:false}
+    hash-secret: ${OMS_PII_HASH_SECRET:dev-only-change-me}
+
+logging:
+  level:
+    root: INFO
+    com.balh.oms: INFO
+    org.springframework.web: INFO

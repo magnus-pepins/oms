@@ -1,0 +1,82 @@
+package com.balh.oms.fix;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.stereotype.Component;
+import quickfix.Application;
+import quickfix.FieldNotFound;
+import quickfix.IncorrectTagValue;
+import quickfix.Message;
+import quickfix.RejectLogon;
+import quickfix.SessionID;
+import quickfix.UnsupportedMessageType;
+import quickfix.field.MsgType;
+
+/**
+ * QuickFIX/J {@link Application} adapter: logon registry + inbound ER → {@link FixInboundHandler}.
+ */
+@Component
+@ConditionalOnProperty(name = "oms.routing.backend", havingValue = "fix")
+public class OmsFixApplication implements Application {
+
+    private static final Logger log = LoggerFactory.getLogger(OmsFixApplication.class);
+
+    private final FixSessionRegistry fixSessionRegistry;
+    private final FixInboundHandler fixInboundHandler;
+
+    public OmsFixApplication(FixSessionRegistry fixSessionRegistry, FixInboundHandler fixInboundHandler) {
+        this.fixSessionRegistry = fixSessionRegistry;
+        this.fixInboundHandler = fixInboundHandler;
+    }
+
+    @Override
+    public void onCreate(SessionID sessionId) {
+        log.debug("FIX session created {}", sessionId);
+    }
+
+    @Override
+    public void onLogon(SessionID sessionId) {
+        fixSessionRegistry.setActiveSession(sessionId);
+        log.info("FIX logon {}", sessionId);
+    }
+
+    @Override
+    public void onLogout(SessionID sessionId) {
+        fixSessionRegistry.clear();
+        log.info("FIX logout {}", sessionId);
+    }
+
+    @Override
+    public void toAdmin(Message message, SessionID sessionId) {
+        // no-op
+    }
+
+    @Override
+    public void fromAdmin(Message message, SessionID sessionId) throws FieldNotFound, IncorrectTagValue, RejectLogon {
+        // no-op
+    }
+
+    @Override
+    public void toApp(Message message, SessionID sessionId) {
+        log.debug("FIX toApp {}", message);
+    }
+
+    @Override
+    public void fromApp(Message message, SessionID sessionId)
+            throws FieldNotFound, IncorrectTagValue, UnsupportedMessageType {
+        String msgType = message.getHeader().getString(MsgType.FIELD);
+        if (!MsgType.EXECUTION_REPORT.equals(msgType)) {
+            log.warn("Unsupported FIX app MsgType={} — {}", msgType, message);
+            throw new UnsupportedMessageType();
+        }
+        try {
+            fixInboundHandler.handleExecutionReport(message);
+        } catch (FieldNotFound e) {
+            throw e;
+        } catch (RuntimeException e) {
+            log.error("FIX inbound handler failed for {}", message, e);
+            throw e;
+        }
+    }
+}

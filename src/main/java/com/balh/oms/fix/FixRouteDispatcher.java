@@ -6,23 +6,23 @@ import org.slf4j.LoggerFactory;
 
 import java.util.UUID;
 import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.LinkedBlockingQueue;
 
 /**
- * FIX outbound route (slice 4 start): implements {@link RouteDispatcher} by enqueueing
- * {@code WORKING} order ids until QuickFIX/J {@code Initiator} send is wired.
+ * FIX outbound route (slice 4): implements {@link RouteDispatcher} by enqueueing {@code WORKING}
+ * order ids; {@link FixOutboundDispatchWorker} drains after logon and sends {@code NewOrderSingle}.
  *
- * <p>Next steps: drain this queue from a session callback after logon, map {@link com.balh.oms.domain.Order}
- * to {@code NewOrderSingle}, and route inbound {@code ExecutionReport} to {@link com.balh.oms.returnpath.ExecutionReportApplier}.
+ * <p>Inbound {@code ExecutionReport} is handled in {@link OmsFixApplication} → {@link FixInboundHandler}
+ * → {@link com.balh.oms.returnpath.ExecutionReportApplier}.
  */
 public final class FixRouteDispatcher implements RouteDispatcher {
 
     private static final Logger log = LoggerFactory.getLogger(FixRouteDispatcher.class);
 
-    /** Bounded queue size — tune via env when outbound worker lands. */
-    private static final int DEFAULT_FIX_OUTBOUND_QUEUE_CAPACITY = 10_000;
+    private final BlockingQueue<UUID> pendingOrderIds;
 
-    private final BlockingQueue<UUID> pendingOrderIds = new LinkedBlockingQueue<>(DEFAULT_FIX_OUTBOUND_QUEUE_CAPACITY);
+    public FixRouteDispatcher(BlockingQueue<UUID> pendingOrderIds) {
+        this.pendingOrderIds = pendingOrderIds;
+    }
 
     @Override
     public void enqueueWorkingOrder(UUID orderId) {
@@ -30,7 +30,14 @@ public final class FixRouteDispatcher implements RouteDispatcher {
             log.error("FIX outbound pending queue full; dropping orderId={}", orderId);
             return;
         }
-        log.info("FIX outbound queued orderId={} (Initiator send path pending slice 4)", orderId);
+        log.debug("FIX outbound queued orderId={}", orderId);
+    }
+
+    /**
+     * Non-blocking poll for the outbound worker (one id per scheduler tick).
+     */
+    public UUID pollPendingOrNull() {
+        return pendingOrderIds.poll();
     }
 
     public int pendingCountForTests() {

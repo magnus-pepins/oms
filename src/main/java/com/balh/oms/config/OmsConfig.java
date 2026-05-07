@@ -32,6 +32,7 @@ public class OmsConfig {
     private final Pii pii = new Pii();
     private final Risk risk = new Risk();
     private final Routing routing = new Routing();
+    private final Fix fix = new Fix();
 
     public Http getHttp() { return http; }
     public Shard getShard() { return shard; }
@@ -44,6 +45,7 @@ public class OmsConfig {
     public Pii getPii() { return pii; }
     public Risk getRisk() { return risk; }
     public Routing getRouting() { return routing; }
+    public Fix getFix() { return fix; }
 
     public static class Http {
         private String internalApiKey = "";
@@ -234,7 +236,9 @@ public class OmsConfig {
 
     /**
      * Outbound routing / return-path simulation (slice 3). {@code backend=noop} is the
-     * default safe mode; {@code simulated} drives {@link com.balh.oms.routing.SimulatedFillEngine}.
+     * default safe mode; {@code simulated} drives {@link com.balh.oms.routing.SimulatedBrokerDispatcher}
+     * + {@link com.balh.oms.routing.SimulatedReturnPathProjectionWorker}; {@code fix} drives QuickFIX/J
+     * ({@link com.balh.oms.fix.FixRouteDispatcher}).
      */
     public static class Routing {
         private String backend = "noop";
@@ -264,5 +268,54 @@ public class OmsConfig {
             public boolean isSchedulerEnabled() { return schedulerEnabled; }
             public void setSchedulerEnabled(boolean schedulerEnabled) { this.schedulerEnabled = schedulerEnabled; }
         }
+    }
+
+    /**
+     * QuickFIX/J initiator / store paths when {@code oms.routing.backend=fix}.
+     */
+    public static class Fix {
+        private boolean autoStart = false;
+        private int outboundQueueCapacity = 10_000;
+        private String fileStorePath = "./queues/fix";
+        private String socketConnectHost = "127.0.0.1";
+        private int socketConnectPort = 9876;
+        private String senderCompId = "OMS_INIT";
+        private String targetCompId = "BROKER_ACCEPT";
+        private int heartBtInt = 30;
+        private long outboundPollIntervalMs = 100L;
+        /** Venue id stamped on {@code ExecutionTradeCommand} from inbound ERs. */
+        private String venueIdForExecutions = "FIX";
+        private boolean useDataDictionary = false;
+
+        public boolean isAutoStart() { return autoStart; }
+        public void setAutoStart(boolean autoStart) { this.autoStart = autoStart; }
+        public int getOutboundQueueCapacity() { return outboundQueueCapacity; }
+        public void setOutboundQueueCapacity(int outboundQueueCapacity) {
+            this.outboundQueueCapacity = Math.max(1, outboundQueueCapacity);
+        }
+        public String getFileStorePath() { return fileStorePath; }
+        public void setFileStorePath(String fileStorePath) { this.fileStorePath = fileStorePath == null ? "./queues/fix" : fileStorePath; }
+        public String getSocketConnectHost() { return socketConnectHost; }
+        public void setSocketConnectHost(String socketConnectHost) {
+            this.socketConnectHost = socketConnectHost == null ? "127.0.0.1" : socketConnectHost;
+        }
+        public int getSocketConnectPort() { return socketConnectPort; }
+        public void setSocketConnectPort(int socketConnectPort) { this.socketConnectPort = socketConnectPort; }
+        public String getSenderCompId() { return senderCompId; }
+        public void setSenderCompId(String senderCompId) { this.senderCompId = senderCompId == null ? "OMS_INIT" : senderCompId; }
+        public String getTargetCompId() { return targetCompId; }
+        public void setTargetCompId(String targetCompId) { this.targetCompId = targetCompId == null ? "BROKER_ACCEPT" : targetCompId; }
+        public int getHeartBtInt() { return heartBtInt; }
+        public void setHeartBtInt(int heartBtInt) { this.heartBtInt = Math.max(1, heartBtInt); }
+        public long getOutboundPollIntervalMs() { return outboundPollIntervalMs; }
+        public void setOutboundPollIntervalMs(long outboundPollIntervalMs) {
+            this.outboundPollIntervalMs = Math.max(1L, outboundPollIntervalMs);
+        }
+        public String getVenueIdForExecutions() { return venueIdForExecutions; }
+        public void setVenueIdForExecutions(String venueIdForExecutions) {
+            this.venueIdForExecutions = venueIdForExecutions == null ? "FIX" : venueIdForExecutions;
+        }
+        public boolean isUseDataDictionary() { return useDataDictionary; }
+        public void setUseDataDictionary(boolean useDataDictionary) { this.useDataDictionary = useDataDictionary; }
     }
 }

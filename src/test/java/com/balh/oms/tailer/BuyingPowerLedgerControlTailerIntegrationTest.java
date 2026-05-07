@@ -38,6 +38,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class BuyingPowerLedgerControlTailerIntegrationTest extends AbstractPostgresIntegrationTest {
 
+    /** WireMock stub status simulating Ledger upstream failure (retryable 5xx class). */
+    private static final int LEDGER_STUB_HTTP_UNAVAILABLE = 503;
+
     private static volatile WireMockServer ledgerWireMock;
 
     @DynamicPropertySource
@@ -114,6 +117,34 @@ class BuyingPowerLedgerControlTailerIntegrationTest extends AbstractPostgresInte
         String reason = jdbc.queryForObject(
                 "SELECT terminal_reason::text FROM orders WHERE id = ?", String.class, orderId);
         assertThat(reason).isEqualTo("RISK_BUYING_POWER");
+    }
+
+    @Test
+    void buyWhenLedgerReturns503RejectedWithInternalError() throws Exception {
+        ledgerWireMock.stubFor(get(urlPathEqualTo("/balances/balance_it"))
+                .withQueryParam("with_queued", equalTo("true"))
+                .willReturn(aResponse()
+                        .withStatus(LEDGER_STUB_HTTP_UNAVAILABLE)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\"error\":\"ledger_unavailable\"}")));
+        UUID accountId = UUID.randomUUID();
+        ResponseEntity<Map<String, Object>> res = postOrder(accountId, "bp-503", "balance_it", "1", "10.00");
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        UUID orderId = UUID.fromString((String) res.getBody().get("id"));
+
+        reconciler.runOnce();
+        String payload = jdbc.queryForObject(
+                "SELECT payload::text FROM control_outbox WHERE order_id = ? ORDER BY id LIMIT 1",
+                String.class,
+                orderId);
+        PendingControlEvent ev = objectMapper.readValue(payload, PendingControlEvent.class);
+        assertThat(controlTailer.apply(ev)).isEqualTo(ControlTailer.TailResult.LEDGER_SERVICE_REJECTED);
+
+        String status = jdbc.queryForObject("SELECT status::text FROM orders WHERE id = ?", String.class, orderId);
+        assertThat(status).isEqualTo("REJECTED");
+        String reason = jdbc.queryForObject(
+                "SELECT terminal_reason::text FROM orders WHERE id = ?", String.class, orderId);
+        assertThat(reason).isEqualTo("INTERNAL_ERROR");
     }
 
     private void stubBalance(String availableBalanceJson) {

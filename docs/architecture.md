@@ -18,7 +18,7 @@ sequenceDiagram
     participant CHR as Chronicle Queue\n(engineering replay)
     participant TAIL as ChronicleControlTailReader\n(scheduled)
     participant TLR as ControlTailer
-    participant BUS as DomainEventPublisher\n(NATS in 1.5+)
+    participant BUS as DomainEventPublisher\n(NATS optional)
 
     Client->>API: POST CreateOrderRequest
     API->>PG: BEGIN
@@ -32,7 +32,9 @@ sequenceDiagram
     REC->>PG: UPDATE control_outbox SET chronicle_enqueued_at = NOW()
     TAIL->>CHR: readBytes (poll)
     TAIL->>TLR: apply(PendingControlEvent)
-    TLR->>PG: UPDATE orders SET status=WORKING WHERE id=? AND version=?
+    TLR->>PG: optional Ledger HTTP\n(buying power when enabled)
+    TLR->>PG: CAS UPDATE orders\n(WORKING or REJECTED)
+    TLR->>BUS: publish OrderWorking / OrderRejected\n(slice 1.5+, after CAS)
 ```
 
 The four invariants encoded by this diagram:
@@ -42,7 +44,9 @@ The four invariants encoded by this diagram:
    crash recovery is trivial: anything visible in `orders` has a matching
    outbox row (or a `chronicle_enqueued_at` timestamp).
 3. **Domain events on NATS / drop copy are published only after commit.**
-   Slice 1 ships a no-op publisher; slice 1.5 swaps in NATS.
+   `OrderAccepted` fires after the ingress transaction commits; **`OrderWorking`**
+   and **`OrderRejected`** fire after the tailer's successful CAS (slice 1.5+).
+   Slice 1 ships a no-op publisher; enable NATS with `OMS_NATS_ENABLED=true`.
 4. **Tailer mutations are CAS on `orders.version`.** Re-applying the same
    payload is a no-op.
 

@@ -26,6 +26,40 @@ from `ControlTailer` after successful reject / working CAS. External FIX drop co
 }
 ```
 
+`OrderWorking` (after successful CAS to `WORKING` in `ControlTailer`; fields mirror accept for desk continuity):
+
+```json
+{
+  "schemaVersion": 1,
+  "type": "OrderWorking",
+  "orderId": "uuid",
+  "eventSeq": 1,
+  "shardId": 0,
+  "accountIdHash": "hex string",
+  "side": "BUY",
+  "instrumentSymbol": "AAPL",
+  "quantity": "10",
+  "limitPrice": "150.00",
+  "timeInForce": "DAY",
+  "workingAt": "ISO-8601 instant"
+}
+```
+
+`OrderRejected` (after successful CAS to `REJECTED` in `ControlTailer`):
+
+```json
+{
+  "schemaVersion": 1,
+  "type": "OrderRejected",
+  "orderId": "uuid",
+  "eventSeq": 1,
+  "shardId": 0,
+  "accountIdHash": "hex string",
+  "rejectCode": "RISK_BUYING_POWER",
+  "terminalAt": "ISO-8601 instant"
+}
+```
+
 - `schemaVersion` is mandatory on every event. Bump it for breaking
   changes.
 - `eventSeq` is `orders.version` at the moment the event was emitted.

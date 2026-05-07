@@ -36,8 +36,18 @@ new key here when introducing one.
 
 | Key                                | Default | Meaning                                                                                              |
 |------------------------------------|---------|------------------------------------------------------------------------------------------------------|
-| `OMS_CONTROL_MAX_JOB_AGE_MS`       | `5000`  | If a control event sits unprocessed past this, reject the order with `RISK_STALE_QUEUE`.             |
+| `OMS_CONTROL_MAX_JOB_AGE_MS`       | `300000` | If a control event sits unprocessed past this (ms), reject with `RISK_STALE_QUEUE`. Interim default 5 min — [oms-phase0-interim-decisions.md](../../system-documentation/plans/oms-phase0-interim-decisions.md). |
 | `OMS_TAILER_BATCH_SIZE`            | `100`   | Reserved for future control-plane batching (Disruptor slice); Chronicle tail batch uses `OMS_CHRONICLE_TAIL_BATCH_MAX_MESSAGES`. |
+
+## Risk (slice 2)
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `OMS_RISK_INSTRUMENT_ALLOWLIST_ENABLED` | `false` | When `true`, only symbols in `OMS_RISK_ALLOWED_INSTRUMENT_SYMBOLS` may pass control. |
+| `OMS_RISK_ALLOWED_INSTRUMENT_SYMBOLS` | (empty) | Comma-separated list (e.g. `AAPL,MSFT`). Compared uppercased. |
+| `OMS_RISK_FAT_FINGER_MAX_LIMIT_PRICE` | `0` | Max limit price per order; `0` disables. |
+| `OMS_RISK_FAT_FINGER_MAX_ORDER_QUANTITY` | `0` | Max order quantity; `0` disables. |
+| `OMS_RISK_MAX_ORDER_NOTIONAL` | `0` | Max `quantity × limit_price`; `0` disables. |
 
 ## Outbox / reconciler
 
@@ -84,7 +94,11 @@ new key here when introducing one.
 | `OMS_LEDGER_API_KEY`           | (empty)                 | Value for `X-Ledger-Key` on balance reads. Required when enabled.         |
 | `OMS_LEDGER_CONNECT_TIMEOUT_MS`  | `2000`                  | HTTP connect timeout for Ledger calls.                                  |
 | `OMS_LEDGER_READ_TIMEOUT_MS`     | `5000`                  | HTTP read timeout for Ledger calls.                                      |
-| `OMS_LEDGER_INFLIGHT_RESERVATION_ENABLED` | `false`          | When true, OMS POSTs a Ledger sync inflight hold on BUY accept (same DB transaction as the order insert). Requires `OMS_LEDGER_INFLIGHT_HOLD_DESTINATION_BALANCE_ID`. |
+| `OMS_LEDGER_INFLIGHT_RESERVATION_ENABLED` | `false`          | When true, OMS places a Ledger BUY inflight hold at order accept (idempotent `reference` `oms:order:{uuid}`). Requires `OMS_LEDGER_INFLIGHT_HOLD_DESTINATION_BALANCE_ID`. |
+| `OMS_LEDGER_INFLIGHT_ASYNC_ENABLED` | `false` | When **true** (and inflight reservation enabled), the hold is **written to `ledger_inflight_outbox` in the same Postgres transaction** as the order; `LedgerInflightOutboxReconciler` calls Ledger **after** commit. When **false**, the Ledger HTTP call runs **synchronously inside** the accept transaction (default). |
+| `OMS_LEDGER_INFLIGHT_OUTBOX_RECONCILER_AGE_MS` | `2000` | Only process outbox rows with `created_at` at least this old (avoids racing uncommitted readers). |
+| `OMS_LEDGER_INFLIGHT_OUTBOX_RECONCILER_BATCH_SIZE` | `50` | Max rows per reconciler tick. |
+| `OMS_LEDGER_INFLIGHT_OUTBOX_RECONCILER_INTERVAL_MS` | `500` | `fixedDelay` between reconciler runs (Spring `@Scheduled`). |
 | `OMS_LEDGER_INFLIGHT_HOLD_DESTINATION_BALANCE_ID` | (empty) | Ledger `balance_id` for the hold leg (bank suspense / OMS hold account). Required when inflight reservation is enabled. |
 | `OMS_LEDGER_INFLIGHT_RESERVATION_CURRENCY` | `EUR`        | ISO currency code for the inflight hold `amount`.                        |
 | `OMS_LEDGER_INFLIGHT_RESERVATION_PRECISION` | `100`       | Ledger amount scaling (e.g. 100 = cents).                                |

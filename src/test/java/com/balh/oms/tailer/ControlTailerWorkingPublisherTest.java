@@ -6,9 +6,11 @@ import com.balh.oms.domain.Order;
 import com.balh.oms.domain.OrderStatus;
 import com.balh.oms.domain.Side;
 import com.balh.oms.events.DomainEventEnvelopeCodec;
+import com.balh.oms.persistence.ControlDecisionsRepository;
 import com.balh.oms.persistence.DomainEventOutboxRepository;
 import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.risk.BuyingPowerAdmission;
+import com.balh.oms.risk.ControlRiskEvaluator;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
@@ -27,6 +29,7 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -38,6 +41,8 @@ class ControlTailerWorkingPublisherTest {
     @Mock OmsConfig config;
     @Mock OmsConfig.Ledger ledgerCfg;
     @Mock BuyingPowerAdmission buyingPower;
+    @Mock ControlRiskEvaluator controlRisk;
+    @Mock ControlDecisionsRepository controlDecisions;
     @Mock DomainEventOutboxRepository domainOutbox;
 
     private final ObjectMapper objectMapper = new ObjectMapper().registerModule(new JavaTimeModule());
@@ -48,7 +53,8 @@ class ControlTailerWorkingPublisherTest {
 
     @BeforeEach
     void setUp() {
-        tailer = new ControlTailer(orders, stale, config, buyingPower, domainOutbox, codec, meterRegistry);
+        tailer = new ControlTailer(
+                orders, stale, config, buyingPower, controlRisk, controlDecisions, domainOutbox, codec, meterRegistry);
     }
 
     @Test
@@ -64,18 +70,27 @@ class ControlTailerWorkingPublisherTest {
                 Instant.parse("2026-05-07T10:00:00Z"),
                 Instant.parse("2026-05-07T10:00:01Z"));
         when(stale.isStale(ev.orderTimestamp())).thenReturn(false);
+        Order beforeCas = sampleOrder(ev.orderId(), 0);
+        Order afterCas = sampleOrder(ev.orderId(), 1);
+        when(orders.findById(ev.orderId())).thenReturn(Optional.of(beforeCas)).thenReturn(Optional.of(afterCas));
+        when(controlRisk.evaluate(beforeCas)).thenReturn(Optional.empty());
         when(orders.updateWithCas(
                 eq(ev.orderId()),
                 eq(ev.orderVersion()),
                 eq(OrderStatus.WORKING),
-                eq(null),
+                isNull(),
                 eq(ev.orderTimestamp()),
-                eq(null))).thenReturn(true);
-        Order reloaded = sampleOrder(ev.orderId());
-        when(orders.findById(ev.orderId())).thenReturn(Optional.of(reloaded));
+                isNull())).thenReturn(true);
 
         assertThat(tailer.apply(ev)).isEqualTo(ControlTailer.TailResult.APPLIED);
 
+        verify(controlDecisions).record(
+                eq(ev.orderId()),
+                eq(ev.orderVersion()),
+                eq("PASS"),
+                isNull(),
+                eq(ControlRiskEvaluator.STAGE_CONTROL),
+                isNull());
         ArgumentCaptor<String> cap = ArgumentCaptor.forClass(String.class);
         verify(domainOutbox).insert(eq(ev.orderId()), cap.capture());
         JsonNode root = objectMapper.readTree(cap.getValue());
@@ -86,14 +101,14 @@ class ControlTailerWorkingPublisherTest {
         assertThat(meterRegistry.counter("oms_order_working_events_published_total").count()).isEqualTo(1.0);
     }
 
-    private static Order sampleOrder(UUID id) {
+    private static Order sampleOrder(UUID id, int version) {
         Instant t = Instant.parse("2026-05-07T10:00:00Z");
         return new Order(
                 id,
                 UUID.randomUUID(),
                 "k",
                 0,
-                1,
+                version,
                 OrderStatus.NEW,
                 null,
                 Side.BUY,

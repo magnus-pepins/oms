@@ -9,12 +9,14 @@ import com.balh.oms.observability.PiiHash;
 import com.balh.oms.events.DomainEventEnvelopeCodec;
 import com.balh.oms.persistence.ControlOutboxRepository;
 import com.balh.oms.persistence.DomainEventOutboxRepository;
+import com.balh.oms.persistence.LedgerInflightOutboxRepository;
 import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.domain.Side;
 import com.balh.oms.ledger.LedgerBalanceClient;
 import com.balh.oms.ledger.LedgerInflightReservationClient;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
 import org.slf4j.Logger;
@@ -53,6 +55,7 @@ public class OrderIngressService {
     private final PiiHash piiHash;
     private final ObjectProvider<LedgerInflightReservationClient> ledgerInflightReservation;
     private final ObjectProvider<LedgerBalanceClient> ledgerBalanceClient;
+    private final LedgerInflightOutboxRepository ledgerInflightOutbox;
     private final MeterRegistry meterRegistry;
 
     public OrderIngressService(
@@ -65,6 +68,7 @@ public class OrderIngressService {
             PiiHash piiHash,
             ObjectProvider<LedgerInflightReservationClient> ledgerInflightReservation,
             ObjectProvider<LedgerBalanceClient> ledgerBalanceClient,
+            LedgerInflightOutboxRepository ledgerInflightOutbox,
             MeterRegistry meterRegistry) {
         this.orders = orders;
         this.outbox = outbox;
@@ -75,6 +79,7 @@ public class OrderIngressService {
         this.piiHash = piiHash;
         this.ledgerInflightReservation = ledgerInflightReservation;
         this.ledgerBalanceClient = ledgerBalanceClient;
+        this.ledgerInflightOutbox = ledgerInflightOutbox;
         this.meterRegistry = meterRegistry;
     }
 
@@ -170,7 +175,7 @@ public class OrderIngressService {
         try {
             String actual = client.fetchIdentityIdForBalance(balanceId);
             if (!actual.trim().equalsIgnoreCase(claimedIdentity.trim())) {
-                throw new LedgerBindingException(HttpStatus.BAD_REQUEST, "ledger_identity_mismatch",
+                throw new LedgerBindingException(HttpStatus.NOT_FOUND, "ledger_identity_mismatch",
                         "ledgerIdentityId does not match the balance owner in Ledger");
             }
         } catch (LedgerBalanceClient.LedgerServiceException e) {
@@ -187,10 +192,6 @@ public class OrderIngressService {
         if (!config.getLedger().isInflightReservationEnabled()) {
             return;
         }
-        LedgerInflightReservationClient client = ledgerInflightReservation.getIfAvailable();
-        if (client == null) {
-            return;
-        }
         if (order.side() != Side.BUY) {
             return;
         }
@@ -200,19 +201,42 @@ public class OrderIngressService {
         if (order.limitPrice() == null) {
             return;
         }
+        if (config.getLedger().isInflightAsyncEnabled()) {
+            enqueueBuyLedgerInflightHold(order);
+            return;
+        }
+        LedgerInflightReservationClient client = ledgerInflightReservation.getIfAvailable();
+        if (client == null) {
+            return;
+        }
         Timer.Sample sample = Timer.start(meterRegistry);
         try {
             client.placeBuyNotionalHold(order.id(), order.ledgerBalanceId(), order.quantity(), order.limitPrice());
             sample.stop(Timer.builder(METRIC_LEDGER_INFLIGHT_HOLD)
                     .description("Ledger sync inflight hold HTTP call at order accept")
                     .tag("result", "success")
+                    .tag("path", "sync")
                     .register(meterRegistry));
         } catch (LedgerInflightReservationClient.LedgerReservationException e) {
             sample.stop(Timer.builder(METRIC_LEDGER_INFLIGHT_HOLD)
                     .description("Ledger sync inflight hold HTTP call at order accept")
                     .tag("result", "failure")
+                    .tag("path", "sync")
                     .register(meterRegistry));
             throw new RuntimeException("ledger inflight reservation failed", e);
+        }
+    }
+
+    private void enqueueBuyLedgerInflightHold(Order order) {
+        try {
+            ObjectNode node = objectMapper.createObjectNode();
+            node.put("ledgerBalanceId", order.ledgerBalanceId());
+            node.put("quantity", order.quantity().toPlainString());
+            node.put("limitPrice", order.limitPrice().toPlainString());
+            ledgerInflightOutbox.insert(order.id(), objectMapper.writeValueAsString(node));
+        } catch (JsonProcessingException e) {
+            log.error("Failed to serialise ledger inflight outbox payload for orderId={}", order.id(), e);
+            throw new RuntimeException("ledger inflight outbox payload serialisation failed", e);
         }
     }
 

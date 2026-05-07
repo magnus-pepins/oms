@@ -1,6 +1,7 @@
 package com.balh.oms.ingress;
 
 import com.balh.oms.AbstractPostgresIntegrationTest;
+import com.balh.oms.reconciler.LedgerInflightOutboxReconciler;
 import com.github.tomakehurst.wiremock.WireMockServer;
 import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
 import org.junit.jupiter.api.AfterAll;
@@ -16,6 +17,7 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
@@ -32,15 +34,17 @@ import static com.github.tomakehurst.wiremock.client.WireMock.urlPathEqualTo;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Ledger sync inflight hold on BUY ingress when {@code oms.ledger.inflight-reservation-enabled=true}.
+ * When {@code oms.ledger.inflight-async-enabled=true}, BUY inflight hold is written to
+ * {@code ledger_inflight_outbox} in the accept transaction and {@link LedgerInflightOutboxReconciler}
+ * POSTs to Ledger after commit.
  */
-class OrderIngressLedgerInflightIntegrationTest extends AbstractPostgresIntegrationTest {
+class LedgerInflightOutboxIntegrationTest extends AbstractPostgresIntegrationTest {
 
     private static volatile WireMockServer ledgerWireMock;
 
     @DynamicPropertySource
-    static void registerLedgerInflight(DynamicPropertyRegistry registry) {
-        synchronized (OrderIngressLedgerInflightIntegrationTest.class) {
+    static void registerLedgerInflightAsync(DynamicPropertyRegistry registry) {
+        synchronized (LedgerInflightOutboxIntegrationTest.class) {
             if (ledgerWireMock == null) {
                 ledgerWireMock = new WireMockServer(WireMockConfiguration.wireMockConfig().dynamicPort());
                 ledgerWireMock.start();
@@ -50,6 +54,8 @@ class OrderIngressLedgerInflightIntegrationTest extends AbstractPostgresIntegrat
         registry.add("oms.ledger.base-url", () -> "http://127.0.0.1:" + ledgerWireMock.port());
         registry.add("oms.ledger.api-key", () -> "it-key");
         registry.add("oms.ledger.inflight-reservation-enabled", () -> "true");
+        registry.add("oms.ledger.inflight-async-enabled", () -> "true");
+        registry.add("oms.ledger.inflight-outbox-reconciler-age-ms", () -> "0");
         registry.add("oms.ledger.inflight-hold-destination-balance-id", () -> "hold_dest_balance");
     }
 
@@ -63,6 +69,8 @@ class OrderIngressLedgerInflightIntegrationTest extends AbstractPostgresIntegrat
 
     @LocalServerPort int port;
     @Autowired TestRestTemplate http;
+    @Autowired JdbcTemplate jdbc;
+    @Autowired LedgerInflightOutboxReconciler ledgerInflightOutboxReconciler;
 
     @BeforeEach
     void resetStubs() {
@@ -70,50 +78,46 @@ class OrderIngressLedgerInflightIntegrationTest extends AbstractPostgresIntegrat
     }
 
     @Test
-    void rejectsBuyWhenLedgerIdentityDoesNotMatchClaim() {
-        ledgerWireMock.stubFor(get(urlPathEqualTo("/balances/cust_balance_1"))
+    void asyncInflightDefersLedgerPostUntilReconcilerRuns() {
+        ledgerWireMock.stubFor(get(urlPathEqualTo("/balances/cust_balance_async"))
                 .withQueryParam("with_queued", equalTo("true"))
                 .willReturn(aResponse()
                         .withHeader("Content-Type", "application/json")
-                        .withBody("{\"availableBalance\":\"999\",\"identityId\":\"ledger-actual-owner\"}")));
-
-        UUID accountId = UUID.randomUUID();
-        ResponseEntity<ApiErrorResponse> res = http.exchange(
-                "http://localhost:" + port + "/internal/v1/orders",
-                HttpMethod.POST,
-                new HttpEntity<>(jsonBody(accountId, "inflight-bad-id", "cust_balance_1", "wrong-claim-id"), authHeaders()),
-                new ParameterizedTypeReference<>() {});
-
-        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
-        assertThat(res.getBody()).isNotNull();
-        assertThat(res.getBody().message()).isEqualTo("ledger_identity_mismatch");
-    }
-
-    @Test
-    void buyOrderWithInflightPostsLedgerSyncTransaction() {
-        ledgerWireMock.stubFor(get(urlPathEqualTo("/balances/cust_balance_1"))
-                .withQueryParam("with_queued", equalTo("true"))
-                .willReturn(aResponse()
-                        .withHeader("Content-Type", "application/json")
-                        .withBody("{\"availableBalance\":\"999\",\"identityId\":\"ident-inflight-it\"}")));
+                        .withBody("{\"availableBalance\":\"999\",\"identityId\":\"ident-async-it\"}")));
         ledgerWireMock.stubFor(post(urlPathEqualTo("/transactions"))
                 .withHeader("X-Ledger-Key", equalTo("it-key"))
                 .willReturn(aResponse()
                         .withStatus(201)
                         .withHeader("Content-Type", "application/json")
-                        .withBody("{\"transactionId\":\"inflight-tx-1\"}")));
+                        .withBody("{\"transactionId\":\"inflight-tx-async\"}")));
 
         UUID accountId = UUID.randomUUID();
         ResponseEntity<Map<String, Object>> res = http.exchange(
                 "http://localhost:" + port + "/internal/v1/orders",
                 HttpMethod.POST,
-                new HttpEntity<>(jsonBody(accountId, "inflight-it-1", "cust_balance_1", "ident-inflight-it"), authHeaders()),
+                new HttpEntity<>(jsonBody(accountId, "inflight-async-1", "cust_balance_async", "ident-async-it"), authHeaders()),
                 new ParameterizedTypeReference<>() {});
 
         assertThat(res.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        UUID orderId = UUID.fromString((String) res.getBody().get("id"));
+
+        ledgerWireMock.verify(0, postRequestedFor(urlPathEqualTo("/transactions")));
+        ledgerWireMock.verify(1, getRequestedFor(urlPathEqualTo("/balances/cust_balance_async")));
+
+        assertThat(jdbc.queryForObject(
+                "SELECT COUNT(*) FROM ledger_inflight_outbox WHERE order_id = ? AND published_at IS NULL",
+                Long.class,
+                orderId))
+                .isEqualTo(1L);
+
+        ledgerInflightOutboxReconciler.runOnce();
 
         ledgerWireMock.verify(1, postRequestedFor(urlPathEqualTo("/transactions")));
-        ledgerWireMock.verify(1, getRequestedFor(urlPathEqualTo("/balances/cust_balance_1")));
+        assertThat(jdbc.queryForObject(
+                "SELECT COUNT(*) FROM ledger_inflight_outbox WHERE order_id = ? AND published_at IS NOT NULL",
+                Long.class,
+                orderId))
+                .isEqualTo(1L);
     }
 
     private static HttpHeaders authHeaders() {

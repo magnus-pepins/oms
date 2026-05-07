@@ -26,6 +26,13 @@ and the milestone plan it links to.
 - `domain_event_outbox` table; canonical JSON **envelopes** are written in the
   same Postgres transaction as the originating change (`OrderAccepted` on
   ingress; `OrderWorking` / `OrderRejected` in `ControlTailer` after CAS).
+- `ledger_inflight_outbox` table (Flyway **V4**): optional **post-commit** path for
+  the Ledger BUY sync inflight hold when `OMS_LEDGER_INFLIGHT_ASYNC_ENABLED=true`
+  (default **false** — synchronous `POST /transactions` in the accept transaction
+  remains the default). `LedgerInflightOutboxReconciler` drains pending rows after
+  commit; Micrometer **`oms_ledger_inflight_hold`** records `path=sync` vs
+  `path=outbox`, plus counters **`oms_ledger_inflight_outbox_published_total`** /
+  **`oms_ledger_inflight_outbox_failed_total`**. Tuning: `OMS_LEDGER_INFLIGHT_OUTBOX_RECONCILER_*`.
 - `DomainFanoutReconciler` + `FanoutClient` drain `domain_event_outbox` to NATS
   JetStream (full envelope as message body) or a no-op transport when NATS is off.
 - `OutboxReconciler` drains `control_outbox` into Chronicle Queue (engineering
@@ -45,10 +52,23 @@ and the milestone plan it links to.
   reconciler-under-load) — skeletons that document assertions; bodies grow with
   later slices.
 
+## What is in slice 2 (risk + audit)
+
+- Flyway **V5** — `control_decisions` (one row per `ControlTailer.apply` outcome)
+  and `oms_runtime_flags` (interim Postgres-backed **global halt** until Redis/Ops
+  toggles exist).
+- **`ControlRiskEvaluator`** — `RISK_KILL_SWITCH` when `global_halt` is true;
+  optional instrument allowlist; fat-finger limit price / quantity; notional cap
+  (`RISK_NOTIONAL_CAP` on `reject_code`). See [docs/risk-checks.md](docs/risk-checks.md).
+- **`oms_control_jobs_rejected_stale_total`** counter on stale control rejects;
+  default **`OMS_CONTROL_MAX_JOB_AGE_MS`** is **300000** (5 min interim — see
+  [system-documentation/plans/oms-phase0-interim-decisions.md](../system-documentation/plans/oms-phase0-interim-decisions.md)).
+
 ## What is NOT in slice 1
 
-- FIX engine (slice 2: QuickFIX/J).
-- Full risk catalogue (kill switch, fat-finger, venue-specific checks).
+- FIX engine (QuickFIX/J — planned **Slice 4** in [oms-realignment-2026-05-07.md](../system-documentation/plans/oms-realignment-2026-05-07.md)).
+- Full risk catalogue from the master plan (STP, sanctions re-check, venue-specific
+  checks, …) — only the slice‑2 subset above is implemented so far.
 - Cluster-aware lease ownership (slice 1.5).
 
 ## Quick start

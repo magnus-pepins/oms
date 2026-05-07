@@ -7,9 +7,11 @@ import com.balh.oms.domain.OrderStatus;
 import com.balh.oms.domain.RejectCode;
 import com.balh.oms.domain.Side;
 import com.balh.oms.events.DomainEventEnvelopeCodec;
+import com.balh.oms.persistence.ControlDecisionsRepository;
 import com.balh.oms.persistence.DomainEventOutboxRepository;
 import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.risk.BuyingPowerAdmission;
+import com.balh.oms.risk.ControlRiskEvaluator;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
@@ -28,7 +30,10 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -41,6 +46,8 @@ class ControlTailerRejectPublisherTest {
     @Mock OmsConfig config;
     @Mock OmsConfig.Ledger ledgerCfg;
     @Mock BuyingPowerAdmission buyingPower;
+    @Mock ControlRiskEvaluator controlRisk;
+    @Mock ControlDecisionsRepository controlDecisions;
     @Mock DomainEventOutboxRepository domainOutbox;
 
     private final ObjectMapper objectMapper = new ObjectMapper().registerModule(new JavaTimeModule());
@@ -51,7 +58,8 @@ class ControlTailerRejectPublisherTest {
 
     @BeforeEach
     void setUp() {
-        tailer = new ControlTailer(orders, stale, config, buyingPower, domainOutbox, codec, meterRegistry);
+        tailer = new ControlTailer(
+                orders, stale, config, buyingPower, controlRisk, controlDecisions, domainOutbox, codec, meterRegistry);
     }
 
     @Test
@@ -63,11 +71,18 @@ class ControlTailerRejectPublisherTest {
                 eq(ev.orderVersion()),
                 eq(OrderStatus.REJECTED),
                 eq(RejectCode.RISK_STALE_QUEUE),
-                eq(null),
+                isNull(),
                 any(Instant.class))).thenReturn(true);
 
         assertThat(tailer.apply(ev)).isEqualTo(ControlTailer.TailResult.STALE_REJECTED);
 
+        verify(controlDecisions).record(
+                eq(ev.orderId()),
+                eq(ev.orderVersion()),
+                eq("REJECT"),
+                eq(RejectCode.RISK_STALE_QUEUE),
+                eq(ControlRiskEvaluator.STAGE_CONTROL),
+                isNull());
         ArgumentCaptor<String> cap = ArgumentCaptor.forClass(String.class);
         verify(domainOutbox).insert(eq(ev.orderId()), cap.capture());
         JsonNode root = objectMapper.readTree(cap.getValue());
@@ -77,6 +92,7 @@ class ControlTailerRejectPublisherTest {
         assertThat(root.path("payload").path("rejectCode").asText()).isEqualTo(RejectCode.RISK_STALE_QUEUE.name());
         assertThat(meterRegistry.counter("oms_order_rejected_events_published_total", "reject_code", "RISK_STALE_QUEUE").count())
                 .isEqualTo(1.0);
+        assertThat(meterRegistry.counter("oms_control_jobs_rejected_stale_total").count()).isEqualTo(1.0);
     }
 
     @Test
@@ -88,11 +104,12 @@ class ControlTailerRejectPublisherTest {
                 eq(ev.orderVersion()),
                 eq(OrderStatus.REJECTED),
                 eq(RejectCode.RISK_STALE_QUEUE),
-                eq(null),
+                isNull(),
                 any(Instant.class))).thenReturn(false);
 
         assertThat(tailer.apply(ev)).isEqualTo(ControlTailer.TailResult.SKIPPED_VERSION_MISMATCH);
         verify(domainOutbox, never()).insert(any(), any());
+        verify(controlDecisions, never()).record(any(), anyInt(), anyString(), any(), anyString(), any());
     }
 
     @Test
@@ -101,6 +118,7 @@ class ControlTailerRejectPublisherTest {
         when(ledgerCfg.isEnabled()).thenReturn(true);
         Order row = sampleOrder(evOrderId());
         when(orders.findById(row.id())).thenReturn(Optional.of(row));
+        when(controlRisk.evaluate(row)).thenReturn(Optional.empty());
         when(buyingPower.evaluate(row)).thenReturn(BuyingPowerAdmission.Outcome.REJECT_INSUFFICIENT);
         PendingControlEvent ev = eventForOrder(row.id());
         when(stale.isStale(ev.orderTimestamp())).thenReturn(false);
@@ -109,11 +127,18 @@ class ControlTailerRejectPublisherTest {
                 eq(ev.orderVersion()),
                 eq(OrderStatus.REJECTED),
                 eq(RejectCode.RISK_BUYING_POWER),
-                eq(null),
+                isNull(),
                 any(Instant.class))).thenReturn(true);
 
         assertThat(tailer.apply(ev)).isEqualTo(ControlTailer.TailResult.BUYING_POWER_REJECTED);
 
+        verify(controlDecisions).record(
+                eq(ev.orderId()),
+                eq(ev.orderVersion()),
+                eq("REJECT"),
+                eq(RejectCode.RISK_BUYING_POWER),
+                eq(ControlRiskEvaluator.STAGE_CONTROL),
+                isNull());
         ArgumentCaptor<String> cap = ArgumentCaptor.forClass(String.class);
         verify(domainOutbox).insert(eq(ev.orderId()), cap.capture());
         assertThat(objectMapper.readTree(cap.getValue()).path("payload").path("rejectCode").asText())

@@ -3,6 +3,13 @@ package com.balh.oms.config;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.context.annotation.Configuration;
 
+import java.math.BigDecimal;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Locale;
+import java.util.Set;
+import java.util.stream.Collectors;
+
 /**
  * Named limit and config keys for the OMS slice 1.
  *
@@ -23,6 +30,7 @@ public class OmsConfig {
     private final Ledger ledger = new Ledger();
     private final DomainEvents domainEvents = new DomainEvents();
     private final Pii pii = new Pii();
+    private final Risk risk = new Risk();
 
     public Http getHttp() { return http; }
     public Shard getShard() { return shard; }
@@ -33,6 +41,7 @@ public class OmsConfig {
     public Ledger getLedger() { return ledger; }
     public DomainEvents getDomainEvents() { return domainEvents; }
     public Pii getPii() { return pii; }
+    public Risk getRisk() { return risk; }
 
     public static class Http {
         private String internalApiKey = "";
@@ -50,7 +59,8 @@ public class OmsConfig {
     }
 
     public static class Control {
-        private long maxJobAgeMs = 5000L;
+        /** Default 5 minutes — see plans/oms-phase0-interim-decisions.md until trading-ops signs a stricter value. */
+        private long maxJobAgeMs = 300_000L;
         private int tailerBatchSize = 100;
         public long getMaxJobAgeMs() { return maxJobAgeMs; }
         public void setMaxJobAgeMs(long v) { this.maxJobAgeMs = v; }
@@ -128,6 +138,15 @@ public class OmsConfig {
         private String apiKey = "";
         private long connectTimeoutMs = 2000L;
         private long readTimeoutMs = 5000L;
+        /**
+         * When true with {@link #inflightReservationEnabled}, BUY inflight hold is enqueued to
+         * {@code ledger_inflight_outbox} in the same DB transaction; {@link com.balh.oms.reconciler.LedgerInflightOutboxReconciler}
+         * calls Ledger after commit.
+         */
+        private boolean inflightAsyncEnabled = false;
+        private long inflightOutboxReconcilerAgeMs = 2000L;
+        private int inflightOutboxReconcilerBatchSize = 50;
+        private long inflightOutboxReconcilerIntervalMs = 500L;
         public boolean isEnabled() { return enabled; }
         public void setEnabled(boolean v) { this.enabled = v; }
         public boolean isInflightReservationEnabled() { return inflightReservationEnabled; }
@@ -146,6 +165,14 @@ public class OmsConfig {
         public void setConnectTimeoutMs(long v) { this.connectTimeoutMs = v; }
         public long getReadTimeoutMs() { return readTimeoutMs; }
         public void setReadTimeoutMs(long v) { this.readTimeoutMs = v; }
+        public boolean isInflightAsyncEnabled() { return inflightAsyncEnabled; }
+        public void setInflightAsyncEnabled(boolean v) { this.inflightAsyncEnabled = v; }
+        public long getInflightOutboxReconcilerAgeMs() { return inflightOutboxReconcilerAgeMs; }
+        public void setInflightOutboxReconcilerAgeMs(long v) { this.inflightOutboxReconcilerAgeMs = v; }
+        public int getInflightOutboxReconcilerBatchSize() { return inflightOutboxReconcilerBatchSize; }
+        public void setInflightOutboxReconcilerBatchSize(int v) { this.inflightOutboxReconcilerBatchSize = v; }
+        public long getInflightOutboxReconcilerIntervalMs() { return inflightOutboxReconcilerIntervalMs; }
+        public void setInflightOutboxReconcilerIntervalMs(long v) { this.inflightOutboxReconcilerIntervalMs = v; }
     }
 
     public static class DomainEvents {
@@ -167,5 +194,39 @@ public class OmsConfig {
         public void setAuditTraceEnabled(boolean v) { this.auditTraceEnabled = v; }
         public String getHashSecret() { return hashSecret; }
         public void setHashSecret(String v) { this.hashSecret = v; }
+    }
+
+    /**
+     * Pre-trade limits read on each control decision. Zero or negative numeric
+     * thresholds mean "check disabled" for that dimension.
+     */
+    public static class Risk {
+        private boolean instrumentAllowlistEnabled = false;
+        private String allowedInstrumentSymbols = "";
+        private BigDecimal fatFingerMaxLimitPrice = BigDecimal.ZERO;
+        private BigDecimal fatFingerMaxOrderQuantity = BigDecimal.ZERO;
+        private BigDecimal maxOrderNotional = BigDecimal.ZERO;
+
+        public boolean isInstrumentAllowlistEnabled() { return instrumentAllowlistEnabled; }
+        public void setInstrumentAllowlistEnabled(boolean v) { this.instrumentAllowlistEnabled = v; }
+        public String getAllowedInstrumentSymbols() { return allowedInstrumentSymbols; }
+        public void setAllowedInstrumentSymbols(String v) { this.allowedInstrumentSymbols = v == null ? "" : v; }
+        public BigDecimal getFatFingerMaxLimitPrice() { return fatFingerMaxLimitPrice; }
+        public void setFatFingerMaxLimitPrice(BigDecimal v) { this.fatFingerMaxLimitPrice = v == null ? BigDecimal.ZERO : v; }
+        public BigDecimal getFatFingerMaxOrderQuantity() { return fatFingerMaxOrderQuantity; }
+        public void setFatFingerMaxOrderQuantity(BigDecimal v) { this.fatFingerMaxOrderQuantity = v == null ? BigDecimal.ZERO : v; }
+        public BigDecimal getMaxOrderNotional() { return maxOrderNotional; }
+        public void setMaxOrderNotional(BigDecimal v) { this.maxOrderNotional = v == null ? BigDecimal.ZERO : v; }
+
+        /** Uppercased symbols from {@link #allowedInstrumentSymbols}, comma-separated. */
+        public Set<String> allowedInstrumentSymbolSet() {
+            if (!instrumentAllowlistEnabled || allowedInstrumentSymbols == null || allowedInstrumentSymbols.isBlank()) {
+                return Collections.emptySet();
+            }
+            return Arrays.stream(allowedInstrumentSymbols.split(","))
+                    .map(s -> s.trim().toUpperCase(Locale.ROOT))
+                    .filter(s -> !s.isEmpty())
+                    .collect(Collectors.toUnmodifiableSet());
+        }
     }
 }

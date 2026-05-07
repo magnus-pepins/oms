@@ -42,7 +42,8 @@ oms:
     id: ${OMS_SHARD_ID:0}
     count: ${OMS_SHARD_COUNT:1}
   control:
-    max-job-age-ms: ${OMS_CONTROL_MAX_JOB_AGE_MS:5000}
+    # Interim default 5 min — plans/oms-phase0-interim-decisions.md; tune per env.
+    max-job-age-ms: ${OMS_CONTROL_MAX_JOB_AGE_MS:300000}
     tailer-batch-size: ${OMS_TAILER_BATCH_SIZE:100}
   outbox:
     reconciler-age-ms: ${OMS_OUTBOX_RECONCILER_AGE_MS:2000}
@@ -68,6 +69,10 @@ oms:
     connect-timeout-ms: ${OMS_LEDGER_CONNECT_TIMEOUT_MS:2000}
     read-timeout-ms: ${OMS_LEDGER_READ_TIMEOUT_MS:5000}
     inflight-reservation-enabled: ${OMS_LEDGER_INFLIGHT_RESERVATION_ENABLED:false}
+    inflight-async-enabled: ${OMS_LEDGER_INFLIGHT_ASYNC_ENABLED:false}
+    inflight-outbox-reconciler-age-ms: ${OMS_LEDGER_INFLIGHT_OUTBOX_RECONCILER_AGE_MS:2000}
+    inflight-outbox-reconciler-batch-size: ${OMS_LEDGER_INFLIGHT_OUTBOX_RECONCILER_BATCH_SIZE:50}
+    inflight-outbox-reconciler-interval-ms: ${OMS_LEDGER_INFLIGHT_OUTBOX_RECONCILER_INTERVAL_MS:500}
     inflight-hold-destination-balance-id: ${OMS_LEDGER_INFLIGHT_HOLD_DESTINATION_BALANCE_ID:}
     inflight-reservation-currency: ${OMS_LEDGER_INFLIGHT_RESERVATION_CURRENCY:EUR}
     inflight-reservation-precision: ${OMS_LEDGER_INFLIGHT_RESERVATION_PRECISION:100}
@@ -78,6 +83,12 @@ oms:
   pii:
     audit-trace-enabled: ${OMS_PII_AUDIT_TRACE_ENABLED:false}
     hash-secret: ${OMS_PII_HASH_SECRET:dev-only-change-me}
+  risk:
+    instrument-allowlist-enabled: ${OMS_RISK_INSTRUMENT_ALLOWLIST_ENABLED:false}
+    allowed-instrument-symbols: ${OMS_RISK_ALLOWED_INSTRUMENT_SYMBOLS:}
+    fat-finger-max-limit-price: ${OMS_RISK_FAT_FINGER_MAX_LIMIT_PRICE:0}
+    fat-finger-max-order-quantity: ${OMS_RISK_FAT_FINGER_MAX_ORDER_QUANTITY:0}
+    max-order-notional: ${OMS_RISK_MAX_ORDER_NOTIONAL:0}
 
 logging:
   level:

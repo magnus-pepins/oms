@@ -10,10 +10,13 @@ import com.balh.oms.events.DomainEventEnvelopeCodec;
 import com.balh.oms.persistence.ControlOutboxRepository;
 import com.balh.oms.persistence.DomainEventOutboxRepository;
 import com.balh.oms.persistence.OrdersRepository;
+import com.balh.oms.domain.Side;
+import com.balh.oms.ledger.LedgerInflightReservationClient;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -41,6 +44,7 @@ public class OrderIngressService {
     private final OmsConfig config;
     private final ObjectMapper objectMapper;
     private final PiiHash piiHash;
+    private final ObjectProvider<LedgerInflightReservationClient> ledgerInflightReservation;
 
     public OrderIngressService(
             OrdersRepository orders,
@@ -49,7 +53,8 @@ public class OrderIngressService {
             DomainEventEnvelopeCodec domainEventEnvelopeCodec,
             OmsConfig config,
             ObjectMapper objectMapper,
-            PiiHash piiHash) {
+            PiiHash piiHash,
+            ObjectProvider<LedgerInflightReservationClient> ledgerInflightReservation) {
         this.orders = orders;
         this.outbox = outbox;
         this.domainEventOutbox = domainEventOutbox;
@@ -57,6 +62,7 @@ public class OrderIngressService {
         this.config = config;
         this.objectMapper = objectMapper;
         this.piiHash = piiHash;
+        this.ledgerInflightReservation = ledgerInflightReservation;
     }
 
     /**
@@ -72,7 +78,7 @@ public class OrderIngressService {
      * returns the pre-existing row.
      *
      * <p>Commit happens when this method returns. Domain fanout delivery is
- * asynchronous via {@link com.balh.oms.reconciler.DomainFanoutReconciler}.
+     * asynchronous via {@link com.balh.oms.reconciler.DomainFanoutReconciler}.
      */
     @Transactional
     public IngressResult persistAccepted(CreateOrderRequest req) {
@@ -111,6 +117,8 @@ public class OrderIngressService {
             return new IngressResult(existing, false);
         }
 
+        maybePlaceBuyLedgerInflightHold(order);
+
         outbox.insert(id, order.version(),
                 serializePayload(new PendingControlEvent(
                         "OrderAccepted",
@@ -127,6 +135,30 @@ public class OrderIngressService {
             throw new RuntimeException("domain event envelope serialisation failed", e);
         }
         return new IngressResult(order, true);
+    }
+
+    private void maybePlaceBuyLedgerInflightHold(Order order) {
+        if (!config.getLedger().isInflightReservationEnabled()) {
+            return;
+        }
+        LedgerInflightReservationClient client = ledgerInflightReservation.getIfAvailable();
+        if (client == null) {
+            return;
+        }
+        if (order.side() != Side.BUY) {
+            return;
+        }
+        if (order.ledgerBalanceId() == null || order.ledgerBalanceId().isBlank()) {
+            return;
+        }
+        if (order.limitPrice() == null) {
+            return;
+        }
+        try {
+            client.placeBuyNotionalHold(order.id(), order.ledgerBalanceId(), order.quantity(), order.limitPrice());
+        } catch (LedgerInflightReservationClient.LedgerReservationException e) {
+            throw new RuntimeException("ledger inflight reservation failed", e);
+        }
     }
 
     private String serializePayload(PendingControlEvent ev) {

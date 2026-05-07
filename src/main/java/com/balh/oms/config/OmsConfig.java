@@ -113,8 +113,17 @@ public class OmsConfig {
 
     public static class Ledger {
         private boolean enabled = false;
-        /** When true, OMS will POST Ledger sync inflight holds (not implemented in this slice). */
+        /** When true, OMS POSTs a Ledger sync inflight hold on BUY accept (see {@link LedgerInflightReservationClient}). */
         private boolean inflightReservationEnabled = false;
+        /**
+         * Ledger {@code balance_id} that receives the customer leg of the inflight hold
+         * (bank-side suspense / OMS hold account). Required when {@link #inflightReservationEnabled} is true.
+         */
+        private String inflightHoldDestinationBalanceId = "";
+        /** ISO currency code for the inflight hold (major unit in {@code amount}). */
+        private String inflightReservationCurrency = "EUR";
+        /** Ledger amount scaling (e.g. 100 = cents). */
+        private int inflightReservationPrecision = 100;
         private String baseUrl = "http://localhost:5001";
         private String apiKey = "";
         private long connectTimeoutMs = 2000L;
@@ -123,6 +132,12 @@ public class OmsConfig {
         public void setEnabled(boolean v) { this.enabled = v; }
         public boolean isInflightReservationEnabled() { return inflightReservationEnabled; }
         public void setInflightReservationEnabled(boolean v) { this.inflightReservationEnabled = v; }
+        public String getInflightHoldDestinationBalanceId() { return inflightHoldDestinationBalanceId; }
+        public void setInflightHoldDestinationBalanceId(String v) { this.inflightHoldDestinationBalanceId = v; }
+        public String getInflightReservationCurrency() { return inflightReservationCurrency; }
+        public void setInflightReservationCurrency(String v) { this.inflightReservationCurrency = v; }
+        public int getInflightReservationPrecision() { return inflightReservationPrecision; }
+        public void setInflightReservationPrecision(int v) { this.inflightReservationPrecision = v; }
         public String getBaseUrl() { return baseUrl; }
         public void setBaseUrl(String v) { this.baseUrl = v; }
         public String getApiKey() { return apiKey; }

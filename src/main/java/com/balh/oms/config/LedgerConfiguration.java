@@ -1,7 +1,9 @@
 package com.balh.oms.config;
 
 import com.balh.oms.ledger.LedgerBalanceClient;
+import com.balh.oms.ledger.LedgerInflightReservationClient;
 import com.balh.oms.ledger.RestLedgerBalanceClient;
+import com.balh.oms.ledger.RestLedgerInflightReservationClient;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
@@ -42,5 +44,39 @@ public class LedgerConfiguration {
             throw new IllegalStateException("oms.ledger.api-key is required when oms.ledger.enabled=true");
         }
         return new RestLedgerBalanceClient(omsLedgerRestClient, key, objectMapper);
+    }
+
+    @Bean
+    @ConditionalOnProperty(
+            prefix = "oms.ledger", name = "inflight-reservation-enabled", havingValue = "true")
+    LedgerInflightReservationClient ledgerInflightReservationClient(
+            RestClient omsLedgerRestClient,
+            OmsConfig config,
+            ObjectMapper objectMapper) {
+        var ledger = config.getLedger();
+        String dest = ledger.getInflightHoldDestinationBalanceId();
+        if (dest == null || dest.isBlank()) {
+            throw new IllegalStateException(
+                    "oms.ledger.inflight-hold-destination-balance-id is required when oms.ledger.inflight-reservation-enabled=true");
+        }
+        int prec = ledger.getInflightReservationPrecision();
+        if (prec <= 0) {
+            throw new IllegalStateException("oms.ledger.inflight-reservation-precision must be positive");
+        }
+        String key = ledger.getApiKey();
+        if (key == null || key.isBlank()) {
+            throw new IllegalStateException("oms.ledger.api-key is required when oms.ledger.inflight-reservation-enabled=true");
+        }
+        String currency = ledger.getInflightReservationCurrency();
+        if (currency == null || currency.isBlank()) {
+            throw new IllegalStateException("oms.ledger.inflight-reservation-currency must not be empty");
+        }
+        return new RestLedgerInflightReservationClient(
+                omsLedgerRestClient,
+                key,
+                objectMapper,
+                dest.trim(),
+                currency.trim(),
+                prec);
     }
 }

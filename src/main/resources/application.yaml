@@ -68,6 +68,9 @@ oms:
     connect-timeout-ms: ${OMS_LEDGER_CONNECT_TIMEOUT_MS:2000}
     read-timeout-ms: ${OMS_LEDGER_READ_TIMEOUT_MS:5000}
     inflight-reservation-enabled: ${OMS_LEDGER_INFLIGHT_RESERVATION_ENABLED:false}
+    inflight-hold-destination-balance-id: ${OMS_LEDGER_INFLIGHT_HOLD_DESTINATION_BALANCE_ID:}
+    inflight-reservation-currency: ${OMS_LEDGER_INFLIGHT_RESERVATION_CURRENCY:EUR}
+    inflight-reservation-precision: ${OMS_LEDGER_INFLIGHT_RESERVATION_PRECISION:100}
   domain-events:
     reconciler-age-ms: ${OMS_DOMAIN_EVENTS_RECONCILER_AGE_MS:2000}
     reconciler-batch-size: ${OMS_DOMAIN_EVENTS_RECONCILER_BATCH_SIZE:100}

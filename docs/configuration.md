@@ -84,7 +84,10 @@ new key here when introducing one.
 | `OMS_LEDGER_API_KEY`           | (empty)                 | Value for `X-Ledger-Key` on balance reads. Required when enabled.         |
 | `OMS_LEDGER_CONNECT_TIMEOUT_MS`  | `2000`                  | HTTP connect timeout for Ledger calls.                                  |
 | `OMS_LEDGER_READ_TIMEOUT_MS`     | `5000`                  | HTTP read timeout for Ledger calls.                                      |
-| `OMS_LEDGER_INFLIGHT_RESERVATION_ENABLED` | `false`          | Reserved: when true, OMS will POST Ledger sync inflight holds on the hot path (not implemented in this slice). |
+| `OMS_LEDGER_INFLIGHT_RESERVATION_ENABLED` | `false`          | When true, OMS POSTs a Ledger sync inflight hold on BUY accept (same DB transaction as the order insert). Requires `OMS_LEDGER_INFLIGHT_HOLD_DESTINATION_BALANCE_ID`. |
+| `OMS_LEDGER_INFLIGHT_HOLD_DESTINATION_BALANCE_ID` | (empty) | Ledger `balance_id` for the hold leg (bank suspense / OMS hold account). Required when inflight reservation is enabled. |
+| `OMS_LEDGER_INFLIGHT_RESERVATION_CURRENCY` | `EUR`        | ISO currency code for the inflight hold `amount`.                        |
+| `OMS_LEDGER_INFLIGHT_RESERVATION_PRECISION` | `100`       | Ledger amount scaling (e.g. 100 = cents).                                |
 
 ## PII
 

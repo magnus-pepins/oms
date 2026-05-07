@@ -4,6 +4,10 @@ The **Customer API BFF** (Hono server in `customer-frontend`) is the governance
 boundary between public clients and internal systems. OMS exposes an **internal**
 HTTP surface only (`/internal/v1/**`, `X-OMS-Internal-Key`).
 
+## Implemented proxy (customer-frontend)
+
+- `POST /api/internal/oms/v1/orders` — `customer-frontend/app/api/internal/oms/v1/orders+api.ts` (authenticated; forwards to OMS `POST /internal/v1/orders` with `X-OMS-Internal-Key`). Env on the BFF: `OMS_INTERNAL_BASE_URL`, `OMS_INTERNAL_API_KEY`.
+
 ## Intended wiring
 
 1. **Ingress:** BFF validates the customer session, maps the request to OMS

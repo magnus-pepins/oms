@@ -14,6 +14,8 @@ import com.balh.oms.domain.Side;
 import com.balh.oms.ledger.LedgerInflightReservationClient;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
@@ -37,6 +39,9 @@ public class OrderIngressService {
 
     private static final Logger log = LoggerFactory.getLogger(OrderIngressService.class);
 
+    /** Micrometer name for Ledger sync inflight hold latency (tag {@code result}). */
+    private static final String METRIC_LEDGER_INFLIGHT_HOLD = "oms_ledger_inflight_hold";
+
     private final OrdersRepository orders;
     private final ControlOutboxRepository outbox;
     private final DomainEventOutboxRepository domainEventOutbox;
@@ -45,6 +50,7 @@ public class OrderIngressService {
     private final ObjectMapper objectMapper;
     private final PiiHash piiHash;
     private final ObjectProvider<LedgerInflightReservationClient> ledgerInflightReservation;
+    private final MeterRegistry meterRegistry;
 
     public OrderIngressService(
             OrdersRepository orders,
@@ -54,7 +60,8 @@ public class OrderIngressService {
             OmsConfig config,
             ObjectMapper objectMapper,
             PiiHash piiHash,
-            ObjectProvider<LedgerInflightReservationClient> ledgerInflightReservation) {
+            ObjectProvider<LedgerInflightReservationClient> ledgerInflightReservation,
+            MeterRegistry meterRegistry) {
         this.orders = orders;
         this.outbox = outbox;
         this.domainEventOutbox = domainEventOutbox;
@@ -63,6 +70,7 @@ public class OrderIngressService {
         this.objectMapper = objectMapper;
         this.piiHash = piiHash;
         this.ledgerInflightReservation = ledgerInflightReservation;
+        this.meterRegistry = meterRegistry;
     }
 
     /**
@@ -154,9 +162,18 @@ public class OrderIngressService {
         if (order.limitPrice() == null) {
             return;
         }
+        Timer.Sample sample = Timer.start(meterRegistry);
         try {
             client.placeBuyNotionalHold(order.id(), order.ledgerBalanceId(), order.quantity(), order.limitPrice());
+            sample.stop(Timer.builder(METRIC_LEDGER_INFLIGHT_HOLD)
+                    .description("Ledger sync inflight hold HTTP call at order accept")
+                    .tag("result", "success")
+                    .register(meterRegistry));
         } catch (LedgerInflightReservationClient.LedgerReservationException e) {
+            sample.stop(Timer.builder(METRIC_LEDGER_INFLIGHT_HOLD)
+                    .description("Ledger sync inflight hold HTTP call at order accept")
+                    .tag("result", "failure")
+                    .register(meterRegistry));
             throw new RuntimeException("ledger inflight reservation failed", e);
         }
     }

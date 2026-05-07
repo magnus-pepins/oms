@@ -91,6 +91,53 @@ class OrdersControllerIntegrationTest extends AbstractPostgresIntegrationTest {
         assertThat(count).isEqualTo(1L);
     }
 
+    @Test
+    void getOrderRejectsWithoutInternalApiKey() {
+        UUID accountId = UUID.randomUUID();
+        ResponseEntity<Map<String, Object>> created = exchange(jsonRequest(accountId, "get-key-1"));
+        assertThat(created.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        UUID orderId = UUID.fromString((String) created.getBody().get("id"));
+
+        ResponseEntity<String> res = http.getForEntity(
+                "http://localhost:" + port + "/internal/v1/orders/" + orderId,
+                String.class);
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+    }
+
+    @Test
+    void getOrderReturnsBodyWhenKeyPresent() {
+        UUID accountId = UUID.randomUUID();
+        ResponseEntity<Map<String, Object>> created = exchange(jsonRequest(accountId, "get-key-2"));
+        assertThat(created.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        UUID orderId = UUID.fromString((String) created.getBody().get("id"));
+
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("X-OMS-Internal-Key", "test-key");
+        ResponseEntity<Map<String, Object>> res = http.exchange(
+                "http://localhost:" + port + "/internal/v1/orders/" + orderId,
+                HttpMethod.GET,
+                new HttpEntity<>(headers),
+                new ParameterizedTypeReference<>() {});
+
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(res.getBody()).isNotNull();
+        assertThat(res.getBody().get("id")).isEqualTo(orderId.toString());
+        assertThat(res.getBody().get("accountId")).isEqualTo(accountId.toString());
+    }
+
+    @Test
+    void getOrderReturns404WhenMissing() {
+        UUID missing = UUID.fromString("00000000-0000-4000-8000-000000000099");
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("X-OMS-Internal-Key", "test-key");
+        ResponseEntity<String> res = http.exchange(
+                "http://localhost:" + port + "/internal/v1/orders/" + missing,
+                HttpMethod.GET,
+                new HttpEntity<>(headers),
+                String.class);
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+    }
+
     private ResponseEntity<Map<String, Object>> exchange(String body) {
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);

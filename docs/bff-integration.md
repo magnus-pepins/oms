@@ -9,6 +9,7 @@ HTTP surface only (`/internal/v1/**`, `X-OMS-Internal-Key`).
 - `POST /api/internal/oms/v1/orders` — `customer-frontend/app/api/internal/oms/v1/orders+api.ts` (authenticated; forwards to OMS `POST /internal/v1/orders` with `X-OMS-Internal-Key`). Env on the BFF: `OMS_INTERNAL_BASE_URL`, `OMS_INTERNAL_API_KEY`.
 - `GET /api/internal/oms/v1/orders/{orderId}` — `customer-frontend/app/api/internal/oms/v1/orders/[orderId]+api.ts` (authenticated; forwards to OMS `GET /internal/v1/orders/{id}`; returns **404** if the order’s `accountId` does not match the session user, same as missing order).
 - Shared URL/key/timeout helpers — `customer-frontend/app/api/internal/oms/v1/omsInternalProxy.ts`.
+- **Ledger balance binding (POST):** when the JSON body includes a non-empty `ledgerBalanceId`, the BFF loads `user_profiles.ledger_identity_id` (Supabase service role) and `GET {LEDGER_API_URL}/balances/{id}?with_queued=true` (`X-Ledger-Key`); the balance’s Ledger `identityId` must match. Mismatch or unknown balance → **404** `not_found`; missing Ledger env → **503** `ledger_config_missing`; profile without identity → **403** `ledger_identity_missing`.
 
 ## Intended wiring
 

@@ -7,6 +7,7 @@ import com.balh.oms.fix.FixRouteDispatcher;
 import com.balh.oms.fix.FixSessionRegistry;
 import com.balh.oms.fix.OmsFixApplication;
 import com.balh.oms.persistence.OrdersRepository;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -30,8 +31,9 @@ public class FixAutoStartBeans {
             FixRouteDispatcher fixRouteDispatcher,
             FixSessionRegistry fixSessionRegistry,
             OrdersRepository ordersRepository,
-            FixNewOrderSingleBuilder newOrderSingleBuilder) {
+            FixNewOrderSingleBuilder newOrderSingleBuilder,
+            MeterRegistry meterRegistry) {
         return new FixOutboundDispatchWorker(
-                fixRouteDispatcher, fixSessionRegistry, ordersRepository, newOrderSingleBuilder);
+                fixRouteDispatcher, fixSessionRegistry, ordersRepository, newOrderSingleBuilder, meterRegistry);
     }
 }

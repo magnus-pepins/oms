@@ -3,6 +3,7 @@ package com.balh.oms.fix;
 import com.balh.oms.domain.Order;
 import com.balh.oms.domain.OrderStatus;
 import com.balh.oms.persistence.OrdersRepository;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -23,16 +24,19 @@ public class FixOutboundDispatchWorker {
     private final FixSessionRegistry fixSessionRegistry;
     private final OrdersRepository ordersRepository;
     private final FixNewOrderSingleBuilder newOrderSingleBuilder;
+    private final MeterRegistry meterRegistry;
 
     public FixOutboundDispatchWorker(
             FixRouteDispatcher fixRouteDispatcher,
             FixSessionRegistry fixSessionRegistry,
             OrdersRepository ordersRepository,
-            FixNewOrderSingleBuilder newOrderSingleBuilder) {
+            FixNewOrderSingleBuilder newOrderSingleBuilder,
+            MeterRegistry meterRegistry) {
         this.fixRouteDispatcher = fixRouteDispatcher;
         this.fixSessionRegistry = fixSessionRegistry;
         this.ordersRepository = ordersRepository;
         this.newOrderSingleBuilder = newOrderSingleBuilder;
+        this.meterRegistry = meterRegistry;
     }
 
     @Scheduled(fixedDelayString = "${oms.fix.outbound-poll-interval-ms:100}")
@@ -52,6 +56,7 @@ public class FixOutboundDispatchWorker {
         try {
             NewOrderSingle nos = newOrderSingleBuilder.build(order);
             Session.sendToTarget(nos, fixSessionRegistry.sessionOrNull());
+            meterRegistry.counter(FixMetrics.METRIC_NOS_SENT).increment();
         } catch (SessionNotFound e) {
             log.warn("FIX sendToTarget failed (no session) orderId={}", id, e);
         } catch (Exception e) {

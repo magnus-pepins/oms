@@ -35,6 +35,14 @@ public class FixInitiatorManager implements SmartLifecycle {
         this.application = application;
     }
 
+    /**
+     * Runs after embedded acceptors registered with lower phase (e.g. slice-4 round-trip IT).
+     */
+    @Override
+    public int getPhase() {
+        return 0;
+    }
+
     @Override
     public void start() {
         if (!running.compareAndSet(false, true)) {

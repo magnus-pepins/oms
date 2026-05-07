@@ -9,8 +9,10 @@ environment variables, and runbooks for **QuickFIX/J** wired to `FixRouteDispatc
 - **Dependencies:** `org.quickfixj:quickfixj-core` + `quickfixj-messages-fix44` (see `build.gradle.kts`).
 - **Smoke test:** `FixLogonSmokeTest` — embedded acceptor + initiator logon on a loopback port.
 - **Spring IT:** `FixRoutingSpringIntegrationTest` — `oms.routing.backend=fix`, `oms.fix.auto-start=false`, asserts `RouteDispatcher` is `FixRouteDispatcher`.
+- **Round-trip IT:** `FixRoundTripSpringIntegrationTest` (profile `fix-roundtrip-it`) — embedded loopback **acceptor** (`FixRoundTripEmbeddedAcceptor`, `SmartLifecycle` phase before initiator) + `oms.fix.auto-start=true`; inserts `WORKING` order, `RouteDispatcher.enqueueWorkingOrder`, awaits **FILLED** and asserts **`oms_fix_nos_sent_total`** / **`oms_fix_inbound_execution_reports_total`** (`disposition=trade_APPLIED`).
 - **Outbound:** `FixRouteDispatcher` enqueues `WORKING` order ids into a bounded `BlockingQueue` (capacity `oms.fix.outbound-queue-capacity`). When `oms.fix.auto-start=true`, `FixInitiatorManager` starts a `SocketInitiator` and `FixOutboundDispatchWorker` polls `oms.fix.outbound-poll-interval-ms`, loads the order, builds `NewOrderSingle` (`FixNewOrderSingleBuilder`), and `Session.sendToTarget` on the active session from `FixSessionRegistry`.
 - **Inbound:** `OmsFixApplication` receives `ExecutionReport` in `fromApp` → `FixInboundHandler` (`@Transactional`) → `FixExecutionReportMapper` → `ExecutionReportApplier` for **PartialFill/Fill** and **Canceled** (`ExecType`).
+- **Metrics:** `oms_fix_nos_sent_total` (successful outbound `sendToTarget`); `oms_fix_inbound_execution_reports_total` with tag `disposition` = `trade_<TradeApplyOutcome>` / `cancel_<CancelApplyOutcome>` / `ignored`.
 - **Mapper unit test:** `FixExecutionReportMapperTest`.
 
 ## Configuration

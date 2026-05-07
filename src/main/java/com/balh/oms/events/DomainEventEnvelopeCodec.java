@@ -108,6 +108,20 @@ public class DomainEventEnvelopeCodec {
         return envelope("OrderCancelled", order.id(), payload);
     }
 
+    /**
+     * {@code OrderRejected} after venue/broker reject CAS (same payload shape as control reject).
+     */
+    public String orderRejectedAfterVenue(Order order, RejectCode reason, int newSeq) throws JsonProcessingException {
+        var payload = new OrderRejectedEvent(
+                order.id(),
+                newSeq,
+                order.shardId(),
+                order.accountIdHash(),
+                reason.name(),
+                Instant.now());
+        return envelope("OrderRejected", order.id(), payload);
+    }
+
     private String envelope(String type, UUID correlationOrderId, Object payload) throws JsonProcessingException {
         ObjectNode root = objectMapper.createObjectNode();
         root.put("schemaVersion", ENVELOPE_SCHEMA_VERSION);

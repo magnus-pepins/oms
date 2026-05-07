@@ -76,11 +76,11 @@ and the milestone plan it links to.
   CAS reaches **`WORKING`** (no-op when `OMS_ROUTING_BACKEND=noop`).
 - **`SimulatedBrokerDispatcher`** + **`SimulatedReturnPathProjectionWorker`** + **`SimulatedExecutionProgram`**
   when `OMS_ROUTING_BACKEND=simulated`, drains a queue and fills in three chunks at `limit_price`.
-  **`FixRouteDispatcher`** when `OMS_ROUTING_BACKEND=fix` (slice 4 start). See [docs/return-path.md](docs/return-path.md) and [docs/fix-out.md](docs/fix-out.md).
+  **`FixRouteDispatcher`** + QuickFIX/J initiator/outbound/inbound when `OMS_ROUTING_BACKEND=fix` (slice 4; see [docs/return-path.md](docs/return-path.md) and [docs/fix-out.md](docs/fix-out.md)).
 
 ## What is NOT in slice 1
 
-- FIX engine (QuickFIX/J — **slice 4 started**: deps + `FixRouteDispatcher` queue + `FixLogonSmokeTest`; full UAT session in [oms-realignment-2026-05-07.md](../system-documentation/plans/oms-realignment-2026-05-07.md) Slice 4).
+- FIX **production** hardening (dedicated FIX session store, outbound token bucket, `route_state`, TLS, broker UAT soak) — see [oms-realignment-2026-05-07.md](../system-documentation/plans/oms-realignment-2026-05-07.md) Slice 4 **deferred** items; Java skeleton is in-repo.
 - Full risk catalogue from the master plan (STP, sanctions re-check, venue-specific
   checks, …) — only the slice‑2 subset above is implemented so far.
 - Cluster-aware lease ownership (slice 1.5).

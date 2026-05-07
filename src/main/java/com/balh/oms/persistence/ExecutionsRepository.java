@@ -87,6 +87,21 @@ public class ExecutionsRepository {
                 BigDecimal.ZERO, null, BigDecimal.ZERO, cumQuantityAfter, "CANCEL", rawJson);
     }
 
+    /**
+     * Venue/broker reject audit row; idempotent on {@code (account_id, venue_exec_ref)}.
+     */
+    public boolean tryInsertVenueReject(
+            UUID orderId,
+            UUID accountId,
+            String venueId,
+            Instant venueTs,
+            String venueExecRef,
+            BigDecimal cumQuantityAfter,
+            String rawJson) {
+        return insertReturning(INSERT_TRADE_SQL, orderId, accountId, venueId, venueTs, venueExecRef,
+                BigDecimal.ZERO, null, BigDecimal.ZERO, cumQuantityAfter, "REJECT", rawJson);
+    }
+
     private boolean insertReturning(
             String sql,
             UUID orderId,

@@ -283,6 +283,8 @@ public class OmsConfig {
         private String targetCompId = "BROKER_ACCEPT";
         private int heartBtInt = 30;
         private long outboundPollIntervalMs = 100L;
+        /** 0 = disabled; otherwise reject WORKING orders at FIX dequeue when older than this (ms). */
+        private long maxOutboundJobAgeMs = 0L;
         /** Venue id stamped on {@code ExecutionTradeCommand} from inbound ERs. */
         private String venueIdForExecutions = "FIX";
         private boolean useDataDictionary = false;
@@ -311,6 +313,14 @@ public class OmsConfig {
         public void setOutboundPollIntervalMs(long outboundPollIntervalMs) {
             this.outboundPollIntervalMs = Math.max(1L, outboundPollIntervalMs);
         }
+        public long getMaxOutboundJobAgeMs() {
+            return maxOutboundJobAgeMs;
+        }
+
+        public void setMaxOutboundJobAgeMs(long maxOutboundJobAgeMs) {
+            this.maxOutboundJobAgeMs = Math.max(0L, maxOutboundJobAgeMs);
+        }
+
         public String getVenueIdForExecutions() { return venueIdForExecutions; }
         public void setVenueIdForExecutions(String venueIdForExecutions) {
             this.venueIdForExecutions = venueIdForExecutions == null ? "FIX" : venueIdForExecutions;

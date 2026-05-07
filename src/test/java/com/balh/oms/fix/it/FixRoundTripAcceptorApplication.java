@@ -28,6 +28,7 @@ import quickfix.fix44.ExecutionReport;
 
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Minimal FIX 4.4 acceptor for slice-4 round-trip IT: reply to {@code D} with a synthetic full fill ER.
@@ -35,6 +36,9 @@ import java.time.ZoneOffset;
 public final class FixRoundTripAcceptorApplication implements Application {
 
     private static final Logger log = LoggerFactory.getLogger(FixRoundTripAcceptorApplication.class);
+
+    /** IT hook: incremented for each inbound {@code D}; used by stale-outbound IT to assert no send. */
+    public static final AtomicInteger NOS_RECEIVED = new AtomicInteger(0);
 
     @Override
     public void onCreate(SessionID sessionId) {
@@ -73,6 +77,7 @@ public final class FixRoundTripAcceptorApplication implements Application {
         if (!MsgType.ORDER_SINGLE.equals(msgType)) {
             throw new UnsupportedMessageType();
         }
+        NOS_RECEIVED.incrementAndGet();
         String clOrdId = message.getString(ClOrdID.FIELD);
         String compact = clOrdId.replace("-", "");
         String sym = message.getString(Symbol.FIELD);

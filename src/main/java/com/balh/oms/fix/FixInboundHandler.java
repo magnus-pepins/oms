@@ -1,6 +1,7 @@
 package com.balh.oms.fix;
 
 import com.balh.oms.config.OmsConfig;
+import com.balh.oms.domain.RejectCode;
 import com.balh.oms.returnpath.ExecutionReportApplier;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
@@ -48,14 +49,38 @@ public class FixInboundHandler {
             return;
         }
         var cancel = mapper.tryParseCancel(message, venueId);
-        if (cancel.isEmpty()) {
-            log.debug("Ignoring ExecutionReport (no trade/cancel mapping), message={}", message);
-            meterRegistry.counter(FixMetrics.METRIC_INBOUND_ER, FixMetrics.TAG_DISPOSITION, "ignored").increment();
+        if (cancel.isPresent()) {
+            ExecutionReportApplier.CancelApplyOutcome cout = applier.applyCancel(cancel.get());
+            meterRegistry
+                    .counter(FixMetrics.METRIC_INBOUND_ER, FixMetrics.TAG_DISPOSITION, "cancel_" + cout.name())
+                    .increment();
             return;
         }
-        ExecutionReportApplier.CancelApplyOutcome cout = applier.applyCancel(cancel.get());
+        var venueReject = mapper.tryParseVenueReject(message, venueId);
+        if (venueReject.isPresent()) {
+            ExecutionReportApplier.VenueRejectApplyOutcome vrOut =
+                    applier.applyVenueReject(venueReject.get(), RejectCode.VENUE_REJECT);
+            meterRegistry
+                    .counter(FixMetrics.METRIC_INBOUND_ER, FixMetrics.TAG_DISPOSITION, "venue_reject_" + vrOut.name())
+                    .increment();
+            return;
+        }
+        log.debug("Ignoring ExecutionReport (no mapping), message={}", message);
+        meterRegistry.counter(FixMetrics.METRIC_INBOUND_ER, FixMetrics.TAG_DISPOSITION, "ignored").increment();
+    }
+
+    @Transactional
+    public void handleOrderCancelReject(Message message) throws FieldNotFound {
+        String venueId = omsConfig.getFix().getVenueIdForExecutions();
+        var cmd = mapper.tryParseOrderCancelReject(message, venueId);
+        if (cmd.isEmpty()) {
+            meterRegistry.counter(FixMetrics.METRIC_INBOUND_ER, FixMetrics.TAG_DISPOSITION, "ocr_ignored").increment();
+            return;
+        }
+        ExecutionReportApplier.VenueRejectApplyOutcome out =
+                applier.applyVenueReject(cmd.get(), RejectCode.VENUE_REJECT);
         meterRegistry
-                .counter(FixMetrics.METRIC_INBOUND_ER, FixMetrics.TAG_DISPOSITION, "cancel_" + cout.name())
+                .counter(FixMetrics.METRIC_INBOUND_ER, FixMetrics.TAG_DISPOSITION, "ocr_" + out.name())
                 .increment();
     }
 }

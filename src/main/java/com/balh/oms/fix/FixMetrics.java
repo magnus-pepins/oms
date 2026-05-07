@@ -9,6 +9,8 @@ public final class FixMetrics {
     public static final String METRIC_INBOUND_ER = "oms_fix_inbound_execution_reports_total";
     public static final String TAG_DISPOSITION = "disposition";
 
+    public static final String METRIC_OUTBOUND_JOB_EXPIRED = "oms_fix_outbound_job_expired_total";
+
     private FixMetrics() {
     }
 }

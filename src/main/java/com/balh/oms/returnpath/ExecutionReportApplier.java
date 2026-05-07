@@ -3,6 +3,7 @@ package com.balh.oms.returnpath;
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.domain.Order;
 import com.balh.oms.domain.OrderStatus;
+import com.balh.oms.domain.RejectCode;
 import com.balh.oms.events.DomainEventEnvelopeCodec;
 import com.balh.oms.persistence.DomainEventOutboxRepository;
 import com.balh.oms.persistence.ExecutionsRepository;
@@ -79,6 +80,14 @@ public class ExecutionReportApplier {
     }
 
     public enum CancelApplyOutcome {
+        APPLIED,
+        DUPLICATE,
+        INVALID_STATE,
+        UNKNOWN_ORDER,
+        VERSION_MISMATCH
+    }
+
+    public enum VenueRejectApplyOutcome {
         APPLIED,
         DUPLICATE,
         INVALID_STATE,
@@ -212,6 +221,67 @@ public class ExecutionReportApplier {
             throw new IllegalStateException("domain event serialisation failed", e);
         }
         return CancelApplyOutcome.APPLIED;
+    }
+
+    /**
+     * Applies a venue/broker reject: {@code executions} REJECT row (idempotent) + CAS to {@code REJECTED} +
+     * {@code OrderRejected} outbox row.
+     */
+    @Transactional
+    public VenueRejectApplyOutcome applyVenueReject(ExecutionVenueRejectCommand cmd, RejectCode terminalReason) {
+        Optional<Order> opt = orders.findById(cmd.orderId());
+        if (opt.isEmpty()) {
+            return VenueRejectApplyOutcome.UNKNOWN_ORDER;
+        }
+        Order order = opt.get();
+        if (!isOpenForTrade(order.status())) {
+            log.warn("Ignoring venue reject for order {} in status {}", cmd.orderId(), order.status());
+            return VenueRejectApplyOutcome.INVALID_STATE;
+        }
+
+        marketContext.ensureStubSnapshot(order.id(), config.getRouting().getMarketContextStubJson());
+
+        boolean inserted = executions.tryInsertVenueReject(
+                order.id(),
+                order.accountId(),
+                cmd.venueId(),
+                cmd.venueTs(),
+                cmd.venueExecRef(),
+                order.cumFilledQuantity(),
+                cmd.rawEnvelopeJson());
+        if (!inserted) {
+            meterRegistry.counter(METRIC_EXECUTIONS_APPLIED, TAG_OUTCOME, OUTCOME_DUPLICATE).increment();
+            return VenueRejectApplyOutcome.DUPLICATE;
+        }
+        meterRegistry.counter(METRIC_EXECUTIONS_APPLIED, TAG_OUTCOME, OUTCOME_INSERTED).increment();
+
+        boolean cas = orders.updateWithCas(
+                order.id(), order.version(), OrderStatus.REJECTED, terminalReason, null, Instant.now());
+        if (!cas) {
+            return VenueRejectApplyOutcome.VERSION_MISMATCH;
+        }
+        int newSeq = order.version() + 1;
+        Order refreshed = orders.findById(order.id()).orElse(order);
+        try {
+            domainEventOutbox.insert(
+                    order.id(), envelopeCodec.orderRejectedAfterVenue(refreshed, terminalReason, newSeq));
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("domain event serialisation failed", e);
+        }
+        return VenueRejectApplyOutcome.APPLIED;
+    }
+
+    /**
+     * Marks a still-open order rejected when it sat too long on the FIX outbound queue (slice 4).
+     */
+    @Transactional
+    public VenueRejectApplyOutcome applyOutboundJobExpired(UUID orderId) {
+        String venueId = config.getFix().getVenueIdForExecutions();
+        Instant ts = Instant.now();
+        String ref = "OMS-OUTBOUND-EXPIRED-" + orderId;
+        String raw = "{\"kind\":\"OutboundJobExpired\",\"orderId\":\"" + orderId + "\"}";
+        return applyVenueReject(
+                new ExecutionVenueRejectCommand(orderId, venueId, ts, ref, raw), RejectCode.FIX_OUTBOUND_JOB_EXPIRED);
     }
 
     private boolean isOpenForTrade(OrderStatus status) {

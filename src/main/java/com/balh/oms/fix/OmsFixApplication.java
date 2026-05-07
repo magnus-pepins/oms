@@ -14,7 +14,7 @@ import quickfix.UnsupportedMessageType;
 import quickfix.field.MsgType;
 
 /**
- * QuickFIX/J {@link Application} adapter: logon registry + inbound ER → {@link FixInboundHandler}.
+ * QuickFIX/J {@link Application} adapter: logon registry + inbound app messages → {@link FixInboundHandler}.
  */
 @Component
 @ConditionalOnProperty(name = "oms.routing.backend", havingValue = "fix")
@@ -66,12 +66,15 @@ public class OmsFixApplication implements Application {
     public void fromApp(Message message, SessionID sessionId)
             throws FieldNotFound, IncorrectTagValue, UnsupportedMessageType {
         String msgType = message.getHeader().getString(MsgType.FIELD);
-        if (!MsgType.EXECUTION_REPORT.equals(msgType)) {
-            log.warn("Unsupported FIX app MsgType={} — {}", msgType, message);
-            throw new UnsupportedMessageType();
-        }
         try {
-            fixInboundHandler.handleExecutionReport(message);
+            if (MsgType.EXECUTION_REPORT.equals(msgType)) {
+                fixInboundHandler.handleExecutionReport(message);
+            } else if (MsgType.ORDER_CANCEL_REJECT.equals(msgType)) {
+                fixInboundHandler.handleOrderCancelReject(message);
+            } else {
+                log.warn("Unsupported FIX app MsgType={} — {}", msgType, message);
+                throw new UnsupportedMessageType();
+            }
         } catch (FieldNotFound e) {
             throw e;
         } catch (RuntimeException e) {

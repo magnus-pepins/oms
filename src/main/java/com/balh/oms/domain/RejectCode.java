@@ -18,5 +18,9 @@ public enum RejectCode {
     RISK_FAT_FINGER_SIZE,
     RISK_RATE_LIMIT,
     RISK_NOTIONAL_CAP,
-    INTERNAL_ERROR
+    INTERNAL_ERROR,
+    /** FIX venue/broker new-order or similar reject ({@code ExecType=Rejected} / cancel reject). */
+    VENUE_REJECT,
+    /** Outbound FIX job exceeded {@code oms.fix.max-outbound-job-age-ms} at dequeue (slice 4). */
+    FIX_OUTBOUND_JOB_EXPIRED
 }

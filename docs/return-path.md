@@ -1,20 +1,22 @@
-# Return path (slice 3)
+# Return path (slice 3–4)
 
 The **return path** applies venue execution reports (ER-shaped messages) to Postgres:
 `executions` rows (idempotent on `(account_id, venue_exec_ref)`), `orders.cum_filled_quantity`,
 and domain fanout envelopes (`OrderPartiallyFilled`, `OrderFilled`, `OrderCancelled`).
 
+**Slice 4 (FIX):** venue **rejects** (`ExecutionReport` `ExecType=Rejected`, `OrderCancelReject`) and **outbound job expiry** map to `executions.exec_type=REJECT`, `orders` → `REJECTED` with `terminal_reason` `VENUE_REJECT` or `FIX_OUTBOUND_JOB_EXPIRED`, and **`OrderRejected`** in `domain_event_outbox` (same envelope shape as control rejects). See `docs/fix-out.md`.
+
 ## Components
 
 | Piece | Role |
 |-------|------|
-| `ExecutionReportApplier` | `@Transactional` apply for trades and cancels; inserts `market_context` stub on first trade. |
-| `ExecutionsRepository` | `ON CONFLICT (account_id, venue_exec_ref) DO NOTHING` for idempotency. |
+| `ExecutionReportApplier` | `@Transactional` apply for trades, cancels, **venue rejects**, and **outbound job expiry**; inserts `market_context` stub on first trade. |
+| `ExecutionsRepository` | `ON CONFLICT (account_id, venue_exec_ref) DO NOTHING` for idempotency; `exec_type` **TRADE** / **CANCEL** / **REJECT**. |
 | `RouteDispatcher` | Called from `ControlTailer` **after commit** when an order reaches `WORKING`. |
 | `SimulatedBrokerDispatcher` | When `OMS_ROUTING_BACKEND=simulated`: enqueues order ids on the simulated route queue. |
 | `SimulatedReturnPathProjectionWorker` | `@Scheduled` drain (or `processPendingQueueOnce()` in tests) → `SimulatedExecutionProgram`. |
 | `SimulatedExecutionProgram` | Emits three synthetic ER applies (⅓, ⅓, remainder) → typically two `OrderPartiallyFilled` then `OrderFilled`. |
-| `FixRouteDispatcher` | When `OMS_ROUTING_BACKEND=fix`: queues ids for QuickFIX/J outbound (slice 4; initiator wiring next). |
+| `FixRouteDispatcher` | When `OMS_ROUTING_BACKEND=fix`: queues ids for QuickFIX/J outbound; see `docs/fix-out.md` for initiator, NOS, inbound ER/OCR, stale dequeue. |
 
 ## Configuration
 
@@ -29,6 +31,6 @@ See `docs/configuration.md` (`oms.routing.*`) and `.env.example`.
 - `oms_executions_applied_total{outcome=inserted|duplicate}`
 - `oms_order_filled_events_published_total`
 
-## Next (slice 4)
+## Next (broker hardening)
 
-`OMS_ROUTING_BACKEND=fix` with QuickFIX/J (`FixRouteDispatcher` today; initiator + `fromApp` → applier next) replaces the simulated path for production; the applier contract stays the same.
+Per master plan: separate FIX session store, outbound token bucket, `route_state` / halt route, TLS and broker UAT soak — not required for the current **slice 4 Java skeleton** in `oms/`.

@@ -1,15 +1,21 @@
 package com.balh.oms.fix;
 
 import com.balh.oms.returnpath.ExecutionTradeCommand;
+import com.balh.oms.returnpath.ExecutionVenueRejectCommand;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import quickfix.Message;
 import quickfix.field.ClOrdID;
 import quickfix.field.CumQty;
+import quickfix.field.CxlRejReason;
 import quickfix.field.ExecID;
 import quickfix.field.ExecType;
 import quickfix.field.LastPx;
 import quickfix.field.LastQty;
 import quickfix.field.LeavesQty;
+import quickfix.field.MsgType;
+import quickfix.field.OrderID;
+import quickfix.field.OrigClOrdID;
 import quickfix.field.TransactTime;
 
 import java.util.Optional;
@@ -19,7 +25,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 class FixExecutionReportMapperTest {
 
-    private final FixExecutionReportMapper mapper = new FixExecutionReportMapper();
+    private final FixExecutionReportMapper mapper = new FixExecutionReportMapper(new ObjectMapper());
 
     @Test
     void mapsFillExecutionReport() throws Exception {
@@ -54,5 +60,38 @@ class FixExecutionReportMapperTest {
         m.setString(CumQty.FIELD, "1");
 
         assertThat(mapper.tryParseTrade(m, "FIX")).isEmpty();
+    }
+
+    @Test
+    void mapsRejectedExecutionReport() throws Exception {
+        UUID orderId = UUID.fromString("22222222-2222-2222-2222-222222222222");
+        Message m = new Message();
+        m.setChar(ExecType.FIELD, ExecType.REJECTED);
+        m.setString(ClOrdID.FIELD, orderId.toString());
+        m.setString(ExecID.FIELD, "rej-1");
+        m.setString(TransactTime.FIELD, "20260115-11:00:00.000");
+
+        Optional<ExecutionVenueRejectCommand> cmd = mapper.tryParseVenueReject(m, "FIX");
+        assertThat(cmd).isPresent();
+        assertThat(cmd.get().orderId()).isEqualTo(orderId);
+        assertThat(cmd.get().venueExecRef()).isEqualTo("rej-1");
+        assertThat(cmd.get().rawEnvelopeJson()).contains("REJECTED");
+    }
+
+    @Test
+    void mapsOrderCancelReject() throws Exception {
+        UUID orderId = UUID.fromString("33333333-3333-3333-3333-333333333333");
+        Message m = new Message();
+        m.getHeader().setString(MsgType.FIELD, MsgType.ORDER_CANCEL_REJECT);
+        m.setString(OrigClOrdID.FIELD, orderId.toString());
+        m.setString(OrderID.FIELD, "BR-42");
+        m.setInt(CxlRejReason.FIELD, CxlRejReason.UNKNOWN_ORDER);
+        m.setString(TransactTime.FIELD, "20260115-12:00:00.000");
+
+        Optional<ExecutionVenueRejectCommand> cmd = mapper.tryParseOrderCancelReject(m, "FIX");
+        assertThat(cmd).isPresent();
+        assertThat(cmd.get().orderId()).isEqualTo(orderId);
+        assertThat(cmd.get().venueExecRef()).isEqualTo("ocr-BR-42-" + CxlRejReason.UNKNOWN_ORDER);
+        assertThat(cmd.get().rawEnvelopeJson()).contains("OrderCancelReject");
     }
 }

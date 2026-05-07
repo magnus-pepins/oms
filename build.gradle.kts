@@ -48,6 +48,9 @@ dependencies {
     // Hashing for PII-safe metric labels
     implementation("net.openhft:zero-allocation-hashing:0.16")
 
+    // NATS JetStream fanout (slice 1.5+; gated by oms.events.nats.enabled)
+    implementation("io.nats:jnats:2.20.5")
+
     // JSON (Jackson is pulled by spring-web; explicit for outbox payload codec)
     implementation("com.fasterxml.jackson.module:jackson-module-parameter-names")
     implementation("com.fasterxml.jackson.datatype:jackson-datatype-jsr310")

@@ -59,6 +59,14 @@ oms:
       enabled: ${OMS_NATS_ENABLED:false}
       url: ${OMS_NATS_URL:nats://localhost:4222}
       subject-prefix: ${OMS_NATS_SUBJECT_PREFIX:oms.events}
+      stream-name: ${OMS_NATS_STREAM_NAME:OMS_EVENTS}
+      connection-timeout-ms: ${OMS_NATS_CONNECTION_TIMEOUT_MS:5000}
+  ledger:
+    enabled: ${OMS_LEDGER_ENABLED:false}
+    base-url: ${OMS_LEDGER_BASE_URL:http://localhost:5001}
+    api-key: ${OMS_LEDGER_API_KEY:}
+    connect-timeout-ms: ${OMS_LEDGER_CONNECT_TIMEOUT_MS:2000}
+    read-timeout-ms: ${OMS_LEDGER_READ_TIMEOUT_MS:5000}
   pii:
     audit-trace-enabled: ${OMS_PII_AUDIT_TRACE_ENABLED:false}
     hash-secret: ${OMS_PII_HASH_SECRET:dev-only-change-me}

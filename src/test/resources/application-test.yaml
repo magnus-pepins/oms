@@ -19,6 +19,8 @@ oms:
   events:
     nats:
       enabled: false
+  ledger:
+    enabled: false
   pii:
     audit-trace-enabled: false
     hash-secret: test-secret

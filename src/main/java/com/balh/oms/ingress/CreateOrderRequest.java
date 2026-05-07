@@ -16,5 +16,7 @@ public record CreateOrderRequest(
         @NotBlank @Size(max = 64) String instrumentSymbol,
         @NotNull @Positive BigDecimal quantity,
         BigDecimal limitPrice,
-        @NotBlank @Size(max = 32) String timeInForce
+        @NotBlank @Size(max = 32) String timeInForce,
+        /** Optional Ledger balance id (e.g. {@code balance_...}) for buying-power gate. */
+        @Size(max = 128) String ledgerBalanceId
 ) {}

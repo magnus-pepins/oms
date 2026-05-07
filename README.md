@@ -1,5 +1,7 @@
 # OMS
 
+[![OMS CI](https://github.com/magnus-pepins/oms/actions/workflows/ci.yml/badge.svg)](https://github.com/magnus-pepins/oms/actions/workflows/ci.yml)
+
 Order Management System for the Balh financial platform ecosystem.
 
 This is the slice-1 bootstrap. It is a runnable Spring Boot 3 application
@@ -8,7 +10,8 @@ control-plane pattern wired end-to-end (outbox reconciler → Chronicle append �
 tail reader → `ControlTailer` CAS updates).
 
 **CI:** GitHub Actions runs `./gradlew test` and `./gradlew bootJar` on pushes
-and PRs to `main` / `master` (see `.github/workflows/ci.yml`).
+and PRs to `main` / `master`, and can be triggered manually (`workflow_dispatch`);
+see `.github/workflows/ci.yml`.
 
 The product / architecture decisions that shaped this code live in the
 [system-documentation](../system-documentation) workspace — primarily
@@ -27,17 +30,19 @@ and the milestone plan it links to.
 - `ControlTailer` applies CAS updates on `orders.version`.
 - Hashed-account-id PII policy enforced by a Micrometer filter and a guard
   test.
+- Optional **Ledger** HTTP client: when `OMS_LEDGER_ENABLED=true`, `ControlTailer`
+  can reject BUY orders (with `ledgerBalanceId` + `limitPrice`) for insufficient
+  `availableBalance` (`RISK_BUYING_POWER`) before CAS to `WORKING`.
+- Optional **NATS JetStream** publisher: when `OMS_NATS_ENABLED=true`, domain
+  events publish after Postgres commit (see `NatsDomainEventPublisher`).
 - Three operational drill scripts (failover, broken-chronicle,
-  reconciler-under-load) — currently skeletons that document the
-  assertions; bodies land alongside slice 1.5.
+  reconciler-under-load) — skeletons that document assertions; bodies grow with
+  later slices.
 
 ## What is NOT in slice 1
 
 - FIX engine (slice 2: QuickFIX/J).
-- Ledger client (slice 2).
-- Real risk catalogue (kill switch, fat-finger, buying power).
-- NATS publisher implementation (only the no-op is wired; the property is
-  ready in `application.yaml`).
+- Full risk catalogue (kill switch, fat-finger, venue-specific checks).
 - Cluster-aware lease ownership (slice 1.5).
 
 ## Quick start
@@ -80,7 +85,8 @@ curl -s http://localhost:8080/internal/v1/orders \
     "instrumentSymbol": "AAPL",
     "quantity": "10",
     "limitPrice": "150.00",
-    "timeInForce": "DAY"
+    "timeInForce": "DAY",
+    "ledgerBalanceId": "balance_replace_with_real_id"
   }'
 ```
 

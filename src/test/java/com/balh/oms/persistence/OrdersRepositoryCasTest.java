@@ -75,7 +75,8 @@ class OrdersRepositoryCasTest extends AbstractPostgresIntegrationTest {
                 now,
                 now,
                 null,
-                "deadbeef"
+                "deadbeef",
+                null
         );
     }
 }

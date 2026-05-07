@@ -1,9 +1,11 @@
 package com.balh.oms.tailer;
 
 import com.balh.oms.chronicle.PendingControlEvent;
+import com.balh.oms.config.OmsConfig;
 import com.balh.oms.domain.OrderStatus;
 import com.balh.oms.domain.RejectCode;
 import com.balh.oms.persistence.OrdersRepository;
+import com.balh.oms.risk.BuyingPowerAdmission;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -25,10 +27,18 @@ public class ControlTailer {
 
     private final OrdersRepository orders;
     private final StaleJobGuard stale;
+    private final OmsConfig config;
+    private final BuyingPowerAdmission buyingPower;
 
-    public ControlTailer(OrdersRepository orders, StaleJobGuard stale) {
+    public ControlTailer(
+            OrdersRepository orders,
+            StaleJobGuard stale,
+            OmsConfig config,
+            BuyingPowerAdmission buyingPower) {
         this.orders = orders;
         this.stale = stale;
+        this.config = config;
+        this.buyingPower = buyingPower;
     }
 
     public TailResult apply(PendingControlEvent event) {
@@ -44,8 +54,39 @@ public class ControlTailer {
             return updated ? TailResult.STALE_REJECTED : TailResult.SKIPPED_VERSION_MISMATCH;
         }
 
-        // Slice 1 ships the OrderAccepted path only. Real risk checks land in
-        // slice 2 (Ledger inflight, kill switch, fat-finger, etc.).
+        if (config.getLedger().isEnabled()) {
+            var row = orders.findById(event.orderId());
+            if (row.isEmpty()) {
+                log.warn("Control event references unknown orderId={}", event.orderId());
+                return TailResult.UNKNOWN_ORDER;
+            }
+            switch (buyingPower.evaluate(row.get())) {
+                case REJECT_INSUFFICIENT -> {
+                    boolean updated = orders.updateWithCas(
+                            event.orderId(),
+                            event.orderVersion(),
+                            OrderStatus.REJECTED,
+                            RejectCode.RISK_BUYING_POWER,
+                            null,
+                            Instant.now()
+                    );
+                    return updated ? TailResult.BUYING_POWER_REJECTED : TailResult.SKIPPED_VERSION_MISMATCH;
+                }
+                case REJECT_LEDGER_UNAVAILABLE -> {
+                    boolean updated = orders.updateWithCas(
+                            event.orderId(),
+                            event.orderVersion(),
+                            OrderStatus.REJECTED,
+                            RejectCode.INTERNAL_ERROR,
+                            null,
+                            Instant.now()
+                    );
+                    return updated ? TailResult.LEDGER_SERVICE_REJECTED : TailResult.SKIPPED_VERSION_MISMATCH;
+                }
+                case PROCEED -> { /* fall through */ }
+            }
+        }
+
         boolean updated = orders.updateWithCas(
                 event.orderId(),
                 event.orderVersion(),
@@ -65,6 +106,9 @@ public class ControlTailer {
     public enum TailResult {
         APPLIED,
         SKIPPED_VERSION_MISMATCH,
-        STALE_REJECTED
+        STALE_REJECTED,
+        UNKNOWN_ORDER,
+        BUYING_POWER_REJECTED,
+        LEDGER_SERVICE_REJECTED
     }
 }

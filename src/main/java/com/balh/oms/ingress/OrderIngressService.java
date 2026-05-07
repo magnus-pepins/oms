@@ -71,6 +71,7 @@ public class OrderIngressService {
         Instant now = Instant.now();
         int shardId = ShardKey.shardFor(req.accountId(), config.getShard().getCount());
         String accountIdHash = piiHash.hash(req.accountId());
+        String ledgerBalanceId = normalizeLedgerBalanceId(req.ledgerBalanceId());
 
         Order order = new Order(
                 id,
@@ -88,7 +89,8 @@ public class OrderIngressService {
                 now,
                 now,
                 null,
-                accountIdHash
+                accountIdHash,
+                ledgerBalanceId
         );
 
         try {
@@ -119,5 +121,13 @@ public class OrderIngressService {
             log.error("Failed to serialise PendingControlEvent for orderId={}", ev.orderId(), e);
             throw new RuntimeException("payload serialisation failed", e);
         }
+    }
+
+    private static String normalizeLedgerBalanceId(String raw) {
+        if (raw == null) {
+            return null;
+        }
+        String t = raw.trim();
+        return t.isEmpty() ? null : t;
     }
 }

@@ -27,5 +27,7 @@ public record Order(
         Instant receivedAt,
         Instant acceptedAt,
         Instant terminalAt,
-        String accountIdHash
+        String accountIdHash,
+        /** Ledger {@code balance_id} when supplied on ingress; used for BUY buying-power checks. */
+        String ledgerBalanceId
 ) {}

@@ -97,7 +97,8 @@ public class ChronicleControlTailReader {
             switch (r) {
                 case APPLIED -> appliedCounter.increment();
                 case STALE_REJECTED -> staleRejectedCounter.increment();
-                case SKIPPED_VERSION_MISMATCH -> skippedCounter.increment();
+                case SKIPPED_VERSION_MISMATCH, UNKNOWN_ORDER -> skippedCounter.increment();
+                case BUYING_POWER_REJECTED, LEDGER_SERVICE_REJECTED -> skippedCounter.increment();
             }
         } catch (Exception e) {
             errorCounter.increment();

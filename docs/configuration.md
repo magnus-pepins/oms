@@ -64,6 +64,18 @@ new key here when introducing one.
 | `OMS_NATS_ENABLED`           | `false`                | When true, the NATS-backed publisher displaces the no-op (slice 1.5+).    |
 | `OMS_NATS_URL`               | `nats://localhost:4222`| NATS connection URL.                                                      |
 | `OMS_NATS_SUBJECT_PREFIX`    | `oms.events`           | Subject prefix; events publish to `${prefix}.${type}`.                    |
+| `OMS_NATS_STREAM_NAME`       | `OMS_EVENTS`           | JetStream stream name created on startup (idempotent if it exists).       |
+| `OMS_NATS_CONNECTION_TIMEOUT_MS` | `5000`            | NATS TCP connect timeout.                                                 |
+
+## Ledger (buying power)
+
+| Key                              | Default                 | Meaning                                                                 |
+|----------------------------------|-------------------------|-------------------------------------------------------------------------|
+| `OMS_LEDGER_ENABLED`             | `false`                 | When true, wires `RestLedgerBalanceClient` and enables the BUY gate in `ControlTailer`. |
+| `OMS_LEDGER_BASE_URL`          | `http://localhost:5001` | Ledger HTTP root (routes mounted at `/`, e.g. `/balances/{id}`).        |
+| `OMS_LEDGER_API_KEY`           | (empty)                 | Value for `X-Ledger-Key` on balance reads. Required when enabled.         |
+| `OMS_LEDGER_CONNECT_TIMEOUT_MS`  | `2000`                  | HTTP connect timeout for Ledger calls.                                  |
+| `OMS_LEDGER_READ_TIMEOUT_MS`     | `5000`                  | HTTP read timeout for Ledger calls.                                      |
 
 ## PII
 

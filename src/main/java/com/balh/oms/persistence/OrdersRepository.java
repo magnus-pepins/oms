@@ -45,13 +45,13 @@ public class OrdersRepository {
                 id, account_id, client_idempotency_key, shard_id, version,
                 status, terminal_reason, side, instrument_symbol,
                 quantity, limit_price, time_in_force,
-                received_at, accepted_at, terminal_at, account_id_hash
+                received_at, accepted_at, terminal_at, account_id_hash, ledger_balance_id
             ) VALUES (
                 :id, :account_id, :client_idempotency_key, :shard_id, 0,
                 CAST(:status AS order_status), CAST(:terminal_reason AS reject_code),
                 CAST(:side AS order_side), :instrument_symbol,
                 :quantity, :limit_price, :time_in_force,
-                :received_at, :accepted_at, :terminal_at, :account_id_hash
+                :received_at, :accepted_at, :terminal_at, :account_id_hash, :ledger_balance_id
             )
             """;
 
@@ -61,7 +61,7 @@ public class OrdersRepository {
                    terminal_reason::text AS terminal_reason,
                    side::text AS side,
                    instrument_symbol, quantity, limit_price, time_in_force,
-                   received_at, accepted_at, terminal_at, account_id_hash
+                   received_at, accepted_at, terminal_at, account_id_hash, ledger_balance_id
             FROM orders WHERE id = :id
             """;
 
@@ -71,7 +71,7 @@ public class OrdersRepository {
                    terminal_reason::text AS terminal_reason,
                    side::text AS side,
                    instrument_symbol, quantity, limit_price, time_in_force,
-                   received_at, accepted_at, terminal_at, account_id_hash
+                   received_at, accepted_at, terminal_at, account_id_hash, ledger_balance_id
             FROM orders
             WHERE account_id = :account_id AND client_idempotency_key = :key
             """;
@@ -149,7 +149,8 @@ public class OrdersRepository {
                 .addValue("received_at", Timestamp.from(o.receivedAt()))
                 .addValue("accepted_at", o.acceptedAt() == null ? null : Timestamp.from(o.acceptedAt()))
                 .addValue("terminal_at", o.terminalAt() == null ? null : Timestamp.from(o.terminalAt()))
-                .addValue("account_id_hash", o.accountIdHash());
+                .addValue("account_id_hash", o.accountIdHash())
+                .addValue("ledger_balance_id", o.ledgerBalanceId());
     }
 
     private static final RowMapper<Order> ROW_MAPPER = (rs, rowNum) -> {
@@ -157,6 +158,7 @@ public class OrdersRepository {
         Timestamp acceptedAt = rs.getTimestamp("accepted_at");
         Timestamp terminalAt = rs.getTimestamp("terminal_at");
         String terminalReason = rs.getString("terminal_reason");
+        String ledgerBalanceId = rs.getString("ledger_balance_id");
         return new Order(
                 (UUID) rs.getObject("id"),
                 (UUID) rs.getObject("account_id"),
@@ -173,7 +175,8 @@ public class OrdersRepository {
                 rs.getTimestamp("received_at").toInstant(),
                 acceptedAt == null ? null : acceptedAt.toInstant(),
                 terminalAt == null ? null : terminalAt.toInstant(),
-                rs.getString("account_id_hash")
+                rs.getString("account_id_hash"),
+                ledgerBalanceId
         );
     };
 }

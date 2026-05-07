@@ -22,7 +22,8 @@ public record CreateOrderResponse(
         String timeInForce,
         Instant receivedAt,
         Instant acceptedAt,
-        Instant terminalAt
+        Instant terminalAt,
+        String ledgerBalanceId
 ) {
     public static CreateOrderResponse from(Order o) {
         return new CreateOrderResponse(
@@ -30,7 +31,8 @@ public record CreateOrderResponse(
                 o.status(),
                 o.terminalReason() == null ? null : o.terminalReason().name(),
                 o.side().name(), o.instrumentSymbol(), o.quantity(), o.limitPrice(),
-                o.timeInForce(), o.receivedAt(), o.acceptedAt(), o.terminalAt()
+                o.timeInForce(), o.receivedAt(), o.acceptedAt(), o.terminalAt(),
+                o.ledgerBalanceId()
         );
     }
 }

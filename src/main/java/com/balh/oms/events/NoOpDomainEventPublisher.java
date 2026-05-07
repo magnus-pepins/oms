@@ -11,7 +11,8 @@ import org.springframework.stereotype.Component;
  *
  * <p>Replace with the NATS publisher when slice 1.5 lands; that PR adds a
  * {@code @ConditionalOnProperty("oms.events.nats.enabled")} bean which
- * displaces this one via {@link ConditionalOnMissingBean}.
+ * displaces this one via {@link ConditionalOnMissingBean} (bean name
+ * {@code natsDomainEventPublisher}).
  */
 @Component
 @ConditionalOnMissingBean(name = "natsDomainEventPublisher")

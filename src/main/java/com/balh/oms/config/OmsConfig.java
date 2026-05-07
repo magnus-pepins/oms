@@ -20,6 +20,7 @@ public class OmsConfig {
     private final Outbox outbox = new Outbox();
     private final Chronicle chronicle = new Chronicle();
     private final Events events = new Events();
+    private final Ledger ledger = new Ledger();
     private final Pii pii = new Pii();
 
     public Http getHttp() { return http; }
@@ -28,6 +29,7 @@ public class OmsConfig {
     public Outbox getOutbox() { return outbox; }
     public Chronicle getChronicle() { return chronicle; }
     public Events getEvents() { return events; }
+    public Ledger getLedger() { return ledger; }
     public Pii getPii() { return pii; }
 
     public static class Http {
@@ -92,13 +94,37 @@ public class OmsConfig {
             private boolean enabled = false;
             private String url = "nats://localhost:4222";
             private String subjectPrefix = "oms.events";
+            private String streamName = "OMS_EVENTS";
+            private long connectionTimeoutMs = 5000L;
             public boolean isEnabled() { return enabled; }
             public void setEnabled(boolean v) { this.enabled = v; }
             public String getUrl() { return url; }
             public void setUrl(String v) { this.url = v; }
             public String getSubjectPrefix() { return subjectPrefix; }
             public void setSubjectPrefix(String v) { this.subjectPrefix = v; }
+            public String getStreamName() { return streamName; }
+            public void setStreamName(String v) { this.streamName = v; }
+            public long getConnectionTimeoutMs() { return connectionTimeoutMs; }
+            public void setConnectionTimeoutMs(long v) { this.connectionTimeoutMs = v; }
         }
+    }
+
+    public static class Ledger {
+        private boolean enabled = false;
+        private String baseUrl = "http://localhost:5001";
+        private String apiKey = "";
+        private long connectTimeoutMs = 2000L;
+        private long readTimeoutMs = 5000L;
+        public boolean isEnabled() { return enabled; }
+        public void setEnabled(boolean v) { this.enabled = v; }
+        public String getBaseUrl() { return baseUrl; }
+        public void setBaseUrl(String v) { this.baseUrl = v; }
+        public String getApiKey() { return apiKey; }
+        public void setApiKey(String v) { this.apiKey = v; }
+        public long getConnectTimeoutMs() { return connectTimeoutMs; }
+        public void setConnectTimeoutMs(long v) { this.connectTimeoutMs = v; }
+        public long getReadTimeoutMs() { return readTimeoutMs; }
+        public void setReadTimeoutMs(long v) { this.readTimeoutMs = v; }
     }
 
     public static class Pii {

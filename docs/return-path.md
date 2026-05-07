@@ -11,14 +11,18 @@ and domain fanout envelopes (`OrderPartiallyFilled`, `OrderFilled`, `OrderCancel
 | `ExecutionReportApplier` | `@Transactional` apply for trades and cancels; inserts `market_context` stub on first trade. |
 | `ExecutionsRepository` | `ON CONFLICT (account_id, venue_exec_ref) DO NOTHING` for idempotency. |
 | `RouteDispatcher` | Called from `ControlTailer` **after commit** when an order reaches `WORKING`. |
-| `SimulatedFillEngine` | When `OMS_ROUTING_BACKEND=simulated`, enqueues order ids and emits three synthetic partial fills (⅓, ⅓, remainder) at the order’s `limit_price` (or `1` if null). |
+| `SimulatedBrokerDispatcher` | When `OMS_ROUTING_BACKEND=simulated`: enqueues order ids on the simulated route queue. |
+| `SimulatedReturnPathProjectionWorker` | `@Scheduled` drain (or `processPendingQueueOnce()` in tests) → `SimulatedExecutionProgram`. |
+| `SimulatedExecutionProgram` | Emits three synthetic ER applies (⅓, ⅓, remainder) → typically two `OrderPartiallyFilled` then `OrderFilled`. |
+| `FixRouteDispatcher` | When `OMS_ROUTING_BACKEND=fix`: queues ids for QuickFIX/J outbound (slice 4; initiator wiring next). |
 
 ## Configuration
 
 See `docs/configuration.md` (`oms.routing.*`) and `.env.example`.
 
-- **`OMS_ROUTING_BACKEND=noop`** (default): no simulated fills; orders stay `WORKING` until a real broker lands in slice 4.
-- **`OMS_ROUTING_BACKEND=simulated`**: enables `SimulatedFillEngine` + scheduled drain (`OMS_SIMULATED_POLL_INTERVAL_MS`). Tests set `OMS_SIMULATED_SCHEDULER_ENABLED=false` and call `drainOnceForTests()`.
+- **`OMS_ROUTING_BACKEND=noop`** (default): no post-`WORKING` dispatch.
+- **`OMS_ROUTING_BACKEND=simulated`**: `SimulatedBrokerDispatcher` + `SimulatedReturnPathProjectionWorker` + scheduled drain (`OMS_SIMULATED_POLL_INTERVAL_MS`). Tests set `OMS_SIMULATED_SCHEDULER_ENABLED=false` and call **`processPendingQueueOnce()`**.
+- **`OMS_ROUTING_BACKEND=fix`**: `FixRouteDispatcher` (see `docs/fix-out.md`).
 
 ## Metrics
 
@@ -27,4 +31,4 @@ See `docs/configuration.md` (`oms.routing.*`) and `.env.example`.
 
 ## Next (slice 4)
 
-`OMS_ROUTING_BACKEND=fix` with QuickFIX/J replaces the simulated engine; the applier contract stays the same.
+`OMS_ROUTING_BACKEND=fix` with QuickFIX/J (`FixRouteDispatcher` today; initiator + `fromApp` → applier next) replaces the simulated path for production; the applier contract stays the same.

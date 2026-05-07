@@ -17,6 +17,8 @@ repositories {
     mavenCentral()
 }
 
+val quickfixjVersion = "2.3.2"
+
 dependencies {
     // Spring Boot 3 minimal: Web + Actuator + JDBC + Flyway
     implementation("org.springframework.boot:spring-boot-starter-web")
@@ -50,6 +52,10 @@ dependencies {
 
     // NATS JetStream fanout (slice 1.5+; gated by oms.events.nats.enabled)
     implementation("io.nats:jnats:2.20.5")
+
+    // QuickFIX/J — slice 4 outbound/inbound FIX wire (gated by oms.routing.backend=fix + initiator wiring)
+    implementation("org.quickfixj:quickfixj-core:$quickfixjVersion")
+    implementation("org.quickfixj:quickfixj-messages-fix44:$quickfixjVersion")
 
     // JSON (Jackson is pulled by spring-web; explicit for outbox payload codec)
     implementation("com.fasterxml.jackson.module:jackson-module-parameter-names")

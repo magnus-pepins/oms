@@ -2,7 +2,7 @@ package com.balh.oms.returnpath;
 
 import com.balh.oms.AbstractPostgresIntegrationTest;
 import com.balh.oms.chronicle.PendingControlEvent;
-import com.balh.oms.routing.SimulatedFillEngine;
+import com.balh.oms.routing.SimulatedReturnPathProjectionWorker;
 import com.balh.oms.tailer.ControlTailer;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -25,7 +25,7 @@ class SimulatedReturnPathIntegrationTest extends AbstractPostgresIntegrationTest
 
     @Autowired ControlTailer controlTailer;
     @Autowired ExecutionReportApplier executionReportApplier;
-    @Autowired SimulatedFillEngine simulatedFillEngine;
+    @Autowired SimulatedReturnPathProjectionWorker simulatedReturnPathProjectionWorker;
     @Autowired JdbcTemplate jdbc;
 
     @BeforeEach
@@ -46,7 +46,7 @@ class SimulatedReturnPathIntegrationTest extends AbstractPostgresIntegrationTest
         PendingControlEvent ev = event(orderId, 0);
         assertThat(controlTailer.apply(ev)).isEqualTo(ControlTailer.TailResult.APPLIED);
 
-        simulatedFillEngine.drainOnceForTests();
+        simulatedReturnPathProjectionWorker.processPendingQueueOnce();
 
         assertThat(jdbc.queryForObject("SELECT status::text FROM orders WHERE id = ?", String.class, orderId))
                 .isEqualTo("FILLED");

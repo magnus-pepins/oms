@@ -90,7 +90,7 @@ oms:
     fat-finger-max-order-quantity: ${OMS_RISK_FAT_FINGER_MAX_ORDER_QUANTITY:0}
     max-order-notional: ${OMS_RISK_MAX_ORDER_NOTIONAL:0}
   routing:
-    # noop | simulated | fix (fix throws at startup until slice 4)
+    # noop | simulated | fix (fix: FixRouteDispatcher queues WORKING ids — see docs/fix-out.md)
     backend: ${OMS_ROUTING_BACKEND:noop}
     market-context-stub-json: ${OMS_MARKET_CONTEXT_STUB_JSON:{"stub":true}}
     simulated:

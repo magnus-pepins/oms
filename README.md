@@ -74,12 +74,13 @@ and the milestone plan it links to.
   **`oms_order_filled_events_published_total`**.
 - **`RouteDispatcher`** — `ControlTailer` registers **after-commit** enqueue when
   CAS reaches **`WORKING`** (no-op when `OMS_ROUTING_BACKEND=noop`).
-- **`SimulatedFillEngine`** — when `OMS_ROUTING_BACKEND=simulated`, drains a queue
-  and fills in three chunks at `limit_price`. See [docs/return-path.md](docs/return-path.md).
+- **`SimulatedBrokerDispatcher`** + **`SimulatedReturnPathProjectionWorker`** + **`SimulatedExecutionProgram`**
+  when `OMS_ROUTING_BACKEND=simulated`, drains a queue and fills in three chunks at `limit_price`.
+  **`FixRouteDispatcher`** when `OMS_ROUTING_BACKEND=fix` (slice 4 start). See [docs/return-path.md](docs/return-path.md) and [docs/fix-out.md](docs/fix-out.md).
 
 ## What is NOT in slice 1
 
-- FIX engine (QuickFIX/J — planned **Slice 4** in [oms-realignment-2026-05-07.md](../system-documentation/plans/oms-realignment-2026-05-07.md)).
+- FIX engine (QuickFIX/J — **slice 4 started**: deps + `FixRouteDispatcher` queue + `FixLogonSmokeTest`; full UAT session in [oms-realignment-2026-05-07.md](../system-documentation/plans/oms-realignment-2026-05-07.md) Slice 4).
 - Full risk catalogue from the master plan (STP, sanctions re-check, venue-specific
   checks, …) — only the slice‑2 subset above is implemented so far.
 - Cluster-aware lease ownership (slice 1.5).
@@ -160,5 +161,6 @@ tests execute instead of being skipped.
 - [docs/drop-copy-events.md](docs/drop-copy-events.md) — domain-event
   envelope and emit points.
 - [docs/return-path.md](docs/return-path.md) — executions, simulated routing, idempotency.
+- [docs/fix-out.md](docs/fix-out.md) — FIX slice 4 wiring status.
 - [docs/configuration.md](docs/configuration.md) — every named limit /
   env key in one place.

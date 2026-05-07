@@ -1,7 +1,7 @@
 package com.balh.oms.config;
 
 import com.balh.oms.routing.RouteDispatcher;
-import com.balh.oms.routing.SimulatedFillEngine;
+import com.balh.oms.routing.SimulatedBrokerDispatcher;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
@@ -15,17 +15,23 @@ public class RoutingDispatchConfiguration {
     @Bean
     public RouteDispatcher routeDispatcher(
             @Value("${oms.routing.backend:noop}") String backend,
-            ObjectProvider<SimulatedFillEngine> simulatedEngine) {
+            ObjectProvider<SimulatedBrokerDispatcher> simulatedDispatcher,
+            ObjectProvider<com.balh.oms.fix.FixRouteDispatcher> fixDispatcher) {
         if ("simulated".equalsIgnoreCase(backend)) {
-            SimulatedFillEngine engine = simulatedEngine.getIfAvailable();
-            if (engine == null) {
+            SimulatedBrokerDispatcher dispatcher = simulatedDispatcher.getIfAvailable();
+            if (dispatcher == null) {
                 throw new IllegalStateException(
-                        "oms.routing.backend=simulated requires SimulatedFillEngine (check @ConditionalOnProperty wiring)");
+                        "oms.routing.backend=simulated requires SimulatedBrokerDispatcher (check SimulatedRoutingBeans wiring)");
             }
-            return engine::enqueueWorkingOrder;
+            return dispatcher;
         }
         if ("fix".equalsIgnoreCase(backend)) {
-            throw new IllegalStateException("oms.routing.backend=fix is not implemented until slice 4");
+            com.balh.oms.fix.FixRouteDispatcher fix = fixDispatcher.getIfAvailable();
+            if (fix == null) {
+                throw new IllegalStateException(
+                        "oms.routing.backend=fix requires FixRouteDispatcher (check FixRoutingBeans wiring)");
+            }
+            return fix;
         }
         return (UUID orderId) -> { };
     }

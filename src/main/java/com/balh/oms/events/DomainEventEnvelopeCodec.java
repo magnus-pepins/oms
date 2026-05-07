@@ -8,6 +8,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.springframework.stereotype.Component;
 
+import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.UUID;
 
@@ -67,6 +68,44 @@ public class DomainEventEnvelopeCodec {
                 order.timeInForce(),
                 Instant.now());
         return envelope("OrderWorking", order.id(), payload);
+    }
+
+    public String orderPartiallyFilled(Order order, int newSeq, BigDecimal cumQty, BigDecimal lastQty,
+            BigDecimal lastPx, String venueId, String venueExecRef) throws JsonProcessingException {
+        var payload = new OrderPartiallyFilledEvent(
+                order.id(),
+                newSeq,
+                order.shardId(),
+                order.accountIdHash(),
+                cumQty,
+                lastQty,
+                lastPx,
+                venueId,
+                venueExecRef,
+                Instant.now());
+        return envelope("OrderPartiallyFilled", order.id(), payload);
+    }
+
+    public String orderFilled(Order order, int newSeq, BigDecimal filledQty, BigDecimal averageFillPrice,
+            String venueId, String venueExecRef) throws JsonProcessingException {
+        var payload = new OrderFilledEvent(
+                order.id(),
+                newSeq,
+                order.shardId(),
+                order.accountIdHash(),
+                filledQty,
+                averageFillPrice,
+                venueId,
+                venueExecRef,
+                Instant.now());
+        return envelope("OrderFilled", order.id(), payload);
+    }
+
+    public String orderCancelled(Order order, int newSeq, String venueId, String venueExecRef)
+            throws JsonProcessingException {
+        var payload = new OrderCancelledEvent(
+                order.id(), newSeq, order.shardId(), order.accountIdHash(), venueId, venueExecRef, Instant.now());
+        return envelope("OrderCancelled", order.id(), payload);
     }
 
     private String envelope(String type, UUID correlationOrderId, Object payload) throws JsonProcessingException {

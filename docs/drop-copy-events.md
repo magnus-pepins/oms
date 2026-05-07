@@ -7,7 +7,9 @@ Slice 1 ships the contract and a **transactional outbox** (`domain_event_outbox`
 drained by `DomainFanoutReconciler`. **NATS JetStream** (`FanoutClient`) is
 optional when `OMS_NATS_ENABLED=true`. **`OrderRejected`** and **`OrderWorking`**
 are written to the same outbox inside `ControlTailer` after successful CAS.
-External FIX drop copy is slice 2+.
+**`OrderPartiallyFilled`**, **`OrderFilled`**, and **`OrderCancelled`** are written
+by `ExecutionReportApplier` (slice 3) after execution rows apply. External FIX
+drop copy reuses the same envelope shapes in slice 4+.
 
 ## Envelope (wire schema)
 
@@ -91,7 +93,10 @@ event-specific record:
 | `OrderAccepted`    | `OrderIngressService.persistAccepted` | Same Postgres transaction as `orders` + `control_outbox` insert; reconciler delivers after commit. |
 | `OrderRejected`    | `ControlTailer.apply`               | Same transaction as successful CAS to `REJECTED` (stale queue, buying power, ledger error). |
 | `OrderWorking`     | `ControlTailer.apply`               | Same transaction as successful CAS to `WORKING`.                               |
-| Execution events   | Slice 2+ FIX gateway                | After Ledger settlement leg lands.                       |
+| `OrderPartiallyFilled` | `ExecutionReportApplier.applyTrade` | After successful CAS to `PARTIALLY_FILLED` (slice 3). |
+| `OrderFilled`      | `ExecutionReportApplier.applyTrade` | After successful CAS to `FILLED` (slice 3). |
+| `OrderCancelled`   | `ExecutionReportApplier.applyCancel`| After successful CAS to `CANCELLED` (slice 3). |
+| Execution events   | Slice 4+ FIX gateway                | Same applier path as simulated fills once FIX lands.                       |
 
 ## Mandatory rule
 

@@ -29,5 +29,7 @@ public record Order(
         Instant terminalAt,
         String accountIdHash,
         /** Ledger {@code balance_id} when supplied on ingress; used for BUY buying-power checks. */
-        String ledgerBalanceId
+        String ledgerBalanceId,
+        /** Cumulative filled quantity from venue execution reports (slice 3). */
+        BigDecimal cumFilledQuantity
 ) {}

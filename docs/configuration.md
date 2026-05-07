@@ -49,6 +49,17 @@ new key here when introducing one.
 | `OMS_RISK_FAT_FINGER_MAX_ORDER_QUANTITY` | `0` | Max order quantity; `0` disables. |
 | `OMS_RISK_MAX_ORDER_NOTIONAL` | `0` | Max `quantity × limit_price`; `0` disables. |
 
+## Routing / return path (slice 3)
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `OMS_ROUTING_BACKEND` | `noop` | `noop` — no post-`WORKING` dispatch. `simulated` — `SimulatedFillEngine` emits synthetic fills. `fix` — reserved (slice 4; fails fast at startup). |
+| `OMS_MARKET_CONTEXT_STUB_JSON` | `{"stub":true}` | JSON written on first fill to `market_context.snapshot_json` until marketdata integration (slice 5). |
+| `OMS_SIMULATED_VENUE_ID` | `SIM` | `venue_id` on synthetic executions. |
+| `OMS_SIMULATED_QUEUE_CAPACITY` | `10000` | Bounded queue for `WORKING` order ids awaiting simulation. |
+| `OMS_SIMULATED_POLL_INTERVAL_MS` | `50` | `@Scheduled` drain interval when simulated backend is enabled. |
+| `OMS_SIMULATED_SCHEDULER_ENABLED` | `true` | When `false`, only explicit `SimulatedFillEngine.drainOnceForTests()` drains the queue (used in integration tests). |
+
 ## Outbox / reconciler
 
 | Key                                   | Default | Meaning                                                                            |

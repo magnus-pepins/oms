@@ -12,6 +12,7 @@ import com.balh.oms.persistence.DomainEventOutboxRepository;
 import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.risk.BuyingPowerAdmission;
 import com.balh.oms.risk.ControlRiskEvaluator;
+import com.balh.oms.routing.RouteDispatcher;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
@@ -49,6 +50,7 @@ class ControlTailerRejectPublisherTest {
     @Mock ControlRiskEvaluator controlRisk;
     @Mock ControlDecisionsRepository controlDecisions;
     @Mock DomainEventOutboxRepository domainOutbox;
+    @Mock RouteDispatcher routeDispatcher;
 
     private final ObjectMapper objectMapper = new ObjectMapper().registerModule(new JavaTimeModule());
     private final DomainEventEnvelopeCodec codec = new DomainEventEnvelopeCodec(objectMapper);
@@ -59,7 +61,16 @@ class ControlTailerRejectPublisherTest {
     @BeforeEach
     void setUp() {
         tailer = new ControlTailer(
-                orders, stale, config, buyingPower, controlRisk, controlDecisions, domainOutbox, codec, meterRegistry);
+                orders,
+                stale,
+                config,
+                buyingPower,
+                controlRisk,
+                controlDecisions,
+                domainOutbox,
+                codec,
+                meterRegistry,
+                routeDispatcher);
     }
 
     @Test
@@ -76,6 +87,7 @@ class ControlTailerRejectPublisherTest {
 
         assertThat(tailer.apply(ev)).isEqualTo(ControlTailer.TailResult.STALE_REJECTED);
 
+        verify(routeDispatcher, never()).enqueueWorkingOrder(any());
         verify(controlDecisions).record(
                 eq(ev.orderId()),
                 eq(ev.orderVersion()),
@@ -109,6 +121,7 @@ class ControlTailerRejectPublisherTest {
 
         assertThat(tailer.apply(ev)).isEqualTo(ControlTailer.TailResult.SKIPPED_VERSION_MISMATCH);
         verify(domainOutbox, never()).insert(any(), any());
+        verify(routeDispatcher, never()).enqueueWorkingOrder(any());
         verify(controlDecisions, never()).record(any(), anyInt(), anyString(), any(), anyString(), any());
     }
 
@@ -132,6 +145,7 @@ class ControlTailerRejectPublisherTest {
 
         assertThat(tailer.apply(ev)).isEqualTo(ControlTailer.TailResult.BUYING_POWER_REJECTED);
 
+        verify(routeDispatcher, never()).enqueueWorkingOrder(any());
         verify(controlDecisions).record(
                 eq(ev.orderId()),
                 eq(ev.orderVersion()),
@@ -177,6 +191,7 @@ class ControlTailerRejectPublisherTest {
                 t,
                 null,
                 "hash",
-                "balance_x");
+                "balance_x",
+                BigDecimal.ZERO);
     }
 }

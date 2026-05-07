@@ -64,6 +64,19 @@ and the milestone plan it links to.
   default **`OMS_CONTROL_MAX_JOB_AGE_MS`** is **300000** (5 min interim — see
   [system-documentation/plans/oms-phase0-interim-decisions.md](../system-documentation/plans/oms-phase0-interim-decisions.md)).
 
+## What is in slice 3 (return path — simulated broker)
+
+- Flyway **V6** — `executions` (idempotent on `(account_id, venue_exec_ref)`),
+  `market_context` stub row, `orders.cum_filled_quantity`.
+- **`ExecutionReportApplier`** — applies trade and cancel ER-shaped commands;
+  emits **`OrderPartiallyFilled`**, **`OrderFilled`**, **`OrderCancelled`** to
+  `domain_event_outbox`; metrics **`oms_executions_applied_total`**,
+  **`oms_order_filled_events_published_total`**.
+- **`RouteDispatcher`** — `ControlTailer` registers **after-commit** enqueue when
+  CAS reaches **`WORKING`** (no-op when `OMS_ROUTING_BACKEND=noop`).
+- **`SimulatedFillEngine`** — when `OMS_ROUTING_BACKEND=simulated`, drains a queue
+  and fills in three chunks at `limit_price`. See [docs/return-path.md](docs/return-path.md).
+
 ## What is NOT in slice 1
 
 - FIX engine (QuickFIX/J — planned **Slice 4** in [oms-realignment-2026-05-07.md](../system-documentation/plans/oms-realignment-2026-05-07.md)).
@@ -146,5 +159,6 @@ tests execute instead of being skipped.
 - [docs/replay.md](docs/replay.md) — Chronicle's role and how to replay.
 - [docs/drop-copy-events.md](docs/drop-copy-events.md) — domain-event
   envelope and emit points.
+- [docs/return-path.md](docs/return-path.md) — executions, simulated routing, idempotency.
 - [docs/configuration.md](docs/configuration.md) — every named limit /
   env key in one place.

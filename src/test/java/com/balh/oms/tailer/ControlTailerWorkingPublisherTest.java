@@ -11,6 +11,7 @@ import com.balh.oms.persistence.DomainEventOutboxRepository;
 import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.risk.BuyingPowerAdmission;
 import com.balh.oms.risk.ControlRiskEvaluator;
+import com.balh.oms.routing.RouteDispatcher;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
@@ -44,6 +45,7 @@ class ControlTailerWorkingPublisherTest {
     @Mock ControlRiskEvaluator controlRisk;
     @Mock ControlDecisionsRepository controlDecisions;
     @Mock DomainEventOutboxRepository domainOutbox;
+    @Mock RouteDispatcher routeDispatcher;
 
     private final ObjectMapper objectMapper = new ObjectMapper().registerModule(new JavaTimeModule());
     private final DomainEventEnvelopeCodec codec = new DomainEventEnvelopeCodec(objectMapper);
@@ -54,7 +56,16 @@ class ControlTailerWorkingPublisherTest {
     @BeforeEach
     void setUp() {
         tailer = new ControlTailer(
-                orders, stale, config, buyingPower, controlRisk, controlDecisions, domainOutbox, codec, meterRegistry);
+                orders,
+                stale,
+                config,
+                buyingPower,
+                controlRisk,
+                controlDecisions,
+                domainOutbox,
+                codec,
+                meterRegistry,
+                routeDispatcher);
     }
 
     @Test
@@ -99,6 +110,7 @@ class ControlTailerWorkingPublisherTest {
         assertThat(root.path("payload").path("eventSeq").asInt()).isEqualTo(1);
         assertThat(root.path("payload").path("side").asText()).isEqualTo("BUY");
         assertThat(meterRegistry.counter("oms_order_working_events_published_total").count()).isEqualTo(1.0);
+        verify(routeDispatcher).enqueueWorkingOrder(eq(ev.orderId()));
     }
 
     private static Order sampleOrder(UUID id, int version) {
@@ -120,6 +132,7 @@ class ControlTailerWorkingPublisherTest {
                 t,
                 null,
                 "hash",
-                null);
+                null,
+                BigDecimal.ZERO);
     }
 }

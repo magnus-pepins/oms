@@ -26,6 +26,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.UUID;
 
@@ -125,7 +126,8 @@ public class OrderIngressService {
                 now,
                 null,
                 accountIdHash,
-                ledgerBalanceId
+                ledgerBalanceId,
+                BigDecimal.ZERO
         );
 
         try {

@@ -11,14 +11,18 @@ import com.balh.oms.persistence.DomainEventOutboxRepository;
 import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.risk.BuyingPowerAdmission;
 import com.balh.oms.risk.ControlRiskEvaluator;
+import com.balh.oms.routing.RouteDispatcher;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.time.Instant;
+import java.util.UUID;
 
 /**
  * Applies a control-plane event to Postgres after it has been read off the
@@ -47,6 +51,7 @@ public class ControlTailer {
     private final DomainEventOutboxRepository domainEventOutbox;
     private final DomainEventEnvelopeCodec envelopeCodec;
     private final MeterRegistry meterRegistry;
+    private final RouteDispatcher routeDispatcher;
 
     public ControlTailer(
             OrdersRepository orders,
@@ -57,7 +62,8 @@ public class ControlTailer {
             ControlDecisionsRepository controlDecisions,
             DomainEventOutboxRepository domainEventOutbox,
             DomainEventEnvelopeCodec envelopeCodec,
-            MeterRegistry meterRegistry) {
+            MeterRegistry meterRegistry,
+            RouteDispatcher routeDispatcher) {
         this.orders = orders;
         this.stale = stale;
         this.config = config;
@@ -67,6 +73,7 @@ public class ControlTailer {
         this.domainEventOutbox = domainEventOutbox;
         this.envelopeCodec = envelopeCodec;
         this.meterRegistry = meterRegistry;
+        this.routeDispatcher = routeDispatcher;
     }
 
     @Transactional
@@ -197,7 +204,21 @@ public class ControlTailer {
         orders.findById(event.orderId()).ifPresentOrElse(
                 o -> publishWorking(event, o, newSeq),
                 () -> log.warn("WORKING CAS succeeded but order {} not found for event publish", event.orderId()));
+        registerRouteDispatch(event.orderId());
         return TailResult.APPLIED;
+    }
+
+    private void registerRouteDispatch(UUID orderId) {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            routeDispatcher.enqueueWorkingOrder(orderId);
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                routeDispatcher.enqueueWorkingOrder(orderId);
+            }
+        });
     }
 
     private void publishRejected(PendingControlEvent event, RejectCode reason) {

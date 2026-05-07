@@ -31,6 +31,7 @@ public class OmsConfig {
     private final DomainEvents domainEvents = new DomainEvents();
     private final Pii pii = new Pii();
     private final Risk risk = new Risk();
+    private final Routing routing = new Routing();
 
     public Http getHttp() { return http; }
     public Shard getShard() { return shard; }
@@ -42,6 +43,7 @@ public class OmsConfig {
     public DomainEvents getDomainEvents() { return domainEvents; }
     public Pii getPii() { return pii; }
     public Risk getRisk() { return risk; }
+    public Routing getRouting() { return routing; }
 
     public static class Http {
         private String internalApiKey = "";
@@ -227,6 +229,40 @@ public class OmsConfig {
                     .map(s -> s.trim().toUpperCase(Locale.ROOT))
                     .filter(s -> !s.isEmpty())
                     .collect(Collectors.toUnmodifiableSet());
+        }
+    }
+
+    /**
+     * Outbound routing / return-path simulation (slice 3). {@code backend=noop} is the
+     * default safe mode; {@code simulated} drives {@link com.balh.oms.routing.SimulatedFillEngine}.
+     */
+    public static class Routing {
+        private String backend = "noop";
+        private String marketContextStubJson = "{\"stub\":true}";
+        private final Simulated simulated = new Simulated();
+
+        public String getBackend() { return backend; }
+        public void setBackend(String v) { this.backend = v == null ? "noop" : v; }
+        public String getMarketContextStubJson() { return marketContextStubJson; }
+        public void setMarketContextStubJson(String v) {
+            this.marketContextStubJson = v == null || v.isBlank() ? "{\"stub\":true}" : v;
+        }
+        public Simulated getSimulated() { return simulated; }
+
+        public static class Simulated {
+            private String venueId = "SIM";
+            private int queueCapacity = 10_000;
+            private long pollIntervalMs = 50L;
+            private boolean schedulerEnabled = true;
+
+            public String getVenueId() { return venueId; }
+            public void setVenueId(String venueId) { this.venueId = venueId == null ? "SIM" : venueId; }
+            public int getQueueCapacity() { return queueCapacity; }
+            public void setQueueCapacity(int queueCapacity) { this.queueCapacity = queueCapacity; }
+            public long getPollIntervalMs() { return pollIntervalMs; }
+            public void setPollIntervalMs(long pollIntervalMs) { this.pollIntervalMs = pollIntervalMs; }
+            public boolean isSchedulerEnabled() { return schedulerEnabled; }
+            public void setSchedulerEnabled(boolean schedulerEnabled) { this.schedulerEnabled = schedulerEnabled; }
         }
     }
 }

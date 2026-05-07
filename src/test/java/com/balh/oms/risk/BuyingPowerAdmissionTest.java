@@ -89,7 +89,8 @@ class BuyingPowerAdmissionTest {
                 now,
                 null,
                 "hash",
-                "balance_x");
+                "balance_x",
+                BigDecimal.ZERO);
         assertThat(admission.evaluate(sell)).isEqualTo(BuyingPowerAdmission.Outcome.PROCEED);
         assertThat(registry.counter("oms_buying_power_sell_ledger_skip_total").count()).isEqualTo(1.0);
     }
@@ -113,7 +114,8 @@ class BuyingPowerAdmissionTest {
                 now,
                 null,
                 "hash",
-                ledgerBalanceId
+                ledgerBalanceId,
+                BigDecimal.ZERO
         );
     }
 }

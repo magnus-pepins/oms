@@ -45,13 +45,15 @@ public class OrdersRepository {
                 id, account_id, client_idempotency_key, shard_id, version,
                 status, terminal_reason, side, instrument_symbol,
                 quantity, limit_price, time_in_force,
-                received_at, accepted_at, terminal_at, account_id_hash, ledger_balance_id
+                received_at, accepted_at, terminal_at, account_id_hash, ledger_balance_id,
+                cum_filled_quantity
             ) VALUES (
                 :id, :account_id, :client_idempotency_key, :shard_id, 0,
                 CAST(:status AS order_status), CAST(:terminal_reason AS reject_code),
                 CAST(:side AS order_side), :instrument_symbol,
                 :quantity, :limit_price, :time_in_force,
-                :received_at, :accepted_at, :terminal_at, :account_id_hash, :ledger_balance_id
+                :received_at, :accepted_at, :terminal_at, :account_id_hash, :ledger_balance_id,
+                :cum_filled_quantity
             )
             """;
 
@@ -61,7 +63,8 @@ public class OrdersRepository {
                    terminal_reason::text AS terminal_reason,
                    side::text AS side,
                    instrument_symbol, quantity, limit_price, time_in_force,
-                   received_at, accepted_at, terminal_at, account_id_hash, ledger_balance_id
+                   received_at, accepted_at, terminal_at, account_id_hash, ledger_balance_id,
+                   cum_filled_quantity
             FROM orders WHERE id = :id
             """;
 
@@ -71,7 +74,8 @@ public class OrdersRepository {
                    terminal_reason::text AS terminal_reason,
                    side::text AS side,
                    instrument_symbol, quantity, limit_price, time_in_force,
-                   received_at, accepted_at, terminal_at, account_id_hash, ledger_balance_id
+                   received_at, accepted_at, terminal_at, account_id_hash, ledger_balance_id,
+                   cum_filled_quantity
             FROM orders
             WHERE account_id = :account_id AND client_idempotency_key = :key
             """;
@@ -81,6 +85,16 @@ public class OrdersRepository {
                SET status = CAST(:status AS order_status),
                    terminal_reason = CAST(:terminal_reason AS reject_code),
                    accepted_at = COALESCE(:accepted_at, accepted_at),
+                   terminal_at = COALESCE(:terminal_at, terminal_at),
+                   version = version + 1
+             WHERE id = :id AND version = :expected_version
+            """;
+
+    private static final String UPDATE_FILL_CAS_SQL = """
+            UPDATE orders
+               SET cum_filled_quantity = :new_cum_filled,
+                   status = CAST(:status AS order_status),
+                   terminal_reason = CAST(:terminal_reason AS reject_code),
                    terminal_at = COALESCE(:terminal_at, terminal_at),
                    version = version + 1
              WHERE id = :id AND version = :expected_version
@@ -133,6 +147,29 @@ public class OrdersRepository {
         return jdbc.update(UPDATE_CAS_SQL, params) == 1;
     }
 
+    /**
+     * Applies a venue fill or cancel outcome with CAS on {@code version}.
+     *
+     * @param terminalAt pass non-null when transitioning to a terminal non-reject status
+     *                     ({@link OrderStatus#FILLED}, {@link OrderStatus#CANCELLED}).
+     */
+    public boolean updateFillOrCancelWithCas(
+            UUID id,
+            int expectedVersion,
+            BigDecimal newCumFilled,
+            OrderStatus newStatus,
+            RejectCode terminalReason,
+            Instant terminalAt) {
+        var params = new MapSqlParameterSource()
+                .addValue("id", id)
+                .addValue("expected_version", expectedVersion)
+                .addValue("new_cum_filled", newCumFilled)
+                .addValue("status", newStatus.name())
+                .addValue("terminal_reason", terminalReason == null ? null : terminalReason.name())
+                .addValue("terminal_at", terminalAt == null ? null : Timestamp.from(terminalAt));
+        return jdbc.update(UPDATE_FILL_CAS_SQL, params) == 1;
+    }
+
     private MapSqlParameterSource params(Order o) {
         return new MapSqlParameterSource()
                 .addValue("id", o.id())
@@ -150,7 +187,8 @@ public class OrdersRepository {
                 .addValue("accepted_at", o.acceptedAt() == null ? null : Timestamp.from(o.acceptedAt()))
                 .addValue("terminal_at", o.terminalAt() == null ? null : Timestamp.from(o.terminalAt()))
                 .addValue("account_id_hash", o.accountIdHash())
-                .addValue("ledger_balance_id", o.ledgerBalanceId());
+                .addValue("ledger_balance_id", o.ledgerBalanceId())
+                .addValue("cum_filled_quantity", o.cumFilledQuantity());
     }
 
     private static final RowMapper<Order> ROW_MAPPER = (rs, rowNum) -> {
@@ -159,6 +197,7 @@ public class OrdersRepository {
         Timestamp terminalAt = rs.getTimestamp("terminal_at");
         String terminalReason = rs.getString("terminal_reason");
         String ledgerBalanceId = rs.getString("ledger_balance_id");
+        BigDecimal cumFilled = rs.getBigDecimal("cum_filled_quantity");
         return new Order(
                 (UUID) rs.getObject("id"),
                 (UUID) rs.getObject("account_id"),
@@ -176,7 +215,8 @@ public class OrdersRepository {
                 acceptedAt == null ? null : acceptedAt.toInstant(),
                 terminalAt == null ? null : terminalAt.toInstant(),
                 rs.getString("account_id_hash"),
-                ledgerBalanceId
+                ledgerBalanceId,
+                cumFilled == null ? BigDecimal.ZERO : cumFilled
         );
     };
 }

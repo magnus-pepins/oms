@@ -66,7 +66,8 @@ class NatsJetStreamPublishTest {
                 t,
                 null,
                 "hash",
-                null);
+                null,
+                BigDecimal.ZERO);
         DomainEventEnvelopeCodec codec = new DomainEventEnvelopeCodec(om);
         try (Connection nc = Nats.connect(opts)) {
             NatsFanoutClient fanout = new NatsFanoutClient(nc, cfg, om, new SimpleMeterRegistry());

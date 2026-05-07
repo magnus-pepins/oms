@@ -16,10 +16,10 @@ services:
       timeout: 3s
       retries: 10
 
-  # Optional. Off in slice 1; the OMS does not strictly need NATS yet, but enabling
-  # it locally lets you exercise the DomainEventPublisher fanout path.
+  # Optional JetStream: `docker compose --profile with-nats up -d` then set
+  # OMS_NATS_ENABLED=true and OMS_NATS_URL=nats://localhost:4222 for bootRun.
   nats:
-    image: nats:2.10-alpine
+    image: nats:2.10.22-alpine
     container_name: oms-nats
     command: ["-js"]
     ports:

@@ -4,8 +4,11 @@ import com.balh.oms.chronicle.PendingControlEvent;
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.domain.OrderStatus;
 import com.balh.oms.domain.RejectCode;
+import com.balh.oms.events.DomainEventPublisher;
+import com.balh.oms.events.OrderRejectedEvent;
 import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.risk.BuyingPowerAdmission;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -25,20 +28,29 @@ public class ControlTailer {
 
     private static final Logger log = LoggerFactory.getLogger(ControlTailer.class);
 
+    private static final String METRIC_REJECT_EVENTS = "oms_order_rejected_events_published_total";
+    private static final String TAG_REJECT_CODE = "reject_code";
+
     private final OrdersRepository orders;
     private final StaleJobGuard stale;
     private final OmsConfig config;
     private final BuyingPowerAdmission buyingPower;
+    private final DomainEventPublisher events;
+    private final MeterRegistry meterRegistry;
 
     public ControlTailer(
             OrdersRepository orders,
             StaleJobGuard stale,
             OmsConfig config,
-            BuyingPowerAdmission buyingPower) {
+            BuyingPowerAdmission buyingPower,
+            DomainEventPublisher events,
+            MeterRegistry meterRegistry) {
         this.orders = orders;
         this.stale = stale;
         this.config = config;
         this.buyingPower = buyingPower;
+        this.events = events;
+        this.meterRegistry = meterRegistry;
     }
 
     public TailResult apply(PendingControlEvent event) {
@@ -51,6 +63,9 @@ public class ControlTailer {
                     null,
                     Instant.now()
             );
+            if (updated) {
+                publishRejected(event, RejectCode.RISK_STALE_QUEUE);
+            }
             return updated ? TailResult.STALE_REJECTED : TailResult.SKIPPED_VERSION_MISMATCH;
         }
 
@@ -70,6 +85,9 @@ public class ControlTailer {
                             null,
                             Instant.now()
                     );
+                    if (updated) {
+                        publishRejected(event, RejectCode.RISK_BUYING_POWER);
+                    }
                     return updated ? TailResult.BUYING_POWER_REJECTED : TailResult.SKIPPED_VERSION_MISMATCH;
                 }
                 case REJECT_LEDGER_UNAVAILABLE -> {
@@ -81,6 +99,9 @@ public class ControlTailer {
                             null,
                             Instant.now()
                     );
+                    if (updated) {
+                        publishRejected(event, RejectCode.INTERNAL_ERROR);
+                    }
                     return updated ? TailResult.LEDGER_SERVICE_REJECTED : TailResult.SKIPPED_VERSION_MISMATCH;
                 }
                 case PROCEED -> { /* fall through */ }
@@ -101,6 +122,12 @@ public class ControlTailer {
             return TailResult.SKIPPED_VERSION_MISMATCH;
         }
         return TailResult.APPLIED;
+    }
+
+    private void publishRejected(PendingControlEvent event, RejectCode reason) {
+        int newSeq = event.orderVersion() + 1;
+        events.publish(OrderRejectedEvent.afterReject(event, reason, newSeq));
+        meterRegistry.counter(METRIC_REJECT_EVENTS, TAG_REJECT_CODE, reason.name()).increment();
     }
 
     public enum TailResult {

@@ -27,7 +27,9 @@ and the milestone plan it links to.
   transaction as the `orders` row.
 - `OutboxReconciler` drains the outbox into Chronicle Queue (engineering
   replay only, NOT a regulatory system of record).
-- `ControlTailer` applies CAS updates on `orders.version`.
+- `ControlTailer` applies CAS updates on `orders.version` and, on terminal
+  reject paths, publishes **`OrderRejected`** to `DomainEventPublisher` (same
+  fire-and-forget contract as `OrderAccepted`).
 - Hashed-account-id PII policy enforced by a Micrometer filter and a guard
   test.
 - Optional **Ledger** HTTP client: when `OMS_LEDGER_ENABLED=true`, `ControlTailer`
@@ -48,8 +50,9 @@ and the milestone plan it links to.
 ## Quick start
 
 ```bash
-# 1. Postgres
+# 1. Postgres (and optionally NATS JetStream for local fanout)
 docker compose up -d postgres
+# docker compose --profile with-nats up -d   # then OMS_NATS_ENABLED=true OMS_NATS_URL=nats://localhost:4222
 
 # 2. Build
 ./gradlew build

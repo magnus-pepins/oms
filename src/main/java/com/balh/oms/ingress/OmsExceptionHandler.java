@@ -7,6 +7,7 @@ import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
+import java.util.List;
 import java.util.stream.Collectors;
 
 /**
@@ -14,6 +15,16 @@ import java.util.stream.Collectors;
  */
 @RestControllerAdvice
 public class OmsExceptionHandler {
+
+    @ExceptionHandler(LedgerBindingException.class)
+    public ResponseEntity<ApiErrorResponse> handleLedgerBinding(LedgerBindingException ex) {
+        var body = new ApiErrorResponse(
+                RejectCode.INTERNAL_ERROR.name(),
+                ex.getErrorCode(),
+                List.of(new ApiErrorResponse.FieldViolation("ledgerBinding", ex.getMessage()))
+        );
+        return ResponseEntity.status(ex.getHttpStatus()).body(body);
+    }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
     public ResponseEntity<ApiErrorResponse> handleValidation(MethodArgumentNotValidException ex) {

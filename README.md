@@ -35,7 +35,8 @@ and the milestone plan it links to.
   successful transition to **`WORKING`**, records **`OrderWorking`**.
 - Hashed-account-id PII policy enforced by a Micrometer filter and a guard
   test.
-- Optional **Ledger** HTTP client: when `OMS_LEDGER_ENABLED=true`, `ControlTailer`
+- Optional **Ledger** HTTP client: when `OMS_LEDGER_ENABLED=true`, ingress verifies
+  `ledgerIdentityId` against Ledger for every `ledgerBalanceId`, and `ControlTailer`
   can reject BUY orders (with `ledgerBalanceId` + `limitPrice`) for insufficient
   `availableBalance` (`RISK_BUYING_POWER`) before CAS to `WORKING`.
 - Optional **NATS JetStream** fanout: when `OMS_NATS_ENABLED=true`, `NatsFanoutClient`
@@ -94,7 +95,8 @@ curl -s http://localhost:8080/internal/v1/orders \
     "quantity": "10",
     "limitPrice": "150.00",
     "timeInForce": "DAY",
-    "ledgerBalanceId": "balance_replace_with_real_id"
+    "ledgerBalanceId": "balance_replace_with_real_id",
+    "ledgerIdentityId": "ledger_identity_that_owns_that_balance"
   }'
 ```
 

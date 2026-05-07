@@ -15,6 +15,14 @@ public interface LedgerBalanceClient {
      */
     BigDecimal fetchAvailableBalance(String balanceId) throws LedgerServiceException;
 
+    /**
+     * Ledger {@code identity_id} owning the balance (from GET body {@code identityId} or nested
+     * {@code identity.identityId}).
+     *
+     * @throws LedgerServiceException when the balance is missing, the response is invalid, or HTTP fails
+     */
+    String fetchIdentityIdForBalance(String balanceId) throws LedgerServiceException;
+
     final class LedgerServiceException extends Exception {
         public LedgerServiceException(String message) {
             super(message);

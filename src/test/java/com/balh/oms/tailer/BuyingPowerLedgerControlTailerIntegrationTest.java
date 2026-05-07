@@ -6,6 +6,7 @@ import com.balh.oms.reconciler.OutboxReconciler;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.tomakehurst.wiremock.WireMockServer;
 import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
+import com.github.tomakehurst.wiremock.stubbing.Scenario;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -123,6 +124,17 @@ class BuyingPowerLedgerControlTailerIntegrationTest extends AbstractPostgresInte
     void buyWhenLedgerReturns503RejectedWithInternalError() throws Exception {
         ledgerWireMock.stubFor(get(urlPathEqualTo("/balances/balance_it"))
                 .withQueryParam("with_queued", equalTo("true"))
+                .inScenario("ledger-bp503")
+                .whenScenarioStateIs(Scenario.STARTED)
+                .willReturn(aResponse()
+                        .withStatus(200)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\"availableBalance\":\"10000.00\",\"identityId\":\"ident-bp-it\"}"))
+                .willSetStateTo("after-ingress"));
+        ledgerWireMock.stubFor(get(urlPathEqualTo("/balances/balance_it"))
+                .withQueryParam("with_queued", equalTo("true"))
+                .inScenario("ledger-bp503")
+                .whenScenarioStateIs("after-ingress")
                 .willReturn(aResponse()
                         .withStatus(LEDGER_STUB_HTTP_UNAVAILABLE)
                         .withHeader("Content-Type", "application/json")
@@ -152,7 +164,9 @@ class BuyingPowerLedgerControlTailerIntegrationTest extends AbstractPostgresInte
                 .withQueryParam("with_queued", equalTo("true"))
                 .willReturn(aResponse()
                         .withHeader("Content-Type", "application/json")
-                        .withBody("{\"availableBalance\":\"" + availableBalanceJson + "\"}")));
+                        .withBody("{\"availableBalance\":\""
+                                + availableBalanceJson
+                                + "\",\"identityId\":\"ident-bp-it\"}")));
     }
 
     private ResponseEntity<Map<String, Object>> postOrder(
@@ -173,7 +187,8 @@ class BuyingPowerLedgerControlTailerIntegrationTest extends AbstractPostgresInte
                   "quantity": "%s",
                   "limitPrice": "%s",
                   "timeInForce": "DAY",
-                  "ledgerBalanceId": "%s"
+                  "ledgerBalanceId": "%s",
+                  "ledgerIdentityId": "ident-bp-it"
                 }
                 """.formatted(accountId, key, quantity, limitPrice, ledgerBalanceId);
         return http.exchange(

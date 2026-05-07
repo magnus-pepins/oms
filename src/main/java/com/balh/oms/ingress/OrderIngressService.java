@@ -11,6 +11,7 @@ import com.balh.oms.persistence.ControlOutboxRepository;
 import com.balh.oms.persistence.DomainEventOutboxRepository;
 import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.domain.Side;
+import com.balh.oms.ledger.LedgerBalanceClient;
 import com.balh.oms.ledger.LedgerInflightReservationClient;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -19,6 +20,7 @@ import io.micrometer.core.instrument.Timer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -50,6 +52,7 @@ public class OrderIngressService {
     private final ObjectMapper objectMapper;
     private final PiiHash piiHash;
     private final ObjectProvider<LedgerInflightReservationClient> ledgerInflightReservation;
+    private final ObjectProvider<LedgerBalanceClient> ledgerBalanceClient;
     private final MeterRegistry meterRegistry;
 
     public OrderIngressService(
@@ -61,6 +64,7 @@ public class OrderIngressService {
             ObjectMapper objectMapper,
             PiiHash piiHash,
             ObjectProvider<LedgerInflightReservationClient> ledgerInflightReservation,
+            ObjectProvider<LedgerBalanceClient> ledgerBalanceClient,
             MeterRegistry meterRegistry) {
         this.orders = orders;
         this.outbox = outbox;
@@ -70,6 +74,7 @@ public class OrderIngressService {
         this.objectMapper = objectMapper;
         this.piiHash = piiHash;
         this.ledgerInflightReservation = ledgerInflightReservation;
+        this.ledgerBalanceClient = ledgerBalanceClient;
         this.meterRegistry = meterRegistry;
     }
 
@@ -90,6 +95,8 @@ public class OrderIngressService {
      */
     @Transactional
     public IngressResult persistAccepted(CreateOrderRequest req) {
+        maybeVerifyLedgerBalanceBinding(req);
+
         UUID id = UUID.randomUUID();
         Instant now = Instant.now();
         int shardId = ShardKey.shardFor(req.accountId(), config.getShard().getCount());
@@ -143,6 +150,37 @@ public class OrderIngressService {
             throw new RuntimeException("domain event envelope serialisation failed", e);
         }
         return new IngressResult(order, true);
+    }
+
+    private void maybeVerifyLedgerBalanceBinding(CreateOrderRequest req) {
+        String balanceId = req.ledgerBalanceId();
+        if (balanceId == null) {
+            return;
+        }
+        String claimedIdentity = req.ledgerIdentityId();
+        if (claimedIdentity == null || claimedIdentity.isBlank()) {
+            throw new LedgerBindingException(HttpStatus.BAD_REQUEST, "ledger_identity_required",
+                    "ledgerIdentityId is required when ledgerBalanceId is set");
+        }
+        LedgerBalanceClient client = ledgerBalanceClient.getIfAvailable();
+        if (client == null) {
+            throw new LedgerBindingException(HttpStatus.BAD_REQUEST, "ledger_verification_unavailable",
+                    "oms.ledger.enabled must be true to accept orders with ledgerBalanceId");
+        }
+        try {
+            String actual = client.fetchIdentityIdForBalance(balanceId);
+            if (!actual.trim().equalsIgnoreCase(claimedIdentity.trim())) {
+                throw new LedgerBindingException(HttpStatus.BAD_REQUEST, "ledger_identity_mismatch",
+                        "ledgerIdentityId does not match the balance owner in Ledger");
+            }
+        } catch (LedgerBalanceClient.LedgerServiceException e) {
+            if ("ledger balance not found".equals(e.getMessage())) {
+                throw new LedgerBindingException(HttpStatus.NOT_FOUND, "ledger_balance_not_found",
+                        "Ledger has no such balance", e);
+            }
+            String msg = e.getMessage() != null ? e.getMessage() : "ledger error";
+            throw new LedgerBindingException(HttpStatus.BAD_GATEWAY, "ledger_identity_lookup_failed", msg, e);
+        }
     }
 
     private void maybePlaceBuyLedgerInflightHold(Order order) {

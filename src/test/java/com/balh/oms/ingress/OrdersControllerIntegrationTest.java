@@ -138,6 +138,35 @@ class OrdersControllerIntegrationTest extends AbstractPostgresIntegrationTest {
         assertThat(res.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
     }
 
+    @Test
+    void rejectsLedgerBalanceWithoutLedgerIntegrationEnabled() {
+        UUID accountId = UUID.randomUUID();
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        headers.set("X-OMS-Internal-Key", "test-key");
+        String body = """
+                {
+                  "accountId": "%s",
+                  "clientIdempotencyKey": "lb-no-ledger",
+                  "side": "BUY",
+                  "instrumentSymbol": "AAPL",
+                  "quantity": "1",
+                  "limitPrice": "10.00",
+                  "timeInForce": "DAY",
+                  "ledgerBalanceId": "balance_x",
+                  "ledgerIdentityId": "id-1"
+                }
+                """.formatted(accountId);
+        ResponseEntity<ApiErrorResponse> res = http.exchange(
+                "http://localhost:" + port + "/internal/v1/orders",
+                HttpMethod.POST,
+                new HttpEntity<>(body, headers),
+                new ParameterizedTypeReference<>() {});
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(res.getBody()).isNotNull();
+        assertThat(res.getBody().message()).isEqualTo("ledger_verification_unavailable");
+    }
+
     private ResponseEntity<Map<String, Object>> exchange(String body) {
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);

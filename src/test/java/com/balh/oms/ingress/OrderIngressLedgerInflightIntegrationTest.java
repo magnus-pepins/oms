@@ -24,6 +24,8 @@ import java.util.UUID;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
 import static com.github.tomakehurst.wiremock.client.WireMock.equalTo;
+import static com.github.tomakehurst.wiremock.client.WireMock.get;
+import static com.github.tomakehurst.wiremock.client.WireMock.getRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.post;
 import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlPathEqualTo;
@@ -68,7 +70,32 @@ class OrderIngressLedgerInflightIntegrationTest extends AbstractPostgresIntegrat
     }
 
     @Test
+    void rejectsBuyWhenLedgerIdentityDoesNotMatchClaim() {
+        ledgerWireMock.stubFor(get(urlPathEqualTo("/balances/cust_balance_1"))
+                .withQueryParam("with_queued", equalTo("true"))
+                .willReturn(aResponse()
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\"availableBalance\":\"999\",\"identityId\":\"ledger-actual-owner\"}")));
+
+        UUID accountId = UUID.randomUUID();
+        ResponseEntity<ApiErrorResponse> res = http.exchange(
+                "http://localhost:" + port + "/internal/v1/orders",
+                HttpMethod.POST,
+                new HttpEntity<>(jsonBody(accountId, "inflight-bad-id", "cust_balance_1", "wrong-claim-id"), authHeaders()),
+                new ParameterizedTypeReference<>() {});
+
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(res.getBody()).isNotNull();
+        assertThat(res.getBody().message()).isEqualTo("ledger_identity_mismatch");
+    }
+
+    @Test
     void buyOrderWithInflightPostsLedgerSyncTransaction() {
+        ledgerWireMock.stubFor(get(urlPathEqualTo("/balances/cust_balance_1"))
+                .withQueryParam("with_queued", equalTo("true"))
+                .willReturn(aResponse()
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\"availableBalance\":\"999\",\"identityId\":\"ident-inflight-it\"}")));
         ledgerWireMock.stubFor(post(urlPathEqualTo("/transactions"))
                 .withHeader("X-Ledger-Key", equalTo("it-key"))
                 .willReturn(aResponse()
@@ -80,12 +107,13 @@ class OrderIngressLedgerInflightIntegrationTest extends AbstractPostgresIntegrat
         ResponseEntity<Map<String, Object>> res = http.exchange(
                 "http://localhost:" + port + "/internal/v1/orders",
                 HttpMethod.POST,
-                new HttpEntity<>(jsonBody(accountId, "inflight-it-1", "cust_balance_1"), authHeaders()),
+                new HttpEntity<>(jsonBody(accountId, "inflight-it-1", "cust_balance_1", "ident-inflight-it"), authHeaders()),
                 new ParameterizedTypeReference<>() {});
 
         assertThat(res.getStatusCode()).isEqualTo(HttpStatus.CREATED);
 
         ledgerWireMock.verify(1, postRequestedFor(urlPathEqualTo("/transactions")));
+        ledgerWireMock.verify(1, getRequestedFor(urlPathEqualTo("/balances/cust_balance_1")));
     }
 
     private static HttpHeaders authHeaders() {
@@ -95,7 +123,7 @@ class OrderIngressLedgerInflightIntegrationTest extends AbstractPostgresIntegrat
         return h;
     }
 
-    private static String jsonBody(UUID accountId, String idempotencyKey, String ledgerBalanceId) {
+    private static String jsonBody(UUID accountId, String idempotencyKey, String ledgerBalanceId, String ledgerIdentityId) {
         return """
                 {
                   "accountId": "%s",
@@ -105,8 +133,9 @@ class OrderIngressLedgerInflightIntegrationTest extends AbstractPostgresIntegrat
                   "quantity": "2",
                   "limitPrice": "10.00",
                   "timeInForce": "DAY",
-                  "ledgerBalanceId": "%s"
+                  "ledgerBalanceId": "%s",
+                  "ledgerIdentityId": "%s"
                 }
-                """.formatted(accountId, idempotencyKey, ledgerBalanceId);
+                """.formatted(accountId, idempotencyKey, ledgerBalanceId, ledgerIdentityId);
     }
 }

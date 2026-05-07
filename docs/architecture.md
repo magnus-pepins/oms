@@ -16,6 +16,7 @@ sequenceDiagram
     participant PG as Postgres\n(orders + control_outbox)
     participant REC as OutboxReconciler\n(scheduled)
     participant CHR as Chronicle Queue\n(engineering replay)
+    participant TAIL as ChronicleControlTailReader\n(scheduled)
     participant TLR as ControlTailer
     participant BUS as DomainEventPublisher\n(NATS in 1.5+)
 
@@ -29,7 +30,8 @@ sequenceDiagram
     REC->>PG: SELECT ... WHERE chronicle_enqueued_at IS NULL
     REC->>CHR: append(payload)
     REC->>PG: UPDATE control_outbox SET chronicle_enqueued_at = NOW()
-    Note over CHR,TLR: Slice 1.5: tailer reads CHR, applies CAS to orders.version
+    TAIL->>CHR: readBytes (poll)
+    TAIL->>TLR: apply(PendingControlEvent)
     TLR->>PG: UPDATE orders SET status=WORKING WHERE id=? AND version=?
 ```
 

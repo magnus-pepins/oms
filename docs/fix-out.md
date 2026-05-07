@@ -12,10 +12,11 @@ environment variables, and runbooks for **QuickFIX/J** wired to `FixRouteDispatc
 - **Round-trip IT:** `FixRoundTripSpringIntegrationTest` (profile `fix-roundtrip-it`) — embedded loopback **acceptor** (`FixRoundTripEmbeddedAcceptor`, `SmartLifecycle` phase before initiator) + `oms.fix.auto-start=true`; inserts `WORKING` order, `RouteDispatcher.enqueueWorkingOrder`, awaits **FILLED** and asserts **`oms_fix_nos_sent_total`** / **`oms_fix_inbound_execution_reports_total`** (`disposition=trade_APPLIED`).
 - **Stale outbound IT:** `FixOutboundStaleSpringIntegrationTest` — same profile; `oms.fix.max-outbound-job-age-ms` bound; old `accepted_at` → dequeue rejects with **`FIX_OUTBOUND_JOB_EXPIRED`** (no NOS to acceptor; **`oms_fix_outbound_job_expired_total`**).
 - **Return-path IT:** `VenueRejectReturnPathIntegrationTest` — `ExecutionReportApplier.applyVenueReject` → `REJECT` execution + **`OrderRejected`**.
-- **Outbound:** `FixRouteDispatcher` enqueues `WORKING` order ids into a bounded `BlockingQueue` (capacity `oms.fix.outbound-queue-capacity`). When `oms.fix.auto-start=true`, `FixInitiatorManager` starts a `SocketInitiator` and `FixOutboundDispatchWorker` polls `oms.fix.outbound-poll-interval-ms`, loads the order, builds `NewOrderSingle` (`FixNewOrderSingleBuilder`), and `Session.sendToTarget` on the active session from `FixSessionRegistry`.
+- **Outbound:** `FixRouteDispatcher` enqueues `WORKING` order ids into a bounded `BlockingQueue` (capacity `oms.fix.outbound-queue-capacity`). When `oms.fix.auto-start=true`, `FixInitiatorManager` starts a `SocketInitiator` and `FixOutboundDispatchWorker` runs on `oms.fix.outbound-poll-interval-ms`. The worker **does not dequeue** while `fix_route_state.send_enabled` is false for `oms.fix.route-key` (orders stay queued). After dequeue, `FixOutboundTokenBucket` may **re-queue** the id when `oms.fix.outbound-tokens-per-second` &gt; `0` and the bucket is empty. Then it loads the order, builds `NewOrderSingle` (`FixNewOrderSingleBuilder`), and `Session.sendToTarget` on the active session from `FixSessionRegistry`.
+- **Route state IT:** `FixRouteStateControllerIntegrationTest` — Flyway `fix_route_state`; GET/PATCH with `X-OMS-Internal-Key`; 401/404.
 - **Inbound:** `OmsFixApplication` routes **`ExecutionReport`** and **`OrderCancelReject`** in `fromApp` → `FixInboundHandler` (`@Transactional`) → `FixExecutionReportMapper` → `ExecutionReportApplier` for **PartialFill/Fill**, **Canceled**, **Rejected** (`ExecType=Rejected` → `OrderRejected` + `executions` **REJECT**), and **OrderCancelReject** (same venue-reject path).
 - **Outbound stale jobs:** when `oms.fix.max-outbound-job-age-ms` &gt; `0`, a **WORKING** order older than that at dequeue is **not** sent; `ExecutionReportApplier.applyOutboundJobExpired` CAS to **`REJECTED`** / **`FIX_OUTBOUND_JOB_EXPIRED`** (metric **`oms_fix_outbound_job_expired_total`**).
-- **Metrics:** `oms_fix_nos_sent_total` (successful outbound `sendToTarget`); `oms_fix_inbound_execution_reports_total` with tag `disposition` = `trade_*` / `cancel_*` / `venue_reject_*` / `ocr_*` / `ignored`; **`oms_fix_outbound_job_expired_total`**.
+- **Metrics:** `oms_fix_nos_sent_total` (successful outbound `sendToTarget`); `oms_fix_inbound_execution_reports_total` with tag `disposition` = `trade_*` / `cancel_*` / `venue_reject_*` / `ocr_*` / `ignored`; **`oms_fix_outbound_job_expired_total`**; **`oms_fix_outbound_route_disabled_skips_total`** (scheduler ticks with logon while send is disabled); **`oms_fix_outbound_throttled_requeues_total`** (token bucket re-queue).
 - **Mapper unit test:** `FixExecutionReportMapperTest`.
 
 ## Configuration
@@ -33,6 +34,9 @@ environment variables, and runbooks for **QuickFIX/J** wired to `FixRouteDispatc
 | `OMS_FIX_MAX_OUTBOUND_JOB_AGE_MS` | **0** = off. Otherwise reject **WORKING** orders at FIX dequeue when `now - accepted_at` exceeds this (ms); **`terminal_reason=FIX_OUTBOUND_JOB_EXPIRED`**. |
 | `OMS_FIX_VENUE_ID_FOR_EXECUTIONS` | Venue id on `ExecutionTradeCommand` / cancel from inbound ERs. |
 | `OMS_FIX_USE_DATA_DICTIONARY` | `Y`/`N` passed to QuickFIX/J (`false` by default, matching smoke test). |
+| `OMS_FIX_ROUTE_KEY` | Matches `fix_route_state.route_key` (default `default`). |
+| `OMS_FIX_OUTBOUND_TOKENS_PER_SECOND` | **0** = unlimited NOS rate; **&gt; 0** enables token-bucket pacing (`OMS_FIX_OUTBOUND_TOKEN_BURST` caps burst). |
+| `OMS_FIX_OUTBOUND_TOKEN_BURST` | Max tokens in bucket when rate limiting is enabled (default `100`). |
 
 See `application.yaml` (`oms.fix.*`) and `.env.example`.
 

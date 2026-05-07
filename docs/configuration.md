@@ -60,6 +60,28 @@ new key here when introducing one.
 | `OMS_SIMULATED_POLL_INTERVAL_MS` | `50` | `@Scheduled` drain interval when simulated backend is enabled. |
 | `OMS_SIMULATED_SCHEDULER_ENABLED` | `true` | When `false`, only explicit `SimulatedReturnPathProjectionWorker.processPendingQueueOnce()` drains the queue (used in integration tests). |
 
+## FIX (slice 4+)
+
+Used when `OMS_ROUTING_BACKEND=fix`. See [fix-out.md](fix-out.md) for session maps and runbooks.
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `OMS_FIX_AUTO_START` | `false` | When `true` (and routing `fix`), starts QuickFIX/J `SocketInitiator` and the outbound drain scheduler. |
+| `OMS_FIX_OUTBOUND_QUEUE_CAPACITY` | `10000` | Bounded queue for `WORKING` order ids awaiting NOS. |
+| `OMS_FIX_FILE_STORE_PATH` | `./queues/fix` | QuickFIX/J file store path. |
+| `OMS_FIX_SOCKET_CONNECT_HOST` | `127.0.0.1` | Acceptor host. |
+| `OMS_FIX_SOCKET_CONNECT_PORT` | `9876` | Acceptor port. |
+| `OMS_FIX_SENDER_COMP_ID` | `OMS_INIT` | Session sender comp id. |
+| `OMS_FIX_TARGET_COMP_ID` | `BROKER_ACCEPT` | Session target comp id. |
+| `OMS_FIX_HEART_BT_INT` | `30` | Heartbeat interval (seconds). |
+| `OMS_FIX_OUTBOUND_POLL_INTERVAL_MS` | `100` | Delay between outbound worker ticks. |
+| `OMS_FIX_MAX_OUTBOUND_JOB_AGE_MS` | `0` | **0** = off; else reject stale `WORKING` at dequeue (`FIX_OUTBOUND_JOB_EXPIRED`). |
+| `OMS_FIX_VENUE_ID_FOR_EXECUTIONS` | `FIX` | `venue_id` on executions from inbound ERs. |
+| `OMS_FIX_USE_DATA_DICTIONARY` | `false` | QuickFIX/J data dictionary flag. |
+| `OMS_FIX_ROUTE_KEY` | `default` | `fix_route_state.route_key` read by the outbound worker; toggle send via internal API or SQL. |
+| `OMS_FIX_OUTBOUND_TOKENS_PER_SECOND` | `0` | NOS token bucket refill rate; **`<= 0` disables** pacing. |
+| `OMS_FIX_OUTBOUND_TOKEN_BURST` | `100` | Bucket capacity when rate limiting is enabled (minimum **1** in config). |
+
 ## Outbox / reconciler
 
 | Key                                   | Default | Meaning                                                                            |

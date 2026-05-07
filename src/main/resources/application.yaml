@@ -112,6 +112,9 @@ oms:
     max-outbound-job-age-ms: ${OMS_FIX_MAX_OUTBOUND_JOB_AGE_MS:0}
     venue-id-for-executions: ${OMS_FIX_VENUE_ID_FOR_EXECUTIONS:FIX}
     use-data-dictionary: ${OMS_FIX_USE_DATA_DICTIONARY:false}
+    route-key: ${OMS_FIX_ROUTE_KEY:default}
+    outbound-tokens-per-second: ${OMS_FIX_OUTBOUND_TOKENS_PER_SECOND:0}
+    outbound-token-burst: ${OMS_FIX_OUTBOUND_TOKEN_BURST:100}
 
 logging:
   level:

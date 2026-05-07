@@ -3,6 +3,8 @@ package com.balh.oms.fix;
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.domain.Order;
 import com.balh.oms.domain.OrderStatus;
+import com.balh.oms.persistence.FixRouteStateRepository;
+import com.balh.oms.persistence.FixRouteStateRow;
 import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.returnpath.ExecutionReportApplier;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -31,6 +33,8 @@ public class FixOutboundDispatchWorker {
     private final MeterRegistry meterRegistry;
     private final OmsConfig omsConfig;
     private final ExecutionReportApplier executionReportApplier;
+    private final FixRouteStateRepository fixRouteStateRepository;
+    private final FixOutboundTokenBucket fixOutboundTokenBucket;
 
     public FixOutboundDispatchWorker(
             FixRouteDispatcher fixRouteDispatcher,
@@ -39,7 +43,9 @@ public class FixOutboundDispatchWorker {
             FixNewOrderSingleBuilder newOrderSingleBuilder,
             MeterRegistry meterRegistry,
             OmsConfig omsConfig,
-            ExecutionReportApplier executionReportApplier) {
+            ExecutionReportApplier executionReportApplier,
+            FixRouteStateRepository fixRouteStateRepository,
+            FixOutboundTokenBucket fixOutboundTokenBucket) {
         this.fixRouteDispatcher = fixRouteDispatcher;
         this.fixSessionRegistry = fixSessionRegistry;
         this.ordersRepository = ordersRepository;
@@ -47,11 +53,17 @@ public class FixOutboundDispatchWorker {
         this.meterRegistry = meterRegistry;
         this.omsConfig = omsConfig;
         this.executionReportApplier = executionReportApplier;
+        this.fixRouteStateRepository = fixRouteStateRepository;
+        this.fixOutboundTokenBucket = fixOutboundTokenBucket;
     }
 
     @Scheduled(fixedDelayString = "${oms.fix.outbound-poll-interval-ms:100}")
     public void drainPendingOutbound() {
         if (!fixSessionRegistry.hasLoggedOnSession()) {
+            return;
+        }
+        if (!isFixRouteSendEnabled()) {
+            meterRegistry.counter(FixMetrics.METRIC_OUTBOUND_ROUTE_DISABLED_SKIPS).increment();
             return;
         }
         UUID id = fixRouteDispatcher.pollPendingOrNull();
@@ -72,6 +84,11 @@ public class FixOutboundDispatchWorker {
                 return;
             }
         }
+        if (!fixOutboundTokenBucket.tryAcquire()) {
+            meterRegistry.counter(FixMetrics.METRIC_OUTBOUND_THROTTLED_REQUEUES).increment();
+            fixRouteDispatcher.enqueueWorkingOrder(id);
+            return;
+        }
         try {
             NewOrderSingle nos = newOrderSingleBuilder.build(order);
             Session.sendToTarget(nos, fixSessionRegistry.sessionOrNull());
@@ -81,5 +98,13 @@ public class FixOutboundDispatchWorker {
         } catch (Exception e) {
             log.error("FIX outbound send failed orderId={}", id, e);
         }
+    }
+
+    private boolean isFixRouteSendEnabled() {
+        String routeKey = omsConfig.getFix().getRouteKey();
+        return fixRouteStateRepository
+                .findByRouteKey(routeKey)
+                .map(FixRouteStateRow::sendEnabled)
+                .orElse(true);
     }
 }

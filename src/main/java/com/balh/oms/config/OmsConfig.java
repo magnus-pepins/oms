@@ -288,6 +288,12 @@ public class OmsConfig {
         /** Venue id stamped on {@code ExecutionTradeCommand} from inbound ERs. */
         private String venueIdForExecutions = "FIX";
         private boolean useDataDictionary = false;
+        /** Logical FIX route key for {@code fix_route_state} (default single route). */
+        private String routeKey = "default";
+        /** NOS rate limit; {@code <= 0} disables token bucket (default). */
+        private double outboundTokensPerSecond = 0;
+        /** Bucket capacity when rate limiting is enabled. */
+        private int outboundTokenBurst = 100;
 
         public boolean isAutoStart() { return autoStart; }
         public void setAutoStart(boolean autoStart) { this.autoStart = autoStart; }
@@ -327,5 +333,29 @@ public class OmsConfig {
         }
         public boolean isUseDataDictionary() { return useDataDictionary; }
         public void setUseDataDictionary(boolean useDataDictionary) { this.useDataDictionary = useDataDictionary; }
+
+        public String getRouteKey() {
+            return routeKey;
+        }
+
+        public void setRouteKey(String routeKey) {
+            this.routeKey = routeKey == null || routeKey.isBlank() ? "default" : routeKey;
+        }
+
+        public double getOutboundTokensPerSecond() {
+            return outboundTokensPerSecond;
+        }
+
+        public void setOutboundTokensPerSecond(double outboundTokensPerSecond) {
+            this.outboundTokensPerSecond = outboundTokensPerSecond;
+        }
+
+        public int getOutboundTokenBurst() {
+            return outboundTokenBurst;
+        }
+
+        public void setOutboundTokenBurst(int outboundTokenBurst) {
+            this.outboundTokenBurst = Math.max(1, outboundTokenBurst);
+        }
     }
 }

@@ -120,6 +120,52 @@ class SimulatedReturnPathIntegrationTest extends AbstractPostgresIntegrationTest
     }
 
     @Test
+    void controlPassThenSimulatedSellFillsAccumulatePendingSellThenDrainClearsIt() {
+        UUID orderId = insertNewSellOrderWithInventory("sell-rp-1", "MSFT", "30", "12.00");
+        PendingControlEvent ev = event(orderId, 0);
+        assertThat(controlTailer.apply(ev)).isEqualTo(ControlTailer.TailResult.APPLIED);
+
+        simulatedReturnPathProjectionWorker.processPendingQueueOnce();
+
+        assertThat(jdbc.queryForObject("SELECT status::text FROM orders WHERE id = ?", String.class, orderId))
+                .isEqualTo("FILLED");
+        assertThat(jdbc.queryForObject("SELECT cum_filled_quantity FROM orders WHERE id = ?", BigDecimal.class, orderId))
+                .isEqualByComparingTo("30");
+
+        int execRows = jdbc.queryForObject("SELECT COUNT(*)::int FROM executions WHERE order_id = ?", Integer.class, orderId);
+        assertThat(execRows).isEqualTo(3);
+
+        UUID accountId = jdbc.queryForObject("SELECT account_id FROM orders WHERE id = ?", UUID.class, orderId);
+        UUID custody = UUID.fromString("a0000001-0000-4000-8000-000000000001");
+        assertThat(jdbc.queryForObject(
+                        "SELECT quantity_total FROM positions WHERE account_id = ? AND instrument_symbol = 'MSFT' AND custody_account_id = ?",
+                        BigDecimal.class,
+                        accountId,
+                        custody))
+                .isEqualByComparingTo("0");
+        assertThat(jdbc.queryForObject(
+                        "SELECT quantity_pending_sell_settle FROM positions WHERE account_id = ? AND instrument_symbol = 'MSFT' AND custody_account_id = ?",
+                        BigDecimal.class,
+                        accountId,
+                        custody))
+                .isEqualByComparingTo("30");
+        assertThat(jdbc.queryForObject(
+                        "SELECT COUNT(*)::int FROM position_history WHERE account_id = ? AND event_type = 'TRADE_SELL_FILL'",
+                        Integer.class,
+                        accountId))
+                .isEqualTo(3);
+
+        List<String> types = jdbc.query(
+                "SELECT envelope_json->>'type' AS t FROM domain_event_outbox WHERE order_id = ? ORDER BY id",
+                (rs, i) -> rs.getString("t"),
+                orderId);
+        assertThat(types).contains("OrderWorking", "OrderPartiallyFilled", "OrderFilled");
+
+        SettlementBrokerDrainAssertions.assertSellTradesSettledClearsPendingSell(
+                jdbc, settlementConfirmProcessor, orderId, 3);
+    }
+
+    @Test
     void duplicateVenueExecRefIsIdempotent() {
         UUID orderId = insertWorkingOrder("idem-1", "AAPL", "10", "5.00", 1);
         String venue = "SIM";
@@ -178,6 +224,42 @@ class SimulatedReturnPathIntegrationTest extends AbstractPostgresIntegrationTest
                 symbol,
                 qty,
                 limitPx);
+        return id;
+    }
+
+    /** SELL {@code NEW} with pre-seeded settled inventory so simulated fills can apply. */
+    private UUID insertNewSellOrderWithInventory(String idemKey, String symbol, String qty, String limitPx) {
+        UUID id = UUID.randomUUID();
+        UUID accountId = UUID.randomUUID();
+        jdbc.update(
+                """
+                        INSERT INTO orders (
+                          id, account_id, client_idempotency_key, shard_id, version,
+                          status, side, instrument_symbol, quantity, limit_price, time_in_force,
+                          received_at, accepted_at, account_id_hash, ledger_balance_id, cum_filled_quantity
+                        ) VALUES (
+                          ?, ?, ?, 0, 0, 'NEW', 'SELL', ?, CAST(? AS NUMERIC), CAST(? AS NUMERIC), 'DAY',
+                          NOW(), NOW(), 'hash', NULL, 0
+                        )
+                        """,
+                id,
+                accountId,
+                idemKey,
+                symbol,
+                qty,
+                limitPx);
+        jdbc.update(
+                """
+                        INSERT INTO positions (
+                          account_id, instrument_symbol, custody_account_id,
+                          quantity_total, quantity_settled, quantity_pending_buy_settle, quantity_pending_sell_settle
+                        ) VALUES (?, ?, CAST(? AS UUID), CAST(? AS NUMERIC), CAST(? AS NUMERIC), 0, 0)
+                        """,
+                accountId,
+                symbol,
+                "a0000001-0000-4000-8000-000000000001",
+                qty,
+                qty);
         return id;
     }
 

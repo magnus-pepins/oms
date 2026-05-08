@@ -7,7 +7,7 @@ This is a **human-run** checklist for validating the OMS QuickFIX/J initiator ag
 - `OMS_ROUTING_BACKEND=fix`, `OMS_FIX_AUTO_START=true` in the soak environment only.
 - `OMS_INTERNAL_API_KEY` set; route gate defaults to send enabled (`fix_route_state`) unless you intentionally halt.
 - Broker UAT host/port, comp IDs, and **TLS** material (`OMS_FIX_SOCKET_USE_SSL`, keystores/truststores) match the venue worksheet.
-- **Session store:** `OMS_FIX_SESSION_STORE_TYPE=file` or `jdbc`. If `jdbc`, Flyway **V9** has been applied (`oms_fix_sessions` / `oms_fix_messages`) and the app DataSource can reach that database.
+- **Session store:** `OMS_FIX_SESSION_STORE_TYPE=file` or `jdbc`. If `jdbc`, Flyway **V9** has been applied (`oms_fix_sessions` / `oms_fix_messages`) on the database QuickFIX will use (application DB by default, or the DB behind **`OMS_FIX_SESSION_JDBC_URL`** when **`OMS_FIX_SESSION_JDBC_DATASOURCE_ENABLED=true`**).
 
 ## Soak procedure (minimal)
 
@@ -27,4 +27,4 @@ This is a **human-run** checklist for validating the OMS QuickFIX/J initiator ag
 
 - No unexplained **disconnect loops**; heartbeats stable for the soak window.
 - No **unauthorized** or **seq** rejects attributable to OMS misconfiguration.
-- **DR note:** after restoring Postgres or the FIX JDBC store, coordinate **seq reset** with the broker before resuming send (see master plan §6.4 / §14.6).
+- **DR note:** after restoring Postgres or the FIX JDBC store, coordinate **seq reset** with the broker before resuming send (see master plan 6.4 / 14.6).

@@ -125,6 +125,13 @@ oms:
     socket-trust-store: ${OMS_FIX_SOCKET_TRUST_STORE:}
     socket-trust-store-password: ${OMS_FIX_SOCKET_TRUST_STORE_PASSWORD:}
     enabled-ssl-protocols: ${OMS_FIX_ENABLED_SSL_PROTOCOLS:}
+    session-jdbc-datasource-enabled: ${OMS_FIX_SESSION_JDBC_DATASOURCE_ENABLED:false}
+    session-jdbc-url: ${OMS_FIX_SESSION_JDBC_URL:}
+    session-jdbc-user: ${OMS_FIX_SESSION_JDBC_USER:}
+    session-jdbc-password: ${OMS_FIX_SESSION_JDBC_PASSWORD:}
+    session-jdbc-pool-max-size: ${OMS_FIX_SESSION_JDBC_POOL_MAX_SIZE:5}
+    session-jdbc-pool-min-idle: ${OMS_FIX_SESSION_JDBC_POOL_MIN_IDLE:1}
+    session-jdbc-connection-timeout-ms: ${OMS_FIX_SESSION_JDBC_CONNECTION_TIMEOUT_MS:2000}
 
 logging:
   level:

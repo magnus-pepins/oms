@@ -295,8 +295,9 @@ public class OmsConfig {
         /** Bucket capacity when rate limiting is enabled. */
         private int outboundTokenBurst = 100;
         /**
-         * {@code file} — {@link quickfix.FileStoreFactory}; {@code jdbc} — {@link quickfix.JdbcStoreFactory} on the
-         * Spring {@link javax.sql.DataSource} (tables {@code oms_fix_sessions} / {@code oms_fix_messages}, Flyway V9).
+         * {@code file} — {@link quickfix.FileStoreFactory}; {@code jdbc} — {@link quickfix.JdbcStoreFactory}.
+         * Default pool is the application {@link javax.sql.DataSource}; optional dedicated pool via
+         * {@link #sessionJdbcDatasourceEnabled} / {@link #sessionJdbcUrl}.
          */
         private String sessionStoreType = "file";
         /** When {@code true}, {@link com.balh.oms.fix.FixRouteStateSodScheduler} sets {@code send_enabled} on all {@code fix_route_state} rows on a cron. */
@@ -311,6 +312,17 @@ public class OmsConfig {
         private String socketTrustStorePassword = "";
         /** Optional; comma-separated protocols for QuickFIX {@code EnabledProtocols} (e.g. {@code TLSv1.2}). */
         private String enabledSslProtocols = "";
+        /**
+         * When {@code true} with {@link #sessionStoreType} {@code jdbc}, QuickFIX {@link quickfix.JdbcStoreFactory} uses a
+         * dedicated pool ({@link #sessionJdbcUrl}) instead of the application {@link javax.sql.DataSource}.
+         */
+        private boolean sessionJdbcDatasourceEnabled = false;
+        private String sessionJdbcUrl = "";
+        private String sessionJdbcUser = "";
+        private String sessionJdbcPassword = "";
+        private int sessionJdbcPoolMaxSize = 5;
+        private int sessionJdbcPoolMinIdle = 1;
+        private long sessionJdbcConnectionTimeoutMs = 2000L;
 
         public boolean isAutoStart() { return autoStart; }
         public void setAutoStart(boolean autoStart) { this.autoStart = autoStart; }
@@ -450,6 +462,62 @@ public class OmsConfig {
 
         public void setEnabledSslProtocols(String enabledSslProtocols) {
             this.enabledSslProtocols = enabledSslProtocols == null ? "" : enabledSslProtocols.trim();
+        }
+
+        public boolean isSessionJdbcDatasourceEnabled() {
+            return sessionJdbcDatasourceEnabled;
+        }
+
+        public void setSessionJdbcDatasourceEnabled(boolean sessionJdbcDatasourceEnabled) {
+            this.sessionJdbcDatasourceEnabled = sessionJdbcDatasourceEnabled;
+        }
+
+        public String getSessionJdbcUrl() {
+            return sessionJdbcUrl;
+        }
+
+        public void setSessionJdbcUrl(String sessionJdbcUrl) {
+            this.sessionJdbcUrl = sessionJdbcUrl == null ? "" : sessionJdbcUrl.trim();
+        }
+
+        public String getSessionJdbcUser() {
+            return sessionJdbcUser;
+        }
+
+        public void setSessionJdbcUser(String sessionJdbcUser) {
+            this.sessionJdbcUser = sessionJdbcUser == null ? "" : sessionJdbcUser.trim();
+        }
+
+        public String getSessionJdbcPassword() {
+            return sessionJdbcPassword;
+        }
+
+        public void setSessionJdbcPassword(String sessionJdbcPassword) {
+            this.sessionJdbcPassword = sessionJdbcPassword == null ? "" : sessionJdbcPassword;
+        }
+
+        public int getSessionJdbcPoolMaxSize() {
+            return sessionJdbcPoolMaxSize;
+        }
+
+        public void setSessionJdbcPoolMaxSize(int sessionJdbcPoolMaxSize) {
+            this.sessionJdbcPoolMaxSize = Math.max(1, sessionJdbcPoolMaxSize);
+        }
+
+        public int getSessionJdbcPoolMinIdle() {
+            return sessionJdbcPoolMinIdle;
+        }
+
+        public void setSessionJdbcPoolMinIdle(int sessionJdbcPoolMinIdle) {
+            this.sessionJdbcPoolMinIdle = Math.max(0, sessionJdbcPoolMinIdle);
+        }
+
+        public long getSessionJdbcConnectionTimeoutMs() {
+            return sessionJdbcConnectionTimeoutMs;
+        }
+
+        public void setSessionJdbcConnectionTimeoutMs(long sessionJdbcConnectionTimeoutMs) {
+            this.sessionJdbcConnectionTimeoutMs = Math.max(250L, sessionJdbcConnectionTimeoutMs);
         }
     }
 }

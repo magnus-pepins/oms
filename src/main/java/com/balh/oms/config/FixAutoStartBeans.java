@@ -11,6 +11,8 @@ import com.balh.oms.persistence.FixRouteStateRepository;
 import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.returnpath.ExecutionReportApplier;
 import io.micrometer.core.instrument.MeterRegistry;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -26,8 +28,16 @@ public class FixAutoStartBeans {
 
     @Bean
     @ConditionalOnProperty(name = "oms.fix.auto-start", havingValue = "true")
-    FixInitiatorManager fixInitiatorManager(OmsConfig omsConfig, OmsFixApplication application, DataSource dataSource) {
-        return new FixInitiatorManager(omsConfig, application, dataSource);
+    FixInitiatorManager fixInitiatorManager(
+            OmsConfig omsConfig,
+            OmsFixApplication application,
+            DataSource dataSource,
+            @Autowired(required = false) @Qualifier("fixSessionStoreDataSource") DataSource fixSessionStoreDataSource) {
+        DataSource jdbcMessageStoreDataSource =
+                omsConfig.getFix().isJdbcSessionStore()
+                        ? (fixSessionStoreDataSource != null ? fixSessionStoreDataSource : dataSource)
+                        : dataSource;
+        return new FixInitiatorManager(omsConfig, application, jdbcMessageStoreDataSource);
     }
 
     @Bean

@@ -81,7 +81,13 @@ Used when `OMS_ROUTING_BACKEND=fix`. See [fix-out.md](fix-out.md) for session ma
 | `OMS_FIX_ROUTE_KEY` | `default` | `fix_route_state.route_key` read by the outbound worker; toggle send via internal API or SQL. |
 | `OMS_FIX_OUTBOUND_TOKENS_PER_SECOND` | `0` | NOS token bucket refill rate; **`<= 0` disables** pacing. |
 | `OMS_FIX_OUTBOUND_TOKEN_BURST` | `100` | Bucket capacity when rate limiting is enabled (minimum **1** in config). |
-| `OMS_FIX_SESSION_STORE_TYPE` | `file` | **`file`** — `FileStoreFactory`; **`jdbc`** — `JdbcStoreFactory` on the Spring `DataSource` (Flyway **V9** `oms_fix_sessions` / `oms_fix_messages`). |
+| `OMS_FIX_SESSION_STORE_TYPE` | `file` | **`file`** — `FileStoreFactory`; **`jdbc`** — `JdbcStoreFactory` (Flyway **V9** `oms_fix_sessions` / `oms_fix_messages`). |
+| `OMS_FIX_SESSION_JDBC_DATASOURCE_ENABLED` | `false` | When **`true`** with JDBC store, QuickFIX uses **`OMS_FIX_SESSION_JDBC_*`** pool instead of the application `DataSource` (plan 6.4). |
+| `OMS_FIX_SESSION_JDBC_URL` | (empty) | JDBC URL for the dedicated FIX session pool; **required** when session JDBC datasource is enabled. |
+| `OMS_FIX_SESSION_JDBC_USER` / `OMS_FIX_SESSION_JDBC_PASSWORD` | (empty) | Credentials for the dedicated pool. |
+| `OMS_FIX_SESSION_JDBC_POOL_MAX_SIZE` | `5` | HikariCP max pool size for the dedicated pool. |
+| `OMS_FIX_SESSION_JDBC_POOL_MIN_IDLE` | `1` | HikariCP min idle. |
+| `OMS_FIX_SESSION_JDBC_CONNECTION_TIMEOUT_MS` | `2000` | HikariCP connection timeout (ms; minimum **250** in `OmsConfig`). |
 | `OMS_FIX_ROUTE_STATE_SOD_ENABLED` | `false` | When **`true`**, cron job sets `fix_route_state.send_enabled=true` on all rows (`FixRouteStateSodScheduler`). |
 | `OMS_FIX_ROUTE_STATE_SOD_CRON` | `0 0 6 * * *` | Spring six-field cron for SOD reconciliation (only when SOD enabled). |
 | `OMS_FIX_SOCKET_USE_SSL` | `false` | QuickFIX **`SocketUseSSL`** for initiator TLS to broker. |

@@ -11,6 +11,7 @@ environment variables, and runbooks for **QuickFIX/J** wired to `FixRouteDispatc
 - **Spring IT:** `FixRoutingSpringIntegrationTest` — `oms.routing.backend=fix`, `oms.fix.auto-start=false`, asserts `RouteDispatcher` is `FixRouteDispatcher`.
 - **Round-trip IT:** `FixRoundTripSpringIntegrationTest` (profile `fix-roundtrip-it`) — embedded loopback **acceptor** (`FixRoundTripEmbeddedAcceptor`, `SmartLifecycle` phase before initiator) + `oms.fix.auto-start=true`; inserts `WORKING` order, `RouteDispatcher.enqueueWorkingOrder`, awaits **FILLED** and asserts **`oms_fix_nos_sent_total`** / **`oms_fix_inbound_execution_reports_total`** (`disposition=trade_APPLIED`).
 - **JDBC session store IT:** `FixRoundTripJdbcStoreSpringIntegrationTest` — same profile with `oms.fix.session-store-type=jdbc`; asserts **`oms_fix_sessions`** row after fill (Flyway **V9**).
+- **Dedicated session JDBC pool IT:** `FixRoundTripJdbcDedicatedSessionPoolSpringIntegrationTest` — `oms.fix.session-jdbc-datasource-enabled=true` with a second Hikari pool (IT points at the same Postgres as wiring proof).
 - **Route-disabled outbound IT:** `FixOutboundRouteDisabledSpringIntegrationTest` — `send_enabled=false` → no NOS, **`oms_fix_outbound_route_disabled_skips_total`**, order stays **WORKING**; after re-enable, **FILLED** as usual.
 - **Stale outbound IT:** `FixOutboundStaleSpringIntegrationTest` — same profile; `oms.fix.max-outbound-job-age-ms` bound; old `accepted_at` → dequeue rejects with **`FIX_OUTBOUND_JOB_EXPIRED`** (no NOS to acceptor; **`oms_fix_outbound_job_expired_total`**).
 - **Return-path IT:** `VenueRejectReturnPathIntegrationTest` — `ExecutionReportApplier.applyVenueReject` → `REJECT` execution + **`OrderRejected`**.
@@ -39,7 +40,7 @@ environment variables, and runbooks for **QuickFIX/J** wired to `FixRouteDispatc
 | `OMS_FIX_ROUTE_KEY` | Matches `fix_route_state.route_key` (default `default`). |
 | `OMS_FIX_OUTBOUND_TOKENS_PER_SECOND` | **0** = unlimited NOS rate; **&gt; 0** enables token-bucket pacing (`OMS_FIX_OUTBOUND_TOKEN_BURST` caps burst). |
 | `OMS_FIX_OUTBOUND_TOKEN_BURST` | Max tokens in bucket when rate limiting is enabled (default `100`). |
-| `OMS_FIX_SESSION_STORE_TYPE` | **`file`** (default) or **`jdbc`** — JDBC uses app `DataSource` + tables `oms_fix_sessions` / `oms_fix_messages` (Flyway V9). |
+| `OMS_FIX_SESSION_STORE_TYPE` | **`file`** (default) or **`jdbc`** — JDBC uses app `DataSource` by default; set **`OMS_FIX_SESSION_JDBC_DATASOURCE_ENABLED=true`** and **`OMS_FIX_SESSION_JDBC_*`** for a **second** Hikari pool (plan 6.4). Apply Flyway **V9** to whichever database holds `oms_fix_*`. |
 | `OMS_FIX_ROUTE_STATE_SOD_ENABLED` / `OMS_FIX_ROUTE_STATE_SOD_CRON` | Optional start-of-day: set all `fix_route_state.send_enabled=true` on cron (`FixRouteStateSodScheduler`). |
 | `OMS_FIX_SOCKET_USE_SSL` / `OMS_FIX_SOCKET_*STORE*` / `OMS_FIX_ENABLED_SSL_PROTOCOLS` | Initiator TLS to broker (QuickFIX `SocketUseSSL`, keystores, `EnabledProtocols`). |
 

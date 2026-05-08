@@ -37,6 +37,7 @@ On each **applied** trade (after idempotent insert into `executions`), **`Positi
 - **`GET /internal/v1/settlement/executions/{id}`** — single row with order fields plus **`rawEnvelopeJson`** (venue envelope). **404** if missing.
 - **`POST /internal/v1/settlement/manual-actions`** — stage a row (`execution_id`, `action_type`, `requested_by`, `payload_json`); execution must exist (**404** if not).
 - **`GET /internal/v1/settlement/manual-actions`** — paginated list; requires **`executionId`** or both **`from`** and **`to`** on `created_at`.
+- **`GET /internal/v1/settlement/manual-actions/{id}`** — single staged/approved row. **404** if missing.
 - **`POST /internal/v1/settlement/manual-actions/{id}/approve`** — sets **`approved_by`** when null; approver must differ from **`requested_by`** (case-insensitive). **409** if already approved or concurrent loss; **400** if same actor.
 
 ### Broker confirm queue

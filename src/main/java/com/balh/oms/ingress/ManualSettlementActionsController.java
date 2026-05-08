@@ -115,6 +115,14 @@ public class ManualSettlementActionsController {
         return ResponseEntity.ok(new ManualSettlementActionsPageResponse(items, lim, off));
     }
 
+    @GetMapping("/{id}")
+    public ResponseEntity<ManualSettlementActionResponse> get(@PathVariable long id) {
+        return repo.findById(id)
+                .map(ManualSettlementActionsController::toResponse)
+                .map(ResponseEntity::ok)
+                .orElse(ResponseEntity.notFound().build());
+    }
+
     @PostMapping("/{id}/approve")
     public ResponseEntity<ManualSettlementActionResponse> approve(
             @PathVariable long id, @RequestBody(required = false) ApproveManualSettlementActionRequest body) {

@@ -89,6 +89,7 @@ class ManualSettlementActionsControllerIntegrationTest extends AbstractPostgresI
                         HttpMethod.POST,
                         new HttpEntity<>(createBody, h),
                         new ParameterizedTypeReference<>() {});
+        assertThat(created.getBody()).isNotNull();
         long actionId = created.getBody().id();
         var approveBody = new ManualSettlementActionsController.ApproveManualSettlementActionRequest("same@example.com");
         ResponseEntity<String> res =
@@ -98,6 +99,40 @@ class ManualSettlementActionsControllerIntegrationTest extends AbstractPostgresI
                         new HttpEntity<>(approveBody, h),
                         String.class);
         assertThat(res.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
+    void getById_returnsRow() {
+        long exId = seedTradeExecution();
+        HttpHeaders h = headers();
+        var createBody =
+                new ManualSettlementActionsController.CreateManualSettlementActionRequest(
+                        exId, "GET_BY_ID", "viewer@example.com", "{}");
+        ResponseEntity<ManualSettlementActionResponse> created =
+                http.exchange(
+                        base(),
+                        HttpMethod.POST,
+                        new HttpEntity<>(createBody, h),
+                        new ParameterizedTypeReference<>() {});
+        assertThat(created.getBody()).isNotNull();
+        long actionId = created.getBody().id();
+        ResponseEntity<ManualSettlementActionResponse> got =
+                http.exchange(
+                        base() + "/" + actionId,
+                        HttpMethod.GET,
+                        new HttpEntity<>(h),
+                        new ParameterizedTypeReference<>() {});
+        assertThat(got.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(got.getBody()).isNotNull();
+        assertThat(got.getBody().actionType()).isEqualTo("GET_BY_ID");
+    }
+
+    @Test
+    void getById_notFound_returns404() {
+        HttpHeaders h = headers();
+        ResponseEntity<String> res =
+                http.exchange(base() + "/999999999", HttpMethod.GET, new HttpEntity<>(h), String.class);
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
     }
 
     @Test

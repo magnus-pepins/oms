@@ -84,6 +84,35 @@ class SettlementPipelineIntegrationTest extends AbstractPostgresIntegrationTest 
     }
 
     @Test
+    void brokerConfirmDrain_clearsSellPendingSettleAndAppendsHistory() {
+        SellSeed seed = seedFilledSellOrderWithExecution();
+        processor.registerAndDrain(List.of(seed.executionId()), 20, 20);
+
+        assertThat(jdbc.queryForObject(
+                        "SELECT settlement_status::text FROM executions WHERE id = ?",
+                        String.class,
+                        seed.executionId()))
+                .isEqualTo("settled");
+        assertThat(jdbc.queryForObject(
+                        "SELECT quantity_pending_sell_settle FROM positions WHERE account_id = ? AND instrument_symbol = 'AAPL' AND custody_account_id = ?",
+                        java.math.BigDecimal.class,
+                        seed.accountId(),
+                        DEFAULT_CUSTODY))
+                .isEqualByComparingTo("0");
+        assertThat(jdbc.queryForObject(
+                        "SELECT quantity_total FROM positions WHERE account_id = ? AND instrument_symbol = 'AAPL' AND custody_account_id = ?",
+                        java.math.BigDecimal.class,
+                        seed.accountId(),
+                        DEFAULT_CUSTODY))
+                .isEqualByComparingTo("0");
+        assertThat(jdbc.queryForObject(
+                        "SELECT COUNT(*)::int FROM position_history WHERE account_id = ? AND event_type = 'SETTLEMENT_SELL_SETTLED'",
+                        Integer.class,
+                        seed.accountId()))
+                .isEqualTo(1);
+    }
+
+    @Test
     void classpathFixtureJsonShape_matchesControllerIngest() throws Exception {
         Seed seed = seedFilledBuyOrderWithExecution();
         String raw =
@@ -142,5 +171,57 @@ class SettlementPipelineIntegrationTest extends AbstractPostgresIntegrationTest 
         return new Seed(accountId, exId);
     }
 
+    /**
+     * Post-SELL-fill position state: customer had 10 settled AAPL, sold 10 → total/settled 0, pending_sell 10
+     * (matches {@link com.balh.oms.persistence.PositionsRepository#recordTradeFill} SELL path).
+     */
+    private SellSeed seedFilledSellOrderWithExecution() {
+        UUID orderId = UUID.randomUUID();
+        UUID accountId = UUID.randomUUID();
+        jdbc.update(
+                """
+                        INSERT INTO orders (
+                          id, account_id, client_idempotency_key, shard_id, version,
+                          status, side, instrument_symbol, quantity, limit_price, time_in_force,
+                          received_at, accepted_at, account_id_hash, ledger_balance_id, cum_filled_quantity
+                        ) VALUES (
+                          ?, ?, ?, 0, 2, 'FILLED', 'SELL', 'AAPL', 10, 5, 'DAY',
+                          NOW(), NOW(), 'h', NULL, 10
+                        )
+                        """,
+                orderId,
+                accountId,
+                "settle-sell-" + orderId);
+        jdbc.update(
+                """
+                        INSERT INTO executions (
+                          order_id, account_id, venue_id, venue_ts, venue_exec_ref,
+                          last_quantity, last_price, leaves_quantity, cum_quantity_after,
+                          exec_type, raw_envelope_json
+                        ) VALUES (
+                          ?, ?, 'SIM', NOW(), ?,
+                          10, 5, 0, 10,
+                          CAST('TRADE' AS execution_exec_type), CAST('{}' AS JSONB)
+                        )
+                        """,
+                orderId,
+                accountId,
+                "vref-sell-" + orderId);
+        long exId = jdbc.queryForObject(
+                "SELECT id FROM executions WHERE order_id = ? ORDER BY id DESC LIMIT 1", Long.class, orderId);
+        jdbc.update(
+                """
+                        INSERT INTO positions (
+                          account_id, instrument_symbol, custody_account_id,
+                          quantity_total, quantity_settled, quantity_pending_buy_settle, quantity_pending_sell_settle
+                        ) VALUES (?, 'AAPL', ?, 0, 0, 0, 10)
+                        """,
+                accountId,
+                DEFAULT_CUSTODY);
+        return new SellSeed(accountId, exId);
+    }
+
     private record Seed(UUID accountId, long executionId) {}
+
+    private record SellSeed(UUID accountId, long executionId) {}
 }

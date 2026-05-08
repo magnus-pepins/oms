@@ -8,7 +8,7 @@ This document describes the **securities post-trade** tables and wiring in OMS. 
 
 - **`custody_accounts`** — broker custody routing (Shape A v1). A deterministic **DEFAULT** omnibus row is inserted for single-broker wiring.
 - **`positions`** — one row per `(account_id, instrument_symbol, custody_account_id)` with quantity columns (`quantity_total`, `quantity_settled`, `quantity_pending_buy_settle`, `quantity_pending_sell_settle`).
-- **`position_history`** — append-only deltas (`TRADE_BUY_FILL` / `TRADE_SELL_FILL`, **`SETTLEMENT_BUY_SETTLED`**) with optional `execution_id` → `executions`.
+- **`position_history`** — append-only deltas (`TRADE_BUY_FILL` / `TRADE_SELL_FILL`, **`SETTLEMENT_BUY_SETTLED`**, **`SETTLEMENT_SELL_SETTLED`**) with optional `execution_id` → `executions`.
 - **`manual_settlement_actions`** — four-eyes manual instructions (§12.8); **`POST /internal/v1/settlement/manual-actions`** + approve route (see Read-only / Manual below).
 - **`executions.settlement_status`** — enum `execution_settlement_status`; new fills default to **`executed`**.
 
@@ -22,8 +22,9 @@ Forward-only path persisted on **`executions`**:
 
 `executed` → `matched` → `confirmed` → `settling` → `settled` (and **`failed`** reserved for later).
 
-- **`SettlementConfirmProcessor`** advances **`TRADE`** rows. **SELL** legs advance status only (no position move on settle in this slice).
+- **`SettlementConfirmProcessor`** advances **`TRADE`** rows.
 - On transition into **`settled`** for **BUY**, **`PositionsRepository.recordBuySettled`** moves quantity from **`quantity_pending_buy_settle`** to **`quantity_settled`** and appends **`SETTLEMENT_BUY_SETTLED`** history.
+- **SELL** fills increment **`quantity_pending_sell_settle`** (same trade-apply txn as **`TRADE_SELL_FILL`**). On transition into **`settled`**, **`PositionsRepository.recordSellSettled`** decrements **`quantity_pending_sell_settle`** and appends **`SETTLEMENT_SELL_SETTLED`** history.
 
 ## Runtime behaviour
 

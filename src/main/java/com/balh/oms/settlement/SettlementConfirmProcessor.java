@@ -147,14 +147,23 @@ public class SettlementConfirmProcessor {
     }
 
     private void applyTransition(SettlementExecutionRow snapshot, String cur, String next) {
-        if ("settled".equals(next) && "BUY".equalsIgnoreCase(snapshot.side())) {
+        if ("settled".equals(next)) {
             UUID custody = UUID.fromString(config.getSettlement().getDefaultCustodyAccountId());
-            positions.recordBuySettled(
-                    snapshot.accountId(),
-                    snapshot.instrumentSymbol(),
-                    custody,
-                    snapshot.lastQuantity(),
-                    snapshot.executionId());
+            if ("BUY".equalsIgnoreCase(snapshot.side())) {
+                positions.recordBuySettled(
+                        snapshot.accountId(),
+                        snapshot.instrumentSymbol(),
+                        custody,
+                        snapshot.lastQuantity(),
+                        snapshot.executionId());
+            } else if ("SELL".equalsIgnoreCase(snapshot.side())) {
+                positions.recordSellSettled(
+                        snapshot.accountId(),
+                        snapshot.instrumentSymbol(),
+                        custody,
+                        snapshot.lastQuantity(),
+                        snapshot.executionId());
+            }
         }
         int n = executions.updateSettlementStatusIf(snapshot.executionId(), cur, next);
         if (n != 1) {

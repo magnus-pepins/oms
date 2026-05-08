@@ -11,7 +11,8 @@ import java.util.UUID;
 
 /**
  * Customer positions and history (slice 6 / §12.2). BUY fills increase total + pending buy settle;
- * SELL fills reduce pending buy first, then settled, then total.
+ * SELL fills reduce pending buy first, then settled, then total, and add the fill qty to {@code
+ * quantity_pending_sell_settle} until broker settlement clears it via {@link #recordSellSettled}.
  */
 @Repository
 public class PositionsRepository {
@@ -40,11 +41,22 @@ public class PositionsRepository {
                     :qty - LEAST(quantity_pending_buy_settle, :qty)
                 ),
                 quantity_total = quantity_total - :qty,
+                quantity_pending_sell_settle = quantity_pending_sell_settle + :qty,
                 updated_at = NOW()
             WHERE account_id = :account_id
               AND instrument_symbol = :symbol
               AND custody_account_id = :custody_id
               AND quantity_total >= :qty
+            """;
+
+    private static final String SETTLE_SELL_SQL = """
+            UPDATE positions SET
+                quantity_pending_sell_settle = quantity_pending_sell_settle - :qty,
+                updated_at = NOW()
+            WHERE account_id = :account_id
+              AND instrument_symbol = :symbol
+              AND custody_account_id = :custody_id
+              AND quantity_pending_sell_settle >= :qty
             """;
 
     private static final String SETTLE_BUY_SQL = """
@@ -145,6 +157,34 @@ public class PositionsRepository {
                             .formatted(updated, accountId, sym, executionId));
         }
         insertHistory(accountId, sym, custodyAccountId, "SETTLEMENT_BUY_SETTLED", settleQuantity, executionId);
+    }
+
+    /**
+     * Clears {@code quantity_pending_sell_settle} for a SELL leg after broker settlement pipeline reaches
+     * {@code settled} (§12.3 terminal).
+     */
+    public void recordSellSettled(
+            UUID accountId, String instrumentSymbol, UUID custodyAccountId, BigDecimal settleQuantity, long executionId) {
+        if (settleQuantity == null || settleQuantity.compareTo(BigDecimal.ZERO) <= 0) {
+            return;
+        }
+        String sym = instrumentSymbol == null ? "" : instrumentSymbol.trim();
+        if (sym.isEmpty()) {
+            return;
+        }
+        int updated = jdbc.update(
+                SETTLE_SELL_SQL,
+                new MapSqlParameterSource()
+                        .addValue("account_id", accountId)
+                        .addValue("symbol", sym)
+                        .addValue("custody_id", custodyAccountId)
+                        .addValue("qty", settleQuantity));
+        if (updated != 1) {
+            throw new IllegalStateException(
+                    "sell settle expected 1 position row, got %s (account=%s symbol=%s execution=%s)"
+                            .formatted(updated, accountId, sym, executionId));
+        }
+        insertHistory(accountId, sym, custodyAccountId, "SETTLEMENT_SELL_SETTLED", settleQuantity, executionId);
     }
 
     private void insertHistory(

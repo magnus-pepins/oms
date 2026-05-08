@@ -135,6 +135,23 @@ public class ExecutionsRepository {
         return ids.isEmpty() ? Optional.empty() : Optional.of(ids.getFirst());
     }
 
+    private static final String SELECT_TRADE_SETTLEMENT_STATUSES_FOR_ORDER = """
+            SELECT settlement_status::text AS settlement_status
+            FROM executions
+            WHERE order_id = :order_id
+              AND exec_type = CAST('TRADE' AS execution_exec_type)
+            """;
+
+    /**
+     * Settlement status strings for {@code TRADE} rows only (one row per partial fill / execution).
+     */
+    public List<String> listTradeSettlementStatusesForOrder(UUID orderId) {
+        return jdbc.query(
+                SELECT_TRADE_SETTLEMENT_STATUSES_FOR_ORDER,
+                new MapSqlParameterSource("order_id", orderId),
+                (rs, rowNum) -> rs.getString("settlement_status"));
+    }
+
     private static final String SELECT_SETTLEMENT_ROW = """
             SELECT e.id AS execution_id, e.settlement_status::text AS settlement_status, e.exec_type::text AS exec_type,
                    e.last_quantity, e.account_id, o.instrument_symbol, o.side::text AS side

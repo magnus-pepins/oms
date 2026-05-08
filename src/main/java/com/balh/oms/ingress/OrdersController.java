@@ -1,7 +1,9 @@
 package com.balh.oms.ingress;
 
 import com.balh.oms.domain.Order;
+import com.balh.oms.persistence.ExecutionsRepository;
 import com.balh.oms.persistence.OrdersRepository;
+import com.balh.oms.settlement.OrderAggregateSettlementStatus;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.validation.Valid;
@@ -41,15 +43,18 @@ public class OrdersController {
 
     private final OrderIngressService ingress;
     private final OrdersRepository orders;
+    private final ExecutionsRepository executions;
     private final Counter ordersCreatedCounter;
     private final Counter ordersDuplicateCounter;
 
     public OrdersController(
             OrderIngressService ingress,
             OrdersRepository orders,
+            ExecutionsRepository executions,
             MeterRegistry registry) {
         this.ingress = ingress;
         this.orders = orders;
+        this.executions = executions;
         this.ordersCreatedCounter = Counter.builder("oms_orders_created_total")
                 .description("Orders accepted via the internal HTTP ingress")
                 .register(registry);
@@ -76,7 +81,11 @@ public class OrdersController {
     @GetMapping("/{id}")
     public ResponseEntity<CreateOrderResponse> getOrder(@PathVariable UUID id) {
         return orders.findById(id)
-                .map(o -> ResponseEntity.ok(CreateOrderResponse.from(o)))
+                .map(o -> {
+                    var tradeStatuses = executions.listTradeSettlementStatusesForOrder(o.id());
+                    String aggregate = OrderAggregateSettlementStatus.summarize(tradeStatuses);
+                    return ResponseEntity.ok(CreateOrderResponse.from(o, aggregate));
+                })
                 .orElseGet(() -> ResponseEntity.notFound().build());
     }
 }

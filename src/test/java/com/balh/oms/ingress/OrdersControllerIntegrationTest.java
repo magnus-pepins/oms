@@ -123,6 +123,44 @@ class OrdersControllerIntegrationTest extends AbstractPostgresIntegrationTest {
         assertThat(res.getBody()).isNotNull();
         assertThat(res.getBody().get("id")).isEqualTo(orderId.toString());
         assertThat(res.getBody().get("accountId")).isEqualTo(accountId.toString());
+        assertThat(res.getBody().get("settlementStatus")).isNull();
+    }
+
+    @Test
+    void getOrder_returnsAggregatedSettlementStatusFromTradeExecutions() {
+        UUID accountId = UUID.randomUUID();
+        ResponseEntity<Map<String, Object>> created = exchange(jsonRequest(accountId, "get-key-settlement"));
+        assertThat(created.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        UUID orderId = UUID.fromString((String) created.getBody().get("id"));
+
+        jdbc.update(
+                """
+                        INSERT INTO executions (
+                          order_id, account_id, venue_id, venue_ts, venue_exec_ref,
+                          last_quantity, last_price, leaves_quantity, cum_quantity_after,
+                          exec_type, raw_envelope_json, settlement_status
+                        ) VALUES (
+                          ?, ?, 'SIM', NOW(), ?,
+                          10, 5, 0, 10,
+                          CAST('TRADE' AS execution_exec_type), CAST('{}' AS JSONB),
+                          CAST('settling' AS execution_settlement_status)
+                        )
+                        """,
+                orderId,
+                accountId,
+                "vref-settle-" + orderId);
+
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("X-OMS-Internal-Key", "test-key");
+        ResponseEntity<Map<String, Object>> res = http.exchange(
+                "http://localhost:" + port + "/internal/v1/orders/" + orderId,
+                HttpMethod.GET,
+                new HttpEntity<>(headers),
+                new ParameterizedTypeReference<>() {});
+
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(res.getBody()).isNotNull();
+        assertThat(res.getBody().get("settlementStatus")).isEqualTo("settling");
     }
 
     @Test

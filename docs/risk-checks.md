@@ -12,7 +12,7 @@ the optional Ledger buying-power gate and the WORKING CAS.
 | **Fat-finger quantity** | `RISK_FAT_FINGER_SIZE` | `OMS_RISK_FAT_FINGER_MAX_ORDER_QUANTITY` | `0` disables. |
 | **Notional cap** | `RISK_NOTIONAL_CAP` | `OMS_RISK_MAX_ORDER_NOTIONAL` | `0` disables. Uses `quantity × limit_price` when both present. |
 
-Every **PASS** or **REJECT** outcome records one row in **`control_decisions`** (Flyway `V5`).
+Every **PASS** or **REJECT** outcome records one row in **`control_decisions`** (Flyway `V5`); rows are queryable via **`GET /internal/v1/control-decisions`** for ops audit tooling.
 
 Stale control events still reject with **`RISK_STALE_QUEUE`** and increment **`oms_control_jobs_rejected_stale_total`**.
 

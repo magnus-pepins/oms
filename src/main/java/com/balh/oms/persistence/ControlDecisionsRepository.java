@@ -1,11 +1,13 @@
 package com.balh.oms.persistence;
 
 import com.balh.oms.domain.RejectCode;
+import java.sql.Timestamp;
+import java.time.Instant;
+import java.util.List;
+import java.util.UUID;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.stereotype.Repository;
-
-import java.util.UUID;
 
 /**
  * Persists one row per {@link com.balh.oms.tailer.ControlTailer#apply} outcome (PASS or REJECT).
@@ -40,5 +42,49 @@ public class ControlDecisionsRepository {
                 .addValue("stage", stage)
                 .addValue("detail", detailJson == null ? "{}" : detailJson);
         jdbc.update(INSERT, params);
+    }
+
+    /**
+     * Lists decisions newest-first. Pass {@code null} for unused filters (caller validates that at
+     * least one dimension is constrained).
+     */
+    public List<ControlDecisionRow> findByFilters(UUID orderId, Instant from, Instant to, int limit, int offset) {
+        StringBuilder sql = new StringBuilder(
+                """
+                        SELECT id, order_id, order_version_before, outcome,
+                               reject_code::text AS reject_code, stage,
+                               COALESCE(detail::text, '{}') AS detail, decided_at
+                        FROM control_decisions
+                        WHERE 1 = 1
+                        """);
+        var params = new MapSqlParameterSource();
+        if (orderId != null) {
+            sql.append(" AND order_id = :order_id");
+            params.addValue("order_id", orderId);
+        }
+        if (from != null) {
+            sql.append(" AND decided_at >= :from_ts");
+            params.addValue("from_ts", Timestamp.from(from));
+        }
+        if (to != null) {
+            sql.append(" AND decided_at < :to_ts");
+            params.addValue("to_ts", Timestamp.from(to));
+        }
+        sql.append(" ORDER BY decided_at DESC, id DESC LIMIT :lim OFFSET :off");
+        params.addValue("lim", limit);
+        params.addValue("off", offset);
+        return jdbc.query(
+                sql.toString(),
+                params,
+                (rs, rowNum) ->
+                        new ControlDecisionRow(
+                                rs.getLong("id"),
+                                rs.getObject("order_id", UUID.class),
+                                rs.getInt("order_version_before"),
+                                rs.getString("outcome"),
+                                rs.getString("reject_code"),
+                                rs.getString("stage"),
+                                rs.getString("detail"),
+                                rs.getTimestamp("decided_at").toInstant()));
     }
 }

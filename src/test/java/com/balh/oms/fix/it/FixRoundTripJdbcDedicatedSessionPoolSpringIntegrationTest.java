@@ -61,7 +61,7 @@ class FixRoundTripJdbcDedicatedSessionPoolSpringIntegrationTest extends Abstract
 
     @BeforeEach
     void truncate() {
-        FixRoundTripAcceptorApplication.NOS_RECEIVED.set(0);
+        FixRoundTripAcceptorApplication.resetItHooks();
         jdbc.update("TRUNCATE TABLE " + FixJdbcSessionSchema.MESSAGES_TABLE);
         jdbc.update("TRUNCATE TABLE " + FixJdbcSessionSchema.SESSIONS_TABLE);
         jdbc.update("TRUNCATE TABLE orders CASCADE");

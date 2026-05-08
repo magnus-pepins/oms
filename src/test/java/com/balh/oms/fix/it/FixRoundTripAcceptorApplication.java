@@ -29,6 +29,7 @@ import quickfix.fix44.ExecutionReport;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Minimal FIX 4.4 acceptor for slice-4 round-trip IT: reply to {@code D} with a synthetic full fill ER.
@@ -39,6 +40,14 @@ public final class FixRoundTripAcceptorApplication implements Application {
 
     /** IT hook: incremented for each inbound {@code D}; used by stale-outbound IT to assert no send. */
     public static final AtomicInteger NOS_RECEIVED = new AtomicInteger(0);
+
+    /** IT hook: last {@code Symbol} on inbound {@code D} (symbol-map coverage). */
+    public static final AtomicReference<String> LAST_NOS_SYMBOL = new AtomicReference<>();
+
+    public static void resetItHooks() {
+        NOS_RECEIVED.set(0);
+        LAST_NOS_SYMBOL.set(null);
+    }
 
     @Override
     public void onCreate(SessionID sessionId) {
@@ -81,6 +90,7 @@ public final class FixRoundTripAcceptorApplication implements Application {
         String clOrdId = message.getString(ClOrdID.FIELD);
         String compact = clOrdId.replace("-", "");
         String sym = message.getString(Symbol.FIELD);
+        LAST_NOS_SYMBOL.set(sym);
         String qtyStr = message.getString(OrderQty.FIELD);
         String pxStr = message.isSetField(Price.FIELD) ? message.getString(Price.FIELD) : "1";
 

@@ -55,7 +55,7 @@ class FixRoundTripSpringIntegrationTest extends AbstractPostgresIntegrationTest 
 
     @BeforeEach
     void truncateOrders() {
-        FixRoundTripAcceptorApplication.NOS_RECEIVED.set(0);
+        FixRoundTripAcceptorApplication.resetItHooks();
         jdbc.update("TRUNCATE TABLE orders CASCADE");
     }
 

@@ -1,10 +1,7 @@
 package com.balh.oms.fix.it;
 
 import com.balh.oms.AbstractPostgresIntegrationTest;
-import com.balh.oms.fix.FixJdbcSessionSchema;
-import com.balh.oms.fix.FixMetrics;
 import com.balh.oms.routing.RouteDispatcher;
-import io.micrometer.core.instrument.MeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -22,12 +19,12 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 
 /**
- * Same as {@link FixRoundTripSpringIntegrationTest} but {@code oms.fix.session-store-type=jdbc} so QuickFIX/J persists
- * seq/messages in {@code oms_fix_sessions} / {@code oms_fix_messages} (Flyway V9).
+ * Slice 5 prep: {@code oms.fix.symbol-map-json} maps OMS {@code instrument_symbol} to broker {@code Symbol} on NOS;
+ * DB row keeps the client symbol.
  */
 @Import(FixRoundTripTestBeans.class)
 @ActiveProfiles({"test", "fix-roundtrip-it"})
-class FixRoundTripJdbcStoreSpringIntegrationTest extends AbstractPostgresIntegrationTest {
+class FixRoundTripSymbolMapSpringIntegrationTest extends AbstractPostgresIntegrationTest {
 
     @Autowired
     private RouteDispatcher routeDispatcher;
@@ -35,14 +32,10 @@ class FixRoundTripJdbcStoreSpringIntegrationTest extends AbstractPostgresIntegra
     @Autowired
     private JdbcTemplate jdbc;
 
-    @Autowired
-    private MeterRegistry meterRegistry;
-
     @DynamicPropertySource
     static void fixRoundTripProps(DynamicPropertyRegistry registry) {
         registry.add("oms.routing.backend", () -> "fix");
         registry.add("oms.fix.auto-start", () -> "true");
-        registry.add("oms.fix.session-store-type", () -> "jdbc");
         registry.add("oms.fix.socket-connect-host", () -> "127.0.0.1");
         registry.add("oms.fix.socket-connect-port", () -> String.valueOf(FixRoundTripFixture.PORT));
         registry.add(
@@ -53,19 +46,18 @@ class FixRoundTripJdbcStoreSpringIntegrationTest extends AbstractPostgresIntegra
         registry.add("oms.fix.outbound-poll-interval-ms", () -> "25");
         registry.add("oms.fix.venue-id-for-executions", () -> "FIX_IT");
         registry.add("oms.risk.instrument-allowlist-enabled", () -> "false");
+        registry.add("oms.fix.symbol-map-json", () -> "{\"AAPL\":\"BRK.A\"}");
     }
 
     @BeforeEach
-    void truncate() {
+    void truncateOrders() {
         FixRoundTripAcceptorApplication.resetItHooks();
-        jdbc.update("TRUNCATE TABLE " + FixJdbcSessionSchema.MESSAGES_TABLE);
-        jdbc.update("TRUNCATE TABLE " + FixJdbcSessionSchema.SESSIONS_TABLE);
         jdbc.update("TRUNCATE TABLE orders CASCADE");
     }
 
     @Test
-    void jdbcStore_roundTrip_writesSessionRow() {
-        UUID orderId = insertWorkingOrder("fix-jdbc-store-1", "AAPL", "10", "5.00", 1);
+    void enqueueWorkingOrder_mapsSymbolOnWire_dbKeepsClientSymbol() {
+        UUID orderId = insertWorkingOrder("fix-symmap-1", "AAPL", "10", "5.00", 1);
         routeDispatcher.enqueueWorkingOrder(orderId);
 
         await().atMost(Duration.ofSeconds(45))
@@ -74,9 +66,11 @@ class FixRoundTripJdbcStoreSpringIntegrationTest extends AbstractPostgresIntegra
                                 jdbc.queryForObject("SELECT status::text FROM orders WHERE id = ?", String.class, orderId))
                         .isEqualTo("FILLED"));
 
-        assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM " + FixJdbcSessionSchema.SESSIONS_TABLE, Long.class))
-                .isPositive();
-        assertThat(meterRegistry.counter(FixMetrics.METRIC_NOS_SENT).count()).isPositive();
+        assertThat(jdbc.queryForObject("SELECT instrument_symbol FROM orders WHERE id = ?", String.class, orderId))
+                .isEqualTo("AAPL");
+        assertThat(jdbc.queryForObject("SELECT cum_filled_quantity FROM orders WHERE id = ?", BigDecimal.class, orderId))
+                .isEqualByComparingTo("10");
+        assertThat(FixRoundTripAcceptorApplication.LAST_NOS_SYMBOL.get()).isEqualTo("BRK.A");
     }
 
     private UUID insertWorkingOrder(String idemKey, String symbol, String qty, String limitPx, int version) {

@@ -56,7 +56,7 @@ class FixOutboundRouteDisabledSpringIntegrationTest extends AbstractPostgresInte
 
     @BeforeEach
     void reset() {
-        FixRoundTripAcceptorApplication.NOS_RECEIVED.set(0);
+        FixRoundTripAcceptorApplication.resetItHooks();
         jdbc.update("TRUNCATE TABLE orders CASCADE");
         jdbc.update("UPDATE fix_route_state SET send_enabled = TRUE, updated_by = 'test', note = NULL WHERE route_key = 'default'");
     }

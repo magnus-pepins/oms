@@ -24,11 +24,17 @@ import java.time.ZoneOffset;
 @ConditionalOnProperty(name = "oms.routing.backend", havingValue = "fix")
 public class FixNewOrderSingleBuilder {
 
+    private final FixSymbolMapper fixSymbolMapper;
+
+    public FixNewOrderSingleBuilder(FixSymbolMapper fixSymbolMapper) {
+        this.fixSymbolMapper = fixSymbolMapper;
+    }
+
     public NewOrderSingle build(Order order) {
         NewOrderSingle nos = new NewOrderSingle();
         nos.set(new ClOrdID(order.id().toString()));
         nos.set(new HandlInst(HandlInst.AUTOMATED_EXECUTION_ORDER_PRIVATE_NO_BROKER_INTERVENTION));
-        nos.set(new Symbol(order.instrumentSymbol()));
+        nos.set(new Symbol(fixSymbolMapper.toVenueSymbol(order.instrumentSymbol())));
         nos.set(new quickfix.field.Side(
                 order.side() == Side.BUY ? quickfix.field.Side.BUY : quickfix.field.Side.SELL));
         nos.setString(OrderQty.FIELD, order.quantity().toPlainString());

@@ -78,6 +78,7 @@ Used when `OMS_ROUTING_BACKEND=fix`. See [fix-out.md](fix-out.md) for session ma
 | `OMS_FIX_MAX_OUTBOUND_JOB_AGE_MS` | `0` | **0** = off; else reject stale `WORKING` at dequeue (`FIX_OUTBOUND_JOB_EXPIRED`). |
 | `OMS_FIX_VENUE_ID_FOR_EXECUTIONS` | `FIX` | `venue_id` on executions from inbound ERs. |
 | `OMS_FIX_USE_DATA_DICTIONARY` | `false` | QuickFIX/J data dictionary flag. |
+| `OMS_FIX_SYMBOL_MAP_JSON` | (empty) | JSON object mapping OMS `instrument_symbol` → broker FIX `Symbol` on NOS (case-insensitive keys). Empty → identity. |
 | `OMS_FIX_ROUTE_KEY` | `default` | `fix_route_state.route_key` read by the outbound worker; toggle send via internal API or SQL. |
 | `OMS_FIX_OUTBOUND_TOKENS_PER_SECOND` | `0` | NOS token bucket refill rate; **`<= 0` disables** pacing. |
 | `OMS_FIX_OUTBOUND_TOKEN_BURST` | `100` | Bucket capacity when rate limiting is enabled (minimum **1** in config). |

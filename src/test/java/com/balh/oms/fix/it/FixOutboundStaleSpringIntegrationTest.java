@@ -54,7 +54,7 @@ class FixOutboundStaleSpringIntegrationTest extends AbstractPostgresIntegrationT
 
     @BeforeEach
     void reset() {
-        FixRoundTripAcceptorApplication.NOS_RECEIVED.set(0);
+        FixRoundTripAcceptorApplication.resetItHooks();
         jdbc.update("TRUNCATE TABLE orders CASCADE");
     }
 

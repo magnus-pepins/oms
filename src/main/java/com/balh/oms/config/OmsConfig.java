@@ -288,6 +288,11 @@ public class OmsConfig {
         /** Venue id stamped on {@code ExecutionTradeCommand} from inbound ERs. */
         private String venueIdForExecutions = "FIX";
         private boolean useDataDictionary = false;
+        /**
+         * JSON object: OMS {@code instrument_symbol} (any case) → broker {@code Symbol} on outbound {@code NewOrderSingle}
+         * (e.g. {@code {"AAPL":"AAPL.NMS"}}). {@code {}} or empty = identity mapping.
+         */
+        private String symbolMapJson = "{}";
         /** Logical FIX route key for {@code fix_route_state} (default single route). */
         private String routeKey = "default";
         /** NOS rate limit; {@code <= 0} disables token bucket (default). */
@@ -362,6 +367,14 @@ public class OmsConfig {
         }
         public boolean isUseDataDictionary() { return useDataDictionary; }
         public void setUseDataDictionary(boolean useDataDictionary) { this.useDataDictionary = useDataDictionary; }
+
+        public String getSymbolMapJson() {
+            return symbolMapJson;
+        }
+
+        public void setSymbolMapJson(String symbolMapJson) {
+            this.symbolMapJson = symbolMapJson == null || symbolMapJson.isBlank() ? "{}" : symbolMapJson.trim();
+        }
 
         public String getRouteKey() {
             return routeKey;

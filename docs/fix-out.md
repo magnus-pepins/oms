@@ -10,6 +10,7 @@ environment variables, and runbooks for **QuickFIX/J** wired to `FixRouteDispatc
 - **Smoke test:** `FixLogonSmokeTest` — embedded acceptor + initiator logon on a loopback port.
 - **Spring IT:** `FixRoutingSpringIntegrationTest` — `oms.routing.backend=fix`, `oms.fix.auto-start=false`, asserts `RouteDispatcher` is `FixRouteDispatcher`.
 - **Round-trip IT:** `FixRoundTripSpringIntegrationTest` (profile `fix-roundtrip-it`) — embedded loopback **acceptor** (`FixRoundTripEmbeddedAcceptor`, `SmartLifecycle` phase before initiator) + `oms.fix.auto-start=true`; inserts `WORKING` order, `RouteDispatcher.enqueueWorkingOrder`, awaits **FILLED** and asserts **`oms_fix_nos_sent_total`** / **`oms_fix_inbound_execution_reports_total`** (`disposition=trade_APPLIED`).
+- **Symbol-map round-trip IT:** `FixRoundTripSymbolMapSpringIntegrationTest` — same profile; **`oms.fix.symbol-map-json`** maps OMS `instrument_symbol` → broker `Symbol` on wire; order row keeps client symbol.
 - **JDBC session store IT:** `FixRoundTripJdbcStoreSpringIntegrationTest` — same profile with `oms.fix.session-store-type=jdbc`; asserts **`oms_fix_sessions`** row after fill (Flyway **V9**).
 - **Dedicated session JDBC pool IT:** `FixRoundTripJdbcDedicatedSessionPoolSpringIntegrationTest` — `oms.fix.session-jdbc-datasource-enabled=true` with a second Hikari pool (IT points at the same Postgres as wiring proof).
 - **Route-disabled outbound IT:** `FixOutboundRouteDisabledSpringIntegrationTest` — `send_enabled=false` → no NOS, **`oms_fix_outbound_route_disabled_skips_total`**, order stays **WORKING**; after re-enable, **FILLED** as usual.
@@ -37,6 +38,7 @@ environment variables, and runbooks for **QuickFIX/J** wired to `FixRouteDispatc
 | `OMS_FIX_MAX_OUTBOUND_JOB_AGE_MS` | **0** = off. Otherwise reject **WORKING** orders at FIX dequeue when `now - accepted_at` exceeds this (ms); **`terminal_reason=FIX_OUTBOUND_JOB_EXPIRED`**. |
 | `OMS_FIX_VENUE_ID_FOR_EXECUTIONS` | Venue id on `ExecutionTradeCommand` / cancel from inbound ERs. |
 | `OMS_FIX_USE_DATA_DICTIONARY` | `Y`/`N` passed to QuickFIX/J (`false` by default, matching smoke test). |
+| `OMS_FIX_SYMBOL_MAP_JSON` | JSON object: OMS `instrument_symbol` key (matched case-insensitively) → broker **`Symbol`** on outbound `NewOrderSingle`. Empty / unset → identity mapping (`{}` in config). |
 | `OMS_FIX_ROUTE_KEY` | Matches `fix_route_state.route_key` (default `default`). |
 | `OMS_FIX_OUTBOUND_TOKENS_PER_SECOND` | **0** = unlimited NOS rate; **&gt; 0** enables token-bucket pacing (`OMS_FIX_OUTBOUND_TOKEN_BURST` caps burst). |
 | `OMS_FIX_OUTBOUND_TOKEN_BURST` | Max tokens in bucket when rate limiting is enabled (default `100`). |
@@ -48,7 +50,7 @@ See `application.yaml` (`oms.fix.*`) and `.env.example`. **Broker UAT soak (huma
 
 ## Field mapping (v1)
 
-- **Outbound `NewOrderSingle`:** `ClOrdID` = order UUID string; `Symbol` = `instrumentSymbol`; `Side`; `OrderQty`; `OrdType` LIMIT if `limitPrice` set else MARKET; `Price` when limit; `TimeInForce` from order string (`DAY` default); `TransactTime` UTC.
+- **Outbound `NewOrderSingle`:** `ClOrdID` = order UUID string; `Symbol` = `FixSymbolMapper.toVenueSymbol(instrumentSymbol)` from **`oms.fix.symbol-map-json`** (identity when unmapped); `Side`; `OrderQty`; `OrdType` LIMIT if `limitPrice` set else MARKET; `Price` when limit; `TimeInForce` from order string (`DAY` default); `TransactTime` UTC.
 - **Inbound `ExecutionReport`:** `ClOrdID` → order id (UUID); `ExecID` → `venue_exec_ref`; `TransactTime` → `venueTs` (fallback `Instant.now()`); **Fill / Partial fill:** `LastQty`, `LastPx` (optional → `0`), `LeavesQty`, `CumQty`; **Canceled:** `ExecType=CANCELED`; **Rejected (new order):** `ExecType=Rejected` → `OrderRejected` / `terminal_reason=VENUE_REJECT`.
 - **Inbound `OrderCancelReject` (9):** `OrigClOrdID` (else `ClOrdID`) → order id; `venue_exec_ref` = `ocr-{OrderID}-{CxlRejReason}`; same **`OrderRejected`** path as ER reject.
 

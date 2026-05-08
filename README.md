@@ -58,6 +58,9 @@ and the milestone plan it links to. **Phase 1 exit (UAT soak, §16 #3, prod sess
 - Flyway **V5** — `control_decisions` (one row per `ControlTailer.apply` outcome)
   and `oms_runtime_flags` (interim Postgres-backed **global halt** until Redis/Ops
   toggles exist).
+- **Internal HTTP** — `GET` / `PATCH /internal/v1/runtime-flags/global_halt` (same
+  `X-OMS-Internal-Key` gate as other `/internal/v1/**` routes) to read/update the
+  halt flag for Ops Console proxies.
 - **`ControlRiskEvaluator`** — `RISK_KILL_SWITCH` when `global_halt` is true;
   optional instrument allowlist; fat-finger limit price / quantity; notional cap
   (`RISK_NOTIONAL_CAP` on `reject_code`). See [docs/risk-checks.md](docs/risk-checks.md).

@@ -5,7 +5,7 @@ the optional Ledger buying-power gate and the WORKING CAS.
 
 | Check | `RejectCode` | Config | Notes |
 |-------|--------------|--------|--------|
-| **Global halt** | `RISK_KILL_SWITCH` | Postgres `oms_runtime_flags` row `global_halt=true` | Interim until Ops toggles Redis-backed flags. |
+| **Global halt** | `RISK_KILL_SWITCH` | Postgres `oms_runtime_flags` row `global_halt=true` | Interim until Ops toggles Redis-backed flags. Ops Console toggles via `GET`/`PATCH /internal/v1/runtime-flags/global_halt` (internal API key). |
 | **Instrument allowlist** | `RISK_INVALID_INSTRUMENT` | `OMS_RISK_INSTRUMENT_ALLOWLIST_ENABLED`, `OMS_RISK_ALLOWED_INSTRUMENT_SYMBOLS` (comma-separated, uppercased at compare) | When disabled, all symbols pass. |
 | **Tradable universe (v1)** | `RISK_INSTRUMENT_NOT_ALLOWED` | `OMS_RISK_INSTRUMENT_TRADABILITY_CHECK_ENABLED`, `OMS_RISK_TRADABLE_INSTRUMENT_SYMBOLS` | Runs **after** the allowlist when both are on. **v1** is a config list only; a marketdata-backed **`instruments`** cache (§10) is still future work. When enabled with an empty symbol list, no symbol passes (fail-closed). |
 | **Fat-finger limit price** | `RISK_FAT_FINGER_PRICE` | `OMS_RISK_FAT_FINGER_MAX_LIMIT_PRICE` | `0` disables. Compares to order `limit_price` when present. |

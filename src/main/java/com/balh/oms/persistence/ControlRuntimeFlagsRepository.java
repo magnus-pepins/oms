@@ -1,10 +1,12 @@
 package com.balh.oms.persistence;
 
+import java.util.List;
+import java.util.Optional;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
 
 /**
- * Reads {@code oms_runtime_flags} (Flyway V5). Missing row means {@code false}.
+ * Reads and updates {@code oms_runtime_flags} (Flyway V5). Missing row means {@code false} for halt.
  */
 @Repository
 public class ControlRuntimeFlagsRepository {
@@ -16,13 +18,35 @@ public class ControlRuntimeFlagsRepository {
     }
 
     public boolean isGlobalHalt() {
-        Integer n = jdbc.queryForObject(
+        return findGlobalHaltRow().map(GlobalHaltRow::value).orElse(false);
+    }
+
+    /** Present when a row exists for {@code global_halt}; absent when no row has been written yet. */
+    public Optional<GlobalHaltRow> findGlobalHaltRow() {
+        List<GlobalHaltRow> rows =
+                jdbc.query(
+                        """
+                                SELECT value_boolean, updated_at FROM oms_runtime_flags
+                                 WHERE flag_key = ?
+                                """,
+                        (rs, rowNum) ->
+                                new GlobalHaltRow(
+                                        rs.getBoolean("value_boolean"),
+                                        rs.getTimestamp("updated_at").toInstant()),
+                        OmsRuntimeFlagKeys.GLOBAL_HALT);
+        return rows.stream().findFirst();
+    }
+
+    public void setGlobalHalt(boolean halted) {
+        jdbc.update(
                 """
-                        SELECT COUNT(*)::int FROM oms_runtime_flags
-                         WHERE flag_key = ? AND value_boolean = true
+                        INSERT INTO oms_runtime_flags (flag_key, value_boolean, updated_at)
+                        VALUES (?, ?, NOW())
+                        ON CONFLICT (flag_key) DO UPDATE SET
+                            value_boolean = EXCLUDED.value_boolean,
+                            updated_at = NOW()
                         """,
-                Integer.class,
-                OmsRuntimeFlagKeys.GLOBAL_HALT);
-        return n != null && n > 0;
+                OmsRuntimeFlagKeys.GLOBAL_HALT,
+                halted);
     }
 }

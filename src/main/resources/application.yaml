@@ -111,6 +111,8 @@ oms:
     manual-action-list-default-limit: ${OMS_SETTLEMENT_MANUAL_ACTION_LIST_DEFAULT_LIMIT:50}
     manual-action-type-max-length: ${OMS_SETTLEMENT_MANUAL_ACTION_TYPE_MAX_LENGTH:128}
     manual-action-payload-json-max-chars: ${OMS_SETTLEMENT_MANUAL_ACTION_PAYLOAD_JSON_MAX_CHARS:20000}
+    # When true, approve runs supported action_type handlers in the same DB transaction (see ManualSettlementActionTypes).
+    manual-action-auto-apply-enabled: ${OMS_SETTLEMENT_MANUAL_ACTION_AUTO_APPLY_ENABLED:true}
   fix:
     # When routing.backend=fix and auto-start=true, starts SocketInitiator + outbound drain scheduler.
     auto-start: ${OMS_FIX_AUTO_START:false}

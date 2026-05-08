@@ -3,6 +3,7 @@ package com.balh.oms.ingress;
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.persistence.ManualSettlementActionsRepository;
 import com.balh.oms.persistence.ManualSettlementActionRow;
+import com.balh.oms.settlement.ManualSettlementActionApplicationService;
 import java.time.Duration;
 import java.time.Instant;
 import org.springframework.format.annotation.DateTimeFormat;
@@ -33,10 +34,15 @@ public class ManualSettlementActionsController {
     public record ApproveManualSettlementActionRequest(String approvedBy) {}
 
     private final ManualSettlementActionsRepository repo;
+    private final ManualSettlementActionApplicationService approveService;
     private final OmsConfig config;
 
-    public ManualSettlementActionsController(ManualSettlementActionsRepository repo, OmsConfig config) {
+    public ManualSettlementActionsController(
+            ManualSettlementActionsRepository repo,
+            ManualSettlementActionApplicationService approveService,
+            OmsConfig config) {
         this.repo = repo;
+        this.approveService = approveService;
         this.config = config;
     }
 
@@ -130,7 +136,7 @@ public class ManualSettlementActionsController {
         if (approvedBy.isEmpty()) {
             return ResponseEntity.badRequest().build();
         }
-        return switch (repo.approve(id, approvedBy)) {
+        return switch (approveService.approve(id, approvedBy)) {
             case OK -> repo.findById(id)
                     .map(ManualSettlementActionsController::toResponse)
                     .map(ResponseEntity::ok)

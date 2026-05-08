@@ -591,6 +591,11 @@ public class OmsConfig {
         private int manualActionTypeMaxLength = 128;
         /** Max JSON text length accepted for {@code payload_json} on create. */
         private int manualActionPayloadJsonMaxChars = 20_000;
+        /**
+         * When {@code true} (default), {@code POST …/manual-actions/{id}/approve} runs supported
+         * {@code action_type} handlers in the same transaction as the approve CAS (see {@link ManualSettlementActionTypes}).
+         */
+        private boolean manualActionAutoApplyEnabled = true;
 
         public String getDefaultCustodyAccountId() {
             return defaultCustodyAccountId;
@@ -666,6 +671,14 @@ public class OmsConfig {
 
         public void setManualActionPayloadJsonMaxChars(int manualActionPayloadJsonMaxChars) {
             this.manualActionPayloadJsonMaxChars = Math.min(500_000, Math.max(256, manualActionPayloadJsonMaxChars));
+        }
+
+        public boolean isManualActionAutoApplyEnabled() {
+            return manualActionAutoApplyEnabled;
+        }
+
+        public void setManualActionAutoApplyEnabled(boolean manualActionAutoApplyEnabled) {
+            this.manualActionAutoApplyEnabled = manualActionAutoApplyEnabled;
         }
     }
 }

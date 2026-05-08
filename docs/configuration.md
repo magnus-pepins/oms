@@ -75,6 +75,7 @@ new key here when introducing one.
 | `OMS_SETTLEMENT_MANUAL_ACTION_LIST_DEFAULT_LIMIT` | `50` | Default page size when **`limit`** is omitted. |
 | `OMS_SETTLEMENT_MANUAL_ACTION_TYPE_MAX_LENGTH` | `128` | Max length of **`action_type`** on create (capped at **512** in `OmsConfig`). |
 | `OMS_SETTLEMENT_MANUAL_ACTION_PAYLOAD_JSON_MAX_CHARS` | `20000` | Max characters accepted for **`payload_json`** text on create (capped at **500000** in `OmsConfig`). |
+| `OMS_SETTLEMENT_MANUAL_ACTION_AUTO_APPLY_ENABLED` | `true` | When **`true`**, **`POST …/manual-actions/{id}/approve`** runs supported **`action_type`** handlers in the **same** transaction as the approve CAS (see [settlement.md](settlement.md) — **`ManualSettlementActionTypes`**). Set **`false`** to record approvals only (legacy behaviour). |
 
 ## FIX (slice 4+)
 

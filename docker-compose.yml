@@ -27,5 +27,27 @@ services:
       - "8222:8222"
     profiles: ["with-nats"]
 
+  # Optional: isolated Postgres for QuickFIX JdbcStore only (plan §6.4).
+  # `docker compose --profile with-fix-session-db up -d postgres-fix-sessions`
+  # then apply V9 DDL — see docs/fix-session-store-isolation.md
+  postgres-fix-sessions:
+    image: postgres:16-alpine
+    container_name: oms-postgres-fix-sessions
+    profiles: ["with-fix-session-db"]
+    environment:
+      POSTGRES_DB: oms_fix_store
+      POSTGRES_USER: oms_fix
+      POSTGRES_PASSWORD: oms_fix
+    ports:
+      - "5433:5432"
+    volumes:
+      - oms-postgres-fix-sessions-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U oms_fix -d oms_fix_store"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
 volumes:
   oms-postgres-data:
+  oms-postgres-fix-sessions-data:

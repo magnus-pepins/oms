@@ -82,7 +82,7 @@ and the milestone plan it links to.
 
 ## What is NOT in slice 1
 
-- FIX **production** hardening (dedicated FIX session store, outbound token bucket, `route_state`, TLS, broker UAT soak) — see [oms-realignment-2026-05-07.md](../system-documentation/plans/oms-realignment-2026-05-07.md) Slice 4 **deferred** items; Java skeleton is in-repo.
+- FIX **production** hardening (named broker UAT sign-off, multi-day soak) — see [oms-realignment-2026-05-07.md](../system-documentation/plans/oms-realignment-2026-05-07.md) and [docs/fix-broker-uat-soak.md](docs/fix-broker-uat-soak.md). **Optional** second Postgres for JDBC session store: Compose profile **`with-fix-session-db`** + [docs/fix-session-store-isolation.md](docs/fix-session-store-isolation.md).
 - Full risk catalogue from the master plan (STP, sanctions re-check, venue-specific
   checks, …) — only the slice‑2 subset above is implemented so far.
 - Cluster-aware lease ownership (slice 1.5).
@@ -93,6 +93,8 @@ and the milestone plan it links to.
 # 1. Postgres (and optionally NATS JetStream for local fanout)
 docker compose up -d postgres
 # docker compose --profile with-nats up -d   # then OMS_NATS_ENABLED=true OMS_NATS_URL=nats://localhost:4222
+# Optional second Postgres for QuickFIX JdbcStore only (see docs/fix-session-store-isolation.md):
+# docker compose --profile with-fix-session-db up -d postgres-fix-sessions
 
 # 2. Build
 ./gradlew build

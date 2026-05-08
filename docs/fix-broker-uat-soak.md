@@ -2,6 +2,8 @@
 
 This is a **human-run** checklist for validating the OMS QuickFIX/J initiator against a broker **UAT** or paper environment after config changes (TLS, comp IDs, store type, seq). Automated soak (multi-hour traffic replay) is **not** implemented in CI; use this in change windows before production.
 
+**Scheduling and Phase 1 sign-off:** use the sibling runbook [plans/oms-phase1-exit-actions.md](../../system-documentation/plans/oms-phase1-exit-actions.md) (system-documentation) for **owner, broker name, soak window, evidence bundle**, and **§16 #3** / **production session-store** decision slots alongside this technical procedure.
+
 ## Preconditions
 
 - `OMS_ROUTING_BACKEND=fix`, `OMS_FIX_AUTO_START=true` in the soak environment only.

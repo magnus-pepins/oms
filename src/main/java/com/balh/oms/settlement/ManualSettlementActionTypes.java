@@ -13,4 +13,10 @@ public final class ManualSettlementActionTypes {
 
     /** Calls {@link SettlementConfirmProcessor#advanceOneSettlementStep(long)} once on {@code execution_id}. */
     public static final String ADVANCE_SETTLEMENT_ONE_STEP = "ADVANCE_SETTLEMENT_ONE_STEP";
+
+    /**
+     * Enqueues one pending {@code broker_settlement_confirm} row for {@code execution_id} via {@link
+     * SettlementConfirmProcessor#enqueueBrokerSettlementConfirmForTradeOrThrow(long)} (idempotent if already queued).
+     */
+    public static final String REGISTER_BROKER_CONFIRM = "REGISTER_BROKER_CONFIRM";
 }

@@ -72,6 +72,24 @@ public class SettlementConfirmProcessor {
     }
 
     /**
+     * Inserts a pending {@code broker_settlement_confirm} row when the execution exists and is {@code TRADE}.
+     * Duplicate queue rows are ignored ({@code ON CONFLICT DO NOTHING}).
+     *
+     * @return {@code 1} if a new row was inserted, {@code 0} if a pending or applied row already existed for this
+     *     execution
+     * @throws IllegalStateException if the execution id is unknown or not {@code TRADE}
+     */
+    public int enqueueBrokerSettlementConfirmForTradeOrThrow(long executionId) {
+        var snap = executions.findSettlementRow(executionId).orElseThrow(() ->
+                new IllegalStateException("execution not found for broker confirm enqueue: " + executionId));
+        if (!"TRADE".equalsIgnoreCase(snap.execType())) {
+            throw new IllegalStateException(
+                    "broker confirm enqueue applies to TRADE executions only: " + executionId);
+        }
+        return confirms.insertIgnore(executionId);
+    }
+
+    /**
      * Registers confirms then drains the queue in separate transactions (each batch pass is
      * transactional via the proxied {@link #processPendingBatch(int)}).
      */

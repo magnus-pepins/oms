@@ -246,6 +246,61 @@ class ManualSettlementActionsControllerIntegrationTest extends AbstractPostgresI
                 .isEqualTo("matched");
     }
 
+    @Test
+    void approve_registerBrokerConfirm_insertsPendingConfirmSecondApproveIdempotent() {
+        long exId = seedTradeExecution();
+        assertThat(jdbc.queryForObject(
+                        "SELECT COUNT(*)::int FROM broker_settlement_confirm WHERE execution_id = ?",
+                        Integer.class,
+                        exId))
+                .isZero();
+
+        HttpHeaders h = headers();
+        long actionId1 = postCreateManualAction(exId, ManualSettlementActionTypes.REGISTER_BROKER_CONFIRM, h);
+        postApprove(actionId1, h);
+
+        assertThat(jdbc.queryForObject(
+                        "SELECT COUNT(*)::int FROM broker_settlement_confirm WHERE execution_id = ? AND applied_at IS NULL",
+                        Integer.class,
+                        exId))
+                .isEqualTo(1);
+
+        long actionId2 = postCreateManualAction(exId, ManualSettlementActionTypes.REGISTER_BROKER_CONFIRM, h);
+        postApprove(actionId2, h);
+
+        assertThat(jdbc.queryForObject(
+                        "SELECT COUNT(*)::int FROM broker_settlement_confirm WHERE execution_id = ?",
+                        Integer.class,
+                        exId))
+                .isEqualTo(1);
+    }
+
+    private long postCreateManualAction(long executionId, String actionType, HttpHeaders h) {
+        var createBody =
+                new ManualSettlementActionsController.CreateManualSettlementActionRequest(
+                        executionId, actionType, "alice@example.com", "{}");
+        ResponseEntity<ManualSettlementActionResponse> created =
+                http.exchange(
+                        base(),
+                        HttpMethod.POST,
+                        new HttpEntity<>(createBody, h),
+                        new ParameterizedTypeReference<>() {});
+        assertThat(created.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(created.getBody()).isNotNull();
+        return created.getBody().id();
+    }
+
+    private void postApprove(long actionId, HttpHeaders h) {
+        var approveBody = new ManualSettlementActionsController.ApproveManualSettlementActionRequest("bob@example.com");
+        ResponseEntity<ManualSettlementActionResponse> approved =
+                http.exchange(
+                        base() + "/" + actionId + "/approve",
+                        HttpMethod.POST,
+                        new HttpEntity<>(approveBody, h),
+                        new ParameterizedTypeReference<>() {});
+        assertThat(approved.getStatusCode()).isEqualTo(HttpStatus.OK);
+    }
+
     private long seedTradeExecution() {
         UUID orderId = UUID.randomUUID();
         UUID accountId = UUID.randomUUID();

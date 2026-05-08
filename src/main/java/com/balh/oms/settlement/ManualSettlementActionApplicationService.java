@@ -10,7 +10,8 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 /**
- * Four-eyes approve then apply supported {@code action_type} handlers in one transaction (slice 6).
+ * Four-eyes approve then apply supported {@code action_type} handlers in one transaction (slice 6):
+ * {@link ManualSettlementActionTypes}.
  */
 @Service
 public class ManualSettlementActionApplicationService {
@@ -75,6 +76,15 @@ public class ManualSettlementActionApplicationService {
                     ManualSettlementActionTypes.ADVANCE_SETTLEMENT_ONE_STEP,
                     row.executionId(),
                     next);
+            return;
+        }
+        if (type.equalsIgnoreCase(ManualSettlementActionTypes.REGISTER_BROKER_CONFIRM)) {
+            int inserted = settlement.enqueueBrokerSettlementConfirmForTradeOrThrow(row.executionId());
+            log.info(
+                    "manual settlement {} applied executionId={} brokerConfirmRowsInserted={}",
+                    ManualSettlementActionTypes.REGISTER_BROKER_CONFIRM,
+                    row.executionId(),
+                    inserted);
             return;
         }
         log.debug("manual settlement action approved with no auto-executor type={} id={}", type, row.id());

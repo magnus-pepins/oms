@@ -13,6 +13,7 @@ import java.util.List;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Broker confirm queue + full §12.3 pipeline without FIX (seeded {@code orders} / {@code executions} / {@code positions}).
@@ -175,6 +176,47 @@ class SettlementPipelineIntegrationTest extends AbstractPostgresIntegrationTest 
         raw = raw.replace("-1", String.valueOf(seed.executionId()));
         var tree = objectMapper.readTree(raw);
         assertThat(tree.get("executionIds").get(0).asLong()).isEqualTo(seed.executionId());
+    }
+
+    @Test
+    void enqueueBrokerSettlementConfirm_nonTrade_throws() {
+        UUID orderId = UUID.randomUUID();
+        UUID accountId = UUID.randomUUID();
+        jdbc.update(
+                """
+                        INSERT INTO orders (
+                          id, account_id, client_idempotency_key, shard_id, version,
+                          status, side, instrument_symbol, quantity, limit_price, time_in_force,
+                          received_at, accepted_at, account_id_hash, ledger_balance_id, cum_filled_quantity
+                        ) VALUES (
+                          ?, ?, ?, 0, 2, 'REJECTED', 'BUY', 'AAPL', 10, 5, 'DAY',
+                          NOW(), NOW(), 'h', NULL, 0
+                        )
+                        """,
+                orderId,
+                accountId,
+                "settle-rej-" + orderId);
+        jdbc.update(
+                """
+                        INSERT INTO executions (
+                          order_id, account_id, venue_id, venue_ts, venue_exec_ref,
+                          last_quantity, last_price, leaves_quantity, cum_quantity_after,
+                          exec_type, raw_envelope_json
+                        ) VALUES (
+                          ?, ?, 'SIM', NOW(), ?,
+                          0, 0, 10, 0,
+                          CAST('REJECT' AS execution_exec_type), CAST('{}' AS JSONB)
+                        )
+                        """,
+                orderId,
+                accountId,
+                "vref-rej-" + orderId);
+        long exId = jdbc.queryForObject(
+                "SELECT id FROM executions WHERE order_id = ? ORDER BY id DESC LIMIT 1", Long.class, orderId);
+
+        assertThatThrownBy(() -> processor.enqueueBrokerSettlementConfirmForTradeOrThrow(exId))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("TRADE");
     }
 
     private Seed seedFilledBuyOrderWithExecution() {

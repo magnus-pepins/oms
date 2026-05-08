@@ -86,6 +86,8 @@ oms:
   risk:
     instrument-allowlist-enabled: ${OMS_RISK_INSTRUMENT_ALLOWLIST_ENABLED:false}
     allowed-instrument-symbols: ${OMS_RISK_ALLOWED_INSTRUMENT_SYMBOLS:}
+    instrument-tradability-check-enabled: ${OMS_RISK_INSTRUMENT_TRADABILITY_CHECK_ENABLED:false}
+    tradable-instrument-symbols: ${OMS_RISK_TRADABLE_INSTRUMENT_SYMBOLS:}
     fat-finger-max-limit-price: ${OMS_RISK_FAT_FINGER_MAX_LIMIT_PRICE:0}
     fat-finger-max-order-quantity: ${OMS_RISK_FAT_FINGER_MAX_ORDER_QUANTITY:0}
     max-order-notional: ${OMS_RISK_MAX_ORDER_NOTIONAL:0}

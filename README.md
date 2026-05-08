@@ -78,6 +78,8 @@ and the milestone plan it links to.
   when `OMS_ROUTING_BACKEND=simulated`, drains a queue and fills in three chunks at `limit_price`.
   **`FixRouteDispatcher`** + QuickFIX/J initiator/outbound/inbound when `OMS_ROUTING_BACKEND=fix` (slice 4; see [docs/return-path.md](docs/return-path.md) and [docs/fix-out.md](docs/fix-out.md)).
 
+- **Slice 5 prep:** FIX outbound **`oms.fix.symbol-map-json`**; optional **tradability** list → **`RISK_INSTRUMENT_NOT_ALLOWED`** ([docs/fix-out.md](docs/fix-out.md), [docs/risk-checks.md](docs/risk-checks.md)).
+
 ## What is NOT in slice 1
 
 - FIX **production** hardening (dedicated FIX session store, outbound token bucket, `route_state`, TLS, broker UAT soak) — see [oms-realignment-2026-05-07.md](../system-documentation/plans/oms-realignment-2026-05-07.md) Slice 4 **deferred** items; Java skeleton is in-repo.

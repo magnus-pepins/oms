@@ -14,6 +14,8 @@ public enum RejectCode {
     RISK_KILL_SWITCH,
     RISK_BUYING_POWER,
     RISK_INVALID_INSTRUMENT,
+    /** Order symbol not in configured tradable universe (v1 list; future: instruments cache / venue). */
+    RISK_INSTRUMENT_NOT_ALLOWED,
     RISK_FAT_FINGER_PRICE,
     RISK_FAT_FINGER_SIZE,
     RISK_RATE_LIMIT,

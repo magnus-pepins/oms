@@ -207,6 +207,13 @@ public class OmsConfig {
     public static class Risk {
         private boolean instrumentAllowlistEnabled = false;
         private String allowedInstrumentSymbols = "";
+        /**
+         * When {@code true}, symbols must appear in {@link #tradableInstrumentSymbolSet()} or the order is rejected
+         * with {@link com.balh.oms.domain.RejectCode#RISK_INSTRUMENT_NOT_ALLOWED} (slice 5 v1; replaces full
+         * marketdata-backed {@code instruments} cache until that integration exists).
+         */
+        private boolean instrumentTradabilityCheckEnabled = false;
+        private String tradableInstrumentSymbols = "";
         private BigDecimal fatFingerMaxLimitPrice = BigDecimal.ZERO;
         private BigDecimal fatFingerMaxOrderQuantity = BigDecimal.ZERO;
         private BigDecimal maxOrderNotional = BigDecimal.ZERO;
@@ -215,6 +222,36 @@ public class OmsConfig {
         public void setInstrumentAllowlistEnabled(boolean v) { this.instrumentAllowlistEnabled = v; }
         public String getAllowedInstrumentSymbols() { return allowedInstrumentSymbols; }
         public void setAllowedInstrumentSymbols(String v) { this.allowedInstrumentSymbols = v == null ? "" : v; }
+
+        public boolean isInstrumentTradabilityCheckEnabled() {
+            return instrumentTradabilityCheckEnabled;
+        }
+
+        public void setInstrumentTradabilityCheckEnabled(boolean instrumentTradabilityCheckEnabled) {
+            this.instrumentTradabilityCheckEnabled = instrumentTradabilityCheckEnabled;
+        }
+
+        public String getTradableInstrumentSymbols() {
+            return tradableInstrumentSymbols;
+        }
+
+        public void setTradableInstrumentSymbols(String tradableInstrumentSymbols) {
+            this.tradableInstrumentSymbols = tradableInstrumentSymbols == null ? "" : tradableInstrumentSymbols;
+        }
+
+        /** Uppercased symbols from {@link #tradableInstrumentSymbols}, comma-separated. */
+        public Set<String> tradableInstrumentSymbolSet() {
+            if (!instrumentTradabilityCheckEnabled
+                    || tradableInstrumentSymbols == null
+                    || tradableInstrumentSymbols.isBlank()) {
+                return Collections.emptySet();
+            }
+            return Arrays.stream(tradableInstrumentSymbols.split(","))
+                    .map(s -> s.trim().toUpperCase(Locale.ROOT))
+                    .filter(s -> !s.isEmpty())
+                    .collect(Collectors.toUnmodifiableSet());
+        }
+
         public BigDecimal getFatFingerMaxLimitPrice() { return fatFingerMaxLimitPrice; }
         public void setFatFingerMaxLimitPrice(BigDecimal v) { this.fatFingerMaxLimitPrice = v == null ? BigDecimal.ZERO : v; }
         public BigDecimal getFatFingerMaxOrderQuantity() { return fatFingerMaxOrderQuantity; }

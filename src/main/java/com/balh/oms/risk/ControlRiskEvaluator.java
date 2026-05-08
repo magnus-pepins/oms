@@ -48,6 +48,15 @@ public class ControlRiskEvaluator {
                 return Optional.of(RejectCode.RISK_INVALID_INSTRUMENT);
             }
         }
+        if (risk.isInstrumentTradabilityCheckEnabled()) {
+            Set<String> tradable = risk.tradableInstrumentSymbolSet();
+            String sym = order.instrumentSymbol() == null
+                    ? ""
+                    : order.instrumentSymbol().trim().toUpperCase(Locale.ROOT);
+            if (sym.isEmpty() || !tradable.contains(sym)) {
+                return Optional.of(RejectCode.RISK_INSTRUMENT_NOT_ALLOWED);
+            }
+        }
         BigDecimal maxLimitPx = risk.getFatFingerMaxLimitPrice();
         if (maxLimitPx.compareTo(BigDecimal.ZERO) > 0
                 && order.limitPrice() != null

@@ -45,6 +45,8 @@ new key here when introducing one.
 |-----|---------|---------|
 | `OMS_RISK_INSTRUMENT_ALLOWLIST_ENABLED` | `false` | When `true`, only symbols in `OMS_RISK_ALLOWED_INSTRUMENT_SYMBOLS` may pass control. |
 | `OMS_RISK_ALLOWED_INSTRUMENT_SYMBOLS` | (empty) | Comma-separated list (e.g. `AAPL,MSFT`). Compared uppercased. |
+| `OMS_RISK_INSTRUMENT_TRADABILITY_CHECK_ENABLED` | `false` | When `true`, symbol must appear in `OMS_RISK_TRADABLE_INSTRUMENT_SYMBOLS` or control rejects **`RISK_INSTRUMENT_NOT_ALLOWED`** (slice 5 v1 list; MP-backed cache later). |
+| `OMS_RISK_TRADABLE_INSTRUMENT_SYMBOLS` | (empty) | Comma-separated tradable symbols when tradability check is enabled. |
 | `OMS_RISK_FAT_FINGER_MAX_LIMIT_PRICE` | `0` | Max limit price per order; `0` disables. |
 | `OMS_RISK_FAT_FINGER_MAX_ORDER_QUANTITY` | `0` | Max order quantity; `0` disables. |
 | `OMS_RISK_MAX_ORDER_NOTIONAL` | `0` | Max `quantity × limit_price`; `0` disables. |

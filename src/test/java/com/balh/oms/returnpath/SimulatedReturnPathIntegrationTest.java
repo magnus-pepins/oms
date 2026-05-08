@@ -71,6 +71,11 @@ class SimulatedReturnPathIntegrationTest extends AbstractPostgresIntegrationTest
                         orderId))
                 .isEqualTo("AAPL");
         assertThat(jdbc.queryForObject(
+                        "SELECT (snapshot_json->>'schemaVersion')::int FROM market_context WHERE order_id = ?",
+                        Integer.class,
+                        orderId))
+                .isEqualTo(MarketContextVenueEvidence.SCHEMA_VERSION);
+        assertThat(jdbc.queryForObject(
                         "SELECT snapshot_json->>'evidenceSource' FROM market_context WHERE order_id = ?",
                         String.class,
                         orderId))

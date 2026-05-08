@@ -57,4 +57,19 @@ public class FixRouteStateRepository {
                 .addValue("note", note);
         return jdbc.update(UPDATE_SQL, params) == 1;
     }
+
+    /**
+     * Start-of-day style reconciliation: enable outbound send on every route row (operator feature-flagged).
+     *
+     * @return number of rows updated
+     */
+    public int sodEnableSendOnAllRoutes(String updatedBy) {
+        String sql = """
+                UPDATE fix_route_state
+                   SET send_enabled = TRUE,
+                       updated_at = NOW(),
+                       updated_by = :updated_by
+                """;
+        return jdbc.update(sql, new MapSqlParameterSource("updated_by", updatedBy));
+    }
 }

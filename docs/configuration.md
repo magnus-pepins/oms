@@ -81,6 +81,15 @@ Used when `OMS_ROUTING_BACKEND=fix`. See [fix-out.md](fix-out.md) for session ma
 | `OMS_FIX_ROUTE_KEY` | `default` | `fix_route_state.route_key` read by the outbound worker; toggle send via internal API or SQL. |
 | `OMS_FIX_OUTBOUND_TOKENS_PER_SECOND` | `0` | NOS token bucket refill rate; **`<= 0` disables** pacing. |
 | `OMS_FIX_OUTBOUND_TOKEN_BURST` | `100` | Bucket capacity when rate limiting is enabled (minimum **1** in config). |
+| `OMS_FIX_SESSION_STORE_TYPE` | `file` | **`file`** — `FileStoreFactory`; **`jdbc`** — `JdbcStoreFactory` on the Spring `DataSource` (Flyway **V9** `oms_fix_sessions` / `oms_fix_messages`). |
+| `OMS_FIX_ROUTE_STATE_SOD_ENABLED` | `false` | When **`true`**, cron job sets `fix_route_state.send_enabled=true` on all rows (`FixRouteStateSodScheduler`). |
+| `OMS_FIX_ROUTE_STATE_SOD_CRON` | `0 0 6 * * *` | Spring six-field cron for SOD reconciliation (only when SOD enabled). |
+| `OMS_FIX_SOCKET_USE_SSL` | `false` | QuickFIX **`SocketUseSSL`** for initiator TLS to broker. |
+| `OMS_FIX_SOCKET_KEY_STORE` | (empty) | Keystore path when TLS enabled. |
+| `OMS_FIX_SOCKET_KEY_STORE_PASSWORD` | (empty) | Keystore password. |
+| `OMS_FIX_SOCKET_TRUST_STORE` | (empty) | Truststore path when TLS enabled. |
+| `OMS_FIX_SOCKET_TRUST_STORE_PASSWORD` | (empty) | Truststore password. |
+| `OMS_FIX_ENABLED_SSL_PROTOCOLS` | (empty) | Optional; passed to QuickFIX **`EnabledProtocols`** (e.g. `TLSv1.2`). |
 
 ## Outbox / reconciler
 

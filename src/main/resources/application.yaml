@@ -115,6 +115,16 @@ oms:
     route-key: ${OMS_FIX_ROUTE_KEY:default}
     outbound-tokens-per-second: ${OMS_FIX_OUTBOUND_TOKENS_PER_SECOND:0}
     outbound-token-burst: ${OMS_FIX_OUTBOUND_TOKEN_BURST:100}
+    # file | jdbc — jdbc uses Spring DataSource + Flyway oms_fix_sessions / oms_fix_messages (V9).
+    session-store-type: ${OMS_FIX_SESSION_STORE_TYPE:file}
+    route-state-sod-enabled: ${OMS_FIX_ROUTE_STATE_SOD_ENABLED:false}
+    route-state-sod-cron: ${OMS_FIX_ROUTE_STATE_SOD_CRON:0 0 6 * * *}
+    socket-use-ssl: ${OMS_FIX_SOCKET_USE_SSL:false}
+    socket-key-store: ${OMS_FIX_SOCKET_KEY_STORE:}
+    socket-key-store-password: ${OMS_FIX_SOCKET_KEY_STORE_PASSWORD:}
+    socket-trust-store: ${OMS_FIX_SOCKET_TRUST_STORE:}
+    socket-trust-store-password: ${OMS_FIX_SOCKET_TRUST_STORE_PASSWORD:}
+    enabled-ssl-protocols: ${OMS_FIX_ENABLED_SSL_PROTOCOLS:}
 
 logging:
   level:

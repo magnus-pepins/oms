@@ -294,6 +294,23 @@ public class OmsConfig {
         private double outboundTokensPerSecond = 0;
         /** Bucket capacity when rate limiting is enabled. */
         private int outboundTokenBurst = 100;
+        /**
+         * {@code file} — {@link quickfix.FileStoreFactory}; {@code jdbc} — {@link quickfix.JdbcStoreFactory} on the
+         * Spring {@link javax.sql.DataSource} (tables {@code oms_fix_sessions} / {@code oms_fix_messages}, Flyway V9).
+         */
+        private String sessionStoreType = "file";
+        /** When {@code true}, {@link com.balh.oms.fix.FixRouteStateSodScheduler} sets {@code send_enabled} on all {@code fix_route_state} rows on a cron. */
+        private boolean routeStateSodEnabled = false;
+        /** Spring 6-field cron; only used when {@link #routeStateSodEnabled} (default from {@code application.yaml}). */
+        private String routeStateSodCron = "";
+        /** QuickFIX/J initiator TLS (broker UAT / prod). */
+        private boolean socketUseSsl = false;
+        private String socketKeyStore = "";
+        private String socketKeyStorePassword = "";
+        private String socketTrustStore = "";
+        private String socketTrustStorePassword = "";
+        /** Optional; comma-separated protocols for QuickFIX {@code EnabledProtocols} (e.g. {@code TLSv1.2}). */
+        private String enabledSslProtocols = "";
 
         public boolean isAutoStart() { return autoStart; }
         public void setAutoStart(boolean autoStart) { this.autoStart = autoStart; }
@@ -356,6 +373,83 @@ public class OmsConfig {
 
         public void setOutboundTokenBurst(int outboundTokenBurst) {
             this.outboundTokenBurst = Math.max(1, outboundTokenBurst);
+        }
+
+        public String getSessionStoreType() {
+            return sessionStoreType;
+        }
+
+        public void setSessionStoreType(String sessionStoreType) {
+            this.sessionStoreType =
+                    sessionStoreType == null || sessionStoreType.isBlank() ? "file" : sessionStoreType.trim();
+        }
+
+        public boolean isJdbcSessionStore() {
+            return "jdbc".equalsIgnoreCase(sessionStoreType);
+        }
+
+        public boolean isRouteStateSodEnabled() {
+            return routeStateSodEnabled;
+        }
+
+        public void setRouteStateSodEnabled(boolean routeStateSodEnabled) {
+            this.routeStateSodEnabled = routeStateSodEnabled;
+        }
+
+        public String getRouteStateSodCron() {
+            return routeStateSodCron;
+        }
+
+        public void setRouteStateSodCron(String routeStateSodCron) {
+            this.routeStateSodCron = routeStateSodCron == null ? "" : routeStateSodCron.trim();
+        }
+
+        public boolean isSocketUseSsl() {
+            return socketUseSsl;
+        }
+
+        public void setSocketUseSsl(boolean socketUseSsl) {
+            this.socketUseSsl = socketUseSsl;
+        }
+
+        public String getSocketKeyStore() {
+            return socketKeyStore;
+        }
+
+        public void setSocketKeyStore(String socketKeyStore) {
+            this.socketKeyStore = socketKeyStore == null ? "" : socketKeyStore;
+        }
+
+        public String getSocketKeyStorePassword() {
+            return socketKeyStorePassword;
+        }
+
+        public void setSocketKeyStorePassword(String socketKeyStorePassword) {
+            this.socketKeyStorePassword = socketKeyStorePassword == null ? "" : socketKeyStorePassword;
+        }
+
+        public String getSocketTrustStore() {
+            return socketTrustStore;
+        }
+
+        public void setSocketTrustStore(String socketTrustStore) {
+            this.socketTrustStore = socketTrustStore == null ? "" : socketTrustStore;
+        }
+
+        public String getSocketTrustStorePassword() {
+            return socketTrustStorePassword;
+        }
+
+        public void setSocketTrustStorePassword(String socketTrustStorePassword) {
+            this.socketTrustStorePassword = socketTrustStorePassword == null ? "" : socketTrustStorePassword;
+        }
+
+        public String getEnabledSslProtocols() {
+            return enabledSslProtocols;
+        }
+
+        public void setEnabledSslProtocols(String enabledSslProtocols) {
+            this.enabledSslProtocols = enabledSslProtocols == null ? "" : enabledSslProtocols.trim();
         }
     }
 }

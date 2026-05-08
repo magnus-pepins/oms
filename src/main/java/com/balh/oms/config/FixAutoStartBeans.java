@@ -15,6 +15,8 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
+import javax.sql.DataSource;
+
 /**
  * FIX initiator + outbound scheduler when {@code oms.routing.backend=fix} and {@code oms.fix.auto-start=true}.
  */
@@ -24,8 +26,8 @@ public class FixAutoStartBeans {
 
     @Bean
     @ConditionalOnProperty(name = "oms.fix.auto-start", havingValue = "true")
-    FixInitiatorManager fixInitiatorManager(OmsConfig omsConfig, OmsFixApplication application) {
-        return new FixInitiatorManager(omsConfig, application);
+    FixInitiatorManager fixInitiatorManager(OmsConfig omsConfig, OmsFixApplication application, DataSource dataSource) {
+        return new FixInitiatorManager(omsConfig, application, dataSource);
     }
 
     @Bean

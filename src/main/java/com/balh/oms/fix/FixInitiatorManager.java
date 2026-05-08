@@ -7,12 +7,14 @@ import org.springframework.context.SmartLifecycle;
 import quickfix.ConfigError;
 import quickfix.DefaultMessageFactory;
 import quickfix.FileStoreFactory;
+import quickfix.JdbcStoreFactory;
 import quickfix.LogFactory;
 import quickfix.MessageStoreFactory;
 import quickfix.ScreenLogFactory;
 import quickfix.SessionSettings;
 import quickfix.SocketInitiator;
 
+import javax.sql.DataSource;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -27,12 +29,14 @@ public class FixInitiatorManager implements SmartLifecycle {
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final OmsConfig omsConfig;
     private final OmsFixApplication application;
+    private final DataSource dataSource;
 
     private volatile SocketInitiator initiator;
 
-    public FixInitiatorManager(OmsConfig omsConfig, OmsFixApplication application) {
+    public FixInitiatorManager(OmsConfig omsConfig, OmsFixApplication application, DataSource dataSource) {
         this.omsConfig = omsConfig;
         this.application = application;
+        this.dataSource = dataSource;
     }
 
     /**
@@ -51,12 +55,22 @@ public class FixInitiatorManager implements SmartLifecycle {
         try {
             Path store = Path.of(omsConfig.getFix().getFileStorePath()).toAbsolutePath().normalize();
             SessionSettings settings = FixSessionSettingsLoader.loadInitiatorSettings(omsConfig, store);
-            MessageStoreFactory storeFactory = new FileStoreFactory(settings);
+            MessageStoreFactory storeFactory;
+            if (omsConfig.getFix().isJdbcSessionStore()) {
+                var jdbcFactory = new JdbcStoreFactory(settings);
+                jdbcFactory.setDataSource(dataSource);
+                storeFactory = jdbcFactory;
+                log.info("FIX message store: JdbcStoreFactory (sessionsTable={}, messagesTable={})",
+                        FixJdbcSessionSchema.SESSIONS_TABLE, FixJdbcSessionSchema.MESSAGES_TABLE);
+            } else {
+                storeFactory = new FileStoreFactory(settings);
+                log.info("FIX message store: FileStoreFactory (storePath={})", store);
+            }
             LogFactory logFactory = new ScreenLogFactory(settings);
             DefaultMessageFactory messageFactory = new DefaultMessageFactory();
             initiator = new SocketInitiator(application, storeFactory, settings, logFactory, messageFactory);
             initiator.start();
-            log.info("FIX SocketInitiator started (storePath={})", store);
+            log.info("FIX SocketInitiator started");
         } catch (ConfigError | IOException e) {
             running.set(false);
             throw new IllegalStateException("FIX initiator start failed", e);

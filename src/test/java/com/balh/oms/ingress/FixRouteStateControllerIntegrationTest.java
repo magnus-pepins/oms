@@ -1,6 +1,7 @@
 package com.balh.oms.ingress;
 
 import com.balh.oms.AbstractPostgresIntegrationTest;
+import com.balh.oms.persistence.FixRouteStateRepository;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
@@ -25,6 +26,19 @@ class FixRouteStateControllerIntegrationTest extends AbstractPostgresIntegration
 
     @Autowired
     TestRestTemplate http;
+
+    @Autowired
+    FixRouteStateRepository fixRouteStateRepository;
+
+    @Test
+    void sodEnableSendOnAllRoutes_setsSendEnabledTrue() {
+        fixRouteStateRepository.updateSendEnabled("default", false, "it", "off");
+        assertThat(fixRouteStateRepository.findByRouteKey("default").orElseThrow().sendEnabled()).isFalse();
+
+        int n = fixRouteStateRepository.sodEnableSendOnAllRoutes("sod-test");
+        assertThat(n).isEqualTo(1);
+        assertThat(fixRouteStateRepository.findByRouteKey("default").orElseThrow().sendEnabled()).isTrue();
+    }
 
     @Test
     void rejectsWithoutInternalApiKey() {

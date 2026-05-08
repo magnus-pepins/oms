@@ -136,6 +136,35 @@ public class SettlementController {
         return ResponseEntity.ok(new SettlementExecutionsPageResponse(items, lim, off));
     }
 
+    /** Single execution joined to order, including raw venue envelope JSON. */
+    @GetMapping("/executions/{executionId}")
+    public ResponseEntity<SettlementExecutionDetailResponse> getExecution(@PathVariable long executionId) {
+        return settlementExecutions
+                .findById(executionId)
+                .map(
+                        r ->
+                                new SettlementExecutionDetailResponse(
+                                        r.id(),
+                                        r.orderId(),
+                                        r.accountId(),
+                                        r.venueId(),
+                                        r.venueTs(),
+                                        r.venueExecRef(),
+                                        r.lastQuantity(),
+                                        r.lastPrice(),
+                                        r.leavesQuantity(),
+                                        r.cumQuantityAfter(),
+                                        r.execType(),
+                                        r.settlementStatus(),
+                                        r.createdAt(),
+                                        r.orderStatus(),
+                                        r.side(),
+                                        r.instrumentSymbol(),
+                                        r.rawEnvelopeJson()))
+                .map(ResponseEntity::ok)
+                .orElse(ResponseEntity.notFound().build());
+    }
+
     @PostMapping("/broker-confirms")
     public ResponseEntity<BrokerConfirmIngestResponse> ingestBrokerConfirms(
             @RequestBody BrokerConfirmIngestRequest body) {

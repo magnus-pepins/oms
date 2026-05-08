@@ -126,6 +126,41 @@ class SettlementControllerIntegrationTest extends AbstractPostgresIntegrationTes
     }
 
     @Test
+    void getExecution_rejectsWithoutInternalApiKey() {
+        long exId = seedTradeExecution();
+        ResponseEntity<String> res = http.getForEntity(base() + "/executions/" + exId, String.class);
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+    }
+
+    @Test
+    void getExecution_byId_returnsDetailIncludingRawEnvelope() {
+        long exId = seedTradeExecution();
+        jdbc.update("UPDATE executions SET raw_envelope_json = CAST(? AS JSONB) WHERE id = ?", "{\"fill\":1}", exId);
+        ResponseEntity<SettlementExecutionDetailResponse> res =
+                http.exchange(
+                        base() + "/executions/" + exId,
+                        HttpMethod.GET,
+                        new HttpEntity<>(headers()),
+                        new ParameterizedTypeReference<>() {});
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(res.getBody()).isNotNull();
+        assertThat(res.getBody().id()).isEqualTo(exId);
+        assertThat(res.getBody().rawEnvelopeJson()).contains("fill");
+        assertThat(res.getBody().instrumentSymbol()).isEqualTo("AAPL");
+    }
+
+    @Test
+    void getExecution_notFound_returns404() {
+        ResponseEntity<String> res =
+                http.exchange(
+                        base() + "/executions/999999999",
+                        HttpMethod.GET,
+                        new HttpEntity<>(headers()),
+                        String.class);
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+    }
+
+    @Test
     void advanceOneStep_notFound_returns404() {
         HttpHeaders h = headers();
         ResponseEntity<SettlementController.SettlementStepResponse> res = http.exchange(

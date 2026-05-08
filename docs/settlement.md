@@ -31,6 +31,11 @@ Forward-only path persisted on **`executions`**:
 
 On each **applied** trade (after idempotent insert into `executions`), **`PositionsRepository.recordTradeFill`** updates **`positions`** + **`position_history`** using **`oms.settlement.default-custody-account-id`** / **`OMS_SETTLEMENT_DEFAULT_CUSTODY_ACCOUNT_ID`** (must match a `custody_accounts.id`).
 
+### Read-only inspection (internal HTTP)
+
+- **`GET /internal/v1/settlement/executions`** — paginated list: `executions` inner join `orders`; requires **`orderId`** or both **`from`** and **`to`** (half-open on `executions.created_at`); optional **`settlementStatus`**; **`limit`** / **`offset`** capped (same pattern as **`GET /internal/v1/control-decisions`**).
+- **`GET /internal/v1/settlement/executions/{id}`** — single row with order fields plus **`rawEnvelopeJson`** (venue envelope). **404** if missing.
+
 ### Broker confirm queue
 
 1. **`POST /internal/v1/settlement/broker-confirms`** — body `{ "executionIds": [ … ] }` (max size from **`OMS_SETTLEMENT_BROKER_CONFIRM_HTTP_MAX_EXECUTION_IDS`**); inserts pending rows (`ON CONFLICT DO NOTHING`).

@@ -170,7 +170,7 @@ tests execute instead of being skipped.
 - [docs/drop-copy-events.md](docs/drop-copy-events.md) — domain-event
   envelope and emit points.
 - [docs/return-path.md](docs/return-path.md) — executions, simulated routing, idempotency, slice-6 fill→positions.
-- [docs/settlement.md](docs/settlement.md) — custody, `positions`, broker confirm queue, §12.3 transitions, internal `/internal/v1/settlement/**` (including **`GET /internal/v1/settlement/executions`** — paginated `executions` join `orders` for ops UIs).
+- [docs/settlement.md](docs/settlement.md) — custody, `positions`, broker confirm queue, §12.3 transitions, internal `/internal/v1/settlement/**` (list + **`GET …/executions/{id}`** with raw envelope; **`GET …/executions`** paginated join `orders` for ops UIs).
 - [docs/fix-out.md](docs/fix-out.md) — FIX slice 4 wiring status.
 - [docs/configuration.md](docs/configuration.md) — every named limit /
   env key in one place.

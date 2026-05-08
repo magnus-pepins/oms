@@ -47,6 +47,16 @@ public class BrokerSettlementConfirmRepository {
                         new PendingConfirmRow(rs.getLong("id"), rs.getLong("execution_id")));
     }
 
+    private static final String DELETE_PENDING_FOR_EXECUTION = """
+            DELETE FROM broker_settlement_confirm
+            WHERE execution_id = :eid AND applied_at IS NULL
+            """;
+
+    public int deletePendingForExecution(long executionId) {
+        return jdbc.update(
+                DELETE_PENDING_FOR_EXECUTION, new MapSqlParameterSource("eid", executionId));
+    }
+
     public void markApplied(long confirmRowId, Instant at) {
         jdbc.update(
                 MARK_APPLIED_SQL,

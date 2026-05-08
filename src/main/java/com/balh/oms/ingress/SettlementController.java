@@ -1,6 +1,8 @@
 package com.balh.oms.ingress;
 
 import com.balh.oms.config.OmsConfig;
+import com.balh.oms.settlement.BrokerFixtureRow;
+import com.balh.oms.settlement.MarkTradeFailedResult;
 import com.balh.oms.settlement.SettlementConfirmProcessor;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -29,6 +31,12 @@ public class SettlementController {
 
     public record SettlementStepResponse(String settlementStatus) {}
 
+    public record BrokerFixtureImportRequest(List<BrokerFixtureRow> rows) {}
+
+    public record BrokerFixtureImportResponse(int insertedRows, int skippedUnresolvedRows, int skippedInvalidRows) {}
+
+    public record MarkTradeFailedResponse(String result) {}
+
     private final SettlementConfirmProcessor processor;
     private final OmsConfig config;
 
@@ -49,6 +57,17 @@ public class SettlementController {
         }
         int n = processor.registerBrokerConfirms(body.executionIds());
         return ResponseEntity.ok(new BrokerConfirmIngestResponse(n));
+    }
+
+    @PostMapping("/broker-confirms/import-json")
+    public ResponseEntity<BrokerFixtureImportResponse> importBrokerFixture(
+            @RequestBody BrokerFixtureImportRequest body) {
+        if (body == null || body.rows() == null) {
+            return ResponseEntity.badRequest().build();
+        }
+        var r = processor.registerBrokerConfirmsFromFixture(body.rows());
+        return ResponseEntity.ok(
+                new BrokerFixtureImportResponse(r.insertedRows(), r.skippedUnresolvedRows(), r.skippedInvalidRows()));
     }
 
     @PostMapping("/process-pending")
@@ -72,5 +91,16 @@ public class SettlementController {
         } catch (IllegalArgumentException ex) {
             return ResponseEntity.badRequest().build();
         }
+    }
+
+    @PostMapping("/executions/{executionId}/mark-failed")
+    public ResponseEntity<?> markTradeFailed(@PathVariable long executionId) {
+        MarkTradeFailedResult r = processor.markTradeFailed(executionId);
+        return switch (r) {
+            case NOT_FOUND -> ResponseEntity.notFound().build();
+            case NOT_TRADE -> ResponseEntity.badRequest().build();
+            case ALREADY_SETTLED -> ResponseEntity.status(HttpStatus.CONFLICT).build();
+            case ALREADY_FAILED, APPLIED -> ResponseEntity.ok(new MarkTradeFailedResponse(r.name()));
+        };
     }
 }

@@ -1,6 +1,9 @@
 package com.balh.oms.ingress;
 
 import com.balh.oms.AbstractPostgresIntegrationTest;
+import com.balh.oms.settlement.BrokerFixtureRow;
+import com.balh.oms.settlement.MarkTradeFailedResult;
+import com.balh.oms.settlement.SettlementConfirmProcessor;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -30,6 +33,9 @@ class SettlementControllerIntegrationTest extends AbstractPostgresIntegrationTes
 
     @Autowired
     JdbcTemplate jdbc;
+
+    @Autowired
+    SettlementConfirmProcessor processor;
 
     @BeforeEach
     void truncate() {
@@ -102,6 +108,71 @@ class SettlementControllerIntegrationTest extends AbstractPostgresIntegrationTes
             assertThat(res.getBody()).isNotNull();
             assertThat(res.getBody().settlementStatus()).isEqualTo(expected);
         }
+    }
+
+    @Test
+    void importJson_resolvesByExecutionIdAndByVenueRef() {
+        long exId = seedTradeExecution();
+        UUID accountId = jdbc.queryForObject("SELECT account_id FROM executions WHERE id = ?", UUID.class, exId);
+        String vref = jdbc.queryForObject("SELECT venue_exec_ref FROM executions WHERE id = ?", String.class, exId);
+        HttpHeaders h = headers();
+        var body = new SettlementController.BrokerFixtureImportRequest(
+                List.of(new BrokerFixtureRow(exId, null, null), new BrokerFixtureRow(null, accountId, vref)));
+        ResponseEntity<SettlementController.BrokerFixtureImportResponse> res = http.exchange(
+                base() + "/broker-confirms/import-json",
+                HttpMethod.POST,
+                new HttpEntity<>(body, h),
+                new ParameterizedTypeReference<>() {});
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(res.getBody()).isNotNull();
+        assertThat(res.getBody().insertedRows()).isEqualTo(1);
+        assertThat(res.getBody().skippedUnresolvedRows()).isZero();
+    }
+
+    @Test
+    void markTradeFailed_whenAlreadySettled_returns409() {
+        long exId = seedTradeExecution();
+        HttpHeaders h = headers();
+        for (int i = 0; i < 4; i++) {
+            ResponseEntity<SettlementController.SettlementStepResponse> step = http.exchange(
+                    base() + "/executions/" + exId + "/advance-one-step",
+                    HttpMethod.POST,
+                    new HttpEntity<>(h),
+                    new ParameterizedTypeReference<>() {});
+            assertThat(step.getStatusCode()).isEqualTo(HttpStatus.OK);
+        }
+        ResponseEntity<?> fail = http.exchange(
+                base() + "/executions/" + exId + "/mark-failed",
+                HttpMethod.POST,
+                new HttpEntity<>(h),
+                new ParameterizedTypeReference<>() {});
+        assertThat(fail.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(processor.markTradeFailed(exId)).isEqualTo(MarkTradeFailedResult.ALREADY_SETTLED);
+    }
+
+    @Test
+    void markTradeFailed_whenPendingConfirm_clearsQueue() {
+        long exId = seedTradeExecution();
+        processor.registerBrokerConfirms(List.of(exId));
+        assertThat(jdbc.queryForObject(
+                        "SELECT COUNT(*)::int FROM broker_settlement_confirm WHERE execution_id = ? AND applied_at IS NULL",
+                        Integer.class,
+                        exId))
+                .isEqualTo(1);
+        HttpHeaders h = headers();
+        ResponseEntity<?> res = http.exchange(
+                base() + "/executions/" + exId + "/mark-failed",
+                HttpMethod.POST,
+                new HttpEntity<>(h),
+                new ParameterizedTypeReference<>() {});
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(jdbc.queryForObject("SELECT settlement_status::text FROM executions WHERE id = ?", String.class, exId))
+                .isEqualTo("failed");
+        assertThat(jdbc.queryForObject(
+                        "SELECT COUNT(*)::int FROM broker_settlement_confirm WHERE execution_id = ? AND applied_at IS NULL",
+                        Integer.class,
+                        exId))
+                .isZero();
     }
 
     private long seedTradeExecution() {

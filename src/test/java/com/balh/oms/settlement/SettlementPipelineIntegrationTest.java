@@ -37,6 +37,24 @@ class SettlementPipelineIntegrationTest extends AbstractPostgresIntegrationTest 
     }
 
     @Test
+    void markTradeFailed_removesPendingBrokerConfirm() {
+        Seed seed = seedFilledBuyOrderWithExecution();
+        processor.registerBrokerConfirms(List.of(seed.executionId()));
+        assertThat(processor.markTradeFailed(seed.executionId())).isEqualTo(MarkTradeFailedResult.APPLIED);
+        assertThat(jdbc.queryForObject(
+                        "SELECT settlement_status::text FROM executions WHERE id = ?",
+                        String.class,
+                        seed.executionId()))
+                .isEqualTo("failed");
+        assertThat(jdbc.queryForObject(
+                        "SELECT COUNT(*)::int FROM broker_settlement_confirm WHERE execution_id = ? AND applied_at IS NULL",
+                        Integer.class,
+                        seed.executionId()))
+                .isZero();
+        assertThat(processor.markTradeFailed(seed.executionId())).isEqualTo(MarkTradeFailedResult.ALREADY_FAILED);
+    }
+
+    @Test
     void brokerConfirmDrain_movesBuyPositionToSettled() {
         Seed seed = seedFilledBuyOrderWithExecution();
         processor.registerAndDrain(List.of(seed.executionId()), 20, 20);

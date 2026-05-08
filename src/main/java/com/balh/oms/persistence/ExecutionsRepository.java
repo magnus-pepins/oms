@@ -179,4 +179,42 @@ public class ExecutionsRepository {
                         .addValue("from_status", fromStatus)
                         .addValue("to_status", toStatus));
     }
+
+    private static final String SELECT_ID_BY_ACCOUNT_VENUE_REF = """
+            SELECT id FROM executions
+            WHERE account_id = :account_id AND venue_exec_ref = :venue_ref
+              AND exec_type = CAST('TRADE' AS execution_exec_type)
+            LIMIT 1
+            """;
+
+    private static final String FAIL_TRADE_SETTLEMENT_SQL = """
+            UPDATE executions SET settlement_status = CAST('failed' AS execution_settlement_status)
+            WHERE id = :id
+              AND exec_type = CAST('TRADE' AS execution_exec_type)
+              AND settlement_status <> CAST('settled' AS execution_settlement_status)
+              AND settlement_status <> CAST('failed' AS execution_settlement_status)
+            """;
+
+    public Optional<Long> findTradeExecutionIdByAccountAndVenueRef(UUID accountId, String venueExecRef) {
+        if (accountId == null || venueExecRef == null || venueExecRef.isBlank()) {
+            return Optional.empty();
+        }
+        List<Long> ids = jdbc.query(
+                SELECT_ID_BY_ACCOUNT_VENUE_REF,
+                new MapSqlParameterSource()
+                        .addValue("account_id", accountId)
+                        .addValue("venue_ref", venueExecRef.trim()),
+                (rs, rowNum) -> rs.getLong("id"));
+        return ids.isEmpty() ? Optional.empty() : Optional.of(ids.getFirst());
+    }
+
+    /**
+     * Moves a {@code TRADE} execution to {@code failed} unless already {@code settled} or {@code failed}.
+     *
+     * @return rows updated (0 or 1).
+     */
+    public int failTradeSettlementToFailed(long executionId) {
+        return jdbc.update(
+                FAIL_TRADE_SETTLEMENT_SQL, new MapSqlParameterSource("id", executionId));
+    }
 }

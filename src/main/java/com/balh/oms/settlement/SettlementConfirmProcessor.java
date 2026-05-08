@@ -5,6 +5,7 @@ import com.balh.oms.persistence.ExecutionsRepository;
 import com.balh.oms.persistence.PositionsRepository;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Tag;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -13,9 +14,11 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Optional;
 import java.util.UUID;
 
 /**
@@ -28,11 +31,13 @@ public class SettlementConfirmProcessor {
     private static final Logger log = LoggerFactory.getLogger(SettlementConfirmProcessor.class);
 
     private static final String METRIC_PROCESSED = "oms_settlement_broker_confirm_processed_total";
+    private static final String METRIC_MARK_FAILED = "oms_settlement_trade_mark_failed_total";
 
     private final BrokerSettlementConfirmRepository confirms;
     private final ExecutionsRepository executions;
     private final PositionsRepository positions;
     private final OmsConfig config;
+    private final MeterRegistry meterRegistry;
     private final Counter processedCounter;
     private SettlementConfirmProcessor self;
 
@@ -46,6 +51,7 @@ public class SettlementConfirmProcessor {
         this.executions = executions;
         this.positions = positions;
         this.config = config;
+        this.meterRegistry = meterRegistry;
         this.processedCounter = meterRegistry.counter(METRIC_PROCESSED);
     }
 
@@ -156,5 +162,89 @@ public class SettlementConfirmProcessor {
                     "settlement CAS failed execution=%s %s->%s"
                             .formatted(snapshot.executionId(), cur, next));
         }
+    }
+
+    /**
+     * Resolves broker fixture rows to {@code executions.id} and registers {@code broker_settlement_confirm} rows.
+     */
+    public BrokerFixtureImportResult registerBrokerConfirmsFromFixture(List<BrokerFixtureRow> rows) {
+        if (rows == null || rows.isEmpty()) {
+            return new BrokerFixtureImportResult(0, 0, 0);
+        }
+        int max = config.getSettlement().getBrokerConfirmHttpMaxExecutionIds();
+        int skippedInvalid = 0;
+        int skippedUnresolved = 0;
+        List<Long> resolved = new ArrayList<>();
+        for (int i = 0; i < rows.size(); i++) {
+            if (i >= max) {
+                skippedInvalid++;
+                continue;
+            }
+            BrokerFixtureRow row = rows.get(i);
+            if (invalidFixtureShape(row)) {
+                skippedInvalid++;
+                continue;
+            }
+            Optional<Long> idOpt = resolveFixtureRow(row);
+            if (idOpt.isEmpty()) {
+                skippedUnresolved++;
+                continue;
+            }
+            resolved.add(idOpt.get());
+        }
+        int inserted = registerBrokerConfirms(resolved);
+        return new BrokerFixtureImportResult(inserted, skippedUnresolved, skippedInvalid);
+    }
+
+    /**
+     * Marks a {@code TRADE} execution {@code failed} (§12.7); removes pending broker confirms. Does not unwind
+     * {@code positions} in this slice.
+     */
+    @Transactional
+    public MarkTradeFailedResult markTradeFailed(long executionId) {
+        var opt = executions.findSettlementRow(executionId);
+        if (opt.isEmpty()) {
+            noteMarkFailed(MarkTradeFailedResult.NOT_FOUND);
+            return MarkTradeFailedResult.NOT_FOUND;
+        }
+        var snap = opt.get();
+        if (!"TRADE".equalsIgnoreCase(snap.execType())) {
+            noteMarkFailed(MarkTradeFailedResult.NOT_TRADE);
+            return MarkTradeFailedResult.NOT_TRADE;
+        }
+        String cur = snap.settlementStatus().trim().toLowerCase(Locale.ROOT);
+        if ("failed".equals(cur)) {
+            noteMarkFailed(MarkTradeFailedResult.ALREADY_FAILED);
+            return MarkTradeFailedResult.ALREADY_FAILED;
+        }
+        if ("settled".equals(cur)) {
+            noteMarkFailed(MarkTradeFailedResult.ALREADY_SETTLED);
+            return MarkTradeFailedResult.ALREADY_SETTLED;
+        }
+        confirms.deletePendingForExecution(executionId);
+        int n = executions.failTradeSettlementToFailed(executionId);
+        if (n != 1) {
+            throw new IllegalStateException("mark settlement failed: unexpected CAS execution=" + executionId);
+        }
+        noteMarkFailed(MarkTradeFailedResult.APPLIED);
+        return MarkTradeFailedResult.APPLIED;
+    }
+
+    private static boolean invalidFixtureShape(BrokerFixtureRow row) {
+        boolean hasExec = row.executionId() != null && row.executionId() > 0;
+        boolean hasPair =
+                row.accountId() != null && row.venueExecRef() != null && !row.venueExecRef().isBlank();
+        return !hasExec && !hasPair;
+    }
+
+    private Optional<Long> resolveFixtureRow(BrokerFixtureRow row) {
+        if (row.executionId() != null && row.executionId() > 0) {
+            return executions.findSettlementRow(row.executionId()).map(SettlementExecutionRow::executionId);
+        }
+        return executions.findTradeExecutionIdByAccountAndVenueRef(row.accountId(), row.venueExecRef());
+    }
+
+    private void noteMarkFailed(MarkTradeFailedResult r) {
+        meterRegistry.counter(METRIC_MARK_FAILED, List.of(Tag.of("result", r.name()))).increment();
     }
 }

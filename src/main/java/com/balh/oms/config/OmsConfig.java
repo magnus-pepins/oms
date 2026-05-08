@@ -583,6 +583,14 @@ public class OmsConfig {
         private long brokerConfirmReconcilerIntervalMs = 10_000L;
         private int brokerConfirmReconcilerBatchSize = 50;
         private int brokerConfirmHttpMaxExecutionIds = 100;
+        /** Max rows returned by {@code GET /internal/v1/settlement/manual-actions}. */
+        private int manualActionListMaxLimit = 200;
+        /** Default page size for manual settlement action list. */
+        private int manualActionListDefaultLimit = 50;
+        /** Max {@code action_type} length (UTF-16 code units). */
+        private int manualActionTypeMaxLength = 128;
+        /** Max JSON text length accepted for {@code payload_json} on create. */
+        private int manualActionPayloadJsonMaxChars = 20_000;
 
         public String getDefaultCustodyAccountId() {
             return defaultCustodyAccountId;
@@ -626,6 +634,38 @@ public class OmsConfig {
 
         public void setBrokerConfirmHttpMaxExecutionIds(int brokerConfirmHttpMaxExecutionIds) {
             this.brokerConfirmHttpMaxExecutionIds = Math.min(10_000, Math.max(1, brokerConfirmHttpMaxExecutionIds));
+        }
+
+        public int getManualActionListMaxLimit() {
+            return manualActionListMaxLimit;
+        }
+
+        public void setManualActionListMaxLimit(int manualActionListMaxLimit) {
+            this.manualActionListMaxLimit = Math.min(500, Math.max(1, manualActionListMaxLimit));
+        }
+
+        public int getManualActionListDefaultLimit() {
+            return manualActionListDefaultLimit;
+        }
+
+        public void setManualActionListDefaultLimit(int manualActionListDefaultLimit) {
+            this.manualActionListDefaultLimit = Math.min(getManualActionListMaxLimit(), Math.max(1, manualActionListDefaultLimit));
+        }
+
+        public int getManualActionTypeMaxLength() {
+            return manualActionTypeMaxLength;
+        }
+
+        public void setManualActionTypeMaxLength(int manualActionTypeMaxLength) {
+            this.manualActionTypeMaxLength = Math.min(512, Math.max(1, manualActionTypeMaxLength));
+        }
+
+        public int getManualActionPayloadJsonMaxChars() {
+            return manualActionPayloadJsonMaxChars;
+        }
+
+        public void setManualActionPayloadJsonMaxChars(int manualActionPayloadJsonMaxChars) {
+            this.manualActionPayloadJsonMaxChars = Math.min(500_000, Math.max(256, manualActionPayloadJsonMaxChars));
         }
     }
 }

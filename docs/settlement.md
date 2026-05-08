@@ -9,7 +9,7 @@ This document describes the **securities post-trade** tables and wiring in OMS. 
 - **`custody_accounts`** — broker custody routing (Shape A v1). A deterministic **DEFAULT** omnibus row is inserted for single-broker wiring.
 - **`positions`** — one row per `(account_id, instrument_symbol, custody_account_id)` with quantity columns (`quantity_total`, `quantity_settled`, `quantity_pending_buy_settle`, `quantity_pending_sell_settle`).
 - **`position_history`** — append-only deltas (`TRADE_BUY_FILL` / `TRADE_SELL_FILL`, **`SETTLEMENT_BUY_SETTLED`**) with optional `execution_id` → `executions`.
-- **`manual_settlement_actions`** — stub for four-eyes manual instructions (Beard Admin later).
+- **`manual_settlement_actions`** — four-eyes manual instructions (§12.8); **`POST /internal/v1/settlement/manual-actions`** + approve route (see Read-only / Manual below).
 - **`executions.settlement_status`** — enum `execution_settlement_status`; new fills default to **`executed`**.
 
 ### Flyway `V12__broker_settlement_confirm.sql`
@@ -35,6 +35,9 @@ On each **applied** trade (after idempotent insert into `executions`), **`Positi
 
 - **`GET /internal/v1/settlement/executions`** — paginated list: `executions` inner join `orders`; requires **`orderId`** or both **`from`** and **`to`** (half-open on `executions.created_at`); optional **`settlementStatus`**; **`limit`** / **`offset`** capped (same pattern as **`GET /internal/v1/control-decisions`**).
 - **`GET /internal/v1/settlement/executions/{id}`** — single row with order fields plus **`rawEnvelopeJson`** (venue envelope). **404** if missing.
+- **`POST /internal/v1/settlement/manual-actions`** — stage a row (`execution_id`, `action_type`, `requested_by`, `payload_json`); execution must exist (**404** if not).
+- **`GET /internal/v1/settlement/manual-actions`** — paginated list; requires **`executionId`** or both **`from`** and **`to`** on `created_at`.
+- **`POST /internal/v1/settlement/manual-actions/{id}/approve`** — sets **`approved_by`** when null; approver must differ from **`requested_by`** (case-insensitive). **409** if already approved or concurrent loss; **400** if same actor.
 
 ### Broker confirm queue
 

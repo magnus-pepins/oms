@@ -107,6 +107,10 @@ oms:
     broker-confirm-reconciler-interval-ms: ${OMS_SETTLEMENT_BROKER_CONFIRM_RECONCILER_INTERVAL_MS:10000}
     broker-confirm-reconciler-batch-size: ${OMS_SETTLEMENT_BROKER_CONFIRM_RECONCILER_BATCH_SIZE:50}
     broker-confirm-http-max-execution-ids: ${OMS_SETTLEMENT_BROKER_CONFIRM_HTTP_MAX_EXECUTION_IDS:100}
+    manual-action-list-max-limit: ${OMS_SETTLEMENT_MANUAL_ACTION_LIST_MAX_LIMIT:200}
+    manual-action-list-default-limit: ${OMS_SETTLEMENT_MANUAL_ACTION_LIST_DEFAULT_LIMIT:50}
+    manual-action-type-max-length: ${OMS_SETTLEMENT_MANUAL_ACTION_TYPE_MAX_LENGTH:128}
+    manual-action-payload-json-max-chars: ${OMS_SETTLEMENT_MANUAL_ACTION_PAYLOAD_JSON_MAX_CHARS:20000}
   fix:
     # When routing.backend=fix and auto-start=true, starts SocketInitiator + outbound drain scheduler.
     auto-start: ${OMS_FIX_AUTO_START:false}

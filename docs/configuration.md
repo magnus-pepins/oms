@@ -71,6 +71,10 @@ new key here when introducing one.
 | `OMS_SETTLEMENT_BROKER_CONFIRM_RECONCILER_INTERVAL_MS` | `10000` | Delay between scheduler passes (ms; minimum **100** in `OmsConfig`). |
 | `OMS_SETTLEMENT_BROKER_CONFIRM_RECONCILER_BATCH_SIZE` | `50` | Max pending confirm rows processed per **`process-pending`** / scheduler tick. |
 | `OMS_SETTLEMENT_BROKER_CONFIRM_HTTP_MAX_EXECUTION_IDS` | `100` | Max **`executionIds`** elements on **`POST /internal/v1/settlement/broker-confirms`**. |
+| `OMS_SETTLEMENT_MANUAL_ACTION_LIST_MAX_LIMIT` | `200` | Max **`limit`** on **`GET /internal/v1/settlement/manual-actions`**. |
+| `OMS_SETTLEMENT_MANUAL_ACTION_LIST_DEFAULT_LIMIT` | `50` | Default page size when **`limit`** is omitted. |
+| `OMS_SETTLEMENT_MANUAL_ACTION_TYPE_MAX_LENGTH` | `128` | Max length of **`action_type`** on create (capped at **512** in `OmsConfig`). |
+| `OMS_SETTLEMENT_MANUAL_ACTION_PAYLOAD_JSON_MAX_CHARS` | `20000` | Max characters accepted for **`payload_json`** text on create (capped at **500000** in `OmsConfig`). |
 
 ## FIX (slice 4+)
 

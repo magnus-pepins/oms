@@ -47,6 +47,17 @@ public class PositionsRepository {
               AND quantity_total >= :qty
             """;
 
+    private static final String SETTLE_BUY_SQL = """
+            UPDATE positions SET
+                quantity_pending_buy_settle = quantity_pending_buy_settle - :qty,
+                quantity_settled = quantity_settled + :qty,
+                updated_at = NOW()
+            WHERE account_id = :account_id
+              AND instrument_symbol = :symbol
+              AND custody_account_id = :custody_id
+              AND quantity_pending_buy_settle >= :qty
+            """;
+
     private static final String INSERT_HISTORY_SQL = """
             INSERT INTO position_history (
                 account_id, instrument_symbol, custody_account_id,
@@ -107,6 +118,33 @@ public class PositionsRepository {
                         executionId);
             }
         }
+    }
+
+    /**
+     * Moves {@code quantity_pending_buy_settle} → {@code quantity_settled} for a BUY leg (§12.3 terminal).
+     */
+    public void recordBuySettled(
+            UUID accountId, String instrumentSymbol, UUID custodyAccountId, BigDecimal settleQuantity, long executionId) {
+        if (settleQuantity == null || settleQuantity.compareTo(BigDecimal.ZERO) <= 0) {
+            return;
+        }
+        String sym = instrumentSymbol == null ? "" : instrumentSymbol.trim();
+        if (sym.isEmpty()) {
+            return;
+        }
+        int updated = jdbc.update(
+                SETTLE_BUY_SQL,
+                new MapSqlParameterSource()
+                        .addValue("account_id", accountId)
+                        .addValue("symbol", sym)
+                        .addValue("custody_id", custodyAccountId)
+                        .addValue("qty", settleQuantity));
+        if (updated != 1) {
+            throw new IllegalStateException(
+                    "buy settle expected 1 position row, got %s (account=%s symbol=%s execution=%s)"
+                            .formatted(updated, accountId, sym, executionId));
+        }
+        insertHistory(accountId, sym, custodyAccountId, "SETTLEMENT_BUY_SETTLED", settleQuantity, executionId);
     }
 
     private void insertHistory(

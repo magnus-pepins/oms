@@ -103,6 +103,10 @@ oms:
   settlement:
     # Must match a row in custody_accounts (Flyway V11 seeds DEFAULT omnibus).
     default-custody-account-id: ${OMS_SETTLEMENT_DEFAULT_CUSTODY_ACCOUNT_ID:a0000001-0000-4000-8000-000000000001}
+    broker-confirm-reconciler-enabled: ${OMS_SETTLEMENT_BROKER_CONFIRM_RECONCILER_ENABLED:false}
+    broker-confirm-reconciler-interval-ms: ${OMS_SETTLEMENT_BROKER_CONFIRM_RECONCILER_INTERVAL_MS:10000}
+    broker-confirm-reconciler-batch-size: ${OMS_SETTLEMENT_BROKER_CONFIRM_RECONCILER_BATCH_SIZE:50}
+    broker-confirm-http-max-execution-ids: ${OMS_SETTLEMENT_BROKER_CONFIRM_HTTP_MAX_EXECUTION_IDS:100}
   fix:
     # When routing.backend=fix and auto-start=true, starts SocketInitiator + outbound drain scheduler.
     auto-start: ${OMS_FIX_AUTO_START:false}

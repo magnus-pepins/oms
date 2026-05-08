@@ -2,6 +2,8 @@ package com.balh.oms.fix.it;
 
 import com.balh.oms.AbstractPostgresIntegrationTest;
 import com.balh.oms.routing.RouteDispatcher;
+import com.balh.oms.settlement.SettlementConfirmProcessor;
+import com.balh.oms.test.SettlementBrokerDrainAssertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -31,6 +33,9 @@ class FixRoundTripSymbolMapSpringIntegrationTest extends AbstractPostgresIntegra
 
     @Autowired
     private JdbcTemplate jdbc;
+
+    @Autowired
+    private SettlementConfirmProcessor settlementConfirmProcessor;
 
     @DynamicPropertySource
     static void fixRoundTripProps(DynamicPropertyRegistry registry) {
@@ -71,6 +76,9 @@ class FixRoundTripSymbolMapSpringIntegrationTest extends AbstractPostgresIntegra
         assertThat(jdbc.queryForObject("SELECT cum_filled_quantity FROM orders WHERE id = ?", BigDecimal.class, orderId))
                 .isEqualByComparingTo("10");
         assertThat(FixRoundTripAcceptorApplication.LAST_NOS_SYMBOL.get()).isEqualTo("BRK.A");
+
+        SettlementBrokerDrainAssertions.assertFullBrokerLifecycleSettles(
+                jdbc, settlementConfirmProcessor, orderId, 1, new BigDecimal("10"));
     }
 
     private UUID insertWorkingOrder(String idemKey, String symbol, String qty, String limitPx, int version) {

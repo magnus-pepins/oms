@@ -28,6 +28,7 @@ See `docs/configuration.md` (`oms.routing.*`) and `.env.example`.
 - **`OMS_ROUTING_BACKEND=noop`** (default): no post-`WORKING` dispatch.
 - **`OMS_ROUTING_BACKEND=simulated`**: `SimulatedBrokerDispatcher` + `SimulatedReturnPathProjectionWorker` + scheduled drain (`OMS_SIMULATED_POLL_INTERVAL_MS`). Tests set `OMS_SIMULATED_SCHEDULER_ENABLED=false` and call **`processPendingQueueOnce()`**.
 - **`OMS_ROUTING_BACKEND=fix`**: `FixRouteDispatcher` (see `docs/fix-out.md`).
+- **Settlement (slice 6):** internal **`/internal/v1/settlement/**`** for broker-confirm ingest and §12.3 advances — see **`docs/settlement.md`**.
 
 ## Metrics
 

@@ -4,7 +4,9 @@ import com.balh.oms.AbstractPostgresIntegrationTest;
 import com.balh.oms.chronicle.PendingControlEvent;
 import com.balh.oms.fix.FixMetrics;
 import com.balh.oms.reconciler.OutboxReconciler;
+import com.balh.oms.settlement.SettlementConfirmProcessor;
 import com.balh.oms.tailer.ControlTailer;
+import com.balh.oms.test.SettlementBrokerDrainAssertions;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
@@ -50,6 +52,7 @@ class FixIngressRoundTripSpringIntegrationTest extends AbstractPostgresIntegrati
     @Autowired private ControlTailer controlTailer;
     @Autowired private ObjectMapper objectMapper;
     @Autowired private MeterRegistry meterRegistry;
+    @Autowired private SettlementConfirmProcessor settlementConfirmProcessor;
 
     @DynamicPropertySource
     static void fixRoundTripProps(DynamicPropertyRegistry registry) {
@@ -113,6 +116,9 @@ class FixIngressRoundTripSpringIntegrationTest extends AbstractPostgresIntegrati
                         .counter(FixMetrics.METRIC_INBOUND_ER, FixMetrics.TAG_DISPOSITION, "trade_APPLIED")
                         .count())
                 .isPositive();
+
+        SettlementBrokerDrainAssertions.assertFullBrokerLifecycleSettles(
+                jdbc, settlementConfirmProcessor, orderId, 1, new BigDecimal("10"));
     }
 
     private UUID postOrder(UUID accountId, String idempotencyKey) {

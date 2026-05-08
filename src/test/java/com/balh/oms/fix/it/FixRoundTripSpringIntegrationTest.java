@@ -3,6 +3,8 @@ package com.balh.oms.fix.it;
 import com.balh.oms.AbstractPostgresIntegrationTest;
 import com.balh.oms.fix.FixMetrics;
 import com.balh.oms.routing.RouteDispatcher;
+import com.balh.oms.settlement.SettlementConfirmProcessor;
+import com.balh.oms.test.SettlementBrokerDrainAssertions;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -36,6 +38,9 @@ class FixRoundTripSpringIntegrationTest extends AbstractPostgresIntegrationTest 
 
     @Autowired
     private MeterRegistry meterRegistry;
+
+    @Autowired
+    private SettlementConfirmProcessor settlementConfirmProcessor;
 
     @DynamicPropertySource
     static void fixRoundTripProps(DynamicPropertyRegistry registry) {
@@ -89,6 +94,9 @@ class FixRoundTripSpringIntegrationTest extends AbstractPostgresIntegrationTest 
                         String.class,
                         orderId))
                 .isEqualTo("venue_execution_report");
+
+        SettlementBrokerDrainAssertions.assertFullBrokerLifecycleSettles(
+                jdbc, settlementConfirmProcessor, orderId, 1, new BigDecimal("10"));
     }
 
     private UUID insertWorkingOrder(String idemKey, String symbol, String qty, String limitPx, int version) {

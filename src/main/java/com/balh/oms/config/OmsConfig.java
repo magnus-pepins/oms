@@ -579,6 +579,10 @@ public class OmsConfig {
      */
     public static class Settlement {
         private String defaultCustodyAccountId = "a0000001-0000-4000-8000-000000000001";
+        private boolean brokerConfirmReconcilerEnabled = false;
+        private long brokerConfirmReconcilerIntervalMs = 10_000L;
+        private int brokerConfirmReconcilerBatchSize = 50;
+        private int brokerConfirmHttpMaxExecutionIds = 100;
 
         public String getDefaultCustodyAccountId() {
             return defaultCustodyAccountId;
@@ -590,6 +594,38 @@ public class OmsConfig {
                     : defaultCustodyAccountId.trim();
             UUID.fromString(trimmed);
             this.defaultCustodyAccountId = trimmed;
+        }
+
+        public boolean isBrokerConfirmReconcilerEnabled() {
+            return brokerConfirmReconcilerEnabled;
+        }
+
+        public void setBrokerConfirmReconcilerEnabled(boolean brokerConfirmReconcilerEnabled) {
+            this.brokerConfirmReconcilerEnabled = brokerConfirmReconcilerEnabled;
+        }
+
+        public long getBrokerConfirmReconcilerIntervalMs() {
+            return brokerConfirmReconcilerIntervalMs;
+        }
+
+        public void setBrokerConfirmReconcilerIntervalMs(long brokerConfirmReconcilerIntervalMs) {
+            this.brokerConfirmReconcilerIntervalMs = Math.max(100L, brokerConfirmReconcilerIntervalMs);
+        }
+
+        public int getBrokerConfirmReconcilerBatchSize() {
+            return brokerConfirmReconcilerBatchSize;
+        }
+
+        public void setBrokerConfirmReconcilerBatchSize(int brokerConfirmReconcilerBatchSize) {
+            this.brokerConfirmReconcilerBatchSize = Math.max(1, brokerConfirmReconcilerBatchSize);
+        }
+
+        public int getBrokerConfirmHttpMaxExecutionIds() {
+            return brokerConfirmHttpMaxExecutionIds;
+        }
+
+        public void setBrokerConfirmHttpMaxExecutionIds(int brokerConfirmHttpMaxExecutionIds) {
+            this.brokerConfirmHttpMaxExecutionIds = Math.min(10_000, Math.max(1, brokerConfirmHttpMaxExecutionIds));
         }
     }
 }

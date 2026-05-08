@@ -67,6 +67,10 @@ new key here when introducing one.
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `OMS_SETTLEMENT_DEFAULT_CUSTODY_ACCOUNT_ID` | `a0000001-0000-4000-8000-000000000001` | UUID of the **`custody_accounts`** row used when applying **trade** fills to **`positions`** (must match DB; Flyway **V11** seeds the default omnibus). See [settlement.md](settlement.md). |
+| `OMS_SETTLEMENT_BROKER_CONFIRM_RECONCILER_ENABLED` | `false` | When **`true`**, **`BrokerSettlementConfirmScheduler`** drains **`broker_settlement_confirm`** on a fixed delay. |
+| `OMS_SETTLEMENT_BROKER_CONFIRM_RECONCILER_INTERVAL_MS` | `10000` | Delay between scheduler passes (ms; minimum **100** in `OmsConfig`). |
+| `OMS_SETTLEMENT_BROKER_CONFIRM_RECONCILER_BATCH_SIZE` | `50` | Max pending confirm rows processed per **`process-pending`** / scheduler tick. |
+| `OMS_SETTLEMENT_BROKER_CONFIRM_HTTP_MAX_EXECUTION_IDS` | `100` | Max **`executionIds`** elements on **`POST /internal/v1/settlement/broker-confirms`**. |
 
 ## FIX (slice 4+)
 

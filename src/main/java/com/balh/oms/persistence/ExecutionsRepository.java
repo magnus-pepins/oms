@@ -1,5 +1,6 @@
 package com.balh.oms.persistence;
 
+import com.balh.oms.settlement.SettlementExecutionRow;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.stereotype.Repository;
@@ -132,5 +133,50 @@ public class ExecutionsRepository {
                 params,
                 (rs, rowNum) -> rs.getLong("id"));
         return ids.isEmpty() ? Optional.empty() : Optional.of(ids.getFirst());
+    }
+
+    private static final String SELECT_SETTLEMENT_ROW = """
+            SELECT e.id AS execution_id, e.settlement_status::text AS settlement_status, e.exec_type::text AS exec_type,
+                   e.last_quantity, e.account_id, o.instrument_symbol, o.side::text AS side
+            FROM executions e
+            JOIN orders o ON o.id = e.order_id
+            WHERE e.id = :id
+            """;
+
+    private static final String UPDATE_SETTLEMENT_STATUS_IF = """
+            UPDATE executions SET settlement_status = CAST(:to_status AS execution_settlement_status)
+            WHERE id = :id
+              AND settlement_status = CAST(:from_status AS execution_settlement_status)
+              AND exec_type = CAST('TRADE' AS execution_exec_type)
+            """;
+
+    public Optional<SettlementExecutionRow> findSettlementRow(long executionId) {
+        var params = new MapSqlParameterSource("id", executionId);
+        List<SettlementExecutionRow> rows = jdbc.query(
+                SELECT_SETTLEMENT_ROW,
+                params,
+                (rs, rowNum) -> new SettlementExecutionRow(
+                        rs.getLong("execution_id"),
+                        rs.getString("settlement_status"),
+                        rs.getString("exec_type"),
+                        rs.getBigDecimal("last_quantity"),
+                        rs.getObject("account_id", UUID.class),
+                        rs.getString("instrument_symbol"),
+                        rs.getString("side")));
+        return rows.isEmpty() ? Optional.empty() : Optional.of(rows.getFirst());
+    }
+
+    /**
+     * CAS settlement status forward for a {@code TRADE} row.
+     *
+     * @return rows updated (0 or 1).
+     */
+    public int updateSettlementStatusIf(long executionId, String fromStatus, String toStatus) {
+        return jdbc.update(
+                UPDATE_SETTLEMENT_STATUS_IF,
+                new MapSqlParameterSource()
+                        .addValue("id", executionId)
+                        .addValue("from_status", fromStatus)
+                        .addValue("to_status", toStatus));
     }
 }

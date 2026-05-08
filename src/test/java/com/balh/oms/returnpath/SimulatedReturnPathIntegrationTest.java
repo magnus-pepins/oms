@@ -3,7 +3,9 @@ package com.balh.oms.returnpath;
 import com.balh.oms.AbstractPostgresIntegrationTest;
 import com.balh.oms.chronicle.PendingControlEvent;
 import com.balh.oms.routing.SimulatedReturnPathProjectionWorker;
+import com.balh.oms.settlement.SettlementConfirmProcessor;
 import com.balh.oms.tailer.ControlTailer;
+import com.balh.oms.test.SettlementBrokerDrainAssertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -27,6 +29,7 @@ class SimulatedReturnPathIntegrationTest extends AbstractPostgresIntegrationTest
     @Autowired ExecutionReportApplier executionReportApplier;
     @Autowired SimulatedReturnPathProjectionWorker simulatedReturnPathProjectionWorker;
     @Autowired JdbcTemplate jdbc;
+    @Autowired SettlementConfirmProcessor settlementConfirmProcessor;
 
     @BeforeEach
     void truncate() {
@@ -111,6 +114,9 @@ class SimulatedReturnPathIntegrationTest extends AbstractPostgresIntegrationTest
                         String.class,
                         orderId))
                 .isEqualTo("executed");
+
+        SettlementBrokerDrainAssertions.assertFullBrokerLifecycleSettles(
+                jdbc, settlementConfirmProcessor, orderId, 3, new BigDecimal("100"));
     }
 
     @Test

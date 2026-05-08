@@ -59,6 +59,23 @@ class SimulatedReturnPathIntegrationTest extends AbstractPostgresIntegrationTest
         assertThat(jdbc.queryForObject(
                 "SELECT COUNT(*)::int FROM market_context WHERE order_id = ?", Integer.class, orderId)).isEqualTo(1);
 
+        String expectedLastRef = "sim-" + orderId + "-3";
+        assertThat(jdbc.queryForObject(
+                        "SELECT snapshot_json->>'venueExecRef' FROM market_context WHERE order_id = ?",
+                        String.class,
+                        orderId))
+                .isEqualTo(expectedLastRef);
+        assertThat(jdbc.queryForObject(
+                        "SELECT snapshot_json->>'instrumentSymbol' FROM market_context WHERE order_id = ?",
+                        String.class,
+                        orderId))
+                .isEqualTo("AAPL");
+        assertThat(jdbc.queryForObject(
+                        "SELECT snapshot_json->>'evidenceSource' FROM market_context WHERE order_id = ?",
+                        String.class,
+                        orderId))
+                .isEqualTo("venue_execution_report");
+
         List<String> types = jdbc.query(
                 "SELECT envelope_json->>'type' AS t FROM domain_event_outbox WHERE order_id = ? ORDER BY id",
                 (rs, i) -> rs.getString("t"),
@@ -79,6 +96,11 @@ class SimulatedReturnPathIntegrationTest extends AbstractPostgresIntegrationTest
         assertThat(jdbc.queryForObject("SELECT COUNT(*)::int FROM executions WHERE venue_exec_ref = ?", Integer.class, "dup-ref-1"))
                 .isEqualTo(1);
         assertThat(jdbc.queryForObject("SELECT version FROM orders WHERE id = ?", Integer.class, orderId)).isEqualTo(2);
+        assertThat(jdbc.queryForObject(
+                        "SELECT snapshot_json->>'venueExecRef' FROM market_context WHERE order_id = ?",
+                        String.class,
+                        orderId))
+                .isEqualTo("dup-ref-1");
     }
 
     @Test

@@ -10,7 +10,7 @@ and domain fanout envelopes (`OrderPartiallyFilled`, `OrderFilled`, `OrderCancel
 
 | Piece | Role |
 |-------|------|
-| `ExecutionReportApplier` | `@Transactional` apply for trades, cancels, **venue rejects**, and **outbound job expiry**; inserts `market_context` stub on first trade. |
+| `ExecutionReportApplier` | `@Transactional` apply for trades, cancels, **venue rejects**, and **outbound job expiry**; merges **`OMS_MARKET_CONTEXT_STUB_JSON`** with venue-attested fields into `market_context.snapshot_json` on each **trade** apply (NBBO/marketdata later). |
 | `ExecutionsRepository` | `ON CONFLICT (account_id, venue_exec_ref) DO NOTHING` for idempotency; `exec_type` **TRADE** / **CANCEL** / **REJECT**. |
 | `RouteDispatcher` | Called from `ControlTailer` **after commit** when an order reaches `WORKING`. |
 | `SimulatedBrokerDispatcher` | When `OMS_ROUTING_BACKEND=simulated`: enqueues order ids on the simulated route queue. |
@@ -33,4 +33,4 @@ See `docs/configuration.md` (`oms.routing.*`) and `.env.example`.
 
 ## Next (broker hardening)
 
-Per master plan: separate FIX session store, outbound token bucket, `route_state` / halt route, TLS and broker UAT soak — not required for the current **slice 4 Java skeleton** in `oms/`.
+Per master plan: optional dedicated FIX session JDBC URL, broker UAT soak, settlement — see `docs/fix-out.md` and `docs/fix-broker-uat-soak.md`.

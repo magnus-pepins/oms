@@ -67,7 +67,7 @@ and the milestone plan it links to.
 ## What is in slice 3 (return path — simulated broker)
 
 - Flyway **V6** — `executions` (idempotent on `(account_id, venue_exec_ref)`),
-  `market_context` stub row, `orders.cum_filled_quantity`.
+  `market_context` (stub JSON merged with venue-attested fields on each trade apply), `orders.cum_filled_quantity`.
 - **`ExecutionReportApplier`** — applies trade and cancel ER-shaped commands;
   emits **`OrderPartiallyFilled`**, **`OrderFilled`**, **`OrderCancelled`** to
   `domain_event_outbox`; metrics **`oms_executions_applied_total`**,

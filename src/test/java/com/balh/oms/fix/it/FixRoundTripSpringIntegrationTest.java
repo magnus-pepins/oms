@@ -78,6 +78,17 @@ class FixRoundTripSpringIntegrationTest extends AbstractPostgresIntegrationTest 
                         .counter(FixMetrics.METRIC_INBOUND_ER, FixMetrics.TAG_DISPOSITION, "trade_APPLIED")
                         .count())
                 .isPositive();
+
+        assertThat(jdbc.queryForObject(
+                        "SELECT snapshot_json->>'venueId' FROM market_context WHERE order_id = ?",
+                        String.class,
+                        orderId))
+                .isEqualTo("FIX_IT");
+        assertThat(jdbc.queryForObject(
+                        "SELECT snapshot_json->>'evidenceSource' FROM market_context WHERE order_id = ?",
+                        String.class,
+                        orderId))
+                .isEqualTo("venue_execution_report");
     }
 
     private UUID insertWorkingOrder(String idemKey, String symbol, String qty, String limitPx, int version) {

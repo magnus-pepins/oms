@@ -9,6 +9,7 @@ import com.balh.oms.persistence.DomainEventOutboxRepository;
 import com.balh.oms.persistence.ExecutionsRepository;
 import com.balh.oms.persistence.MarketContextRepository;
 import com.balh.oms.persistence.OrdersRepository;
+import com.balh.oms.returnpath.MarketContextVenueEvidence;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -107,7 +108,16 @@ public class ExecutionReportApplier {
             return TradeApplyOutcome.INVALID_STATE;
         }
 
-        marketContext.ensureStubSnapshot(order.id(), config.getRouting().getMarketContextStubJson());
+        try {
+            String patch = MarketContextVenueEvidence.toJsonPatch(objectMapper, order, cmd);
+            marketContext.mergeVenueFillEvidence(
+                    order.id(),
+                    cmd.venueTs(),
+                    config.getRouting().getMarketContextStubJson(),
+                    patch);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("market_context evidence serialisation failed", e);
+        }
 
         String raw = rawTradeJson(cmd);
         boolean inserted = executions.tryInsertTrade(

@@ -154,7 +154,8 @@ public class ExecutionsRepository {
 
     private static final String SELECT_SETTLEMENT_ROW = """
             SELECT e.id AS execution_id, e.settlement_status::text AS settlement_status, e.exec_type::text AS exec_type,
-                   e.last_quantity, e.account_id, o.instrument_symbol, o.side::text AS side
+                   e.last_quantity, e.account_id, o.instrument_symbol, o.side::text AS side,
+                   e.sell_position_from_pending_buy, e.sell_position_from_settled
             FROM executions e
             JOIN orders o ON o.id = e.order_id
             WHERE e.id = :id
@@ -179,7 +180,9 @@ public class ExecutionsRepository {
                         rs.getBigDecimal("last_quantity"),
                         rs.getObject("account_id", UUID.class),
                         rs.getString("instrument_symbol"),
-                        rs.getString("side")));
+                        rs.getString("side"),
+                        rs.getBigDecimal("sell_position_from_pending_buy"),
+                        rs.getBigDecimal("sell_position_from_settled")));
         return rows.isEmpty() ? Optional.empty() : Optional.of(rows.getFirst());
     }
 
@@ -233,5 +236,27 @@ public class ExecutionsRepository {
     public int failTradeSettlementToFailed(long executionId) {
         return jdbc.update(
                 FAIL_TRADE_SETTLEMENT_SQL, new MapSqlParameterSource("id", executionId));
+    }
+
+    private static final String UPDATE_SELL_FILL_POSITION_SPLIT_SQL = """
+            UPDATE executions SET
+                sell_position_from_pending_buy = :from_pb,
+                sell_position_from_settled = :from_settled
+            WHERE id = :id AND exec_type = CAST('TRADE' AS execution_exec_type)
+            """;
+
+    /**
+     * Persists how a SELL fill was sourced from {@code positions} (for exact unwind on mark-failed).
+     */
+    public void updateSellFillPositionSplit(long executionId, SellFillPositionSplit split) {
+        int n = jdbc.update(
+                UPDATE_SELL_FILL_POSITION_SPLIT_SQL,
+                new MapSqlParameterSource()
+                        .addValue("id", executionId)
+                        .addValue("from_pb", split.fromPendingBuy())
+                        .addValue("from_settled", split.fromSettled()));
+        if (n != 1) {
+            throw new IllegalStateException("update sell fill split: expected 1 row, got " + n + " execution=" + executionId);
+        }
     }
 }

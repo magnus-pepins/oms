@@ -8,13 +8,17 @@ This document describes the **securities post-trade** tables and wiring in OMS. 
 
 - **`custody_accounts`** — broker custody routing (Shape A v1). A deterministic **DEFAULT** omnibus row is inserted for single-broker wiring.
 - **`positions`** — one row per `(account_id, instrument_symbol, custody_account_id)` with quantity columns (`quantity_total`, `quantity_settled`, `quantity_pending_buy_settle`, `quantity_pending_sell_settle`).
-- **`position_history`** — append-only deltas (`TRADE_BUY_FILL` / `TRADE_SELL_FILL`, **`SETTLEMENT_BUY_SETTLED`**, **`SETTLEMENT_SELL_SETTLED`**) with optional `execution_id` → `executions`.
+- **`position_history`** — append-only deltas (`TRADE_BUY_FILL` / `TRADE_SELL_FILL`, **`SETTLEMENT_BUY_SETTLED`**, **`SETTLEMENT_SELL_SETTLED`**, **`MARK_FAILED_UNWIND_BUY`** / **`MARK_FAILED_UNWIND_SELL`**) with optional `execution_id` → `executions`.
 - **`manual_settlement_actions`** — four-eyes manual instructions (§12.8); **`POST /internal/v1/settlement/manual-actions`** + approve route (see Read-only / Manual below).
 - **`executions.settlement_status`** — enum `execution_settlement_status`; new fills default to **`executed`**.
 
 ### Flyway `V12__broker_settlement_confirm.sql`
 
 - **`broker_settlement_confirm`** — one row per **`execution_id`** (unique). **`applied_at`** null = pending; **`SettlementConfirmProcessor`** / internal HTTP drain the queue and run the §12.3 chain to **`settled`**.
+
+### Flyway `V13__execution_sell_fill_position_split.sql`
+
+- **`executions.sell_position_from_pending_buy`** / **`sell_position_from_settled`** — for **SELL** **`TRADE`** rows, how the fill was sourced from **`positions`** (exact unwind on operator **`mark-failed`**). Written in the same transaction as the fill (**`ExecutionReportApplier`** + **`PositionsRepository.recordTradeFill`**).
 
 ## State machine (§12.3)
 
@@ -30,7 +34,11 @@ Forward-only path persisted on **`executions`**:
 
 ### Trade apply (return path)
 
-On each **applied** trade (after idempotent insert into `executions`), **`PositionsRepository.recordTradeFill`** updates **`positions`** + **`position_history`** using **`oms.settlement.default-custody-account-id`** / **`OMS_SETTLEMENT_DEFAULT_CUSTODY_ACCOUNT_ID`** (must match a `custody_accounts.id`).
+On each **applied** trade (after idempotent insert into `executions`), **`PositionsRepository.recordTradeFill`** updates **`positions`** + **`position_history`** using **`oms.settlement.default-custody-account-id`** / **`OMS_SETTLEMENT_DEFAULT_CUSTODY_ACCOUNT_ID`** (must match a `custody_accounts.id`). **SELL** fills also persist **`sell_position_from_*`** on **`executions`** for mark-failed unwind.
+
+### Operator mark-failed (`POST …/executions/{id}/mark-failed`)
+
+Clears pending **`broker_settlement_confirm`** rows, moves the **`TRADE`** **`settlement_status`** to **`failed`**, and **unwinds `positions`** for that execution’s fill when possible: **BUY** always reverses **`quantity_total`** / **`quantity_pending_buy_settle`** (appends **`MARK_FAILED_UNWIND_BUY`** history). **SELL** reverses when **`sell_position_from_*`** were stored at fill time (appends **`MARK_FAILED_UNWIND_SELL`**); legacy SELL rows without splits log a skip and leave **`positions`** unchanged (operator must correct manually).
 
 ### Read-only inspection (internal HTTP)
 

@@ -3,6 +3,7 @@ package com.balh.oms.returnpath;
 import com.balh.oms.AbstractPostgresIntegrationTest;
 import com.balh.oms.chronicle.PendingControlEvent;
 import com.balh.oms.routing.SimulatedReturnPathProjectionWorker;
+import com.balh.oms.settlement.MarkTradeFailedResult;
 import com.balh.oms.settlement.SettlementConfirmProcessor;
 import com.balh.oms.tailer.ControlTailer;
 import com.balh.oms.test.SettlementBrokerDrainAssertions;
@@ -163,6 +164,44 @@ class SimulatedReturnPathIntegrationTest extends AbstractPostgresIntegrationTest
 
         SettlementBrokerDrainAssertions.assertSellTradesSettledClearsPendingSell(
                 jdbc, settlementConfirmProcessor, orderId, 3);
+    }
+
+    @Test
+    void markTradeFailed_onFirstSellPartialExecution_revertsOneThirdPendingSell() {
+        UUID orderId = insertNewSellOrderWithInventory("sell-mf-1", "MSFT", "30", "12.00");
+        PendingControlEvent ev = event(orderId, 0);
+        assertThat(controlTailer.apply(ev)).isEqualTo(ControlTailer.TailResult.APPLIED);
+        simulatedReturnPathProjectionWorker.processPendingQueueOnce();
+
+        long firstExecId = jdbc.queryForObject(
+                """
+                        SELECT id FROM executions
+                        WHERE order_id = ? AND exec_type = CAST('TRADE' AS execution_exec_type)
+                        ORDER BY id LIMIT 1
+                        """,
+                Long.class,
+                orderId);
+        assertThat(settlementConfirmProcessor.markTradeFailed(firstExecId)).isEqualTo(MarkTradeFailedResult.APPLIED);
+
+        UUID accountId = jdbc.queryForObject("SELECT account_id FROM orders WHERE id = ?", UUID.class, orderId);
+        UUID custody = UUID.fromString("a0000001-0000-4000-8000-000000000001");
+        assertThat(jdbc.queryForObject(
+                        "SELECT quantity_pending_sell_settle FROM positions WHERE account_id = ? AND instrument_symbol = 'MSFT' AND custody_account_id = ?",
+                        BigDecimal.class,
+                        accountId,
+                        custody))
+                .isEqualByComparingTo("20");
+        assertThat(jdbc.queryForObject(
+                        "SELECT quantity_total FROM positions WHERE account_id = ? AND instrument_symbol = 'MSFT' AND custody_account_id = ?",
+                        BigDecimal.class,
+                        accountId,
+                        custody))
+                .isEqualByComparingTo("10");
+        assertThat(jdbc.queryForObject(
+                        "SELECT sell_position_from_settled FROM executions WHERE id = ?",
+                        BigDecimal.class,
+                        firstExecId))
+                .isEqualByComparingTo("10");
     }
 
     @Test

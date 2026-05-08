@@ -10,6 +10,7 @@ import com.balh.oms.persistence.ExecutionsRepository;
 import com.balh.oms.persistence.MarketContextRepository;
 import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.persistence.PositionsRepository;
+import com.balh.oms.persistence.SellFillPositionSplit;
 import com.balh.oms.returnpath.MarketContextVenueEvidence;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -141,11 +142,10 @@ public class ExecutionReportApplier {
         }
         meterRegistry.counter(METRIC_EXECUTIONS_APPLIED, TAG_OUTCOME, OUTCOME_INSERTED).increment();
 
-        positions.recordTradeFill(
-                order,
-                insertedId.get(),
-                cmd.lastQuantity(),
-                UUID.fromString(config.getSettlement().getDefaultCustodyAccountId()));
+        UUID custody = UUID.fromString(config.getSettlement().getDefaultCustodyAccountId());
+        Optional<SellFillPositionSplit> sellSplit =
+                positions.recordTradeFill(order, insertedId.get(), cmd.lastQuantity(), custody);
+        sellSplit.ifPresent(split -> executions.updateSellFillPositionSplit(insertedId.get(), split));
 
         BigDecimal newCum = order.cumFilledQuantity().add(cmd.lastQuantity());
         if (newCum.compareTo(order.quantity()) > 0) {

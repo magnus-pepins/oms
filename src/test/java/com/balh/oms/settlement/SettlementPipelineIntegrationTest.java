@@ -55,6 +55,58 @@ class SettlementPipelineIntegrationTest extends AbstractPostgresIntegrationTest 
     }
 
     @Test
+    void markTradeFailed_revertsBuyFillPosition() {
+        Seed seed = seedFilledBuyOrderWithExecution();
+        assertThat(processor.markTradeFailed(seed.executionId())).isEqualTo(MarkTradeFailedResult.APPLIED);
+        assertThat(jdbc.queryForObject(
+                        "SELECT quantity_total FROM positions WHERE account_id = ? AND instrument_symbol = 'AAPL' AND custody_account_id = ?",
+                        java.math.BigDecimal.class,
+                        seed.accountId(),
+                        DEFAULT_CUSTODY))
+                .isEqualByComparingTo("0");
+        assertThat(jdbc.queryForObject(
+                        "SELECT quantity_pending_buy_settle FROM positions WHERE account_id = ? AND instrument_symbol = 'AAPL' AND custody_account_id = ?",
+                        java.math.BigDecimal.class,
+                        seed.accountId(),
+                        DEFAULT_CUSTODY))
+                .isEqualByComparingTo("0");
+        assertThat(jdbc.queryForObject(
+                        "SELECT COUNT(*)::int FROM position_history WHERE account_id = ? AND event_type = 'MARK_FAILED_UNWIND_BUY'",
+                        Integer.class,
+                        seed.accountId()))
+                .isEqualTo(1);
+    }
+
+    @Test
+    void markTradeFailed_revertsSellFillPositionWhenSplitStored() {
+        SellSeed seed = seedFilledSellOrderWithExecution();
+        assertThat(processor.markTradeFailed(seed.executionId())).isEqualTo(MarkTradeFailedResult.APPLIED);
+        assertThat(jdbc.queryForObject(
+                        "SELECT quantity_total FROM positions WHERE account_id = ? AND instrument_symbol = 'AAPL' AND custody_account_id = ?",
+                        java.math.BigDecimal.class,
+                        seed.accountId(),
+                        DEFAULT_CUSTODY))
+                .isEqualByComparingTo("10");
+        assertThat(jdbc.queryForObject(
+                        "SELECT quantity_settled FROM positions WHERE account_id = ? AND instrument_symbol = 'AAPL' AND custody_account_id = ?",
+                        java.math.BigDecimal.class,
+                        seed.accountId(),
+                        DEFAULT_CUSTODY))
+                .isEqualByComparingTo("10");
+        assertThat(jdbc.queryForObject(
+                        "SELECT quantity_pending_sell_settle FROM positions WHERE account_id = ? AND instrument_symbol = 'AAPL' AND custody_account_id = ?",
+                        java.math.BigDecimal.class,
+                        seed.accountId(),
+                        DEFAULT_CUSTODY))
+                .isEqualByComparingTo("0");
+        assertThat(jdbc.queryForObject(
+                        "SELECT COUNT(*)::int FROM position_history WHERE account_id = ? AND event_type = 'MARK_FAILED_UNWIND_SELL'",
+                        Integer.class,
+                        seed.accountId()))
+                .isEqualTo(1);
+    }
+
+    @Test
     void brokerConfirmDrain_movesBuyPositionToSettled() {
         Seed seed = seedFilledBuyOrderWithExecution();
         processor.registerAndDrain(List.of(seed.executionId()), 20, 20);
@@ -218,6 +270,9 @@ class SettlementPipelineIntegrationTest extends AbstractPostgresIntegrationTest 
                         """,
                 accountId,
                 DEFAULT_CUSTODY);
+        jdbc.update(
+                "UPDATE executions SET sell_position_from_pending_buy = 0, sell_position_from_settled = 10 WHERE id = ?",
+                exId);
         return new SellSeed(accountId, exId);
     }
 

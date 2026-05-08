@@ -206,8 +206,9 @@ public class SettlementConfirmProcessor {
     }
 
     /**
-     * Marks a {@code TRADE} execution {@code failed} (§12.7); removes pending broker confirms. Does not unwind
-     * {@code positions} in this slice.
+     * Marks a {@code TRADE} execution {@code failed} (§12.7); removes pending broker confirms; unwinds
+     * {@code positions} for the trade fill when {@link PositionsRepository#revertPositionForMarkTradeFailed}
+     * applies (BUY always; SELL when {@code executions.sell_position_from_*} were stored at fill time).
      */
     @Transactional
     public MarkTradeFailedResult markTradeFailed(long executionId) {
@@ -231,6 +232,8 @@ public class SettlementConfirmProcessor {
             return MarkTradeFailedResult.ALREADY_SETTLED;
         }
         confirms.deletePendingForExecution(executionId);
+        UUID custody = UUID.fromString(config.getSettlement().getDefaultCustodyAccountId());
+        positions.revertPositionForMarkTradeFailed(snap, custody);
         int n = executions.failTradeSettlementToFailed(executionId);
         if (n != 1) {
             throw new IllegalStateException("mark settlement failed: unexpected CAS execution=" + executionId);

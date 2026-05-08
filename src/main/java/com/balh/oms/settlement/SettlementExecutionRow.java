@@ -13,4 +13,6 @@ public record SettlementExecutionRow(
         BigDecimal lastQuantity,
         UUID accountId,
         String instrumentSymbol,
-        String side) {}
+        String side,
+        BigDecimal sellPositionFromPendingBuy,
+        BigDecimal sellPositionFromSettled) {}

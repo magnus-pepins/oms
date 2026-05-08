@@ -7,6 +7,7 @@ import org.springframework.stereotype.Repository;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 
 /**
@@ -54,10 +55,9 @@ public class ExecutionsRepository {
     }
 
     /**
-     * @return {@code true} if a new row was inserted; {@code false} if idempotent duplicate
-     *         on {@code (account_id, venue_exec_ref)}.
+     * @return inserted {@code executions.id}, or empty if idempotent duplicate on {@code (account_id, venue_exec_ref)}.
      */
-    public boolean tryInsertTrade(
+    public Optional<Long> tryInsertTrade(
             UUID orderId,
             UUID accountId,
             String venueId,
@@ -75,7 +75,7 @@ public class ExecutionsRepository {
     /**
      * Cancel acknowledgement row (audit); idempotent on {@code (account_id, venue_exec_ref)}.
      */
-    public boolean tryInsertCancel(
+    public Optional<Long> tryInsertCancel(
             UUID orderId,
             UUID accountId,
             String venueId,
@@ -90,7 +90,7 @@ public class ExecutionsRepository {
     /**
      * Venue/broker reject audit row; idempotent on {@code (account_id, venue_exec_ref)}.
      */
-    public boolean tryInsertVenueReject(
+    public Optional<Long> tryInsertVenueReject(
             UUID orderId,
             UUID accountId,
             String venueId,
@@ -102,7 +102,7 @@ public class ExecutionsRepository {
                 BigDecimal.ZERO, null, BigDecimal.ZERO, cumQuantityAfter, "REJECT", rawJson);
     }
 
-    private boolean insertReturning(
+    private Optional<Long> insertReturning(
             String sql,
             UUID orderId,
             UUID accountId,
@@ -131,6 +131,6 @@ public class ExecutionsRepository {
                 sql,
                 params,
                 (rs, rowNum) -> rs.getLong("id"));
-        return !ids.isEmpty();
+        return ids.isEmpty() ? Optional.empty() : Optional.of(ids.getFirst());
     }
 }

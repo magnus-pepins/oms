@@ -30,7 +30,7 @@ class SimulatedReturnPathIntegrationTest extends AbstractPostgresIntegrationTest
 
     @BeforeEach
     void truncate() {
-        jdbc.update("TRUNCATE TABLE orders CASCADE");
+        jdbc.update("TRUNCATE TABLE manual_settlement_actions, position_history, positions, orders CASCADE");
     }
 
     @DynamicPropertySource
@@ -86,6 +86,31 @@ class SimulatedReturnPathIntegrationTest extends AbstractPostgresIntegrationTest
                 (rs, i) -> rs.getString("t"),
                 orderId);
         assertThat(types).contains("OrderWorking", "OrderPartiallyFilled", "OrderFilled");
+
+        UUID accountId = jdbc.queryForObject("SELECT account_id FROM orders WHERE id = ?", UUID.class, orderId);
+        UUID custody = UUID.fromString("a0000001-0000-4000-8000-000000000001");
+        assertThat(jdbc.queryForObject(
+                        "SELECT quantity_total FROM positions WHERE account_id = ? AND instrument_symbol = 'AAPL' AND custody_account_id = ?",
+                        BigDecimal.class,
+                        accountId,
+                        custody))
+                .isEqualByComparingTo("100");
+        assertThat(jdbc.queryForObject(
+                        "SELECT quantity_pending_buy_settle FROM positions WHERE account_id = ? AND instrument_symbol = 'AAPL' AND custody_account_id = ?",
+                        BigDecimal.class,
+                        accountId,
+                        custody))
+                .isEqualByComparingTo("100");
+        assertThat(jdbc.queryForObject(
+                        "SELECT COUNT(*)::int FROM position_history WHERE account_id = ? AND event_type = 'TRADE_BUY_FILL'",
+                        Integer.class,
+                        accountId))
+                .isEqualTo(3);
+        assertThat(jdbc.queryForObject(
+                        "SELECT settlement_status::text FROM executions WHERE order_id = ? ORDER BY id LIMIT 1",
+                        String.class,
+                        orderId))
+                .isEqualTo("executed");
     }
 
     @Test

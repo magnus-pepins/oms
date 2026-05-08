@@ -9,6 +9,7 @@ import com.balh.oms.persistence.DomainEventOutboxRepository;
 import com.balh.oms.persistence.ExecutionsRepository;
 import com.balh.oms.persistence.MarketContextRepository;
 import com.balh.oms.persistence.OrdersRepository;
+import com.balh.oms.persistence.PositionsRepository;
 import com.balh.oms.returnpath.MarketContextVenueEvidence;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -52,6 +53,7 @@ public class ExecutionReportApplier {
     private final ObjectMapper objectMapper;
     private final OmsConfig config;
     private final MeterRegistry meterRegistry;
+    private final PositionsRepository positions;
 
     public ExecutionReportApplier(
             OrdersRepository orders,
@@ -61,7 +63,8 @@ public class ExecutionReportApplier {
             DomainEventEnvelopeCodec envelopeCodec,
             ObjectMapper objectMapper,
             OmsConfig config,
-            MeterRegistry meterRegistry) {
+            MeterRegistry meterRegistry,
+            PositionsRepository positions) {
         this.orders = orders;
         this.executions = executions;
         this.marketContext = marketContext;
@@ -70,6 +73,7 @@ public class ExecutionReportApplier {
         this.objectMapper = objectMapper;
         this.config = config;
         this.meterRegistry = meterRegistry;
+        this.positions = positions;
     }
 
     public enum TradeApplyOutcome {
@@ -120,7 +124,7 @@ public class ExecutionReportApplier {
         }
 
         String raw = rawTradeJson(cmd);
-        boolean inserted = executions.tryInsertTrade(
+        Optional<Long> insertedId = executions.tryInsertTrade(
                 order.id(),
                 order.accountId(),
                 cmd.venueId(),
@@ -131,11 +135,17 @@ public class ExecutionReportApplier {
                 cmd.leavesQuantity(),
                 cmd.cumQuantityAfter(),
                 raw);
-        if (!inserted) {
+        if (insertedId.isEmpty()) {
             meterRegistry.counter(METRIC_EXECUTIONS_APPLIED, TAG_OUTCOME, OUTCOME_DUPLICATE).increment();
             return TradeApplyOutcome.DUPLICATE;
         }
         meterRegistry.counter(METRIC_EXECUTIONS_APPLIED, TAG_OUTCOME, OUTCOME_INSERTED).increment();
+
+        positions.recordTradeFill(
+                order,
+                insertedId.get(),
+                cmd.lastQuantity(),
+                UUID.fromString(config.getSettlement().getDefaultCustodyAccountId()));
 
         BigDecimal newCum = order.cumFilledQuantity().add(cmd.lastQuantity());
         if (newCum.compareTo(order.quantity()) > 0) {
@@ -197,7 +207,7 @@ public class ExecutionReportApplier {
         }
 
         String raw = rawCancelJson(cmd);
-        boolean inserted = executions.tryInsertCancel(
+        Optional<Long> insertedId = executions.tryInsertCancel(
                 order.id(),
                 order.accountId(),
                 cmd.venueId(),
@@ -205,7 +215,7 @@ public class ExecutionReportApplier {
                 cmd.venueExecRef(),
                 order.cumFilledQuantity(),
                 raw);
-        if (!inserted) {
+        if (insertedId.isEmpty()) {
             meterRegistry.counter(METRIC_EXECUTIONS_APPLIED, TAG_OUTCOME, OUTCOME_DUPLICATE).increment();
             return CancelApplyOutcome.DUPLICATE;
         }
@@ -251,7 +261,7 @@ public class ExecutionReportApplier {
 
         marketContext.ensureStubSnapshot(order.id(), config.getRouting().getMarketContextStubJson());
 
-        boolean inserted = executions.tryInsertVenueReject(
+        Optional<Long> insertedId = executions.tryInsertVenueReject(
                 order.id(),
                 order.accountId(),
                 cmd.venueId(),
@@ -259,7 +269,7 @@ public class ExecutionReportApplier {
                 cmd.venueExecRef(),
                 order.cumFilledQuantity(),
                 cmd.rawEnvelopeJson());
-        if (!inserted) {
+        if (insertedId.isEmpty()) {
             meterRegistry.counter(METRIC_EXECUTIONS_APPLIED, TAG_OUTCOME, OUTCOME_DUPLICATE).increment();
             return VenueRejectApplyOutcome.DUPLICATE;
         }

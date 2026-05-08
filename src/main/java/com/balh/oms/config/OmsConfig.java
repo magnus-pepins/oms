@@ -8,6 +8,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.Locale;
 import java.util.Set;
+import java.util.UUID;
 import java.util.stream.Collectors;
 
 /**
@@ -33,6 +34,7 @@ public class OmsConfig {
     private final Risk risk = new Risk();
     private final Routing routing = new Routing();
     private final Fix fix = new Fix();
+    private final Settlement settlement = new Settlement();
 
     public Http getHttp() { return http; }
     public Shard getShard() { return shard; }
@@ -46,6 +48,7 @@ public class OmsConfig {
     public Risk getRisk() { return risk; }
     public Routing getRouting() { return routing; }
     public Fix getFix() { return fix; }
+    public Settlement getSettlement() { return settlement; }
 
     public static class Http {
         private String internalApiKey = "";
@@ -568,6 +571,25 @@ public class OmsConfig {
 
         public void setSessionJdbcConnectionTimeoutMs(long sessionJdbcConnectionTimeoutMs) {
             this.sessionJdbcConnectionTimeoutMs = Math.max(250L, sessionJdbcConnectionTimeoutMs);
+        }
+    }
+
+    /**
+     * Post-trade settlement / custody (slice 6). Defaults align with Flyway {@code V11__settlement_positions.sql}.
+     */
+    public static class Settlement {
+        private String defaultCustodyAccountId = "a0000001-0000-4000-8000-000000000001";
+
+        public String getDefaultCustodyAccountId() {
+            return defaultCustodyAccountId;
+        }
+
+        public void setDefaultCustodyAccountId(String defaultCustodyAccountId) {
+            String trimmed = defaultCustodyAccountId == null || defaultCustodyAccountId.isBlank()
+                    ? "a0000001-0000-4000-8000-000000000001"
+                    : defaultCustodyAccountId.trim();
+            UUID.fromString(trimmed);
+            this.defaultCustodyAccountId = trimmed;
         }
     }
 }

@@ -100,6 +100,9 @@ oms:
       queue-capacity: ${OMS_SIMULATED_QUEUE_CAPACITY:10000}
       poll-interval-ms: ${OMS_SIMULATED_POLL_INTERVAL_MS:50}
       scheduler-enabled: ${OMS_SIMULATED_SCHEDULER_ENABLED:true}
+  settlement:
+    # Must match a row in custody_accounts (Flyway V11 seeds DEFAULT omnibus).
+    default-custody-account-id: ${OMS_SETTLEMENT_DEFAULT_CUSTODY_ACCOUNT_ID:a0000001-0000-4000-8000-000000000001}
   fix:
     # When routing.backend=fix and auto-start=true, starts SocketInitiator + outbound drain scheduler.
     auto-start: ${OMS_FIX_AUTO_START:false}

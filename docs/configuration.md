@@ -62,6 +62,12 @@ new key here when introducing one.
 | `OMS_SIMULATED_POLL_INTERVAL_MS` | `50` | `@Scheduled` drain interval when simulated backend is enabled. |
 | `OMS_SIMULATED_SCHEDULER_ENABLED` | `true` | When `false`, only explicit `SimulatedReturnPathProjectionWorker.processPendingQueueOnce()` drains the queue (used in integration tests). |
 
+## Settlement / positions (slice 6)
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `OMS_SETTLEMENT_DEFAULT_CUSTODY_ACCOUNT_ID` | `a0000001-0000-4000-8000-000000000001` | UUID of the **`custody_accounts`** row used when applying **trade** fills to **`positions`** (must match DB; Flyway **V11** seeds the default omnibus). See [settlement.md](settlement.md). |
+
 ## FIX (slice 4+)
 
 Used when `OMS_ROUTING_BACKEND=fix`. See [fix-out.md](fix-out.md) for session maps and runbooks.

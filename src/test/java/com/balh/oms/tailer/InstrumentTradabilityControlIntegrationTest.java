@@ -25,7 +25,7 @@ class InstrumentTradabilityControlIntegrationTest extends AbstractPostgresIntegr
 
     @BeforeEach
     void truncateTradingTables() {
-        jdbc.update("TRUNCATE TABLE orders CASCADE");
+        jdbc.update(AbstractPostgresIntegrationTest.SQL_TRUNCATE_ORDERS_AND_SETTLEMENT);
         jdbc.update("TRUNCATE TABLE oms_runtime_flags RESTART IDENTITY");
     }
 

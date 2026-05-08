@@ -70,7 +70,7 @@ class FixIngressRoundTripSpringIntegrationTest extends AbstractPostgresIntegrati
     @BeforeEach
     void reset() {
         FixRoundTripAcceptorApplication.resetItHooks();
-        jdbc.update("TRUNCATE TABLE orders CASCADE");
+        jdbc.update(AbstractPostgresIntegrationTest.SQL_TRUNCATE_ORDERS_AND_SETTLEMENT);
     }
 
     @Test
@@ -94,6 +94,20 @@ class FixIngressRoundTripSpringIntegrationTest extends AbstractPostgresIntegrati
 
         assertThat(jdbc.queryForObject("SELECT cum_filled_quantity FROM orders WHERE id = ?", BigDecimal.class, orderId))
                 .isEqualByComparingTo("10");
+
+        UUID custody = UUID.fromString("a0000001-0000-4000-8000-000000000001");
+        assertThat(jdbc.queryForObject(
+                        "SELECT quantity_total FROM positions WHERE account_id = ? AND instrument_symbol = 'AAPL' AND custody_account_id = ?",
+                        BigDecimal.class,
+                        accountId,
+                        custody))
+                .isEqualByComparingTo("10");
+        assertThat(jdbc.queryForObject(
+                        "SELECT COUNT(*)::int FROM position_history WHERE account_id = ? AND event_type = 'TRADE_BUY_FILL'",
+                        Integer.class,
+                        accountId))
+                .isEqualTo(1);
+
         assertThat(meterRegistry.counter(FixMetrics.METRIC_NOS_SENT).count()).isPositive();
         assertThat(meterRegistry
                         .counter(FixMetrics.METRIC_INBOUND_ER, FixMetrics.TAG_DISPOSITION, "trade_APPLIED")

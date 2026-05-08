@@ -30,7 +30,7 @@ class SimulatedReturnPathIntegrationTest extends AbstractPostgresIntegrationTest
 
     @BeforeEach
     void truncate() {
-        jdbc.update("TRUNCATE TABLE manual_settlement_actions, position_history, positions, orders CASCADE");
+        jdbc.update(AbstractPostgresIntegrationTest.SQL_TRUNCATE_ORDERS_AND_SETTLEMENT);
     }
 
     @DynamicPropertySource

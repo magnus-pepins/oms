@@ -52,7 +52,7 @@ class FixRoundTripSymbolMapSpringIntegrationTest extends AbstractPostgresIntegra
     @BeforeEach
     void truncateOrders() {
         FixRoundTripAcceptorApplication.resetItHooks();
-        jdbc.update("TRUNCATE TABLE orders CASCADE");
+        jdbc.update(AbstractPostgresIntegrationTest.SQL_TRUNCATE_ORDERS_AND_SETTLEMENT);
     }
 
     @Test

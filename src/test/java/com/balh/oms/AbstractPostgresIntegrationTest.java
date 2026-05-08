@@ -24,6 +24,16 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 @ActiveProfiles("test")
 public abstract class AbstractPostgresIntegrationTest {
 
+    /**
+     * Clears the order graph and slice-6 settlement tables in one statement.
+     *
+     * <p>{@code TRUNCATE orders CASCADE} alone does not remove {@code positions} (no FK from
+     * positions to orders), which can leak state across integration tests that reuse the same
+     * container and default custody account.
+     */
+    public static final String SQL_TRUNCATE_ORDERS_AND_SETTLEMENT =
+            "TRUNCATE TABLE manual_settlement_actions, position_history, positions, orders CASCADE";
+
     @Container
     protected static final PostgreSQLContainer<?> POSTGRES =
             new PostgreSQLContainer<>("postgres:16-alpine")

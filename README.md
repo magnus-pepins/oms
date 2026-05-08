@@ -164,7 +164,8 @@ tests execute instead of being skipped.
 - [docs/replay.md](docs/replay.md) — Chronicle's role and how to replay.
 - [docs/drop-copy-events.md](docs/drop-copy-events.md) — domain-event
   envelope and emit points.
-- [docs/return-path.md](docs/return-path.md) — executions, simulated routing, idempotency.
+- [docs/return-path.md](docs/return-path.md) — executions, simulated routing, idempotency, slice-6 fill→positions.
+- [docs/settlement.md](docs/settlement.md) — custody, `positions`, `position_history`, `settlement_status`.
 - [docs/fix-out.md](docs/fix-out.md) — FIX slice 4 wiring status.
 - [docs/configuration.md](docs/configuration.md) — every named limit /
   env key in one place.

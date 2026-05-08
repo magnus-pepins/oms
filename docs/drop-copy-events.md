@@ -8,7 +8,7 @@ drained by `DomainFanoutReconciler`. **NATS JetStream** (`FanoutClient`) is
 optional when `OMS_NATS_ENABLED=true`. **`OrderRejected`** and **`OrderWorking`**
 are written to the same outbox inside `ControlTailer` after successful CAS.
 **`OrderPartiallyFilled`**, **`OrderFilled`**, and **`OrderCancelled`** are written
-by `ExecutionReportApplier` (slice 3) after execution rows apply. External FIX
+by `ExecutionReportApplier` (slice 3) after execution rows apply; applied **trades** also write **`positions`** / **`position_history`** (slice 6 — see `docs/settlement.md`). External FIX
 drop copy reuses the same envelope shapes in slice 4+.
 
 ## Envelope (wire schema)

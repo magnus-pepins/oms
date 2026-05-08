@@ -1,19 +1,25 @@
 package com.balh.oms.ingress;
 
 import com.balh.oms.config.OmsConfig;
+import com.balh.oms.persistence.SettlementExecutionsRepository;
 import com.balh.oms.settlement.BrokerFixtureRow;
 import com.balh.oms.settlement.MarkTradeFailedResult;
 import com.balh.oms.settlement.SettlementConfirmProcessor;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.List;
+import java.util.Set;
+import java.util.UUID;
+import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
-
-import java.util.List;
 
 /**
  * Internal settlement controls (slice 6). Secured by {@link ApiKeyFilter} like other
@@ -22,6 +28,14 @@ import java.util.List;
 @RestController
 @RequestMapping("/internal/v1/settlement")
 public class SettlementController {
+
+    private static final int DEFAULT_EXECUTION_LIST_LIMIT = 100;
+    private static final int MAX_EXECUTION_LIST_LIMIT = 500;
+    private static final int MAX_EXECUTION_LIST_OFFSET = 10_000;
+    private static final long MAX_EXECUTION_LIST_RANGE_WITHOUT_ORDER_DAYS = 31;
+
+    private static final Set<String> ALLOWED_SETTLEMENT_STATUSES =
+            Set.of("executed", "matched", "confirmed", "settling", "settled", "failed");
 
     public record BrokerConfirmIngestRequest(List<Long> executionIds) {}
 
@@ -39,10 +53,87 @@ public class SettlementController {
 
     private final SettlementConfirmProcessor processor;
     private final OmsConfig config;
+    private final SettlementExecutionsRepository settlementExecutions;
 
-    public SettlementController(SettlementConfirmProcessor processor, OmsConfig config) {
+    public SettlementController(
+            SettlementConfirmProcessor processor,
+            OmsConfig config,
+            SettlementExecutionsRepository settlementExecutions) {
         this.processor = processor;
         this.config = config;
+        this.settlementExecutions = settlementExecutions;
+    }
+
+    /**
+     * Paginated read of executions joined to orders. Either {@code orderId} is present, or both
+     * {@code from} and {@code to} must be present (half-open {@code [from, to)} on {@code
+     * executions.created_at}). Without {@code orderId}, the range must not exceed 31 days and must
+     * have {@code to} strictly after {@code from}.
+     */
+    @GetMapping("/executions")
+    public ResponseEntity<SettlementExecutionsPageResponse> listExecutions(
+            @RequestParam(required = false) UUID orderId,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) Instant from,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) Instant to,
+            @RequestParam(required = false) String settlementStatus,
+            @RequestParam(required = false) Integer limit,
+            @RequestParam(required = false) Integer offset) {
+        if (orderId == null && (from == null || to == null)) {
+            return ResponseEntity.badRequest().build();
+        }
+        if (settlementStatus != null && !ALLOWED_SETTLEMENT_STATUSES.contains(settlementStatus)) {
+            return ResponseEntity.badRequest().build();
+        }
+        if (from != null ^ to != null) {
+            return ResponseEntity.badRequest().build();
+        }
+        if (from != null && to != null) {
+            if (!to.isAfter(from)) {
+                return ResponseEntity.badRequest().build();
+            }
+            if (orderId == null) {
+                long days = Duration.between(from, to).toDays();
+                if (days > MAX_EXECUTION_LIST_RANGE_WITHOUT_ORDER_DAYS) {
+                    return ResponseEntity.badRequest().build();
+                }
+            }
+        }
+        int lim = limit == null ? DEFAULT_EXECUTION_LIST_LIMIT : limit;
+        if (lim < 1) {
+            lim = DEFAULT_EXECUTION_LIST_LIMIT;
+        }
+        if (lim > MAX_EXECUTION_LIST_LIMIT) {
+            lim = MAX_EXECUTION_LIST_LIMIT;
+        }
+        int off = offset == null ? 0 : offset;
+        if (off < 0 || off > MAX_EXECUTION_LIST_OFFSET) {
+            return ResponseEntity.badRequest().build();
+        }
+        var items =
+                settlementExecutions
+                        .findByFilters(orderId, from, to, settlementStatus, lim, off)
+                        .stream()
+                        .map(
+                                r ->
+                                        new SettlementExecutionResponse(
+                                                r.id(),
+                                                r.orderId(),
+                                                r.accountId(),
+                                                r.venueId(),
+                                                r.venueTs(),
+                                                r.venueExecRef(),
+                                                r.lastQuantity(),
+                                                r.lastPrice(),
+                                                r.leavesQuantity(),
+                                                r.cumQuantityAfter(),
+                                                r.execType(),
+                                                r.settlementStatus(),
+                                                r.createdAt(),
+                                                r.orderStatus(),
+                                                r.side(),
+                                                r.instrumentSymbol()))
+                        .toList();
+        return ResponseEntity.ok(new SettlementExecutionsPageResponse(items, lim, off));
     }
 
     @PostMapping("/broker-confirms")

@@ -18,6 +18,8 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
 
+import java.sql.Timestamp;
+import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
 
@@ -51,6 +53,76 @@ class SettlementControllerIntegrationTest extends AbstractPostgresIntegrationTes
                 new HttpEntity<>(new SettlementController.BrokerConfirmIngestRequest(List.of(1L)), h),
                 String.class);
         assertThat(res.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+    }
+
+    @Test
+    void listExecutions_rejectsWithoutInternalApiKey() {
+        ResponseEntity<String> res = http.getForEntity(base() + "/executions?orderId=" + UUID.randomUUID(), String.class);
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+    }
+
+    @Test
+    void listExecutions_badRequestWhenNoOrderIdAndNoTimeWindow() {
+        ResponseEntity<String> res =
+                http.exchange(base() + "/executions", HttpMethod.GET, new HttpEntity<>(headers()), String.class);
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
+    void listExecutions_badRequestWhenInvalidSettlementStatus() {
+        UUID orderId = UUID.randomUUID();
+        ResponseEntity<String> res =
+                http.exchange(
+                        base() + "/executions?orderId=" + orderId + "&settlementStatus=not_an_enum",
+                        HttpMethod.GET,
+                        new HttpEntity<>(headers()),
+                        String.class);
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
+    void listExecutions_byOrderId_returnsJoinedOrderFields() {
+        long exId = seedTradeExecution();
+        UUID orderId =
+                jdbc.queryForObject("SELECT order_id FROM executions WHERE id = ?", UUID.class, exId);
+        ResponseEntity<SettlementExecutionsPageResponse> res =
+                http.exchange(
+                        base() + "/executions?orderId=" + orderId + "&limit=20",
+                        HttpMethod.GET,
+                        new HttpEntity<>(headers()),
+                        new ParameterizedTypeReference<>() {});
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(res.getBody()).isNotNull();
+        assertThat(res.getBody().items()).hasSize(1);
+        SettlementExecutionResponse row = res.getBody().items().getFirst();
+        assertThat(row.id()).isEqualTo(exId);
+        assertThat(row.orderId()).isEqualTo(orderId);
+        assertThat(row.orderStatus()).isEqualTo("FILLED");
+        assertThat(row.side()).isEqualTo("BUY");
+        assertThat(row.instrumentSymbol()).isEqualTo("AAPL");
+        assertThat(row.settlementStatus()).isEqualTo("executed");
+        assertThat(row.execType()).isEqualTo("TRADE");
+    }
+
+    @Test
+    void listExecutions_byTimeWindow_withoutOrderId() {
+        long exId = seedTradeExecution();
+        Timestamp createdTs =
+                jdbc.queryForObject("SELECT created_at FROM executions WHERE id = ?", Timestamp.class, exId);
+        Instant created = createdTs.toInstant();
+        Instant from = created.minusSeconds(3600);
+        Instant to = created.plusSeconds(3600);
+        ResponseEntity<SettlementExecutionsPageResponse> res =
+                http.exchange(
+                        base() + "/executions?from=" + from + "&to=" + to,
+                        HttpMethod.GET,
+                        new HttpEntity<>(headers()),
+                        new ParameterizedTypeReference<>() {});
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(res.getBody()).isNotNull();
+        assertThat(res.getBody().items()).isNotEmpty();
+        assertThat(res.getBody().items().stream().map(SettlementExecutionResponse::id).anyMatch(id -> id == exId))
+                .isTrue();
     }
 
     @Test

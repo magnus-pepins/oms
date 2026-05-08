@@ -16,7 +16,8 @@ see `.github/workflows/ci.yml`.
 The product / architecture decisions that shaped this code live in the
 [system-documentation](../system-documentation) workspace — primarily
 [plans/oms-fix-gateway-and-settlement.md](../system-documentation/plans/oms-fix-gateway-and-settlement.md)
-and the milestone plan it links to.
+and the milestone plan it links to. **Phase 1 exit (UAT soak, §16 #3, prod session store):** fill
+[plans/oms-phase1-exit-actions.md](../system-documentation/plans/oms-phase1-exit-actions.md).
 
 ## What is in slice 1
 
@@ -82,7 +83,7 @@ and the milestone plan it links to.
 
 ## What is NOT in slice 1
 
-- FIX **production** hardening (named broker UAT sign-off, multi-day soak) — see [oms-realignment-2026-05-07.md](../system-documentation/plans/oms-realignment-2026-05-07.md) and [docs/fix-broker-uat-soak.md](docs/fix-broker-uat-soak.md). **Optional** second Postgres for JDBC session store: Compose profile **`with-fix-session-db`** + [docs/fix-session-store-isolation.md](docs/fix-session-store-isolation.md).
+- FIX **production** hardening (named broker UAT sign-off, multi-day soak) — see [oms-realignment-2026-05-07.md](../system-documentation/plans/oms-realignment-2026-05-07.md), [docs/fix-broker-uat-soak.md](docs/fix-broker-uat-soak.md), and the **scheduling / sign-off runbook** [plans/oms-phase1-exit-actions.md](../system-documentation/plans/oms-phase1-exit-actions.md). **Optional** second Postgres for JDBC session store: Compose profile **`with-fix-session-db`** + [docs/fix-session-store-isolation.md](docs/fix-session-store-isolation.md).
 - Full risk catalogue from the master plan (STP, sanctions re-check, venue-specific
   checks, …) — only the slice‑2 subset above is implemented so far.
 - Cluster-aware lease ownership (slice 1.5).

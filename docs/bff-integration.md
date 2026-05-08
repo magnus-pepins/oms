@@ -30,3 +30,5 @@ ad-hoc HTTP-side publishes. The envelope carries `schemaVersion`, `type`,
 `occurredAt`, `correlationId` (order UUID), and `payload`.
 
 See [drop-copy-events.md](drop-copy-events.md) for payload field shapes.
+
+**Optional BFF JetStream consumer:** when `BFF_OMS_DOMAIN_EVENTS_CONSUMER_ENABLED=true` on the standalone BFF (same `NATS_URL` as OMS; stream `OMS_EVENTS` must exist), `customer-frontend/lib/server/omsDomainEventsConsumer.ts` runs a durable pull consumer on `oms.events.>` — **metrics + logs** (`customer_api_oms_domain_events_*`); **GET** remains the OMS proxy. Dedupe: Redis `oms:fanout:dedup:*` when `REDIS_URL` is set.

@@ -10,6 +10,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # Gradle clean test + Docker pulls should finish well under this; cap avoids zombie jobs when a step hangs.
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v4

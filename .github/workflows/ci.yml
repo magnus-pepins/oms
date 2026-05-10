@@ -24,8 +24,13 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
+      # Warm primary DB image so Testcontainers does not fail the Gradle "Test" step on first-pull
+      # latency or anonymous Docker Hub rate limits before tests start.
+      - name: Pre-pull container images used in tests
+        run: docker pull postgres:16-alpine
+
       - name: Test
-        run: ./gradlew test --no-daemon
+        run: ./gradlew clean test --no-daemon --no-build-cache --stacktrace
 
       - name: Assemble
-        run: ./gradlew bootJar --no-daemon
+        run: ./gradlew bootJar --no-daemon --no-build-cache

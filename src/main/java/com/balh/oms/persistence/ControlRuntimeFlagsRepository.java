@@ -23,6 +23,14 @@ public class ControlRuntimeFlagsRepository {
 
     /** Present when a row exists for {@code global_halt}; absent when no row has been written yet. */
     public Optional<GlobalHaltRow> findGlobalHaltRow() {
+        return findBooleanFlagRow(OmsRuntimeFlagKeys.GLOBAL_HALT);
+    }
+
+    public void setGlobalHalt(boolean halted) {
+        upsertBooleanFlag(OmsRuntimeFlagKeys.GLOBAL_HALT, halted);
+    }
+
+    public Optional<GlobalHaltRow> findBooleanFlagRow(String flagKey) {
         List<GlobalHaltRow> rows =
                 jdbc.query(
                         """
@@ -33,11 +41,11 @@ public class ControlRuntimeFlagsRepository {
                                 new GlobalHaltRow(
                                         rs.getBoolean("value_boolean"),
                                         rs.getTimestamp("updated_at").toInstant()),
-                        OmsRuntimeFlagKeys.GLOBAL_HALT);
+                        flagKey);
         return rows.stream().findFirst();
     }
 
-    public void setGlobalHalt(boolean halted) {
+    public void upsertBooleanFlag(String flagKey, boolean value) {
         jdbc.update(
                 """
                         INSERT INTO oms_runtime_flags (flag_key, value_boolean, updated_at)
@@ -46,7 +54,13 @@ public class ControlRuntimeFlagsRepository {
                             value_boolean = EXCLUDED.value_boolean,
                             updated_at = NOW()
                         """,
-                OmsRuntimeFlagKeys.GLOBAL_HALT,
-                halted);
+                flagKey,
+                value);
+    }
+
+    public boolean isCanaryPauseSimulatedFills() {
+        return findBooleanFlagRow(OmsRuntimeFlagKeys.CANARY_PAUSE_SIMULATED_FILLS)
+                .map(GlobalHaltRow::value)
+                .orElse(false);
     }
 }

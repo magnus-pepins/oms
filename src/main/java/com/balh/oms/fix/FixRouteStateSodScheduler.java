@@ -9,6 +9,9 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
+import java.time.Instant;
+import java.util.Optional;
+
 /**
  * Optional start-of-day reconciliation: sets {@code fix_route_state.send_enabled = true} for all routes.
  * Disabled by default; enable with {@code oms.fix.route-state-sod-enabled=true} and set
@@ -24,12 +27,17 @@ public class FixRouteStateSodScheduler {
     private final FixRouteStateRepository fixRouteStateRepository;
     private final MeterRegistry meterRegistry;
     private final OmsConfig omsConfig;
+    private final FixSodPolicyEngine sodPolicyEngine;
 
     public FixRouteStateSodScheduler(
-            FixRouteStateRepository fixRouteStateRepository, MeterRegistry meterRegistry, OmsConfig omsConfig) {
+            FixRouteStateRepository fixRouteStateRepository,
+            MeterRegistry meterRegistry,
+            OmsConfig omsConfig,
+            FixSodPolicyEngine sodPolicyEngine) {
         this.fixRouteStateRepository = fixRouteStateRepository;
         this.meterRegistry = meterRegistry;
         this.omsConfig = omsConfig;
+        this.sodPolicyEngine = sodPolicyEngine;
     }
 
     @Scheduled(cron = "${oms.fix.route-state-sod-cron}")
@@ -37,6 +45,13 @@ public class FixRouteStateSodScheduler {
         String cron = omsConfig.getFix().getRouteStateSodCron();
         if (cron == null || cron.isBlank()) {
             log.warn("oms.fix.route-state-sod-cron is blank; skipping FIX route-state SOD reconciliation");
+            return;
+        }
+        Optional<String> skip = sodPolicyEngine.skipReasonAt(Instant.now());
+        if (skip.isPresent()) {
+            meterRegistry.counter(FixMetrics.METRIC_ROUTE_STATE_SOD_SKIPPED, FixMetrics.TAG_SKIP_REASON, skip.get())
+                    .increment();
+            log.info("FIX route-state SOD reconciliation skipped ({})", skip.get());
             return;
         }
         int n = fixRouteStateRepository.sodEnableSendOnAllRoutes("sod-reconciler");

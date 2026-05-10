@@ -32,7 +32,7 @@ public abstract class AbstractPostgresIntegrationTest {
      * container and default custody account.
      */
     public static final String SQL_TRUNCATE_ORDERS_AND_SETTLEMENT =
-            "TRUNCATE TABLE manual_settlement_actions, position_history, positions, orders CASCADE";
+            "TRUNCATE TABLE corporate_action_event, manual_settlement_actions, ledger_settlement_outbox, broker_settlement_confirm, settlement_file_import_batch, position_history, positions, orders CASCADE";
 
     @Container
     protected static final PostgreSQLContainer<?> POSTGRES =

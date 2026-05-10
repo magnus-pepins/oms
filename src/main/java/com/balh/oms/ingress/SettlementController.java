@@ -5,6 +5,8 @@ import com.balh.oms.persistence.SettlementExecutionsRepository;
 import com.balh.oms.settlement.BrokerFixtureRow;
 import com.balh.oms.settlement.MarkTradeFailedResult;
 import com.balh.oms.settlement.SettlementConfirmProcessor;
+import com.balh.oms.settlement.SettlementFileImportBatchRepository;
+import com.balh.oms.settlement.SettlementFileImportService;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
@@ -12,6 +14,7 @@ import java.util.Set;
 import java.util.UUID;
 import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -19,7 +22,9 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RequestPart;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.multipart.MultipartFile;
 
 /**
  * Internal settlement controls (slice 6). Secured by {@link ApiKeyFilter} like other
@@ -49,19 +54,40 @@ public class SettlementController {
 
     public record BrokerFixtureImportResponse(int insertedRows, int skippedUnresolvedRows, int skippedInvalidRows) {}
 
+    public record SettlementFileImportResponse(
+            boolean duplicate,
+            long batchId,
+            String status,
+            Integer rowCount,
+            String errorSummary,
+            int insertedConfirms,
+            int skippedInvalidRows,
+            int skippedUnresolvedRows) {}
+
+    public record SettlementFileImportBatchesResponse(
+            List<SettlementFileImportBatchRepository.FileImportBatchListRow> items, int limit, int offset) {}
+
     public record MarkTradeFailedResponse(String result) {}
 
     private final SettlementConfirmProcessor processor;
     private final OmsConfig config;
     private final SettlementExecutionsRepository settlementExecutions;
+    private final SettlementFileImportService settlementFileImportService;
+    private final SettlementFileImportBatchRepository settlementFileImportBatchRepository;
+
+    private static final int MAX_FILE_IMPORT_LIST_OFFSET = 10_000;
 
     public SettlementController(
             SettlementConfirmProcessor processor,
             OmsConfig config,
-            SettlementExecutionsRepository settlementExecutions) {
+            SettlementExecutionsRepository settlementExecutions,
+            SettlementFileImportService settlementFileImportService,
+            SettlementFileImportBatchRepository settlementFileImportBatchRepository) {
         this.processor = processor;
         this.config = config;
         this.settlementExecutions = settlementExecutions;
+        this.settlementFileImportService = settlementFileImportService;
+        this.settlementFileImportBatchRepository = settlementFileImportBatchRepository;
     }
 
     /**
@@ -188,6 +214,64 @@ public class SettlementController {
         var r = processor.registerBrokerConfirmsFromFixture(body.rows());
         return ResponseEntity.ok(
                 new BrokerFixtureImportResponse(r.insertedRows(), r.skippedUnresolvedRows(), r.skippedInvalidRows()));
+    }
+
+    @PostMapping(value = "/file-import", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ResponseEntity<SettlementFileImportResponse> importSettlementFile(
+            @RequestParam("source") String source, @RequestPart("file") MultipartFile file) {
+        if (source == null || source.isBlank() || file == null || file.isEmpty()) {
+            return ResponseEntity.badRequest().build();
+        }
+        long max = config.getSettlement().getFileImportMaxBytes();
+        if (file.getSize() > 0 && file.getSize() > max) {
+            return ResponseEntity.status(HttpStatus.PAYLOAD_TOO_LARGE).build();
+        }
+        final byte[] bytes;
+        try {
+            bytes = file.getBytes();
+        } catch (java.io.IOException e) {
+            return ResponseEntity.badRequest().build();
+        }
+        if (bytes.length > max) {
+            return ResponseEntity.status(HttpStatus.PAYLOAD_TOO_LARGE).build();
+        }
+        try {
+            SettlementFileImportService.Result r =
+                    settlementFileImportService.ingestMultipart(source, file.getOriginalFilename(), bytes);
+            return ResponseEntity.ok(
+                    new SettlementFileImportResponse(
+                            r.duplicate(),
+                            r.batchId(),
+                            r.status(),
+                            r.rowCount(),
+                            r.errorSummary(),
+                            r.insertedConfirms(),
+                            r.skippedInvalid(),
+                            r.skippedUnresolved()));
+        } catch (IllegalArgumentException ex) {
+            if ("file too large".equals(ex.getMessage())) {
+                return ResponseEntity.status(HttpStatus.PAYLOAD_TOO_LARGE).build();
+            }
+            return ResponseEntity.badRequest().build();
+        }
+    }
+
+    @GetMapping("/file-import-batches")
+    public ResponseEntity<SettlementFileImportBatchesResponse> listFileImportBatches(
+            @RequestParam(required = false) Integer limit, @RequestParam(required = false) Integer offset) {
+        int max = config.getSettlement().getFileImportListMaxLimit();
+        int def = config.getSettlement().getFileImportListDefaultLimit();
+        int lim = limit == null ? def : limit;
+        if (lim < 1) {
+            lim = def;
+        }
+        lim = Math.min(lim, max);
+        int off = offset == null ? 0 : offset;
+        if (off < 0 || off > MAX_FILE_IMPORT_LIST_OFFSET) {
+            return ResponseEntity.badRequest().build();
+        }
+        var rows = settlementFileImportBatchRepository.listRecentBatches(lim, off);
+        return ResponseEntity.ok(new SettlementFileImportBatchesResponse(rows, lim, off));
     }
 
     @PostMapping("/process-pending")

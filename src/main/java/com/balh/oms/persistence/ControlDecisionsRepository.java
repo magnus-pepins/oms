@@ -1,6 +1,7 @@
 package com.balh.oms.persistence;
 
 import com.balh.oms.domain.RejectCode;
+import io.micrometer.core.instrument.MeterRegistry;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.List;
@@ -15,6 +16,14 @@ import org.springframework.stereotype.Repository;
 @Repository
 public class ControlDecisionsRepository {
 
+    /** Micrometer counter mirrored for every successful {@link #record} (Ops Prometheus / W5.2). */
+    private static final String METRIC_CONTROL_DECISIONS_RECORDED = "oms_control_decisions_recorded_total";
+
+    private static final String TAG_OUTCOME = "outcome";
+    private static final String TAG_REJECT_CODE = "reject_code";
+    /** Tag value when {@code rejectCode} is null (PASS rows in Postgres). */
+    private static final String REJECT_CODE_TAG_NONE = "NONE";
+
     private static final String INSERT = """
             INSERT INTO control_decisions (order_id, order_version_before, outcome, reject_code, stage, detail)
             VALUES (:order_id, :order_version_before, :outcome,
@@ -22,9 +31,11 @@ public class ControlDecisionsRepository {
             """;
 
     private final NamedParameterJdbcTemplate jdbc;
+    private final MeterRegistry meterRegistry;
 
-    public ControlDecisionsRepository(NamedParameterJdbcTemplate jdbc) {
+    public ControlDecisionsRepository(NamedParameterJdbcTemplate jdbc, MeterRegistry meterRegistry) {
         this.jdbc = jdbc;
+        this.meterRegistry = meterRegistry;
     }
 
     public void record(
@@ -41,7 +52,13 @@ public class ControlDecisionsRepository {
                 .addValue("reject_code", rejectCode == null ? null : rejectCode.name())
                 .addValue("stage", stage)
                 .addValue("detail", detailJson == null ? "{}" : detailJson);
-        jdbc.update(INSERT, params);
+        int rows = jdbc.update(INSERT, params);
+        if (rows > 0) {
+            String rejectTag = rejectCode == null ? REJECT_CODE_TAG_NONE : rejectCode.name();
+            meterRegistry
+                    .counter(METRIC_CONTROL_DECISIONS_RECORDED, TAG_OUTCOME, outcome, TAG_REJECT_CODE, rejectTag)
+                    .increment();
+        }
     }
 
     /**

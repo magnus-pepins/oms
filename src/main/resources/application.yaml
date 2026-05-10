@@ -18,6 +18,10 @@ spring:
     enabled: true
     locations: classpath:db/migration
     baseline-on-migrate: false
+  servlet:
+    multipart:
+      max-file-size: ${OMS_SETTLEMENT_FILE_IMPORT_MAX_BYTES:10000000}
+      max-request-size: ${OMS_SETTLEMENT_FILE_IMPORT_MAX_BYTES:10000000}
 
 management:
   endpoints:
@@ -76,6 +80,22 @@ oms:
     inflight-hold-destination-balance-id: ${OMS_LEDGER_INFLIGHT_HOLD_DESTINATION_BALANCE_ID:}
     inflight-reservation-currency: ${OMS_LEDGER_INFLIGHT_RESERVATION_CURRENCY:EUR}
     inflight-reservation-precision: ${OMS_LEDGER_INFLIGHT_RESERVATION_PRECISION:100}
+    settlement-outbox-enabled: ${OMS_LEDGER_SETTLEMENT_OUTBOX_ENABLED:false}
+    settlement-outbox-reconciler-enabled: ${OMS_LEDGER_SETTLEMENT_OUTBOX_RECONCILER_ENABLED:false}
+    settlement-outbox-reconciler-age-ms: ${OMS_LEDGER_SETTLEMENT_OUTBOX_RECONCILER_AGE_MS:2000}
+    settlement-outbox-reconciler-batch-size: ${OMS_LEDGER_SETTLEMENT_OUTBOX_RECONCILER_BATCH_SIZE:50}
+    settlement-outbox-reconciler-interval-ms: ${OMS_LEDGER_SETTLEMENT_OUTBOX_RECONCILER_INTERVAL_MS:500}
+    settlement-posting-http-path: ${OMS_LEDGER_SETTLEMENT_POSTING_HTTP_PATH:/internal/v0/settlement-outbox}
+  marketdata:
+    enabled: ${OMS_MARKETDATA_HTTP_ENABLED:false}
+    base-url: ${OMS_MARKETDATA_HTTP_BASE_URL:http://localhost:6001}
+    api-key: ${OMS_MARKETDATA_HTTP_API_KEY:}
+    connect-timeout-ms: ${OMS_MARKETDATA_HTTP_CONNECT_TIMEOUT_MS:2000}
+    read-timeout-ms: ${OMS_MARKETDATA_HTTP_READ_TIMEOUT_MS:5000}
+    instruments-http-path: ${OMS_MARKETDATA_HTTP_INSTRUMENTS_PATH:/internal/v0/instruments}
+    nbbo-http-path: ${OMS_MARKETDATA_HTTP_NBBO_PATH:/internal/v0/nbbo}
+    instruments-refresh-interval-ms: ${OMS_MARKETDATA_HTTP_INSTRUMENTS_REFRESH_INTERVAL_MS:60000}
+    nbbo-in-market-context-enabled: ${OMS_MARKETDATA_HTTP_NBBO_IN_MARKET_CONTEXT_ENABLED:false}
   domain-events:
     reconciler-age-ms: ${OMS_DOMAIN_EVENTS_RECONCILER_AGE_MS:2000}
     reconciler-batch-size: ${OMS_DOMAIN_EVENTS_RECONCILER_BATCH_SIZE:100}
@@ -87,14 +107,31 @@ oms:
     instrument-allowlist-enabled: ${OMS_RISK_INSTRUMENT_ALLOWLIST_ENABLED:false}
     allowed-instrument-symbols: ${OMS_RISK_ALLOWED_INSTRUMENT_SYMBOLS:}
     instrument-tradability-check-enabled: ${OMS_RISK_INSTRUMENT_TRADABILITY_CHECK_ENABLED:false}
+    instrument-tradability-from-marketdata-enabled: ${OMS_RISK_INSTRUMENT_TRADABILITY_FROM_MARKETDATA_ENABLED:false}
     tradable-instrument-symbols: ${OMS_RISK_TRADABLE_INSTRUMENT_SYMBOLS:}
+    instrument-symbol-halt-check-enabled: ${OMS_RISK_INSTRUMENT_SYMBOL_HALT_CHECK_ENABLED:false}
+    halted-instrument-symbols: ${OMS_RISK_HALTED_INSTRUMENT_SYMBOLS:}
     fat-finger-max-limit-price: ${OMS_RISK_FAT_FINGER_MAX_LIMIT_PRICE:0}
     fat-finger-max-order-quantity: ${OMS_RISK_FAT_FINGER_MAX_ORDER_QUANTITY:0}
     max-order-notional: ${OMS_RISK_MAX_ORDER_NOTIONAL:0}
+    sanctions-recheck-enabled: ${OMS_RISK_SANCTIONS_RECHECK_ENABLED:false}
+    sanctions-recheck-strict: ${OMS_RISK_SANCTIONS_RECHECK_STRICT:false}
+    sanctions-cache-max-age-seconds: ${OMS_SANCTIONS_CACHE_MAX_AGE_S:3600}
+    order-min-interval-ms-per-account: ${OMS_RISK_ORDER_MIN_INTERVAL_MS_PER_ACCOUNT:0}
+    tick-size-check-enabled: ${OMS_RISK_TICK_SIZE_CHECK_ENABLED:false}
+    tick-size-increment: ${OMS_RISK_TICK_SIZE_INCREMENT:0}
+    stp-gate-enabled: ${OMS_RISK_STP_GATE_ENABLED:false}
+    stp-gate-reject-all: ${OMS_RISK_STP_GATE_REJECT_ALL:false}
+    fix-route-send-enabled-check-enabled: ${OMS_RISK_FIX_ROUTE_SEND_ENABLED_CHECK_ENABLED:false}
+    max-aggregate-position-quantity-check-enabled: ${OMS_RISK_MAX_AGGREGATE_POSITION_QUANTITY_CHECK_ENABLED:false}
+    max-aggregate-position-quantity: ${OMS_RISK_MAX_AGGREGATE_POSITION_QUANTITY:0}
   routing:
     # noop | simulated | fix (fix: QuickFIX/J initiator when oms.fix.auto-start=true — see docs/fix-out.md)
     backend: ${OMS_ROUTING_BACKEND:noop}
     market-context-stub-json: ${OMS_MARKET_CONTEXT_STUB_JSON:{"stub":true}}
+    nbbo-reference-in-market-context-enabled: ${OMS_ROUTING_NBBO_REFERENCE_IN_MARKET_CONTEXT_ENABLED:false}
+    nbbo-stub-bid-price: ${OMS_ROUTING_NBBO_STUB_BID_PRICE:0}
+    nbbo-stub-ask-price: ${OMS_ROUTING_NBBO_STUB_ASK_PRICE:0}
     simulated:
       venue-id: ${OMS_SIMULATED_VENUE_ID:SIM}
       queue-capacity: ${OMS_SIMULATED_QUEUE_CAPACITY:10000}
@@ -107,12 +144,39 @@ oms:
     broker-confirm-reconciler-interval-ms: ${OMS_SETTLEMENT_BROKER_CONFIRM_RECONCILER_INTERVAL_MS:10000}
     broker-confirm-reconciler-batch-size: ${OMS_SETTLEMENT_BROKER_CONFIRM_RECONCILER_BATCH_SIZE:50}
     broker-confirm-http-max-execution-ids: ${OMS_SETTLEMENT_BROKER_CONFIRM_HTTP_MAX_EXECUTION_IDS:100}
+    file-import-max-bytes: ${OMS_SETTLEMENT_FILE_IMPORT_MAX_BYTES:10000000}
+    file-import-max-rows: ${OMS_SETTLEMENT_FILE_IMPORT_MAX_ROWS:10000}
+    file-import-register-slice-size: ${OMS_SETTLEMENT_FILE_IMPORT_REGISTER_SLICE_SIZE:50}
+    file-import-error-summary-max-chars: ${OMS_SETTLEMENT_FILE_IMPORT_ERROR_SUMMARY_MAX_CHARS:2000}
+    file-import-list-max-limit: ${OMS_SETTLEMENT_FILE_IMPORT_LIST_MAX_LIMIT:200}
+    file-import-list-default-limit: ${OMS_SETTLEMENT_FILE_IMPORT_LIST_DEFAULT_LIMIT:50}
     manual-action-list-max-limit: ${OMS_SETTLEMENT_MANUAL_ACTION_LIST_MAX_LIMIT:200}
     manual-action-list-default-limit: ${OMS_SETTLEMENT_MANUAL_ACTION_LIST_DEFAULT_LIMIT:50}
     manual-action-type-max-length: ${OMS_SETTLEMENT_MANUAL_ACTION_TYPE_MAX_LENGTH:128}
     manual-action-payload-json-max-chars: ${OMS_SETTLEMENT_MANUAL_ACTION_PAYLOAD_JSON_MAX_CHARS:20000}
     # When true, approve runs supported action_type handlers in the same DB transaction (see ManualSettlementActionTypes).
     manual-action-auto-apply-enabled: ${OMS_SETTLEMENT_MANUAL_ACTION_AUTO_APPLY_ENABLED:true}
+    file-import-drop-folder-enabled: ${OMS_SETTLEMENT_FILE_IMPORT_DROP_FOLDER_ENABLED:false}
+    file-import-drop-folder-path: ${OMS_SETTLEMENT_FILE_IMPORT_DROP_FOLDER_PATH:}
+    file-import-drop-folder-poll-interval-ms: ${OMS_SETTLEMENT_FILE_IMPORT_DROP_FOLDER_POLL_INTERVAL_MS:30000}
+    file-import-drop-folder-max-files-per-poll: ${OMS_SETTLEMENT_FILE_IMPORT_DROP_FOLDER_MAX_FILES_PER_POLL:20}
+    free-riding-attribution-enabled: ${OMS_SETTLEMENT_FREE_RIDING_ATTRIBUTION_ENABLED:false}
+    free-riding-attribution-max-funding-executions: ${OMS_SETTLEMENT_FREE_RIDING_ATTRIBUTION_MAX_FUNDING_EXECUTIONS:8}
+  desk:
+    snapshot-enabled: ${OMS_DESK_SNAPSHOT_ENABLED:false}
+    snapshot-max-limit: ${OMS_DESK_SNAPSHOT_MAX_LIMIT:50}
+    snapshot-max-age-hours: ${OMS_DESK_SNAPSHOT_MAX_AGE_HOURS:24}
+  fx:
+    module-enabled: ${OMS_FX_MODULE_ENABLED:false}
+  corporate-action:
+    processor-enabled: ${OMS_CORPORATE_ACTION_PROCESSOR_ENABLED:false}
+    processor-interval-ms: ${OMS_CORPORATE_ACTION_PROCESSOR_INTERVAL_MS:60000}
+    processor-batch-size: ${OMS_CORPORATE_ACTION_PROCESSOR_BATCH_SIZE:50}
+    ingest-instrument-symbol-max-length: ${OMS_CORPORATE_ACTION_INGEST_INSTRUMENT_SYMBOL_MAX_LENGTH:64}
+    ingest-action-type-max-length: ${OMS_CORPORATE_ACTION_INGEST_ACTION_TYPE_MAX_LENGTH:64}
+    ingest-payload-json-max-chars: ${OMS_CORPORATE_ACTION_INGEST_PAYLOAD_JSON_MAX_CHARS:16000}
+    list-max-limit: ${OMS_CORPORATE_ACTION_LIST_MAX_LIMIT:200}
+    list-default-limit: ${OMS_CORPORATE_ACTION_LIST_DEFAULT_LIMIT:50}
   fix:
     # When routing.backend=fix and auto-start=true, starts SocketInitiator + outbound drain scheduler.
     auto-start: ${OMS_FIX_AUTO_START:false}
@@ -136,6 +200,9 @@ oms:
     session-store-type: ${OMS_FIX_SESSION_STORE_TYPE:file}
     route-state-sod-enabled: ${OMS_FIX_ROUTE_STATE_SOD_ENABLED:false}
     route-state-sod-cron: ${OMS_FIX_ROUTE_STATE_SOD_CRON:0 0 6 * * *}
+    route-state-sod-policy-mode: ${OMS_FIX_ROUTE_STATE_SOD_POLICY_MODE:always}
+    route-state-sod-policy-zone-id: ${OMS_FIX_ROUTE_STATE_SOD_POLICY_ZONE_ID:UTC}
+    route-state-sod-policy-calendar-json: ${OMS_FIX_ROUTE_STATE_SOD_POLICY_CALENDAR_JSON:{}}
     socket-use-ssl: ${OMS_FIX_SOCKET_USE_SSL:false}
     socket-key-store: ${OMS_FIX_SOCKET_KEY_STORE:}
     socket-key-store-password: ${OMS_FIX_SOCKET_KEY_STORE_PASSWORD:}
@@ -149,6 +216,10 @@ oms:
     session-jdbc-pool-max-size: ${OMS_FIX_SESSION_JDBC_POOL_MAX_SIZE:5}
     session-jdbc-pool-min-idle: ${OMS_FIX_SESSION_JDBC_POOL_MIN_IDLE:1}
     session-jdbc-connection-timeout-ms: ${OMS_FIX_SESSION_JDBC_CONNECTION_TIMEOUT_MS:2000}
+    mass-cancel-on-disconnect-enabled: ${OMS_FIX_MASS_CANCEL_ON_DISCONNECT_ENABLED:false}
+    manual-mass-cancel-enabled: ${OMS_FIX_MANUAL_MASS_CANCEL_ENABLED:false}
+    manual-mass-cancel-wire-enabled: ${OMS_FIX_MANUAL_MASS_CANCEL_WIRE_ENABLED:false}
+    manual-mass-cancel-reason-max-chars: ${OMS_FIX_MANUAL_MASS_CANCEL_REASON_MAX_CHARS:512}
 
 logging:
   level:

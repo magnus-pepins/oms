@@ -4,9 +4,13 @@ package com.balh.oms.domain;
  * Canonical reject taxonomy. Mirrors the {@code reject_code} Postgres enum and
  * the wire-format reject codes shipped on domain events.
  *
- * <p>Slice 1 actively uses {@link #RISK_STALE_QUEUE} and {@link #RISK_DUPLICATE};
- * the rest are reserved so that adding new checks does not require schema
- * migration churn.
+ * <p><strong>Actively emitted on the hot path today:</strong> {@link #RISK_STALE_QUEUE} (stale control jobs),
+ * plus the risk / venue / internal codes listed in {@code oms/docs/risk-checks.md}.
+ *
+ * <p>{@link #RISK_DUPLICATE} exists in the Postgres enum for forward compatibility with plan §5.11, but
+ * <strong>ingress duplicate idempotency</strong> ({@code UNIQUE (account_id, client_idempotency_key)}) returns
+ * HTTP 200 with the existing order and does <strong>not</strong> emit this code or enqueue control — see
+ * {@code OrdersControllerIntegrationTest#duplicateIdempotencyKeyReturnsExistingOrder}.
  */
 public enum RejectCode {
     RISK_STALE_QUEUE,
@@ -24,5 +28,17 @@ public enum RejectCode {
     /** FIX venue/broker new-order or similar reject ({@code ExecType=Rejected} / cancel reject). */
     VENUE_REJECT,
     /** Outbound FIX job exceeded {@code oms.fix.max-outbound-job-age-ms} at dequeue (slice 4). */
-    FIX_OUTBOUND_JOB_EXPIRED
+    FIX_OUTBOUND_JOB_EXPIRED,
+    /** Symbol is on an operator-configured halt list (slice 5). */
+    RISK_SYMBOL_HALT,
+    /** Reserved for concentration / position limit checks (slice 5 catalogue). */
+    RISK_CONCENTRATION_LIMIT,
+    /** Reserved for session / calendar gates (slice 5 catalogue). */
+    RISK_MARKET_SESSION_CLOSED,
+    /** Sanctions / PEP cache stale or screening failed when execution-time re-check is enabled (slice 8). */
+    RISK_COMPLIANCE_SANCTIONS,
+    /** Limit price / quote not aligned to instrument tick grid when tick check is enabled (slice 8). */
+    RISK_TICK_SIZE_VIOLATION,
+    /** Straight-through processing / venue session gate failed (slice 8). */
+    RISK_STP_GATE
 }

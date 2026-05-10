@@ -35,6 +35,10 @@ public class OmsConfig {
     private final Routing routing = new Routing();
     private final Fix fix = new Fix();
     private final Settlement settlement = new Settlement();
+    private final Marketdata marketdata = new Marketdata();
+    private final CorporateAction corporateAction = new CorporateAction();
+    private final Desk desk = new Desk();
+    private final Fx fx = new Fx();
 
     public Http getHttp() { return http; }
     public Shard getShard() { return shard; }
@@ -49,6 +53,10 @@ public class OmsConfig {
     public Routing getRouting() { return routing; }
     public Fix getFix() { return fix; }
     public Settlement getSettlement() { return settlement; }
+    public Marketdata getMarketdata() { return marketdata; }
+    public CorporateAction getCorporateAction() { return corporateAction; }
+    public Desk getDesk() { return desk; }
+    public Fx getFx() { return fx; }
 
     public static class Http {
         private String internalApiKey = "";
@@ -154,6 +162,26 @@ public class OmsConfig {
         private long inflightOutboxReconcilerAgeMs = 2000L;
         private int inflightOutboxReconcilerBatchSize = 50;
         private long inflightOutboxReconcilerIntervalMs = 500L;
+        /**
+         * When {@code true}, a row is written to {@code ledger_settlement_outbox} in the same transaction as OMS
+         * transition to {@code settled} on {@code TRADE} executions; {@link com.balh.oms.reconciler.LedgerSettlementOutboxReconciler}
+         * delivers when {@link #settlementOutboxReconcilerEnabled} is {@code true}.
+         */
+        private boolean settlementOutboxEnabled = false;
+        /**
+         * When {@code true} with {@link #enabled}, {@link com.balh.oms.reconciler.LedgerSettlementOutboxReconciler} POSTs
+         * unposted rows to Ledger and sets {@code posted_at}.
+         */
+        private boolean settlementOutboxReconcilerEnabled = false;
+        private long settlementOutboxReconcilerAgeMs = 2000L;
+        private int settlementOutboxReconcilerBatchSize = 50;
+        private long settlementOutboxReconcilerIntervalMs = 500L;
+        /**
+         * Path on the Ledger HTTP base URL for settlement outbox POST (must start with {@code /} or be relative segment;
+         * normalized to a leading slash). Finance must align Ledger route with this value.
+         */
+        private String settlementPostingHttpPath = "/internal/v0/settlement-outbox";
+
         public boolean isEnabled() { return enabled; }
         public void setEnabled(boolean v) { this.enabled = v; }
         public boolean isInflightReservationEnabled() { return inflightReservationEnabled; }
@@ -180,6 +208,54 @@ public class OmsConfig {
         public void setInflightOutboxReconcilerBatchSize(int v) { this.inflightOutboxReconcilerBatchSize = v; }
         public long getInflightOutboxReconcilerIntervalMs() { return inflightOutboxReconcilerIntervalMs; }
         public void setInflightOutboxReconcilerIntervalMs(long v) { this.inflightOutboxReconcilerIntervalMs = v; }
+
+        public boolean isSettlementOutboxEnabled() {
+            return settlementOutboxEnabled;
+        }
+
+        public void setSettlementOutboxEnabled(boolean settlementOutboxEnabled) {
+            this.settlementOutboxEnabled = settlementOutboxEnabled;
+        }
+
+        public boolean isSettlementOutboxReconcilerEnabled() {
+            return settlementOutboxReconcilerEnabled;
+        }
+
+        public void setSettlementOutboxReconcilerEnabled(boolean settlementOutboxReconcilerEnabled) {
+            this.settlementOutboxReconcilerEnabled = settlementOutboxReconcilerEnabled;
+        }
+
+        public long getSettlementOutboxReconcilerAgeMs() {
+            return settlementOutboxReconcilerAgeMs;
+        }
+
+        public void setSettlementOutboxReconcilerAgeMs(long settlementOutboxReconcilerAgeMs) {
+            this.settlementOutboxReconcilerAgeMs = Math.max(0L, settlementOutboxReconcilerAgeMs);
+        }
+
+        public int getSettlementOutboxReconcilerBatchSize() {
+            return settlementOutboxReconcilerBatchSize;
+        }
+
+        public void setSettlementOutboxReconcilerBatchSize(int settlementOutboxReconcilerBatchSize) {
+            this.settlementOutboxReconcilerBatchSize = Math.max(1, settlementOutboxReconcilerBatchSize);
+        }
+
+        public long getSettlementOutboxReconcilerIntervalMs() {
+            return settlementOutboxReconcilerIntervalMs;
+        }
+
+        public void setSettlementOutboxReconcilerIntervalMs(long settlementOutboxReconcilerIntervalMs) {
+            this.settlementOutboxReconcilerIntervalMs = Math.max(100L, settlementOutboxReconcilerIntervalMs);
+        }
+
+        public String getSettlementPostingHttpPath() {
+            return settlementPostingHttpPath;
+        }
+
+        public void setSettlementPostingHttpPath(String settlementPostingHttpPath) {
+            this.settlementPostingHttpPath = settlementPostingHttpPath == null ? "" : settlementPostingHttpPath.trim();
+        }
     }
 
     public static class DomainEvents {
@@ -217,9 +293,56 @@ public class OmsConfig {
          */
         private boolean instrumentTradabilityCheckEnabled = false;
         private String tradableInstrumentSymbols = "";
+        /**
+         * When {@code true} with {@link #instrumentTradabilityCheckEnabled} and {@link OmsConfig#getMarketdata()}
+         * {@code enabled}, {@link com.balh.oms.marketdata.MarketdataInstrumentsCache} symbols override CSV when non-empty;
+         * otherwise CSV {@link #tradableInstrumentSymbols} applies.
+         */
+        private boolean instrumentTradabilityFromMarketdataEnabled = false;
+        /**
+         * When {@code true}, symbols in {@link #haltedInstrumentSymbolSet()} reject with {@link
+         * com.balh.oms.domain.RejectCode#RISK_SYMBOL_HALT} (evaluated before allowlist / tradability).
+         */
+        private boolean instrumentSymbolHaltCheckEnabled = false;
+        private String haltedInstrumentSymbols = "";
         private BigDecimal fatFingerMaxLimitPrice = BigDecimal.ZERO;
         private BigDecimal fatFingerMaxOrderQuantity = BigDecimal.ZERO;
         private BigDecimal maxOrderNotional = BigDecimal.ZERO;
+        /**
+         * When {@code true}, {@link com.balh.oms.risk.SanctionsExecutionGate} runs before other risk checks
+         * (after global halt). Uses {@link #sanctionsCacheMaxAgeSeconds} for permissive cache; {@link
+         * #sanctionsRecheckStrict} rejects every order until a real downstream client exists.
+         */
+        private boolean sanctionsRecheckEnabled = false;
+        private boolean sanctionsRecheckStrict = false;
+        private long sanctionsCacheMaxAgeSeconds = 3_600L;
+        /**
+         * Minimum wall-clock spacing between accepted control evaluations per {@code account_id}; {@code 0}
+         * disables ({@link com.balh.oms.domain.RejectCode#RISK_RATE_LIMIT} on violation).
+         */
+        private long orderMinIntervalMsPerAccount = 0L;
+        /** When {@code true}, limit prices must align to {@link #tickSizeIncrement} grid (zero disables increment). */
+        private boolean tickSizeCheckEnabled = false;
+        private java.math.BigDecimal tickSizeIncrement = java.math.BigDecimal.ZERO;
+        /**
+         * Reserved STP / venue-calendar gate (slice 8). When enabled without venue calendar wiring, evaluator
+         * returns {@link com.balh.oms.domain.RejectCode#RISK_STP_GATE} only if {@link #stpGateRejectAll} is true
+         * (testing knob; default false).
+         */
+        private boolean stpGateEnabled = false;
+        private boolean stpGateRejectAll = false;
+        /**
+         * When {@code true} with {@code oms.routing.backend=fix}, rejects at control if {@code fix_route_state.send_enabled}
+         * is false for {@code oms.fix.route-key} ({@link com.balh.oms.domain.RejectCode#RISK_MARKET_SESSION_CLOSED}).
+         */
+        private boolean fixRouteSendEnabledCheckEnabled = false;
+        /**
+         * When {@code true}, BUY orders where {@code positions.quantity_total + order.quantity} exceeds
+         * {@link #maxAggregatePositionQuantity} reject with {@link com.balh.oms.domain.RejectCode#RISK_CONCENTRATION_LIMIT}.
+         */
+        private boolean maxAggregatePositionQuantityCheckEnabled = false;
+        /** Max position quantity per account+symbol+custody (default omnibus); {@code 0} disables even when check enabled. */
+        private java.math.BigDecimal maxAggregatePositionQuantity = java.math.BigDecimal.ZERO;
 
         public boolean isInstrumentAllowlistEnabled() { return instrumentAllowlistEnabled; }
         public void setInstrumentAllowlistEnabled(boolean v) { this.instrumentAllowlistEnabled = v; }
@@ -242,6 +365,43 @@ public class OmsConfig {
             this.tradableInstrumentSymbols = tradableInstrumentSymbols == null ? "" : tradableInstrumentSymbols;
         }
 
+        public boolean isInstrumentTradabilityFromMarketdataEnabled() {
+            return instrumentTradabilityFromMarketdataEnabled;
+        }
+
+        public void setInstrumentTradabilityFromMarketdataEnabled(boolean instrumentTradabilityFromMarketdataEnabled) {
+            this.instrumentTradabilityFromMarketdataEnabled = instrumentTradabilityFromMarketdataEnabled;
+        }
+
+        public boolean isInstrumentSymbolHaltCheckEnabled() {
+            return instrumentSymbolHaltCheckEnabled;
+        }
+
+        public void setInstrumentSymbolHaltCheckEnabled(boolean instrumentSymbolHaltCheckEnabled) {
+            this.instrumentSymbolHaltCheckEnabled = instrumentSymbolHaltCheckEnabled;
+        }
+
+        public String getHaltedInstrumentSymbols() {
+            return haltedInstrumentSymbols;
+        }
+
+        public void setHaltedInstrumentSymbols(String haltedInstrumentSymbols) {
+            this.haltedInstrumentSymbols = haltedInstrumentSymbols == null ? "" : haltedInstrumentSymbols;
+        }
+
+        /** Uppercased symbols from {@link #haltedInstrumentSymbols}, comma-separated. */
+        public Set<String> haltedInstrumentSymbolSet() {
+            if (!instrumentSymbolHaltCheckEnabled
+                    || haltedInstrumentSymbols == null
+                    || haltedInstrumentSymbols.isBlank()) {
+                return Collections.emptySet();
+            }
+            return Arrays.stream(haltedInstrumentSymbols.split(","))
+                    .map(s -> s.trim().toUpperCase(Locale.ROOT))
+                    .filter(s -> !s.isEmpty())
+                    .collect(Collectors.toUnmodifiableSet());
+        }
+
         /** Uppercased symbols from {@link #tradableInstrumentSymbols}, comma-separated. */
         public Set<String> tradableInstrumentSymbolSet() {
             if (!instrumentTradabilityCheckEnabled
@@ -261,6 +421,97 @@ public class OmsConfig {
         public void setFatFingerMaxOrderQuantity(BigDecimal v) { this.fatFingerMaxOrderQuantity = v == null ? BigDecimal.ZERO : v; }
         public BigDecimal getMaxOrderNotional() { return maxOrderNotional; }
         public void setMaxOrderNotional(BigDecimal v) { this.maxOrderNotional = v == null ? BigDecimal.ZERO : v; }
+
+        public boolean isSanctionsRecheckEnabled() {
+            return sanctionsRecheckEnabled;
+        }
+
+        public void setSanctionsRecheckEnabled(boolean sanctionsRecheckEnabled) {
+            this.sanctionsRecheckEnabled = sanctionsRecheckEnabled;
+        }
+
+        public boolean isSanctionsRecheckStrict() {
+            return sanctionsRecheckStrict;
+        }
+
+        public void setSanctionsRecheckStrict(boolean sanctionsRecheckStrict) {
+            this.sanctionsRecheckStrict = sanctionsRecheckStrict;
+        }
+
+        public long getSanctionsCacheMaxAgeSeconds() {
+            return sanctionsCacheMaxAgeSeconds;
+        }
+
+        public void setSanctionsCacheMaxAgeSeconds(long sanctionsCacheMaxAgeSeconds) {
+            this.sanctionsCacheMaxAgeSeconds = Math.max(0L, sanctionsCacheMaxAgeSeconds);
+        }
+
+        public long getOrderMinIntervalMsPerAccount() {
+            return orderMinIntervalMsPerAccount;
+        }
+
+        public void setOrderMinIntervalMsPerAccount(long orderMinIntervalMsPerAccount) {
+            this.orderMinIntervalMsPerAccount = Math.max(0L, orderMinIntervalMsPerAccount);
+        }
+
+        public boolean isTickSizeCheckEnabled() {
+            return tickSizeCheckEnabled;
+        }
+
+        public void setTickSizeCheckEnabled(boolean tickSizeCheckEnabled) {
+            this.tickSizeCheckEnabled = tickSizeCheckEnabled;
+        }
+
+        public java.math.BigDecimal getTickSizeIncrement() {
+            return tickSizeIncrement;
+        }
+
+        public void setTickSizeIncrement(java.math.BigDecimal tickSizeIncrement) {
+            this.tickSizeIncrement = tickSizeIncrement == null ? java.math.BigDecimal.ZERO : tickSizeIncrement;
+        }
+
+        public boolean isStpGateEnabled() {
+            return stpGateEnabled;
+        }
+
+        public void setStpGateEnabled(boolean stpGateEnabled) {
+            this.stpGateEnabled = stpGateEnabled;
+        }
+
+        public boolean isStpGateRejectAll() {
+            return stpGateRejectAll;
+        }
+
+        public void setStpGateRejectAll(boolean stpGateRejectAll) {
+            this.stpGateRejectAll = stpGateRejectAll;
+        }
+
+        public boolean isFixRouteSendEnabledCheckEnabled() {
+            return fixRouteSendEnabledCheckEnabled;
+        }
+
+        public void setFixRouteSendEnabledCheckEnabled(boolean fixRouteSendEnabledCheckEnabled) {
+            this.fixRouteSendEnabledCheckEnabled = fixRouteSendEnabledCheckEnabled;
+        }
+
+        public boolean isMaxAggregatePositionQuantityCheckEnabled() {
+            return maxAggregatePositionQuantityCheckEnabled;
+        }
+
+        public void setMaxAggregatePositionQuantityCheckEnabled(boolean maxAggregatePositionQuantityCheckEnabled) {
+            this.maxAggregatePositionQuantityCheckEnabled = maxAggregatePositionQuantityCheckEnabled;
+        }
+
+        public java.math.BigDecimal getMaxAggregatePositionQuantity() {
+            return maxAggregatePositionQuantity;
+        }
+
+        public void setMaxAggregatePositionQuantity(java.math.BigDecimal maxAggregatePositionQuantity) {
+            this.maxAggregatePositionQuantity =
+                    maxAggregatePositionQuantity == null
+                            ? java.math.BigDecimal.ZERO
+                            : maxAggregatePositionQuantity.max(java.math.BigDecimal.ZERO);
+        }
 
         /** Uppercased symbols from {@link #allowedInstrumentSymbols}, comma-separated. */
         public Set<String> allowedInstrumentSymbolSet() {
@@ -283,6 +534,9 @@ public class OmsConfig {
     public static class Routing {
         private String backend = "noop";
         private String marketContextStubJson = "{\"stub\":true}";
+        private boolean nbboReferenceInMarketContextEnabled = false;
+        private BigDecimal nbboStubBidPrice = BigDecimal.ZERO;
+        private BigDecimal nbboStubAskPrice = BigDecimal.ZERO;
         private final Simulated simulated = new Simulated();
 
         public String getBackend() { return backend; }
@@ -291,6 +545,36 @@ public class OmsConfig {
         public void setMarketContextStubJson(String v) {
             this.marketContextStubJson = v == null || v.isBlank() ? "{\"stub\":true}" : v;
         }
+
+        /**
+         * When {@code true} with positive {@link #getNbboStubBidPrice()} and {@link #getNbboStubAskPrice()}, each trade
+         * apply merges an NBBO-class reference object into {@code market_context.snapshot_json} (slice 5 stub until
+         * Marketdata Platform quotes are wired).
+         */
+        public boolean isNbboReferenceInMarketContextEnabled() {
+            return nbboReferenceInMarketContextEnabled;
+        }
+
+        public void setNbboReferenceInMarketContextEnabled(boolean nbboReferenceInMarketContextEnabled) {
+            this.nbboReferenceInMarketContextEnabled = nbboReferenceInMarketContextEnabled;
+        }
+
+        public BigDecimal getNbboStubBidPrice() {
+            return nbboStubBidPrice;
+        }
+
+        public void setNbboStubBidPrice(BigDecimal nbboStubBidPrice) {
+            this.nbboStubBidPrice = nbboStubBidPrice == null ? BigDecimal.ZERO : nbboStubBidPrice;
+        }
+
+        public BigDecimal getNbboStubAskPrice() {
+            return nbboStubAskPrice;
+        }
+
+        public void setNbboStubAskPrice(BigDecimal nbboStubAskPrice) {
+            this.nbboStubAskPrice = nbboStubAskPrice == null ? BigDecimal.ZERO : nbboStubAskPrice;
+        }
+
         public Simulated getSimulated() { return simulated; }
 
         public static class Simulated {
@@ -349,6 +633,18 @@ public class OmsConfig {
         private boolean routeStateSodEnabled = false;
         /** Spring 6-field cron; only used when {@link #routeStateSodEnabled} (default from {@code application.yaml}). */
         private String routeStateSodCron = "";
+        /**
+         * {@code always} (default) — run SOD on every cron fire. {@code weekdays} — Mon–Fri only in
+         * {@link #routeStateSodPolicyZoneId}. {@code region_calendar} — JSON in {@link #routeStateSodPolicyCalendarJson}.
+         */
+        private String routeStateSodPolicyMode = "always";
+        /** IANA zone id for weekday / region calendar evaluation (default UTC). */
+        private String routeStateSodPolicyZoneId = "UTC";
+        /**
+         * When {@link #routeStateSodPolicyMode} is {@code region_calendar}, JSON document with {@code activeRegionId}
+         * and {@code regions} map (see {@link FixSodPolicyEngine}).
+         */
+        private String routeStateSodPolicyCalendarJson = "{}";
         /** QuickFIX/J initiator TLS (broker UAT / prod). */
         private boolean socketUseSsl = false;
         private String socketKeyStore = "";
@@ -368,6 +664,18 @@ public class OmsConfig {
         private int sessionJdbcPoolMaxSize = 5;
         private int sessionJdbcPoolMinIdle = 1;
         private long sessionJdbcConnectionTimeoutMs = 2000L;
+        /** When {@code true}, initiator {@code onLogout} increments {@code oms_fix_mass_cancel_disconnect_signal_total}. */
+        private boolean massCancelOnDisconnectEnabled = false;
+        /**
+         * When {@code true}, {@code POST /internal/v1/fix/mass-cancel-request} is allowed (signal-only unless wire flag is also on).
+         */
+        private boolean manualMassCancelEnabled = false;
+        /**
+         * When {@code true} with a logged-on FIX session, {@code OrderMassCancelRequest} may be sent (broker contract required).
+         */
+        private boolean manualMassCancelWireEnabled = false;
+        /** Max UTF-16 length for optional {@code reason} on manual mass-cancel POST. */
+        private int manualMassCancelReasonMaxChars = 512;
 
         public boolean isAutoStart() { return autoStart; }
         public void setAutoStart(boolean autoStart) { this.autoStart = autoStart; }
@@ -467,6 +775,39 @@ public class OmsConfig {
 
         public void setRouteStateSodCron(String routeStateSodCron) {
             this.routeStateSodCron = routeStateSodCron == null ? "" : routeStateSodCron.trim();
+        }
+
+        public String getRouteStateSodPolicyMode() {
+            return routeStateSodPolicyMode;
+        }
+
+        public void setRouteStateSodPolicyMode(String routeStateSodPolicyMode) {
+            this.routeStateSodPolicyMode =
+                    routeStateSodPolicyMode == null || routeStateSodPolicyMode.isBlank()
+                            ? "always"
+                            : routeStateSodPolicyMode.trim().toLowerCase(Locale.ROOT);
+        }
+
+        public String getRouteStateSodPolicyZoneId() {
+            return routeStateSodPolicyZoneId;
+        }
+
+        public void setRouteStateSodPolicyZoneId(String routeStateSodPolicyZoneId) {
+            this.routeStateSodPolicyZoneId =
+                    routeStateSodPolicyZoneId == null || routeStateSodPolicyZoneId.isBlank()
+                            ? "UTC"
+                            : routeStateSodPolicyZoneId.trim();
+        }
+
+        public String getRouteStateSodPolicyCalendarJson() {
+            return routeStateSodPolicyCalendarJson;
+        }
+
+        public void setRouteStateSodPolicyCalendarJson(String routeStateSodPolicyCalendarJson) {
+            this.routeStateSodPolicyCalendarJson =
+                    routeStateSodPolicyCalendarJson == null || routeStateSodPolicyCalendarJson.isBlank()
+                            ? "{}"
+                            : routeStateSodPolicyCalendarJson.trim();
         }
 
         public boolean isSocketUseSsl() {
@@ -572,6 +913,38 @@ public class OmsConfig {
         public void setSessionJdbcConnectionTimeoutMs(long sessionJdbcConnectionTimeoutMs) {
             this.sessionJdbcConnectionTimeoutMs = Math.max(250L, sessionJdbcConnectionTimeoutMs);
         }
+
+        public boolean isMassCancelOnDisconnectEnabled() {
+            return massCancelOnDisconnectEnabled;
+        }
+
+        public void setMassCancelOnDisconnectEnabled(boolean massCancelOnDisconnectEnabled) {
+            this.massCancelOnDisconnectEnabled = massCancelOnDisconnectEnabled;
+        }
+
+        public boolean isManualMassCancelEnabled() {
+            return manualMassCancelEnabled;
+        }
+
+        public void setManualMassCancelEnabled(boolean manualMassCancelEnabled) {
+            this.manualMassCancelEnabled = manualMassCancelEnabled;
+        }
+
+        public boolean isManualMassCancelWireEnabled() {
+            return manualMassCancelWireEnabled;
+        }
+
+        public void setManualMassCancelWireEnabled(boolean manualMassCancelWireEnabled) {
+            this.manualMassCancelWireEnabled = manualMassCancelWireEnabled;
+        }
+
+        public int getManualMassCancelReasonMaxChars() {
+            return manualMassCancelReasonMaxChars;
+        }
+
+        public void setManualMassCancelReasonMaxChars(int manualMassCancelReasonMaxChars) {
+            this.manualMassCancelReasonMaxChars = Math.min(4000, Math.max(32, manualMassCancelReasonMaxChars));
+        }
     }
 
     /**
@@ -583,6 +956,18 @@ public class OmsConfig {
         private long brokerConfirmReconcilerIntervalMs = 10_000L;
         private int brokerConfirmReconcilerBatchSize = 50;
         private int brokerConfirmHttpMaxExecutionIds = 100;
+        /** Max bytes accepted for {@code POST …/settlement/file-import} body (before SHA + parse). */
+        private long fileImportMaxBytes = 10_000_000L;
+        /** Max broker fixture rows read from one file (beyond this are counted as skipped-invalid in ingest). */
+        private int fileImportMaxRows = 10_000;
+        /** Max execution ids registered per DB transaction during file ingest slices. */
+        private int fileImportRegisterSliceSize = 50;
+        /** Truncation bound for {@code settlement_file_import_batch.error_summary}. */
+        private int fileImportErrorSummaryMaxChars = 2000;
+        /** Max rows returned by {@code GET /internal/v1/settlement/file-import-batches}. */
+        private int fileImportListMaxLimit = 200;
+        /** Default page size for file import batch list. */
+        private int fileImportListDefaultLimit = 50;
         /** Max rows returned by {@code GET /internal/v1/settlement/manual-actions}. */
         private int manualActionListMaxLimit = 200;
         /** Default page size for manual settlement action list. */
@@ -596,6 +981,19 @@ public class OmsConfig {
          * {@code action_type} handlers in the same transaction as the approve CAS (see {@link ManualSettlementActionTypes}).
          */
         private boolean manualActionAutoApplyEnabled = true;
+        /** When true, {@link com.balh.oms.settlement.SettlementFileDropFolderIngestScheduler} ingests {@code .json} files. */
+        private boolean fileImportDropFolderEnabled = false;
+        /** Absolute or relative path watched for incoming broker JSON files (see docs/broker-eod-file-contract.md). */
+        private String fileImportDropFolderPath = "";
+        private long fileImportDropFolderPollIntervalMs = 30_000L;
+        private int fileImportDropFolderMaxFilesPerPoll = 20;
+        /**
+         * When {@code true}, BUY {@code TRADE} fills may append prior unsettled BUY execution ids to
+         * {@code executions.unsettled_funded_by_exec_ids} (stub attribution — finance replaces rules later).
+         */
+        private boolean freeRidingAttributionEnabled = false;
+        /** Max prior execution ids merged into {@code unsettled_funded_by_exec_ids} per fill. */
+        private int freeRidingAttributionMaxFundingExecutions = 8;
 
         public String getDefaultCustodyAccountId() {
             return defaultCustodyAccountId;
@@ -641,6 +1039,54 @@ public class OmsConfig {
             this.brokerConfirmHttpMaxExecutionIds = Math.min(10_000, Math.max(1, brokerConfirmHttpMaxExecutionIds));
         }
 
+        public long getFileImportMaxBytes() {
+            return fileImportMaxBytes;
+        }
+
+        public void setFileImportMaxBytes(long fileImportMaxBytes) {
+            this.fileImportMaxBytes = Math.min(100_000_000L, Math.max(1024L, fileImportMaxBytes));
+        }
+
+        public int getFileImportMaxRows() {
+            return fileImportMaxRows;
+        }
+
+        public void setFileImportMaxRows(int fileImportMaxRows) {
+            this.fileImportMaxRows = Math.min(500_000, Math.max(1, fileImportMaxRows));
+        }
+
+        public int getFileImportRegisterSliceSize() {
+            return fileImportRegisterSliceSize;
+        }
+
+        public void setFileImportRegisterSliceSize(int fileImportRegisterSliceSize) {
+            this.fileImportRegisterSliceSize = Math.min(10_000, Math.max(1, fileImportRegisterSliceSize));
+        }
+
+        public int getFileImportErrorSummaryMaxChars() {
+            return fileImportErrorSummaryMaxChars;
+        }
+
+        public void setFileImportErrorSummaryMaxChars(int fileImportErrorSummaryMaxChars) {
+            this.fileImportErrorSummaryMaxChars = Math.min(50_000, Math.max(256, fileImportErrorSummaryMaxChars));
+        }
+
+        public int getFileImportListMaxLimit() {
+            return fileImportListMaxLimit;
+        }
+
+        public void setFileImportListMaxLimit(int fileImportListMaxLimit) {
+            this.fileImportListMaxLimit = Math.min(500, Math.max(1, fileImportListMaxLimit));
+        }
+
+        public int getFileImportListDefaultLimit() {
+            return fileImportListDefaultLimit;
+        }
+
+        public void setFileImportListDefaultLimit(int fileImportListDefaultLimit) {
+            this.fileImportListDefaultLimit = Math.min(getFileImportListMaxLimit(), Math.max(1, fileImportListDefaultLimit));
+        }
+
         public int getManualActionListMaxLimit() {
             return manualActionListMaxLimit;
         }
@@ -679,6 +1125,273 @@ public class OmsConfig {
 
         public void setManualActionAutoApplyEnabled(boolean manualActionAutoApplyEnabled) {
             this.manualActionAutoApplyEnabled = manualActionAutoApplyEnabled;
+        }
+
+        public boolean isFileImportDropFolderEnabled() {
+            return fileImportDropFolderEnabled;
+        }
+
+        public void setFileImportDropFolderEnabled(boolean fileImportDropFolderEnabled) {
+            this.fileImportDropFolderEnabled = fileImportDropFolderEnabled;
+        }
+
+        public String getFileImportDropFolderPath() {
+            return fileImportDropFolderPath;
+        }
+
+        public void setFileImportDropFolderPath(String fileImportDropFolderPath) {
+            this.fileImportDropFolderPath = fileImportDropFolderPath == null ? "" : fileImportDropFolderPath.trim();
+        }
+
+        public long getFileImportDropFolderPollIntervalMs() {
+            return fileImportDropFolderPollIntervalMs;
+        }
+
+        public void setFileImportDropFolderPollIntervalMs(long fileImportDropFolderPollIntervalMs) {
+            this.fileImportDropFolderPollIntervalMs = Math.max(5_000L, fileImportDropFolderPollIntervalMs);
+        }
+
+        public int getFileImportDropFolderMaxFilesPerPoll() {
+            return fileImportDropFolderMaxFilesPerPoll;
+        }
+
+        public void setFileImportDropFolderMaxFilesPerPoll(int fileImportDropFolderMaxFilesPerPoll) {
+            this.fileImportDropFolderMaxFilesPerPoll = Math.min(500, Math.max(1, fileImportDropFolderMaxFilesPerPoll));
+        }
+
+        public boolean isFreeRidingAttributionEnabled() {
+            return freeRidingAttributionEnabled;
+        }
+
+        public void setFreeRidingAttributionEnabled(boolean freeRidingAttributionEnabled) {
+            this.freeRidingAttributionEnabled = freeRidingAttributionEnabled;
+        }
+
+        public int getFreeRidingAttributionMaxFundingExecutions() {
+            return freeRidingAttributionMaxFundingExecutions;
+        }
+
+        public void setFreeRidingAttributionMaxFundingExecutions(int freeRidingAttributionMaxFundingExecutions) {
+            this.freeRidingAttributionMaxFundingExecutions = Math.min(256, Math.max(1, freeRidingAttributionMaxFundingExecutions));
+        }
+    }
+
+    /**
+     * Desk / attendant read APIs (bounded list — internal key only). See {@code GET /internal/v1/desk/orders/snapshot}.
+     */
+    public static class Desk {
+        private boolean snapshotEnabled = false;
+        private int snapshotMaxLimit = 50;
+        private int snapshotMaxAgeHours = 24;
+
+        public boolean isSnapshotEnabled() {
+            return snapshotEnabled;
+        }
+
+        public void setSnapshotEnabled(boolean snapshotEnabled) {
+            this.snapshotEnabled = snapshotEnabled;
+        }
+
+        public int getSnapshotMaxLimit() {
+            return snapshotMaxLimit;
+        }
+
+        public void setSnapshotMaxLimit(int snapshotMaxLimit) {
+            this.snapshotMaxLimit = Math.min(500, Math.max(1, snapshotMaxLimit));
+        }
+
+        public int getSnapshotMaxAgeHours() {
+            return snapshotMaxAgeHours;
+        }
+
+        public void setSnapshotMaxAgeHours(int snapshotMaxAgeHours) {
+            this.snapshotMaxAgeHours = Math.min(168, Math.max(1, snapshotMaxAgeHours));
+        }
+    }
+
+    /**
+     * FX module (§11.5) — off by default; health endpoint documents rollout state.
+     */
+    public static class Fx {
+        private boolean moduleEnabled = false;
+
+        public boolean isModuleEnabled() {
+            return moduleEnabled;
+        }
+
+        public void setModuleEnabled(boolean moduleEnabled) {
+            this.moduleEnabled = moduleEnabled;
+        }
+    }
+
+    /**
+     * Corporate action inbox (slice 8 stub): ingest via internal HTTP; optional processor marks rows processed.
+     */
+    public static class CorporateAction {
+        private boolean processorEnabled = false;
+        private long processorIntervalMs = 60_000L;
+        private int processorBatchSize = 50;
+        private int ingestInstrumentSymbolMaxLength = 64;
+        private int ingestActionTypeMaxLength = 64;
+        private int ingestPayloadJsonMaxChars = 16_000;
+        private int listMaxLimit = 200;
+        private int listDefaultLimit = 50;
+
+        public boolean isProcessorEnabled() {
+            return processorEnabled;
+        }
+
+        public void setProcessorEnabled(boolean processorEnabled) {
+            this.processorEnabled = processorEnabled;
+        }
+
+        public long getProcessorIntervalMs() {
+            return processorIntervalMs;
+        }
+
+        public void setProcessorIntervalMs(long processorIntervalMs) {
+            this.processorIntervalMs = Math.max(5_000L, processorIntervalMs);
+        }
+
+        public int getProcessorBatchSize() {
+            return processorBatchSize;
+        }
+
+        public void setProcessorBatchSize(int processorBatchSize) {
+            this.processorBatchSize = Math.min(500, Math.max(1, processorBatchSize));
+        }
+
+        public int getIngestInstrumentSymbolMaxLength() {
+            return ingestInstrumentSymbolMaxLength;
+        }
+
+        public void setIngestInstrumentSymbolMaxLength(int ingestInstrumentSymbolMaxLength) {
+            this.ingestInstrumentSymbolMaxLength = Math.min(256, Math.max(1, ingestInstrumentSymbolMaxLength));
+        }
+
+        public int getIngestActionTypeMaxLength() {
+            return ingestActionTypeMaxLength;
+        }
+
+        public void setIngestActionTypeMaxLength(int ingestActionTypeMaxLength) {
+            this.ingestActionTypeMaxLength = Math.min(256, Math.max(1, ingestActionTypeMaxLength));
+        }
+
+        public int getIngestPayloadJsonMaxChars() {
+            return ingestPayloadJsonMaxChars;
+        }
+
+        public void setIngestPayloadJsonMaxChars(int ingestPayloadJsonMaxChars) {
+            this.ingestPayloadJsonMaxChars = Math.min(500_000, Math.max(2, ingestPayloadJsonMaxChars));
+        }
+
+        public int getListMaxLimit() {
+            return listMaxLimit;
+        }
+
+        public void setListMaxLimit(int listMaxLimit) {
+            this.listMaxLimit = Math.min(500, Math.max(1, listMaxLimit));
+        }
+
+        public int getListDefaultLimit() {
+            return listDefaultLimit;
+        }
+
+        public void setListDefaultLimit(int listDefaultLimit) {
+            this.listDefaultLimit = Math.min(200, Math.max(1, listDefaultLimit));
+        }
+    }
+
+    /**
+     * Optional HTTP integration to a Marketdata-style service (instruments list + NBBO quotes for evidence).
+     * Defaults are safe-off; paths are relative to {@link #baseUrl}.
+     */
+    public static class Marketdata {
+        private boolean enabled = false;
+        private String baseUrl = "";
+        private String apiKey = "";
+        private long connectTimeoutMs = 2000L;
+        private long readTimeoutMs = 5000L;
+        private String instrumentsHttpPath = "/internal/v0/instruments";
+        private String nbboHttpPath = "/internal/v0/nbbo";
+        private long instrumentsRefreshIntervalMs = 60_000L;
+        /**
+         * When {@code true} with {@link com.balh.oms.config.OmsConfig.Routing#isNbboReferenceInMarketContextEnabled()},
+         * trade applies try HTTP NBBO
+         * before stub bid/ask (symbol query param {@code symbol}).
+         */
+        private boolean nbboInMarketContextEnabled = false;
+
+        public boolean isEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(boolean enabled) {
+            this.enabled = enabled;
+        }
+
+        public String getBaseUrl() {
+            return baseUrl;
+        }
+
+        public void setBaseUrl(String baseUrl) {
+            this.baseUrl = baseUrl == null ? "" : baseUrl.trim();
+        }
+
+        public String getApiKey() {
+            return apiKey;
+        }
+
+        public void setApiKey(String apiKey) {
+            this.apiKey = apiKey == null ? "" : apiKey;
+        }
+
+        public long getConnectTimeoutMs() {
+            return connectTimeoutMs;
+        }
+
+        public void setConnectTimeoutMs(long connectTimeoutMs) {
+            this.connectTimeoutMs = Math.max(250L, connectTimeoutMs);
+        }
+
+        public long getReadTimeoutMs() {
+            return readTimeoutMs;
+        }
+
+        public void setReadTimeoutMs(long readTimeoutMs) {
+            this.readTimeoutMs = Math.max(250L, readTimeoutMs);
+        }
+
+        public String getInstrumentsHttpPath() {
+            return instrumentsHttpPath;
+        }
+
+        public void setInstrumentsHttpPath(String instrumentsHttpPath) {
+            this.instrumentsHttpPath = instrumentsHttpPath == null ? "" : instrumentsHttpPath.trim();
+        }
+
+        public String getNbboHttpPath() {
+            return nbboHttpPath;
+        }
+
+        public void setNbboHttpPath(String nbboHttpPath) {
+            this.nbboHttpPath = nbboHttpPath == null ? "" : nbboHttpPath.trim();
+        }
+
+        public long getInstrumentsRefreshIntervalMs() {
+            return instrumentsRefreshIntervalMs;
+        }
+
+        public void setInstrumentsRefreshIntervalMs(long instrumentsRefreshIntervalMs) {
+            this.instrumentsRefreshIntervalMs = Math.max(5_000L, instrumentsRefreshIntervalMs);
+        }
+
+        public boolean isNbboInMarketContextEnabled() {
+            return nbboInMarketContextEnabled;
+        }
+
+        public void setNbboInMarketContextEnabled(boolean nbboInMarketContextEnabled) {
+            this.nbboInMarketContextEnabled = nbboInMarketContextEnabled;
         }
     }
 }

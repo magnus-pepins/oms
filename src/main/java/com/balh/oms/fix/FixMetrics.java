@@ -13,6 +13,8 @@ public final class FixMetrics {
     public static final String METRIC_OUTBOUND_ROUTE_DISABLED_SKIPS = "oms_fix_outbound_route_disabled_skips_total";
     public static final String METRIC_OUTBOUND_THROTTLED_REQUEUES = "oms_fix_outbound_throttled_requeues_total";
     public static final String METRIC_ROUTE_STATE_SOD_RECONCILIATIONS = "oms_fix_route_state_sod_reconciliations_total";
+    public static final String METRIC_ROUTE_STATE_SOD_SKIPPED = "oms_fix_route_state_sod_skipped_total";
+    public static final String TAG_SKIP_REASON = "reason";
 
     private FixMetrics() {
     }

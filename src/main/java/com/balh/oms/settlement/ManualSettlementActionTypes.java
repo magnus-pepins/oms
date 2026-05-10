@@ -19,4 +19,10 @@ public final class ManualSettlementActionTypes {
      * SettlementConfirmProcessor#enqueueBrokerSettlementConfirmForTradeOrThrow(long)} (idempotent if already queued).
      */
     public static final String REGISTER_BROKER_CONFIRM = "REGISTER_BROKER_CONFIRM";
+
+    /**
+     * Deletes pending {@code broker_settlement_confirm} rows for {@code execution_id} via {@link
+     * SettlementConfirmProcessor#clearPendingBrokerConfirmsForTradeOrThrow(long)} (idempotent when queue empty).
+     */
+    public static final String CLEAR_PENDING_BROKER_CONFIRM = "CLEAR_PENDING_BROKER_CONFIRM";
 }

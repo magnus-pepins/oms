@@ -259,4 +259,55 @@ public class ExecutionsRepository {
             throw new IllegalStateException("update sell fill split: expected 1 row, got " + n + " execution=" + executionId);
         }
     }
+
+    private static final String SELECT_UNSETTLED_BUY_TRADE_IDS_FOR_ATTRIBUTION = """
+            SELECT e.id
+            FROM executions e
+            JOIN orders o ON o.id = e.order_id
+            WHERE e.account_id = :account_id
+              AND o.instrument_symbol = :symbol
+              AND o.side = CAST('BUY' AS order_side)
+              AND e.id <> :exclude_id
+              AND e.exec_type = CAST('TRADE' AS execution_exec_type)
+              AND e.settlement_status::text IN ('executed', 'matched')
+            ORDER BY e.id DESC
+            LIMIT :limit
+            """;
+
+    private static final String APPEND_UNSETTLED_FUNDED_ONE = """
+            UPDATE executions
+            SET unsettled_funded_by_exec_ids = unsettled_funded_by_exec_ids || ARRAY[ :fid ]::bigint[]
+            WHERE id = :eid
+              AND exec_type = CAST('TRADE' AS execution_exec_type)
+            """;
+
+    /**
+     * Prior BUY trade legs for the same account/symbol still in early settlement states (stub free-riding input).
+     */
+    public List<Long> findUnsettledBuyTradeExecutionIdsForAttribution(
+            UUID accountId, String instrumentSymbol, long excludeExecutionId, int limit) {
+        return jdbc.query(
+                SELECT_UNSETTLED_BUY_TRADE_IDS_FOR_ATTRIBUTION,
+                new MapSqlParameterSource()
+                        .addValue("account_id", accountId)
+                        .addValue("symbol", instrumentSymbol)
+                        .addValue("exclude_id", excludeExecutionId)
+                        .addValue("limit", limit),
+                (rs, rowNum) -> rs.getLong("id"));
+    }
+
+    public void appendUnsettledFundedByExecutionIds(long executionId, List<Long> fundingExecutionIds) {
+        if (fundingExecutionIds.isEmpty()) {
+            return;
+        }
+        for (Long fid : fundingExecutionIds) {
+            int n = jdbc.update(
+                    APPEND_UNSETTLED_FUNDED_ONE,
+                    new MapSqlParameterSource().addValue("fid", fid).addValue("eid", executionId));
+            if (n != 1) {
+                throw new IllegalStateException(
+                        "append unsettled_funded_by_exec_ids: expected 1 row, got " + n + " execution=" + executionId);
+            }
+        }
+    }
 }

@@ -118,3 +118,9 @@ originating Postgres transaction, and handed to NATS only after commit by
 The FIX drop-copy session is a separate consumer of the same NATS subject
 tree. The mapping from `OrderAccepted` / `OrderWorking` / etc. to FIX
 ER messages lives in the slice-2 FIX gateway service.
+
+## Slice 8 — durable archive consumer (deferred)
+
+A **long-retention JetStream consumer** (or object-store archive) that copies the same envelopes to compliance storage is **not** bundled in the OMS JAR. **Formal defer:** [plans/oms-realignment-2026-05-07.md](../../../system-documentation/plans/oms-realignment-2026-05-07.md) §5.1 — owner **compliance + platform**; gate **retention policy + infra** (S3 prefix, idempotent sink, bounded batch) before in-process wiring.
+
+Operators may run a **sidecar** subscriber using this document as the schema contract; OMS continues to publish via **`DomainFanoutReconciler`** + optional NATS JetStream only.

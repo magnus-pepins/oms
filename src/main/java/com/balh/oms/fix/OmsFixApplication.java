@@ -24,10 +24,15 @@ public class OmsFixApplication implements Application {
 
     private final FixSessionRegistry fixSessionRegistry;
     private final FixInboundHandler fixInboundHandler;
+    private final FixMassCancelOnDisconnectService massCancelOnDisconnectService;
 
-    public OmsFixApplication(FixSessionRegistry fixSessionRegistry, FixInboundHandler fixInboundHandler) {
+    public OmsFixApplication(
+            FixSessionRegistry fixSessionRegistry,
+            FixInboundHandler fixInboundHandler,
+            FixMassCancelOnDisconnectService massCancelOnDisconnectService) {
         this.fixSessionRegistry = fixSessionRegistry;
         this.fixInboundHandler = fixInboundHandler;
+        this.massCancelOnDisconnectService = massCancelOnDisconnectService;
     }
 
     @Override
@@ -44,6 +49,7 @@ public class OmsFixApplication implements Application {
     @Override
     public void onLogout(SessionID sessionId) {
         fixSessionRegistry.clear();
+        massCancelOnDisconnectService.onInitiatorLogout(sessionId);
         log.info("FIX logout {}", sessionId);
     }
 

@@ -1,5 +1,6 @@
 package com.balh.oms.config;
 
+import com.balh.oms.persistence.ControlRuntimeFlagsRepository;
 import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.returnpath.ExecutionReportApplier;
 import com.balh.oms.routing.SimulatedBrokerDispatcher;
@@ -44,7 +45,8 @@ public class SimulatedRoutingBeans {
     SimulatedReturnPathProjectionWorker simulatedReturnPathProjectionWorker(
             BlockingQueue<UUID> simulatedRouteOrderQueue,
             SimulatedExecutionProgram program,
-            OmsConfig config) {
-        return new SimulatedReturnPathProjectionWorker(simulatedRouteOrderQueue, program, config);
+            OmsConfig config,
+            ControlRuntimeFlagsRepository runtimeFlags) {
+        return new SimulatedReturnPathProjectionWorker(simulatedRouteOrderQueue, program, config, runtimeFlags);
     }
 }

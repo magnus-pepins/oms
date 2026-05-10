@@ -89,6 +89,13 @@ class OrdersControllerIntegrationTest extends AbstractPostgresIntegrationTest {
                 "SELECT COUNT(*) FROM orders WHERE account_id = ? AND client_idempotency_key = 'key-1'",
                 Long.class, accountId);
         assertThat(count).isEqualTo(1L);
+
+        UUID orderId = UUID.fromString((String) first.getBody().get("id"));
+        Long duplicateRejectAudit = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM control_decisions WHERE order_id = ? AND reject_code::text = 'RISK_DUPLICATE'",
+                Long.class,
+                orderId);
+        assertThat(duplicateRejectAudit).isZero();
     }
 
     @Test

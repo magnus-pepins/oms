@@ -1,6 +1,7 @@
 package com.balh.oms.routing;
 
 import com.balh.oms.config.OmsConfig;
+import com.balh.oms.persistence.ControlRuntimeFlagsRepository;
 import org.springframework.scheduling.annotation.Scheduled;
 
 import java.util.UUID;
@@ -18,14 +19,17 @@ public final class SimulatedReturnPathProjectionWorker {
     private final BlockingQueue<UUID> orderQueue;
     private final SimulatedExecutionProgram executionProgram;
     private final OmsConfig config;
+    private final ControlRuntimeFlagsRepository runtimeFlags;
 
     public SimulatedReturnPathProjectionWorker(
             BlockingQueue<UUID> orderQueue,
             SimulatedExecutionProgram executionProgram,
-            OmsConfig config) {
+            OmsConfig config,
+            ControlRuntimeFlagsRepository runtimeFlags) {
         this.orderQueue = orderQueue;
         this.executionProgram = executionProgram;
         this.config = config;
+        this.runtimeFlags = runtimeFlags;
     }
 
     @Scheduled(
@@ -40,6 +44,9 @@ public final class SimulatedReturnPathProjectionWorker {
 
     /** Test hook: process at most one queued order through the programmed fill sequence. */
     public void processPendingQueueOnce() {
+        if (runtimeFlags.isCanaryPauseSimulatedFills()) {
+            return;
+        }
         UUID id = orderQueue.poll();
         if (id == null) {
             return;

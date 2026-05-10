@@ -1,6 +1,7 @@
 package com.balh.oms.ingress;
 
 import com.balh.oms.persistence.ControlRuntimeFlagsRepository;
+import com.balh.oms.persistence.OmsRuntimeFlagKeys;
 import jakarta.validation.Valid;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -45,5 +46,28 @@ public class RuntimeFlagsController {
                         .findGlobalHaltRow()
                         .map(r -> new GlobalHaltResponse(r.value(), r.updatedAt()))
                         .orElseGet(GlobalHaltResponse::absent));
+    }
+
+    @GetMapping("/canary_pause_simulated_fills")
+    public ResponseEntity<BooleanRuntimeFlagResponse> getCanaryPauseSimulatedFills() {
+        return ResponseEntity.ok(
+                runtimeFlags
+                        .findBooleanFlagRow(OmsRuntimeFlagKeys.CANARY_PAUSE_SIMULATED_FILLS)
+                        .map(r -> new BooleanRuntimeFlagResponse(r.value(), r.updatedAt()))
+                        .orElseGet(BooleanRuntimeFlagResponse::absent));
+    }
+
+    @PatchMapping("/canary_pause_simulated_fills")
+    public ResponseEntity<BooleanRuntimeFlagResponse> patchCanaryPauseSimulatedFills(
+            @Valid @RequestBody BooleanRuntimeFlagPatchRequest body) {
+        String actor = body.updatedBy() == null || body.updatedBy().isBlank() ? "internal-api" : body.updatedBy();
+        runtimeFlags.upsertBooleanFlag(
+                OmsRuntimeFlagKeys.CANARY_PAUSE_SIMULATED_FILLS, Boolean.TRUE.equals(body.value()));
+        log.warn("canary_pause_simulated_fills set to {} by {}", body.value(), actor);
+        return ResponseEntity.ok(
+                runtimeFlags
+                        .findBooleanFlagRow(OmsRuntimeFlagKeys.CANARY_PAUSE_SIMULATED_FILLS)
+                        .map(r -> new BooleanRuntimeFlagResponse(r.value(), r.updatedAt()))
+                        .orElseGet(BooleanRuntimeFlagResponse::absent));
     }
 }

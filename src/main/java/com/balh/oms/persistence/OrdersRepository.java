@@ -13,6 +13,7 @@ import org.springframework.stereotype.Repository;
 import java.math.BigDecimal;
 import java.sql.Timestamp;
 import java.time.Instant;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -80,6 +81,15 @@ public class OrdersRepository {
             WHERE account_id = :account_id AND client_idempotency_key = :key
             """;
 
+    private static final String SELECT_DESK_SNAPSHOT_SQL = """
+            SELECT id, account_id, instrument_symbol, side::text AS side, status::text AS status,
+                   version, received_at
+            FROM orders
+            WHERE received_at >= :min_received
+            ORDER BY received_at DESC
+            LIMIT :limit
+            """;
+
     private static final String UPDATE_CAS_SQL = """
             UPDATE orders
                SET status = CAST(:status AS order_status),
@@ -124,6 +134,34 @@ public class OrdersRepository {
                 .addValue("key", idempotencyKey);
         var rows = jdbc.query(SELECT_BY_IDEMPOTENCY_SQL, params, ROW_MAPPER);
         return rows.stream().findFirst();
+    }
+
+    /** Bounded recent rows for desk / attendant snapshot (internal API only). */
+    public record DeskSnapshotRow(
+            UUID id,
+            UUID accountId,
+            String instrumentSymbol,
+            String side,
+            String status,
+            int version,
+            Instant receivedAt) {}
+
+    public List<DeskSnapshotRow> findDeskSnapshot(Instant minReceived, int limit) {
+        var params = new MapSqlParameterSource()
+                .addValue("min_received", Timestamp.from(minReceived))
+                .addValue("limit", limit);
+        return jdbc.query(
+                SELECT_DESK_SNAPSHOT_SQL,
+                params,
+                (rs, rowNum) ->
+                        new DeskSnapshotRow(
+                                (UUID) rs.getObject("id"),
+                                (UUID) rs.getObject("account_id"),
+                                rs.getString("instrument_symbol"),
+                                rs.getString("side"),
+                                rs.getString("status"),
+                                rs.getInt("version"),
+                                rs.getTimestamp("received_at").toInstant()));
     }
 
     /**

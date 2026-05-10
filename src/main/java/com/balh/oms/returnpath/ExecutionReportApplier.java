@@ -4,26 +4,31 @@ import com.balh.oms.config.OmsConfig;
 import com.balh.oms.domain.Order;
 import com.balh.oms.domain.OrderStatus;
 import com.balh.oms.domain.RejectCode;
+import com.balh.oms.domain.Side;
 import com.balh.oms.events.DomainEventEnvelopeCodec;
+import com.balh.oms.marketdata.MarketdataNbboQuote;
+import com.balh.oms.marketdata.MarketdataPlatformHttpClient;
 import com.balh.oms.persistence.DomainEventOutboxRepository;
 import com.balh.oms.persistence.ExecutionsRepository;
 import com.balh.oms.persistence.MarketContextRepository;
 import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.persistence.PositionsRepository;
 import com.balh.oms.persistence.SellFillPositionSplit;
-import com.balh.oms.returnpath.MarketContextVenueEvidence;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.Instant;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -43,6 +48,11 @@ public class ExecutionReportApplier {
     private static final String OUTCOME_DUPLICATE = "duplicate";
 
     private static final String METRIC_ORDER_FILLED_EVENTS = "oms_order_filled_events_published_total";
+    private static final String METRIC_FREE_RIDING_ATTRIBUTION = "oms_free_riding_attribution_merges_total";
+    /** Trade ER apply latency including market_context merge (best-ex evidence path). */
+    private static final String TIMER_TRADE_APPLY = "oms.trade.apply";
+    /** HTTP NBBO fetch latency when marketdata integration is active. */
+    private static final String TIMER_NBBO_FETCH = "oms.marketdata.nbbo.fetch";
 
     private static final int PRICE_SCALE = 10;
 
@@ -55,6 +65,7 @@ public class ExecutionReportApplier {
     private final OmsConfig config;
     private final MeterRegistry meterRegistry;
     private final PositionsRepository positions;
+    private final ObjectProvider<MarketdataPlatformHttpClient> marketdataHttp;
 
     public ExecutionReportApplier(
             OrdersRepository orders,
@@ -65,7 +76,8 @@ public class ExecutionReportApplier {
             ObjectMapper objectMapper,
             OmsConfig config,
             MeterRegistry meterRegistry,
-            PositionsRepository positions) {
+            PositionsRepository positions,
+            ObjectProvider<MarketdataPlatformHttpClient> marketdataHttp) {
         this.orders = orders;
         this.executions = executions;
         this.marketContext = marketContext;
@@ -75,6 +87,7 @@ public class ExecutionReportApplier {
         this.config = config;
         this.meterRegistry = meterRegistry;
         this.positions = positions;
+        this.marketdataHttp = marketdataHttp;
     }
 
     public enum TradeApplyOutcome {
@@ -112,9 +125,13 @@ public class ExecutionReportApplier {
             log.warn("Ignoring trade ER for order {} in status {}", cmd.orderId(), order.status());
             return TradeApplyOutcome.INVALID_STATE;
         }
+        return meterRegistry.timer(TIMER_TRADE_APPLY).record(() -> applyTradeAfterPreChecks(order, cmd));
+    }
 
+    private TradeApplyOutcome applyTradeAfterPreChecks(Order order, ExecutionTradeCommand cmd) {
         try {
-            String patch = MarketContextVenueEvidence.toJsonPatch(objectMapper, order, cmd);
+            Optional<MarketContextVenueEvidence.NbboQuoteRef> nbbo = resolveNbbo(order, cmd);
+            String patch = MarketContextVenueEvidence.toJsonPatch(objectMapper, order, cmd, nbbo);
             marketContext.mergeVenueFillEvidence(
                     order.id(),
                     cmd.venueTs(),
@@ -141,6 +158,19 @@ public class ExecutionReportApplier {
             return TradeApplyOutcome.DUPLICATE;
         }
         meterRegistry.counter(METRIC_EXECUTIONS_APPLIED, TAG_OUTCOME, OUTCOME_INSERTED).increment();
+
+        if (config.getSettlement().isFreeRidingAttributionEnabled() && order.side() == Side.BUY) {
+            List<Long> funding =
+                    executions.findUnsettledBuyTradeExecutionIdsForAttribution(
+                            order.accountId(),
+                            order.instrumentSymbol(),
+                            insertedId.get(),
+                            config.getSettlement().getFreeRidingAttributionMaxFundingExecutions());
+            if (!funding.isEmpty()) {
+                executions.appendUnsettledFundedByExecutionIds(insertedId.get(), funding);
+                meterRegistry.counter(METRIC_FREE_RIDING_ATTRIBUTION).increment();
+            }
+        }
 
         UUID custody = UUID.fromString(config.getSettlement().getDefaultCustodyAccountId());
         Optional<SellFillPositionSplit> sellSplit =
@@ -306,6 +336,35 @@ public class ExecutionReportApplier {
 
     private boolean isOpenForTrade(OrderStatus status) {
         return status == OrderStatus.WORKING || status == OrderStatus.PARTIALLY_FILLED;
+    }
+
+    private Optional<MarketContextVenueEvidence.NbboQuoteRef> resolveNbbo(Order order, ExecutionTradeCommand cmd) {
+        var r = config.getRouting();
+        if (!r.isNbboReferenceInMarketContextEnabled()) {
+            return Optional.empty();
+        }
+        var md = config.getMarketdata();
+        if (md.isNbboInMarketContextEnabled() && md.isEnabled()) {
+            MarketdataPlatformHttpClient c = marketdataHttp.getIfAvailable();
+            if (c != null) {
+                Optional<MarketdataNbboQuote> live =
+                        meterRegistry
+                                .timer(TIMER_NBBO_FETCH, "source", "http")
+                                .record(() -> c.fetchNbbo(order.instrumentSymbol()));
+                if (live.isPresent()) {
+                    MarketdataNbboQuote q = live.get();
+                    return Optional.of(
+                            new MarketContextVenueEvidence.NbboQuoteRef(
+                                    q.bid(), q.ask(), q.asOf(), "NBBO_MARKETDATA_HTTP"));
+                }
+            }
+        }
+        BigDecimal bid = r.getNbboStubBidPrice();
+        BigDecimal ask = r.getNbboStubAskPrice();
+        if (bid.compareTo(BigDecimal.ZERO) <= 0 || ask.compareTo(BigDecimal.ZERO) <= 0) {
+            return Optional.empty();
+        }
+        return Optional.of(new MarketContextVenueEvidence.NbboQuoteRef(bid, ask, cmd.venueTs()));
     }
 
     private String rawTradeJson(ExecutionTradeCommand cmd) {

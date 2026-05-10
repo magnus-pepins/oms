@@ -70,8 +70,11 @@ and v1.15 of [plans/oms-fix-gateway-and-settlement.md](../../system-documentatio
 
 - `RejectCode` is a Java enum from day one, mirrored to a Postgres
   `reject_code` enum via Flyway.
-- Slice 1 ships at least `RISK_STALE_QUEUE` and `RISK_DUPLICATE`. The full
-  catalogue (plan §5.11) is added incrementally as risk checks land.
+- Slice 1 ships at least `RISK_STALE_QUEUE` on the control path. `RISK_DUPLICATE`
+  exists in the enum for §5.11 forward compatibility; **ingress** duplicate
+  `(account_id, client_idempotency_key)` returns HTTP 200 with the existing order
+  and does **not** emit `RISK_DUPLICATE` (see `OrdersControllerIntegrationTest`).
+  The full catalogue (plan §5.11) is added incrementally as risk checks land.
 
 ## 10. PII policy
 

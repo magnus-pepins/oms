@@ -28,6 +28,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -71,6 +72,88 @@ class FixLogonSmokeTest {
         }
     }
 
+    /**
+     * Exit-gate §14.6: with {@code ResetOnLogon=Y} on both sides, a disconnect/reconnect cycle must complete a
+     * second logon (sequence reset contract for day rollover / test acceptors).
+     */
+    @Test
+    void reconnectCompletesSecondLogonWhenResetOnLogonEnabled() throws Exception {
+        int port = freeTcpPort();
+        Path root = Files.createTempDirectory("oms-qfj-reset-on-logon");
+
+        SessionSettings acceptorSettings =
+                sessionSettings(port, true, "ACCEPTOR", "INITIATOR", root.resolve("acc"), true);
+        SessionSettings initiatorSettings =
+                sessionSettings(port, false, "INITIATOR", "ACCEPTOR", root.resolve("ini"), true);
+
+        AtomicReference<CountDownLatch> acceptorWave = new AtomicReference<>(new CountDownLatch(1));
+        AtomicReference<CountDownLatch> initiatorWave = new AtomicReference<>(new CountDownLatch(1));
+
+        Application acceptorApp = waveLatchApp(acceptorWave);
+        Application initiatorApp = waveLatchApp(initiatorWave);
+
+        MessageStoreFactory accStore = new FileStoreFactory(acceptorSettings);
+        LogFactory accLog = new ScreenLogFactory(acceptorSettings);
+        MessageStoreFactory iniStore = new FileStoreFactory(initiatorSettings);
+        LogFactory iniLog = new ScreenLogFactory(initiatorSettings);
+        DefaultMessageFactory msgFactory = new DefaultMessageFactory();
+
+        SocketAcceptor acceptor = new SocketAcceptor(acceptorApp, accStore, acceptorSettings, accLog, msgFactory);
+        SocketInitiator initiator = new SocketInitiator(initiatorApp, iniStore, initiatorSettings, iniLog, msgFactory);
+
+        acceptor.start();
+        try {
+            initiator.start();
+            assertThat(initiatorWave.get().await(15, TimeUnit.SECONDS)).isTrue();
+            assertThat(acceptorWave.get().await(15, TimeUnit.SECONDS)).isTrue();
+
+            initiator.stop();
+            acceptorWave.set(new CountDownLatch(1));
+            initiatorWave.set(new CountDownLatch(1));
+
+            initiator.start();
+            assertThat(initiatorWave.get().await(15, TimeUnit.SECONDS)).isTrue();
+            assertThat(acceptorWave.get().await(15, TimeUnit.SECONDS)).isTrue();
+        } finally {
+            initiator.stop();
+            acceptor.stop();
+        }
+    }
+
+    private static Application waveLatchApp(AtomicReference<CountDownLatch> wave) {
+        return new Application() {
+            @Override
+            public void onCreate(SessionID sessionId) {}
+
+            @Override
+            public void onLogon(SessionID sessionId) {
+                CountDownLatch latch = wave.get();
+                if (latch != null) {
+                    latch.countDown();
+                }
+            }
+
+            @Override
+            public void onLogout(SessionID sessionId) {}
+
+            @Override
+            public void toAdmin(Message message, SessionID sessionId) {}
+
+            @Override
+            public void fromAdmin(Message message, SessionID sessionId)
+                    throws FieldNotFound, IncorrectTagValue, RejectLogon {}
+
+            @Override
+            public void toApp(Message message, SessionID sessionId) {}
+
+            @Override
+            public void fromApp(Message message, SessionID sessionId)
+                    throws FieldNotFound, IncorrectTagValue, UnsupportedMessageType {
+                new MessageCracker() {}.crack(message, sessionId);
+            }
+        };
+    }
+
     private static Application latchApp(CountDownLatch logonLatch) {
         return new Application() {
             @Override
@@ -103,7 +186,14 @@ class FixLogonSmokeTest {
     }
 
     private static SessionSettings sessionSettings(
-            int port, boolean acceptor, String sender, String target, Path fileStorePath) throws ConfigError, IOException {
+            int port, boolean acceptor, String sender, String target, Path fileStorePath)
+            throws ConfigError, IOException {
+        return sessionSettings(port, acceptor, sender, target, fileStorePath, false);
+    }
+
+    private static SessionSettings sessionSettings(
+            int port, boolean acceptor, String sender, String target, Path fileStorePath, boolean resetOnLogon)
+            throws ConfigError, IOException {
         Files.createDirectories(fileStorePath);
         SessionSettings s = new SessionSettings();
         s.setString("ConnectionType", acceptor ? "acceptor" : "initiator");
@@ -126,6 +216,9 @@ class FixLogonSmokeTest {
         s.setString(sid, "BeginString", "FIX.4.4");
         s.setString(sid, "SenderCompID", sender);
         s.setString(sid, "TargetCompID", target);
+        if (resetOnLogon) {
+            s.setString(sid, "ResetOnLogon", "Y");
+        }
         return s;
     }
 

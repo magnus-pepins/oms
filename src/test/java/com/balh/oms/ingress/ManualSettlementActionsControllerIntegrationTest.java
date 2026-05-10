@@ -275,6 +275,40 @@ class ManualSettlementActionsControllerIntegrationTest extends AbstractPostgresI
                 .isEqualTo(1);
     }
 
+    @Test
+    void approve_clearPendingBrokerConfirm_removesQueueWithoutChangingSettlementStatus() {
+        long exId = seedTradeExecution();
+        assertThat(jdbc.queryForObject(
+                        "SELECT settlement_status::text FROM executions WHERE id = ?",
+                        String.class,
+                        exId))
+                .isEqualTo("executed");
+
+        HttpHeaders h = headers();
+        long enqueueActionId = postCreateManualAction(exId, ManualSettlementActionTypes.REGISTER_BROKER_CONFIRM, h);
+        postApprove(enqueueActionId, h);
+        assertThat(jdbc.queryForObject(
+                        "SELECT COUNT(*)::int FROM broker_settlement_confirm WHERE execution_id = ? AND applied_at IS NULL",
+                        Integer.class,
+                        exId))
+                .isEqualTo(1);
+
+        long clearActionId =
+                postCreateManualAction(exId, ManualSettlementActionTypes.CLEAR_PENDING_BROKER_CONFIRM, h);
+        postApprove(clearActionId, h);
+
+        assertThat(jdbc.queryForObject(
+                        "SELECT COUNT(*)::int FROM broker_settlement_confirm WHERE execution_id = ? AND applied_at IS NULL",
+                        Integer.class,
+                        exId))
+                .isZero();
+        assertThat(jdbc.queryForObject(
+                        "SELECT settlement_status::text FROM executions WHERE id = ?",
+                        String.class,
+                        exId))
+                .isEqualTo("executed");
+    }
+
     private long postCreateManualAction(long executionId, String actionType, HttpHeaders h) {
         var createBody =
                 new ManualSettlementActionsController.CreateManualSettlementActionRequest(

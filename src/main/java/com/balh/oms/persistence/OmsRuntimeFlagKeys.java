@@ -10,4 +10,10 @@ public final class OmsRuntimeFlagKeys {
 
     /** When {@code true}, {@link com.balh.oms.risk.ControlRiskEvaluator} rejects with {@code RISK_KILL_SWITCH}. */
     public static final String GLOBAL_HALT = "global_halt";
+
+    /**
+     * When {@code true}, {@link com.balh.oms.routing.SimulatedReturnPathProjectionWorker} skips draining synthetic fills
+     * (mid-day canary / rollback hook for simulated routing only).
+     */
+    public static final String CANARY_PAUSE_SIMULATED_FILLS = "canary_pause_simulated_fills";
 }

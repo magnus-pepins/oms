@@ -82,6 +82,11 @@ public class PositionsRepository {
             WHERE account_id = :account_id AND instrument_symbol = :symbol AND custody_account_id = :custody_id
             """;
 
+    private static final String SELECT_QUANTITY_TOTAL = """
+            SELECT COALESCE(quantity_total, 0) AS quantity_total FROM positions
+            WHERE account_id = :account_id AND instrument_symbol = :symbol AND custody_account_id = :custody_id
+            """;
+
     private static final String REVERT_BUY_MARK_FAILED_SQL = """
             UPDATE positions SET
                 quantity_total = quantity_total - :qty,
@@ -314,6 +319,22 @@ public class PositionsRepository {
                             .formatted(updated, accountId, sym, executionId));
         }
         insertHistory(accountId, sym, custodyAccountId, "SETTLEMENT_SELL_SETTLED", settleQuantity, executionId);
+    }
+
+    public BigDecimal findQuantityTotal(UUID accountId, String instrumentSymbol, UUID custodyAccountId) {
+        String sym = instrumentSymbol == null ? "" : instrumentSymbol.trim();
+        if (sym.isEmpty()) {
+            return BigDecimal.ZERO;
+        }
+        List<BigDecimal> rows =
+                jdbc.query(
+                        SELECT_QUANTITY_TOTAL,
+                        new MapSqlParameterSource()
+                                .addValue("account_id", accountId)
+                                .addValue("symbol", sym)
+                                .addValue("custody_id", custodyAccountId),
+                        (rs, rowNum) -> rs.getBigDecimal("quantity_total"));
+        return rows.isEmpty() ? BigDecimal.ZERO : rows.getFirst();
     }
 
     private void insertHistory(

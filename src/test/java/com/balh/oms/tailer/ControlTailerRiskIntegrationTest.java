@@ -2,6 +2,7 @@ package com.balh.oms.tailer;
 
 import com.balh.oms.AbstractPostgresIntegrationTest;
 import com.balh.oms.chronicle.PendingControlEvent;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -21,6 +22,7 @@ class ControlTailerRiskIntegrationTest extends AbstractPostgresIntegrationTest {
 
     @Autowired ControlTailer controlTailer;
     @Autowired JdbcTemplate jdbc;
+    @Autowired MeterRegistry meterRegistry;
 
     @BeforeEach
     void truncateTradingTables() {
@@ -46,6 +48,14 @@ class ControlTailerRiskIntegrationTest extends AbstractPostgresIntegrationTest {
 
         UUID orderId = insertOrderRow("halt-1", "AAPL", "1", "10.00");
         PendingControlEvent ev = event(orderId, 0);
+        var killSwitchCounter =
+                meterRegistry.counter(
+                        "oms_control_decisions_recorded_total",
+                        "outcome",
+                        "REJECT",
+                        "reject_code",
+                        "RISK_KILL_SWITCH");
+        double beforeRecorded = killSwitchCounter.count();
         assertThat(controlTailer.apply(ev)).isEqualTo(ControlTailer.TailResult.RISK_PIPELINE_REJECTED);
 
         assertThat(jdbc.queryForObject("SELECT status::text FROM orders WHERE id = ?", String.class, orderId))
@@ -57,6 +67,7 @@ class ControlTailerRiskIntegrationTest extends AbstractPostgresIntegrationTest {
                 "SELECT COUNT(*)::int FROM control_decisions WHERE order_id = ? AND outcome = 'REJECT'",
                 Integer.class,
                 orderId)).isEqualTo(1);
+        assertThat(killSwitchCounter.count()).isEqualTo(beforeRecorded + 1.0);
     }
 
     @Test

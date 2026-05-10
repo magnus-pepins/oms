@@ -7,7 +7,7 @@ environment variables, and runbooks for **QuickFIX/J** wired to `FixRouteDispatc
 ## Current state (slice 4 wiring)
 
 - **Dependencies:** `org.quickfixj:quickfixj-core` + `quickfixj-messages-fix44` (see `build.gradle.kts`).
-- **Smoke test:** `FixLogonSmokeTest` — embedded acceptor + initiator logon on a loopback port.
+- **Smoke test:** `FixLogonSmokeTest` — embedded acceptor + initiator logon on a loopback port; includes **`reconnectCompletesSecondLogonWhenResetOnLogonEnabled`** with **`ResetOnLogon=Y`** on both sides (§14.6 day-rollover / seq-reset contract).
 - **Spring IT:** `FixRoutingSpringIntegrationTest` — `oms.routing.backend=fix`, `oms.fix.auto-start=false`, asserts `RouteDispatcher` is `FixRouteDispatcher`.
 - **Round-trip IT:** `FixRoundTripSpringIntegrationTest` (profile `fix-roundtrip-it`) — embedded loopback **acceptor** (`FixRoundTripEmbeddedAcceptor`, `SmartLifecycle` phase before initiator) + `oms.fix.auto-start=true`; inserts `WORKING` order, `RouteDispatcher.enqueueWorkingOrder`, awaits **FILLED** and asserts **`oms_fix_nos_sent_total`** / **`oms_fix_inbound_execution_reports_total`** (`disposition=trade_APPLIED`).
 - **HTTP ingress → FIX round-trip IT:** `FixIngressRoundTripSpringIntegrationTest` — same profile; **`POST /internal/v1/orders`** → outbox reconciler → **`ControlTailer.apply`** → **`WORKING`** → NOS → synthetic fill → **FILLED**; asserts **`positions`** / **`position_history`** (slice 6) and **broker-confirm drain → `settled`** via shared test assertions.
@@ -22,7 +22,7 @@ environment variables, and runbooks for **QuickFIX/J** wired to `FixRouteDispatc
 - **Route state IT:** `FixRouteStateControllerIntegrationTest` — Flyway `fix_route_state`; GET/PATCH with `X-OMS-Internal-Key`; 401/404.
 - **Inbound:** `OmsFixApplication` routes **`ExecutionReport`** and **`OrderCancelReject`** in `fromApp` → `FixInboundHandler` (`@Transactional`) → `FixExecutionReportMapper` → `ExecutionReportApplier` for **PartialFill/Fill**, **Canceled**, **Rejected** (`ExecType=Rejected` → `OrderRejected` + `executions` **REJECT**), and **OrderCancelReject** (same venue-reject path).
 - **Outbound stale jobs:** when `oms.fix.max-outbound-job-age-ms` &gt; `0`, a **WORKING** order older than that at dequeue is **not** sent; `ExecutionReportApplier.applyOutboundJobExpired` CAS to **`REJECTED`** / **`FIX_OUTBOUND_JOB_EXPIRED`** (metric **`oms_fix_outbound_job_expired_total`**).
-- **Metrics:** `oms_fix_nos_sent_total` (successful outbound `sendToTarget`); `oms_fix_inbound_execution_reports_total` with tag `disposition` = `trade_*` / `cancel_*` / `venue_reject_*` / `ocr_*` / `ignored`; **`oms_fix_outbound_job_expired_total`**; **`oms_fix_outbound_route_disabled_skips_total`** (scheduler ticks with logon while send is disabled); **`oms_fix_outbound_throttled_requeues_total`** (token bucket re-queue); **`oms_fix_route_state_sod_reconciliations_total`** (SOD job runs when enabled).
+- **Metrics:** `oms_fix_nos_sent_total` (successful outbound `sendToTarget`); `oms_fix_inbound_execution_reports_total` with tag `disposition` = `trade_*` / `cancel_*` / `venue_reject_*` / `ocr_*` / `ignored`; **`oms_fix_outbound_job_expired_total`**; **`oms_fix_outbound_route_disabled_skips_total`** (scheduler ticks with logon while send is disabled); **`oms_fix_outbound_throttled_requeues_total`** (token bucket re-queue); **`oms_fix_route_state_sod_reconciliations_total`** (SOD job runs when enabled); **`oms_fix_route_state_sod_skipped_total`** (`reason` tag when **`FixSodPolicyEngine`** gates the cron).
 - **Mapper unit test:** `FixExecutionReportMapperTest`.
 
 ## Configuration
@@ -49,6 +49,18 @@ environment variables, and runbooks for **QuickFIX/J** wired to `FixRouteDispatc
 | `OMS_FIX_SOCKET_USE_SSL` / `OMS_FIX_SOCKET_*STORE*` / `OMS_FIX_ENABLED_SSL_PROTOCOLS` | Initiator TLS to broker (QuickFIX `SocketUseSSL`, keystores, `EnabledProtocols`). |
 
 See `application.yaml` (`oms.fix.*`) and `.env.example`. **Broker UAT soak (human checklist):** [fix-broker-uat-soak.md](fix-broker-uat-soak.md).
+
+### Manual mass cancel (trading-ops / §9.3)
+
+Internal HTTP **`POST /internal/v1/fix/mass-cancel-request`** (JSON: **`requestedBy`**, optional **`reason`**, optional **`wire`**) is gated by **`OMS_FIX_MANUAL_MASS_CANCEL_ENABLED`**. Default behaviour records the request and observability; venue **`MassCancelRequest`** wiring requires **`OMS_FIX_MANUAL_MASS_CANCEL_WIRE_ENABLED=true`** and a **named broker** contract (same deferral family as §14.5). Ops Console proxies this path as **`POST /api/oms-trading/mass-cancel-request`** (**admin-only**).
+
+### Mass cancel on disconnect (§14.5) — broker contract defer
+
+When **`OMS_FIX_MASS_CANCEL_ON_DISCONNECT_ENABLED=true`**, OMS increments **`oms_fix_mass_cancel_disconnect_signal_total`** and logs from **`FixMassCancelOnDisconnectService`** on initiator **`onLogout`**. **Automated venue** `OrderCancelRequest` / `MassCancelRequest` **fan-out is intentionally not implemented** until the **named counterparty** documents: which open orders are in scope (e.g. `ClOrdID` = OMS order UUID), behaviour on partial fills, and whether the broker expects a single mass message or per-order cancels. Until then, ops follow manual kill / broker desk procedures after a disconnect signal. Written defer: [plans/oms-realignment-2026-05-07.md](../../../system-documentation/plans/oms-realignment-2026-05-07.md) §5.1.
+
+### ResetOnLogon (§14.6)
+
+Broker day-rollover and test acceptors often require **`ResetOnLogon=Y`** (QuickFIX session setting) so sequence numbers reset on each logon. Production values are broker-specific; the smoke test above proves the QuickFIX/J stack tolerates a second logon after **`SocketInitiator.stop()` / `start()`** when both sides enable reset-on-logon.
 
 ## Field mapping (v1)
 

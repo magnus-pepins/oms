@@ -3,6 +3,9 @@ package com.balh.oms.settlement;
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.persistence.ExecutionsRepository;
 import com.balh.oms.persistence.PositionsRepository;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Tag;
@@ -36,6 +39,8 @@ public class SettlementConfirmProcessor {
     private final BrokerSettlementConfirmRepository confirms;
     private final ExecutionsRepository executions;
     private final PositionsRepository positions;
+    private final LedgerSettlementOutboxRepository ledgerSettlementOutbox;
+    private final ObjectMapper objectMapper;
     private final OmsConfig config;
     private final MeterRegistry meterRegistry;
     private final Counter processedCounter;
@@ -45,11 +50,15 @@ public class SettlementConfirmProcessor {
             BrokerSettlementConfirmRepository confirms,
             ExecutionsRepository executions,
             PositionsRepository positions,
+            LedgerSettlementOutboxRepository ledgerSettlementOutbox,
+            ObjectMapper objectMapper,
             OmsConfig config,
             MeterRegistry meterRegistry) {
         this.confirms = confirms;
         this.executions = executions;
         this.positions = positions;
+        this.ledgerSettlementOutbox = ledgerSettlementOutbox;
+        this.objectMapper = objectMapper;
         this.config = config;
         this.meterRegistry = meterRegistry;
         this.processedCounter = meterRegistry.counter(METRIC_PROCESSED);
@@ -87,6 +96,24 @@ public class SettlementConfirmProcessor {
                     "broker confirm enqueue applies to TRADE executions only: " + executionId);
         }
         return confirms.insertIgnore(executionId);
+    }
+
+    /**
+     * Removes pending {@code broker_settlement_confirm} rows for a {@code TRADE} execution without changing
+     * {@code settlement_status} (operator correction when a confirm was queued in error).
+     */
+    @Transactional
+    public ClearPendingBrokerConfirmResult clearPendingBrokerConfirmsForTradeOrThrow(long executionId) {
+        var opt = executions.findSettlementRow(executionId);
+        if (opt.isEmpty()) {
+            return ClearPendingBrokerConfirmResult.NOT_FOUND;
+        }
+        var snap = opt.get();
+        if (!"TRADE".equalsIgnoreCase(snap.execType())) {
+            return ClearPendingBrokerConfirmResult.NOT_TRADE;
+        }
+        confirms.deletePendingForExecution(executionId);
+        return ClearPendingBrokerConfirmResult.APPLIED;
     }
 
     /**
@@ -189,21 +216,40 @@ public class SettlementConfirmProcessor {
                     "settlement CAS failed execution=%s %s->%s"
                             .formatted(snapshot.executionId(), cur, next));
         }
+        if (config.getLedger().isSettlementOutboxEnabled() && "settled".equals(next)) {
+            try {
+                ObjectNode p = objectMapper.createObjectNode();
+                p.put("schemaVersion", 1);
+                p.put("event", "SETTLEMENT_SETTLED");
+                p.put("executionId", snapshot.executionId());
+                p.put("side", snapshot.side());
+                p.put("instrumentSymbol", snapshot.instrumentSymbol());
+                p.put("quantity", snapshot.lastQuantity().toPlainString());
+                int inserted = ledgerSettlementOutbox.insertIgnore(
+                        snapshot.executionId(), "settled", objectMapper.writeValueAsString(p));
+                log.debug(
+                        "ledger settlement outbox enqueue executionId={} inserted={}",
+                        snapshot.executionId(),
+                        inserted);
+            } catch (JsonProcessingException e) {
+                throw new IllegalStateException("ledger settlement outbox payload failed", e);
+            }
+        }
     }
 
     /**
-     * Resolves broker fixture rows to {@code executions.id} and registers {@code broker_settlement_confirm} rows.
+     * Resolves broker fixture rows to {@code executions.id} (same rules as {@link #registerBrokerConfirmsFromFixture}
+     * but does not insert {@code broker_settlement_confirm}).
      */
-    public BrokerFixtureImportResult registerBrokerConfirmsFromFixture(List<BrokerFixtureRow> rows) {
+    public BrokerFixtureResolutionOutcome resolveBrokerFixtureRows(List<BrokerFixtureRow> rows, int maxRows) {
         if (rows == null || rows.isEmpty()) {
-            return new BrokerFixtureImportResult(0, 0, 0);
+            return new BrokerFixtureResolutionOutcome(List.of(), 0, 0);
         }
-        int max = config.getSettlement().getBrokerConfirmHttpMaxExecutionIds();
         int skippedInvalid = 0;
         int skippedUnresolved = 0;
         List<Long> resolved = new ArrayList<>();
         for (int i = 0; i < rows.size(); i++) {
-            if (i >= max) {
+            if (i >= maxRows) {
                 skippedInvalid++;
                 continue;
             }
@@ -219,8 +265,21 @@ public class SettlementConfirmProcessor {
             }
             resolved.add(idOpt.get());
         }
-        int inserted = registerBrokerConfirms(resolved);
-        return new BrokerFixtureImportResult(inserted, skippedUnresolved, skippedInvalid);
+        return new BrokerFixtureResolutionOutcome(resolved, skippedInvalid, skippedUnresolved);
+    }
+
+    /**
+     * Resolves broker fixture rows to {@code executions.id} and registers {@code broker_settlement_confirm} rows.
+     */
+    public BrokerFixtureImportResult registerBrokerConfirmsFromFixture(List<BrokerFixtureRow> rows) {
+        if (rows == null || rows.isEmpty()) {
+            return new BrokerFixtureImportResult(0, 0, 0);
+        }
+        int max = config.getSettlement().getBrokerConfirmHttpMaxExecutionIds();
+        BrokerFixtureResolutionOutcome outcome = resolveBrokerFixtureRows(rows, max);
+        int inserted = registerBrokerConfirms(outcome.resolvedExecutionIds());
+        return new BrokerFixtureImportResult(
+                inserted, outcome.skippedUnresolvedRows(), outcome.skippedInvalidRows());
     }
 
     /**

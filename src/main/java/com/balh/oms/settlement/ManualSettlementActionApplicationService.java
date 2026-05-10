@@ -87,6 +87,24 @@ public class ManualSettlementActionApplicationService {
                     inserted);
             return;
         }
+        if (type.equalsIgnoreCase(ManualSettlementActionTypes.CLEAR_PENDING_BROKER_CONFIRM)) {
+            ClearPendingBrokerConfirmResult cr =
+                    settlement.clearPendingBrokerConfirmsForTradeOrThrow(row.executionId());
+            switch (cr) {
+                case APPLIED -> log.info(
+                        "manual settlement {} applied executionId={} result={}",
+                        ManualSettlementActionTypes.CLEAR_PENDING_BROKER_CONFIRM,
+                        row.executionId(),
+                        cr);
+                default -> throw new IllegalStateException(
+                        "manual %s could not apply: executionId=%s result=%s"
+                                .formatted(
+                                        ManualSettlementActionTypes.CLEAR_PENDING_BROKER_CONFIRM,
+                                        row.executionId(),
+                                        cr));
+            }
+            return;
+        }
         log.debug("manual settlement action approved with no auto-executor type={} id={}", type, row.id());
     }
 }

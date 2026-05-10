@@ -21,12 +21,15 @@ public class ManualSettlementActionsRepository {
     }
 
     public boolean executionExists(long executionId) {
-        Integer n =
+        // Use EXISTS so an absent row yields a guaranteed boolean (true|false) instead of an
+        // empty result set, which would surface as EmptyResultDataAccessException -> HTTP 500
+        // when the controller intends to map "no row" to 404.
+        Boolean exists =
                 jdbc.queryForObject(
-                        "SELECT 1 FROM executions WHERE id = :id LIMIT 1",
+                        "SELECT EXISTS (SELECT 1 FROM executions WHERE id = :id)",
                         new MapSqlParameterSource("id", executionId),
-                        Integer.class);
-        return n != null && n == 1;
+                        Boolean.class);
+        return Boolean.TRUE.equals(exists);
     }
 
     public long insert(long executionId, String actionType, String requestedBy, String payloadJson) {

@@ -56,7 +56,7 @@ class InstrumentTradabilityControlIntegrationTest extends AbstractPostgresIntegr
     }
 
     private static PendingControlEvent event(UUID orderId, int version) {
-        Instant ts = Instant.parse("2026-05-07T14:00:00Z");
+        Instant ts = Instant.now();
         return new PendingControlEvent("OrderAccepted", orderId, version, 0, "h", ts, ts);
     }
 

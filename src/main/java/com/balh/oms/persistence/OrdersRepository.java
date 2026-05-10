@@ -4,7 +4,6 @@ import com.balh.oms.domain.Order;
 import com.balh.oms.domain.OrderStatus;
 import com.balh.oms.domain.RejectCode;
 import com.balh.oms.domain.Side;
-import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
@@ -41,6 +40,10 @@ public class OrdersRepository {
         public DuplicateOrderException(String message) { super(message); }
     }
 
+    // ON CONFLICT DO NOTHING keeps the JDBC transaction healthy on idempotent re-submits so the
+    // caller can SELECT the pre-existing row in the same transaction. A raw duplicate-key error
+    // would abort the transaction at the Postgres level (every later statement returns
+    // "current transaction is aborted, commands ignored until end of transaction block").
     private static final String INSERT_SQL = """
             INSERT INTO orders (
                 id, account_id, client_idempotency_key, shard_id, version,
@@ -56,6 +59,7 @@ public class OrdersRepository {
                 :received_at, :accepted_at, :terminal_at, :account_id_hash, :ledger_balance_id,
                 :cum_filled_quantity
             )
+            ON CONFLICT (account_id, client_idempotency_key) DO NOTHING
             """;
 
     private static final String SELECT_BY_ID_SQL = """
@@ -111,10 +115,9 @@ public class OrdersRepository {
             """;
 
     public void insert(Order o) {
-        try {
-            jdbc.update(INSERT_SQL, params(o));
-        } catch (DataIntegrityViolationException e) {
-            // UNIQUE (account_id, client_idempotency_key) violation.
+        int affected = jdbc.update(INSERT_SQL, params(o));
+        if (affected == 0) {
+            // ON CONFLICT (account_id, client_idempotency_key) suppressed the insert — already exists.
             throw new DuplicateOrderException(
                     "duplicate order for account=%s key=%s".formatted(
                             o.accountId(), o.clientIdempotencyKey()));

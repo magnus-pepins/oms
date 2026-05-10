@@ -63,8 +63,11 @@ class FixRoundTripJdbcStoreSpringIntegrationTest extends AbstractPostgresIntegra
     @BeforeEach
     void truncate() {
         FixRoundTripAcceptorApplication.resetItHooks();
-        jdbc.update("TRUNCATE TABLE " + FixJdbcSessionSchema.MESSAGES_TABLE);
-        jdbc.update("TRUNCATE TABLE " + FixJdbcSessionSchema.SESSIONS_TABLE);
+        // QuickFIX/J's JdbcStore writes the session row at QuickFIX session creation
+        // (Spring context init). It only INSERTs once and UPDATEs thereafter, so truncating
+        // oms_fix_sessions/oms_fix_messages here would leave subsequent UPDATEs affecting
+        // zero rows, breaking the COUNT > 0 assertion despite a healthy round-trip. We rely
+        // on per-test-class Spring contexts for isolation instead.
         jdbc.update(AbstractPostgresIntegrationTest.SQL_TRUNCATE_ORDERS_AND_SETTLEMENT);
     }
 

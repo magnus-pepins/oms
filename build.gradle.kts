@@ -76,6 +76,13 @@ tasks.withType<Test> {
     useJUnitPlatform()
     // Keep test logs deterministic: do not run integration suites in parallel until we enable Postgres pooling.
     systemProperty("junit.jupiter.execution.parallel.enabled", "false")
+    testLogging {
+        events("failed", "skipped")
+        showExceptions = true
+        showCauses = true
+        showStackTraces = true
+        exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+    }
 }
 
 tasks.named<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJar") {

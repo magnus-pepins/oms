@@ -102,6 +102,28 @@ class SettlementFileImportIntegrationTest extends AbstractPostgresIntegrationTes
     }
 
     @Test
+    void fileImport_unknownExecutionId_appliesBatchWithSkippedUnresolved_noConfirmInserted() {
+        long bogusExecutionId = 9_999_999_999L;
+        String json =
+                """
+                        {"rows":[{"executionId":%d,"accountId":null,"venueExecRef":null}]}
+                        """
+                        .formatted(bogusExecutionId);
+        ResponseEntity<SettlementController.SettlementFileImportResponse> res = postFile(json);
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(res.getBody()).isNotNull();
+        assertThat(res.getBody().duplicate()).isFalse();
+        assertThat(res.getBody().status()).isEqualTo("applied");
+        assertThat(res.getBody().insertedConfirms()).isZero();
+        assertThat(res.getBody().skippedUnresolvedRows()).isEqualTo(1);
+        assertThat(jdbc.queryForObject(
+                        "SELECT COUNT(*)::int FROM broker_settlement_confirm WHERE execution_id = ?",
+                        Integer.class,
+                        bogusExecutionId))
+                .isZero();
+    }
+
+    @Test
     void fileImport_listBatches_returnsRows() {
         long exId = seedTradeExecution();
         String json =

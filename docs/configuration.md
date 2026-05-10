@@ -110,7 +110,7 @@ Transport choice vs MQTT: [marketdata-ingestion-path.md](marketdata-ingestion-pa
 | `OMS_SETTLEMENT_FILE_IMPORT_ERROR_SUMMARY_MAX_CHARS` | `2000` | Truncation bound for **`settlement_file_import_batch.error_summary`**. |
 | `OMS_SETTLEMENT_FILE_IMPORT_LIST_MAX_LIMIT` | `200` | Max **`limit`** on **`GET /internal/v1/settlement/file-import-batches`**. |
 | `OMS_SETTLEMENT_FILE_IMPORT_LIST_DEFAULT_LIMIT` | `50` | Default **`limit`** when the query param is omitted. |
-| `OMS_SETTLEMENT_FILE_IMPORT_DROP_FOLDER_ENABLED` | `false` | When **`true`**, poll **`OMS_SETTLEMENT_FILE_IMPORT_DROP_FOLDER_PATH`** for `*.json` and ingest via **`SettlementFileImportService`** (see [broker-eod-file-contract.md](broker-eod-file-contract.md)). |
+| `OMS_SETTLEMENT_FILE_IMPORT_DROP_FOLDER_ENABLED` | `false` | When **`true`**, poll **`OMS_SETTLEMENT_FILE_IMPORT_DROP_FOLDER_PATH`** for `*.json` and ingest via **`SettlementFileImportService`** (see [broker-eod-file-contract.md](broker-eod-file-contract.md), [settlement-eod-ingest.md](settlement-eod-ingest.md)). |
 | `OMS_SETTLEMENT_FILE_IMPORT_DROP_FOLDER_PATH` | _(empty)_ | Directory to watch; subdirs **`.oms-done/`** and **`.oms-failed/`** are created for archives. |
 | `OMS_SETTLEMENT_FILE_IMPORT_DROP_FOLDER_POLL_INTERVAL_MS` | `30000` | Scheduler fixed delay between polls (minimum `5000`). |
 | `OMS_SETTLEMENT_FILE_IMPORT_DROP_FOLDER_MAX_FILES_PER_POLL` | `20` | Max JSON files processed per wake (cap `500`). |

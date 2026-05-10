@@ -14,6 +14,15 @@ import static org.assertj.core.api.Assertions.assertThat;
 class SanctionsExecutionGateTest {
 
     @Test
+    void disabledMode_passes() {
+        OmsConfig cfg = new OmsConfig();
+        cfg.getRisk().setSanctionsRecheckEnabled(false);
+        cfg.getRisk().setSanctionsRecheckStrict(true);
+        var gate = new SanctionsExecutionGate(cfg, Clock.systemUTC());
+        assertThat(gate.evaluate(UUID.randomUUID())).isEmpty();
+    }
+
+    @Test
     void strictMode_rejects() {
         OmsConfig cfg = new OmsConfig();
         cfg.getRisk().setSanctionsRecheckEnabled(true);

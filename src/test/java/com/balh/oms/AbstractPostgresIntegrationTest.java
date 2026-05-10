@@ -43,12 +43,20 @@ public abstract class AbstractPostgresIntegrationTest {
     /** Docker / runner flakes: retry container start before failing the JVM test run. */
     private static final int POSTGRES_CONTAINER_STARTUP_ATTEMPTS = 3;
 
+    /**
+     * Default Postgres {@code max_connections} is 100. Many cached {@code @SpringBootTest} contexts
+     * each open a Hikari pool against this single shared container; without a higher cap, CI hits
+     * {@code FATAL: sorry, too many clients already} and HTTP ITs see uncaught JDBC failures as 500.
+     */
+    private static final int POSTGRES_MAX_CONNECTIONS = 256;
+
     @Container
     protected static final PostgreSQLContainer<?> POSTGRES =
             new PostgreSQLContainer<>("postgres:16-alpine")
                     .withDatabaseName("oms")
                     .withUsername("oms")
                     .withPassword("oms")
+                    .withCommand("postgres", "-c", "max_connections=" + POSTGRES_MAX_CONNECTIONS)
                     .withStartupAttempts(POSTGRES_CONTAINER_STARTUP_ATTEMPTS);
 
     @DynamicPropertySource

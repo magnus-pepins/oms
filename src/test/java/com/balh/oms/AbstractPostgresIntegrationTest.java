@@ -25,12 +25,10 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 public abstract class AbstractPostgresIntegrationTest {
 
     /**
-     * GitHub Actions: Spring’s test {@code ApplicationContext} cache can retain many distinct
-     * {@code @SpringBootTest} contexts over one JVM; each context opens a Hikari pool against this
-     * single container. Postgres’ default {@code max_connections=100} is then easy to exhaust,
-     * surfacing as {@code Connection refused} / generic HTTP 500 on the first DB touch.
+     * Hikari waits for a TCP connection from the Testcontainers-mapped port; GitHub-hosted runners
+     * occasionally expose the mapped port before Postgres accepts connections.
      */
-    private static final int POSTGRES_TEST_MAX_CONNECTIONS = 400;
+    private static final String HIKARI_CONNECTION_TIMEOUT_MS = "60000";
 
     /**
      * Clears the order graph and slice-6 settlement tables in one statement.
@@ -42,21 +40,22 @@ public abstract class AbstractPostgresIntegrationTest {
     public static final String SQL_TRUNCATE_ORDERS_AND_SETTLEMENT =
             "TRUNCATE TABLE corporate_action_event, manual_settlement_actions, ledger_settlement_outbox, broker_settlement_confirm, settlement_file_import_batch, position_history, positions, orders CASCADE";
 
+    /** Docker / runner flakes: retry container start before failing the JVM test run. */
+    private static final int POSTGRES_CONTAINER_STARTUP_ATTEMPTS = 3;
+
     @Container
     protected static final PostgreSQLContainer<?> POSTGRES =
             new PostgreSQLContainer<>("postgres:16-alpine")
                     .withDatabaseName("oms")
                     .withUsername("oms")
                     .withPassword("oms")
-                    .withCommand(
-                            "postgres",
-                            "-c",
-                            "max_connections=" + POSTGRES_TEST_MAX_CONNECTIONS);
+                    .withStartupAttempts(POSTGRES_CONTAINER_STARTUP_ATTEMPTS);
 
     @DynamicPropertySource
     static void registerPgProperties(DynamicPropertyRegistry registry) {
         registry.add("spring.datasource.url", POSTGRES::getJdbcUrl);
         registry.add("spring.datasource.username", POSTGRES::getUsername);
         registry.add("spring.datasource.password", POSTGRES::getPassword);
+        registry.add("spring.datasource.hikari.connection-timeout", () -> HIKARI_CONNECTION_TIMEOUT_MS);
     }
 }

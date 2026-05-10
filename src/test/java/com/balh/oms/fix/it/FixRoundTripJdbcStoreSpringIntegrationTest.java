@@ -49,7 +49,7 @@ class FixRoundTripJdbcStoreSpringIntegrationTest extends AbstractPostgresIntegra
         registry.add("oms.fix.auto-start", () -> "true");
         registry.add("oms.fix.session-store-type", () -> "jdbc");
         registry.add("oms.fix.socket-connect-host", () -> "127.0.0.1");
-        registry.add("oms.fix.socket-connect-port", () -> String.valueOf(FixRoundTripFixture.PORT));
+        FixRoundTripDynamicProperties.registerLoopbackPort(registry);
         registry.add(
                 "oms.fix.file-store-path",
                 () -> FixRoundTripFixture.INITIATOR_STORE.toAbsolutePath().toString());

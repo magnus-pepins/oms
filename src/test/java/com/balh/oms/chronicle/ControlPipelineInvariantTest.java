@@ -13,6 +13,7 @@ import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -55,7 +56,12 @@ class ControlPipelineInvariantTest extends AbstractPostgresIntegrationTest {
                 HttpMethod.POST,
                 new HttpEntity<>(jsonRequest(accountId, "k1"), authHeaders()),
                 new ParameterizedTypeReference<>() {});
-        UUID orderId = UUID.fromString((String) res.getBody().get("id"));
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(res.getBody()).as("POST /internal/v1/orders body").isNotNull();
+        assertThat(res.getBody().get("id"))
+                .as("order id in body (status=%s, body=%s)", res.getStatusCode(), res.getBody())
+                .isNotNull();
+        UUID orderId = parseOrderId(res.getBody().get("id"));
 
         // 1. The orders row exists immediately after the HTTP call returns
         //    (HTTP 201 means the @Transactional commit boundary has closed).
@@ -99,6 +105,15 @@ class ControlPipelineInvariantTest extends AbstractPostgresIntegrationTest {
         long countAfterSecondRun = journal.appendCount();
         reconciler.runOnce();
         assertThat(journal.appendCount()).isEqualTo(countAfterSecondRun);
+    }
+
+    private static UUID parseOrderId(Object raw) {
+        return switch (raw) {
+            case UUID u -> u;
+            case String s -> UUID.fromString(s);
+            case null -> throw new IllegalArgumentException("order id is null");
+            default -> UUID.fromString(raw.toString());
+        };
     }
 
     private HttpHeaders authHeaders() {

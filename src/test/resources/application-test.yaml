@@ -4,8 +4,8 @@ spring:
   datasource:
     hikari:
       # Many cached @SpringBootTest contexts each hold a pool against one Testcontainers Postgres.
-      # Budget: spring.test.context.cache.maxSize (see build.gradle.kts) × this pool ≤ PG default
-      # max_connections (~100). Do not raise max_connections in the container for CI — can OOM Postgres.
+      # Budget: spring.test.context.cache.maxSize (build.gradle.kts) × (primary pool below + any
+      # oms.fix.session-jdbc-pool-max-size) ≤ PG default max_connections (~100).
       maximum-pool-size: 2
       minimum-idle: 1
 
@@ -34,6 +34,14 @@ oms:
       enabled: false
   ledger:
     enabled: false
+  # FIX dedicated session-store DataSource (oms.fix.session-jdbc-datasource-enabled=true) uses its own
+  # Hikari pool with default max 5 from application.yaml — multiplied by many cached @SpringBootTest
+  # contexts it can exhaust shared Testcontainers Postgres (~100 max_connections) before Ryuk teardown.
+  fix:
+    session-jdbc-pool-max-size: 2
+    session-jdbc-pool-min-idle: 1
+    # Align with AbstractPostgresIntegrationTest Hikari connection-timeout for slow CI starts.
+    session-jdbc-connection-timeout-ms: 60000
   domain-events:
     reconciler-age-ms: 0
     reconciler-batch-size: 100

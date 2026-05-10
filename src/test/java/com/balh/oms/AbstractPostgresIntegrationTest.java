@@ -45,9 +45,11 @@ public abstract class AbstractPostgresIntegrationTest {
 
     /**
      * Use the image default {@code max_connections} (~100). A single JVM shares this container across
-     * many cached {@code @SpringBootTest} contexts; {@code application-test.yaml} caps Hikari and
-     * {@code build.gradle.kts} caps {@code spring.test.context.cache.maxSize} so total app pools stay
-     * well under that budget.
+     * many cached {@code @SpringBootTest} contexts; {@code application-test.yaml} caps the primary
+     * Hikari pool and {@code oms.fix.session-jdbc-pool-max-size} caps the optional FIX session-store pool
+     * (see {@code FixSessionStoreDataSourceConfiguration}); {@code build.gradle.kts} caps
+     * {@code spring.test.context.cache.maxSize} so total demand stays under the image default
+     * {@code max_connections} (~100).
      *
      * <p><strong>Do not</strong> raise {@code max_connections} aggressively here for CI: a very high
      * value increases PostgreSQL memory reservation and we have seen the {@code postgres} process OOM

@@ -25,8 +25,20 @@ val quickfixjVersion = "2.3.2"
  * `application-test.yaml`, plus any second pools such as `oms.fix.session-jdbc-pool-max-size`)
  * comfortably under the image default `max_connections` (~100). Do not crank `max_connections` in
  * the container for CI — that can OOM-kill Postgres on GitHub runners.
+ *
+ * <p>On GitHub Actions we set this to **1**: each distinct `@SpringBootTest` configuration still
+ * gets its own context while running, but we never **retain** more than one loaded context at a
+ * time, so prior contexts close and release all pools before the next heavy IT — the only reliable
+ * way to stay under `max_connections` with dozens of unique IT configurations sharing one static
+ * Postgres.
  */
-val springTestContextCacheMaxSize = 10
+val springTestContextCacheMaxSizeDefaultLocal = 10
+val springTestContextCacheMaxSizeDefaultCi = 1
+
+val springTestContextCacheMaxSize =
+    System.getenv("SPRING_TEST_CONTEXT_CACHE_MAX_SIZE")?.toIntOrNull()?.coerceIn(1, 64)
+        ?: if (System.getenv("GITHUB_ACTIONS") == "true") springTestContextCacheMaxSizeDefaultCi
+        else springTestContextCacheMaxSizeDefaultLocal
 
 dependencies {
     // Spring Boot 3 minimal: Web + Actuator + JDBC + Flyway

@@ -24,6 +24,11 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
+      # Single-project builds rarely benefit from parallel task execution; disabling avoids
+      # rare races with Testcontainers + Spring context lifecycle on GitHub-hosted runners.
+      - name: Disable Gradle parallel tasks on CI
+        run: printf '\n# CI stability (see workflow)\norg.gradle.parallel=false\n' >> gradle.properties
+
       # Warm images used by Testcontainers so pulls do not race test timeouts or Hub limits.
       - name: Pre-pull container images used in tests
         run: |

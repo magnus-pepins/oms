@@ -20,25 +20,13 @@ repositories {
 val quickfixjVersion = "2.3.2"
 
 /**
- * Spring Test default context cache is 32; cap growth so fewer Hikari pools pin the single
- * Testcontainers Postgres. Keep (this value × primary Hikari `maximum-pool-size` in
- * `application-test.yaml`, plus any second pools such as `oms.fix.session-jdbc-pool-max-size`)
- * comfortably under the image default `max_connections` (~100). Do not crank `max_connections` in
- * the container for CI — that can OOM-kill Postgres on GitHub runners.
- *
- * <p>On GitHub Actions we set this to **1**: each distinct `@SpringBootTest` configuration still
- * gets its own context while running, but we never **retain** more than one loaded context at a
- * time, so prior contexts close and release all pools before the next heavy IT — the only reliable
- * way to stay under `max_connections` with dozens of unique IT configurations sharing one static
- * Postgres.
+ * Spring Test default context cache is 32; cap growth so fewer Hikari pools pin the integration
+ * Postgres. Keep (this value × primary Hikari `maximum-pool-size` in `application-test.yaml`, plus
+ * any second pools such as `oms.fix.session-jdbc-pool-max-size`) under the server `max_connections`
+ * budget. Override with env `SPRING_TEST_CONTEXT_CACHE_MAX_SIZE` (1–64) if needed.
  */
-val springTestContextCacheMaxSizeDefaultLocal = 10
-val springTestContextCacheMaxSizeDefaultCi = 1
-
 val springTestContextCacheMaxSize =
-    System.getenv("SPRING_TEST_CONTEXT_CACHE_MAX_SIZE")?.toIntOrNull()?.coerceIn(1, 64)
-        ?: if (System.getenv("GITHUB_ACTIONS") == "true") springTestContextCacheMaxSizeDefaultCi
-        else springTestContextCacheMaxSizeDefaultLocal
+    System.getenv("SPRING_TEST_CONTEXT_CACHE_MAX_SIZE")?.toIntOrNull()?.coerceIn(1, 64) ?: 10
 
 dependencies {
     // Spring Boot 3 minimal: Web + Actuator + JDBC + Flyway
@@ -78,7 +66,7 @@ dependencies {
     implementation("org.quickfixj:quickfixj-core:$quickfixjVersion")
     implementation("org.quickfixj:quickfixj-messages-fix44:$quickfixjVersion")
 
-    // JSON (Jackson is pulled by spring-web; explicit for outbox payload codec)
+    // JSON (Jackson is pulled from spring-web; explicit on the classpath for outbox payload codec)
     implementation("com.fasterxml.jackson.module:jackson-module-parameter-names")
     implementation("com.fasterxml.jackson.datatype:jackson-datatype-jsr310")
 

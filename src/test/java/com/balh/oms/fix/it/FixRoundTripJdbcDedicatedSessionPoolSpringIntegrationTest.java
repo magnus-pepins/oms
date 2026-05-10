@@ -49,9 +49,9 @@ class FixRoundTripJdbcDedicatedSessionPoolSpringIntegrationTest extends Abstract
         registry.add("oms.fix.auto-start", () -> "true");
         registry.add("oms.fix.session-store-type", () -> "jdbc");
         registry.add("oms.fix.session-jdbc-datasource-enabled", () -> "true");
-        registry.add("oms.fix.session-jdbc-url", POSTGRES::getJdbcUrl);
-        registry.add("oms.fix.session-jdbc-user", POSTGRES::getUsername);
-        registry.add("oms.fix.session-jdbc-password", POSTGRES::getPassword);
+        registry.add("oms.fix.session-jdbc-url", AbstractPostgresIntegrationTest::integrationTestJdbcUrl);
+        registry.add("oms.fix.session-jdbc-user", AbstractPostgresIntegrationTest::integrationTestJdbcUser);
+        registry.add("oms.fix.session-jdbc-password", AbstractPostgresIntegrationTest::integrationTestJdbcPassword);
         registry.add("oms.fix.socket-connect-host", () -> "127.0.0.1");
         FixRoundTripDynamicProperties.registerLoopbackPort(registry);
         registry.add(

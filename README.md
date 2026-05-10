@@ -9,7 +9,7 @@ backed by Postgres + Flyway, with the Postgres-first / Chronicle-after
 control-plane pattern wired end-to-end (outbox reconciler → Chronicle append →
 tail reader → `ControlTailer` CAS updates).
 
-**CI:** GitHub Actions runs `./gradlew clean test` (Testcontainers + Spring integration suites) then `./gradlew bootJar` on pushes and PRs to `main` / `master`, and can be triggered manually (`workflow_dispatch`); see `.github/workflows/ci.yml`. Failed runs upload an **`oms-test-reports`** artifact (JUnit XML + HTML under `build/`). If the job log is not visible, download that artifact or run `./gradlew clean test --no-daemon --no-build-cache` locally (Docker required for integration tests).
+**CI:** GitHub Actions runs `./gradlew clean test` against a **job-level Postgres service** (see `services:` in `.github/workflows/ci.yml` and env `OMS_CI_JDBC_*` in `AbstractPostgresIntegrationTest`), then `./gradlew bootJar` on pushes and PRs to `main` / `master`, and can be triggered manually (`workflow_dispatch`). Testcontainers is still used on CI for other images (e.g. NATS). Failed runs upload an **`oms-test-reports`** artifact (JUnit XML + HTML under `build/`). If the job log is not visible, download that artifact or run `./gradlew clean test --no-daemon --no-build-cache` locally (**Docker required** for Testcontainers Postgres and NATS-backed ITs).
 
 The product / architecture decisions that shaped this code live in the
 [system-documentation](../system-documentation) workspace — primarily
@@ -117,10 +117,14 @@ Flyway migrations run on startup against that database.
 The Postgres from `docker compose up -d postgres` is what **`bootRun`**
 connects to when you set `OMS_PG_URL` as above.
 
-`./gradlew test` integration tests use **Testcontainers**, which starts a
+**Locally,** `./gradlew test` integration tests use **Testcontainers**, which starts a
 **separate** short-lived Postgres container on an ephemeral port. That only
 requires the Docker daemon (same machine as Gradle); it does not read
 `OMS_PG_URL`. Having Compose Postgres up is fine — both can run at once.
+
+**On GitHub Actions CI,** the workflow starts a **service** Postgres container instead;
+tests point at it via `OMS_CI_JDBC_URL` (see `AbstractPostgresIntegrationTest`).
+
 `BuyingPowerLedgerControlTailerIntegrationTest` also starts an embedded
 **WireMock** Ledger stub (no separate Ledger container).
 
@@ -147,8 +151,7 @@ curl -s http://localhost:8080/internal/v1/orders \
 ./gradlew test
 ```
 
-Integration tests use Testcontainers (Postgres). They run when Docker is
-available. If Docker is not running, those classes are **skipped** (see
+Integration tests extend `AbstractPostgresIntegrationTest`, which uses **Testcontainers Postgres** when `OMS_CI_JDBC_URL` is **not** set (local / IDE). When that env var **is** set (GitHub Actions CI), JDBC targets that URL instead. If Docker is not running and you are not using CI env, those classes are **skipped** (see
 `@Testcontainers(disabledWithoutDocker = true)` on
 `AbstractPostgresIntegrationTest`) so `./gradlew build` still succeeds.
 `ShardKeyTest` always runs without Docker.

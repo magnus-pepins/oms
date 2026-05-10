@@ -3,9 +3,9 @@ spring:
     enabled: true
   datasource:
     hikari:
-      # Many cached @SpringBootTest contexts each hold a pool against one Testcontainers Postgres.
-      # Budget: spring.test.context.cache.maxSize (build.gradle.kts; 1 on GHA) × (primary pool below + any
-      # oms.fix.session-jdbc-pool-max-size) ≤ PG default max_connections (~100).
+      # Many cached @SpringBootTest contexts each hold a pool against the shared integration Postgres.
+      # Budget: spring.test.context.cache.maxSize (build.gradle.kts) × (primary pool below + any
+      # oms.fix.session-jdbc-pool-max-size) ≤ Postgres max_connections (GHA service or Testcontainers).
       maximum-pool-size: 2
       minimum-idle: 1
 

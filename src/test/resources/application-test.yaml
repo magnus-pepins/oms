@@ -4,8 +4,8 @@ spring:
   datasource:
     hikari:
       # Many cached @SpringBootTest contexts each hold a pool against one Testcontainers Postgres.
-      # Keep per-context usage low so spring.test.context.cache.maxSize × pool ≤ POSTGRES_MAX_CONNECTIONS
-      # in AbstractPostgresIntegrationTest (default PG max_connections=100 is too tight for full CI).
+      # Budget: spring.test.context.cache.maxSize (see build.gradle.kts) × this pool ≤ PG default
+      # max_connections (~100). Do not raise max_connections in the container for CI — can OOM Postgres.
       maximum-pool-size: 2
       minimum-idle: 1
 

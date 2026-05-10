@@ -21,10 +21,11 @@ val quickfixjVersion = "2.3.2"
 
 /**
  * Spring Test default context cache is 32; cap growth so fewer Hikari pools pin the single
- * Testcontainers Postgres. Must stay roughly in budget with `application-test.yaml` Hikari
- * `maximum-pool-size` and `AbstractPostgresIntegrationTest` `max_connections`.
+ * Testcontainers Postgres. Keep (this value × `application-test.yaml` Hikari `maximum-pool-size`)
+ * comfortably under the container image default `max_connections` (~100); do not compensate with
+ * an extreme `max_connections` override — that can OOM-kill Postgres on GitHub runners.
  */
-val springTestContextCacheMaxSize = 24
+val springTestContextCacheMaxSize = 16
 
 dependencies {
     // Spring Boot 3 minimal: Web + Actuator + JDBC + Flyway

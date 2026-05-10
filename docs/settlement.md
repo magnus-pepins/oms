@@ -1,6 +1,6 @@
 # Settlement spine (slice 6 — Phase 1 §12.2–12.3)
 
-This document describes the **securities post-trade** tables and wiring in OMS. **Ledger** cash legs, broker EOD file formats, and Beard Admin four-eyes flows remain plan-driven. **Phase 1 breaks dry-run (ops):** [settlement-breaks-dry-run-runbook.md](settlement-breaks-dry-run-runbook.md).
+This document describes the **securities post-trade** tables and wiring in OMS. **Ledger** cash legs, broker EOD file formats, and Beard Admin four-eyes flows remain plan-driven. **Broker EOD `rows` JSON contract (W2.1):** [broker-eod-file-contract.md](broker-eod-file-contract.md). **Phase 1 breaks dry-run (ops):** [settlement-breaks-dry-run-runbook.md](settlement-breaks-dry-run-runbook.md).
 
 ## Schema
 

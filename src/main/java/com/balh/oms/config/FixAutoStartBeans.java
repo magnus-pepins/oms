@@ -16,6 +16,7 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.core.env.Environment;
 
 import javax.sql.DataSource;
 
@@ -32,10 +33,18 @@ public class FixAutoStartBeans {
             OmsConfig omsConfig,
             OmsFixApplication application,
             DataSource dataSource,
+            Environment environment,
             @Autowired(required = false) @Qualifier("fixSessionStoreDataSource") DataSource fixSessionStoreDataSource) {
+        DataSource dedicated = fixSessionStoreDataSource;
+        if (dedicated != null
+                && omsConfig.getFix().isJdbcSessionStore()
+                && PostgresJdbcUrlEquivalence.isSameLogicalDatabase(
+                        environment.getProperty("spring.datasource.url"), omsConfig.getFix().getSessionJdbcUrl())) {
+            dedicated = null;
+        }
         DataSource jdbcMessageStoreDataSource =
                 omsConfig.getFix().isJdbcSessionStore()
-                        ? (fixSessionStoreDataSource != null ? fixSessionStoreDataSource : dataSource)
+                        ? (dedicated != null ? dedicated : dataSource)
                         : dataSource;
         return new FixInitiatorManager(omsConfig, application, jdbcMessageStoreDataSource);
     }

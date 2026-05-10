@@ -44,6 +44,18 @@ public final class PostgresJdbcUrlEquivalence {
         } else if (auth.startsWith("localhost:")) {
             auth = "127.0.0.1:" + auth.substring("localhost:".length());
         }
+        auth = withDefaultPostgresPort(auth);
         return auth + "/" + database;
+    }
+
+    /** Host-only authority uses Postgres default 5432 so it matches URLs that spell the port explicitly. */
+    private static String withDefaultPostgresPort(String authority) {
+        if (authority.startsWith("[")) {
+            return authority;
+        }
+        if (!authority.contains(":")) {
+            return authority + ":5432";
+        }
+        return authority;
     }
 }

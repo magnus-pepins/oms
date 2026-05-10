@@ -23,10 +23,10 @@ class PostgresJdbcUrlEquivalenceTest {
     }
 
     @Test
-    void differentDatabaseNotSame() {
+    void hostWithoutPortMatchesExplicit5432() {
         assertThat(PostgresJdbcUrlEquivalence.isSameLogicalDatabase(
-                        "jdbc:postgresql://127.0.0.1:5432/oms",
-                        "jdbc:postgresql://127.0.0.1:5432/other"))
-                .isFalse();
+                        "jdbc:postgresql://127.0.0.1/oms",
+                        "jdbc:postgresql://127.0.0.1:5432/oms"))
+                .isTrue();
     }
 }

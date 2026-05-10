@@ -37,6 +37,10 @@ jobs:
           wait
 
       - name: Test
+        env:
+          # Ryuk sidecar occasionally fails to start on GitHub-hosted runners; disabling is a
+          # documented Testcontainers trade-off for CI (containers still stop with the JVM).
+          TESTCONTAINERS_RYUK_DISABLED: true
         run: ./gradlew clean test --no-daemon --no-build-cache --stacktrace
 
       - name: Print failing JUnit XML to the log

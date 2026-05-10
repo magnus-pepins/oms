@@ -92,7 +92,9 @@ class ControlTailerRiskIntegrationTest extends AbstractPostgresIntegrationTest {
 
     @Test
     void notionalCapRejects() {
-        UUID orderId = insertOrderRow("not-1", "AAPL", "10", "60.00");
+        // Fat-finger limit price is evaluated before notional; stay at or below max limit (50)
+        // while qty × limit exceeds max notional (500).
+        UUID orderId = insertOrderRow("not-1", "AAPL", "11", "50.00");
         PendingControlEvent ev = event(orderId, 0);
         assertThat(controlTailer.apply(ev)).isEqualTo(ControlTailer.TailResult.RISK_PIPELINE_REJECTED);
         assertThat(jdbc.queryForObject(

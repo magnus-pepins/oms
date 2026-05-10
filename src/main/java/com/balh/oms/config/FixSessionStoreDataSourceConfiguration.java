@@ -21,7 +21,8 @@ import org.springframework.core.type.AnnotatedTypeMetadata;
  * {@code oms.fix.session-jdbc-datasource-enabled=true} (master plan 6.4: isolate FIX seq/message IO from the
  * application pool). Apply Flyway {@code V9} DDL to that database before enabling in production.
  *
- * <p>When {@code oms.fix.session-jdbc-url} equals {@code spring.datasource.url}, we do <strong>not</strong> register
+ * <p>When {@code oms.fix.session-jdbc-url} is the <strong>same logical</strong> database as {@code spring.datasource.url}
+ * ({@link PostgresJdbcUrlEquivalence}), we do <strong>not</strong> register
  * {@code fixSessionStoreDataSource}: {@link FixAutoStartBeans} injects the primary {@code DataSource} for the JDBC
  * session store (see {@code fixSessionStoreDataSource != null ? ... : dataSource}). Registering an alias bean that
  * delegates to the primary caused a bootstrap cycle (Flyway resolves {@code fixSessionStoreDataSource} while that
@@ -58,7 +59,7 @@ public class FixSessionStoreDataSourceConfiguration {
             if (main == null || fix == null) {
                 return false;
             }
-            return main.trim().equals(fix.trim());
+            return PostgresJdbcUrlEquivalence.isSameLogicalDatabase(main, fix);
         }
     }
 

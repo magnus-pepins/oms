@@ -56,7 +56,9 @@ class ControlPipelineInvariantTest extends AbstractPostgresIntegrationTest {
                 HttpMethod.POST,
                 new HttpEntity<>(jsonRequest(accountId, "k1"), authHeaders()),
                 new ParameterizedTypeReference<>() {});
-        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(res.getStatusCode())
+                .describedAs("POST /internal/v1/orders response body: %s", res.getBody())
+                .isEqualTo(HttpStatus.CREATED);
         assertThat(res.getBody()).as("POST /internal/v1/orders body").isNotNull();
         assertThat(res.getBody().get("id"))
                 .as("order id in body (status=%s, body=%s)", res.getStatusCode(), res.getBody())

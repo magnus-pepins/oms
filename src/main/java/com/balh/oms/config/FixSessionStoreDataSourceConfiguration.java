@@ -3,7 +3,6 @@ package com.balh.oms.config;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 import javax.sql.DataSource;
-import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.AutoConfigureAfter;
 import org.springframework.boot.autoconfigure.condition.AllNestedConditions;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -103,7 +102,7 @@ public class FixSessionStoreDataSourceConfiguration {
     static class ReuseMainJdbcPool {
 
         @Bean(name = "fixSessionStoreDataSource", destroyMethod = "")
-        DataSource fixSessionStoreDataSourceSameUrlAsMain(@Qualifier("dataSource") DataSource dataSource) {
+        DataSource fixSessionStoreDataSourceSameUrlAsMain(DataSource dataSource) {
             return dataSource;
         }
     }

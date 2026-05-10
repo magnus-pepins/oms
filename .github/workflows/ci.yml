@@ -19,6 +19,7 @@ jobs:
         with:
           java-version: "21"
           distribution: "temurin"
+          cache: "gradle"
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
@@ -45,13 +46,14 @@ jobs:
       - name: Print failing JUnit XML to the log
         if: failure()
         run: |
-          set -euo pipefail
+          set -u
+          echo "==== test-results tree ===="
+          ls -laR build/test-results 2>&1 || true
+          echo "==== JUnit XML (first 400 lines each) ===="
           shopt -s nullglob || true
-          for f in build/test-results/test/TEST-*.xml; do
-            if grep -qE '<(failure|error)' "$f" 2>/dev/null; then
-              echo "======== $f ========"
-              cat "$f"
-            fi
+          for f in build/test-results/test/*.xml; do
+            echo "======== $f ========"
+            head -n 400 "$f" || true
           done
 
       - name: Upload test reports on failure

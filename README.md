@@ -9,9 +9,7 @@ backed by Postgres + Flyway, with the Postgres-first / Chronicle-after
 control-plane pattern wired end-to-end (outbox reconciler → Chronicle append →
 tail reader → `ControlTailer` CAS updates).
 
-**CI:** GitHub Actions runs `./gradlew test` and `./gradlew bootJar` on pushes
-and PRs to `main` / `master`, and can be triggered manually (`workflow_dispatch`);
-see `.github/workflows/ci.yml`.
+**CI:** GitHub Actions runs `./gradlew clean test` (Testcontainers + Spring integration suites) then `./gradlew bootJar` on pushes and PRs to `main` / `master`, and can be triggered manually (`workflow_dispatch`); see `.github/workflows/ci.yml`. Failed runs upload an **`oms-test-reports`** artifact (JUnit XML + HTML under `build/`). If the job log is not visible, download that artifact or run `./gradlew clean test --no-daemon --no-build-cache` locally (Docker required for integration tests).
 
 The product / architecture decisions that shaped this code live in the
 [system-documentation](../system-documentation) workspace — primarily

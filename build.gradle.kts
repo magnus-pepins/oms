@@ -69,7 +69,8 @@ dependencies {
     testImplementation("org.testcontainers:junit-jupiter:1.20.3")
     testImplementation("org.assertj:assertj-core:3.26.3")
     testImplementation("org.awaitility:awaitility:4.2.2")
-    testImplementation("org.wiremock:wiremock:3.9.1")
+    // WireMock 3 core does not ship an HTTP server; Jetty 12 extension is required on the test classpath.
+    testImplementation("org.wiremock:wiremock-jetty12:3.9.1")
 }
 
 tasks.withType<Test> {

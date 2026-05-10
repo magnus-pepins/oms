@@ -2,6 +2,7 @@ package com.balh.oms.risk;
 
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.domain.RejectCode;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.time.Clock;
@@ -23,6 +24,11 @@ public class SanctionsExecutionGate {
     private final Clock clock;
     private final Map<UUID, Instant> lastPass = new ConcurrentHashMap<>();
 
+    /**
+     * Application wiring: single {@code Clock} is not a bean — use UTC. Tests in this package use
+     * {@link #SanctionsExecutionGate(OmsConfig, Clock)} with a fixed clock.
+     */
+    @Autowired
     public SanctionsExecutionGate(OmsConfig omsConfig) {
         this(omsConfig, Clock.systemUTC());
     }

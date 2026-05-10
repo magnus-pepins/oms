@@ -39,6 +39,18 @@ jobs:
       - name: Test
         run: ./gradlew clean test --no-daemon --no-build-cache --stacktrace
 
+      - name: Print failing JUnit XML to the log
+        if: failure()
+        run: |
+          set -euo pipefail
+          shopt -s nullglob || true
+          for f in build/test-results/test/TEST-*.xml; do
+            if grep -qE '<(failure|error)' "$f" 2>/dev/null; then
+              echo "======== $f ========"
+              cat "$f"
+            fi
+          done
+
       - name: Upload test reports on failure
         if: failure()
         uses: actions/upload-artifact@v4

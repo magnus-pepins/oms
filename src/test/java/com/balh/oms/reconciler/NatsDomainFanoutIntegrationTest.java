@@ -18,6 +18,8 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -76,8 +78,9 @@ class NatsDomainFanoutIntegrationTest extends AbstractPostgresIntegrationTest {
             Message m = sub.nextMessage(Duration.ofSeconds(5).toMillis());
             assertThat(m).isNotNull();
             String payload = new String(m.getData(), StandardCharsets.UTF_8);
-            assertThat(payload).contains("\"type\":\"OrderAccepted\"");
-            assertThat(payload).contains("\"schemaVersion\"");
+            JsonNode root = new ObjectMapper().readTree(payload);
+            assertThat(root.path("type").asText()).isEqualTo("OrderAccepted");
+            assertThat(root.path("schemaVersion").asInt()).isEqualTo(1);
         }
     }
 

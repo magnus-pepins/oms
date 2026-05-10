@@ -21,11 +21,12 @@ import org.springframework.core.type.AnnotatedTypeMetadata;
  * {@code oms.fix.session-jdbc-datasource-enabled=true} (master plan 6.4: isolate FIX seq/message IO from the
  * application pool). Apply Flyway {@code V9} DDL to that database before enabling in production.
  *
- * <p>When {@code oms.fix.session-jdbc-url} is identical to {@code spring.datasource.url}, we register the
- * <strong>same</strong> {@code DataSource} bean as {@code fixSessionStoreDataSource} (with {@code destroyMethod=""})
- * instead of opening a second Hikari pool. A second pool to the same JDBC URL is redundant and has caused QuickFIX
- * session rows to be invisible to the application's {@code JdbcTemplate} on some CI runners (connection / pool
- * interaction).
+ * <p>When {@code oms.fix.session-jdbc-url} equals {@code spring.datasource.url}, we do <strong>not</strong> register
+ * {@code fixSessionStoreDataSource}: {@link FixAutoStartBeans} injects the primary {@code DataSource} for the JDBC
+ * session store (see {@code fixSessionStoreDataSource != null ? ... : dataSource}). Registering an alias bean that
+ * delegates to the primary caused a bootstrap cycle (Flyway resolves {@code fixSessionStoreDataSource} while that
+ * bean factory was still resolving {@code DataSource}). A second Hikari pool to the same URL is also redundant and
+ * has caused session rows to be invisible to {@code JdbcTemplate} on some runners.
  */
 @Configuration(proxyBeanMethods = false)
 @AutoConfigureAfter(DataSourceAutoConfiguration.class)
@@ -47,7 +48,6 @@ public class FixSessionStoreDataSourceConfiguration {
         static class DedicatedEnabled {}
     }
 
-    /** FIX session JDBC URL matches the Spring Boot primary datasource URL — reuse that pool. */
     static final class SameJdbcUrlAsSpringDatasource implements Condition {
 
         @Override
@@ -62,27 +62,11 @@ public class FixSessionStoreDataSourceConfiguration {
         }
     }
 
-    /** Dedicated FIX JDBC store with a URL different from {@code spring.datasource.url} — separate Hikari pool. */
     static final class NotSameJdbcUrlAsSpringDatasource implements Condition {
 
         @Override
         public boolean matches(ConditionContext context, AnnotatedTypeMetadata metadata) {
             return !new SameJdbcUrlAsSpringDatasource().matches(context, metadata);
-        }
-    }
-
-    /**
-     * Self-contained: nested {@code @Configuration} conditions are evaluated independently of the outer class
-     * {@code @Conditional} in some Spring versions.
-     */
-    static final class DedicatedAndSameJdbcUrl implements Condition {
-
-        private static final OnDedicatedFixSessionJdbc ON_DEDICATED = new OnDedicatedFixSessionJdbc();
-        private static final SameJdbcUrlAsSpringDatasource SAME_URL = new SameJdbcUrlAsSpringDatasource();
-
-        @Override
-        public boolean matches(ConditionContext context, AnnotatedTypeMetadata metadata) {
-            return ON_DEDICATED.matches(context, metadata) && SAME_URL.matches(context, metadata);
         }
     }
 
@@ -94,16 +78,6 @@ public class FixSessionStoreDataSourceConfiguration {
         @Override
         public boolean matches(ConditionContext context, AnnotatedTypeMetadata metadata) {
             return ON_DEDICATED.matches(context, metadata) && NOT_SAME_URL.matches(context, metadata);
-        }
-    }
-
-    @Configuration(proxyBeanMethods = false)
-    @Conditional(DedicatedAndSameJdbcUrl.class)
-    static class ReuseMainJdbcPool {
-
-        @Bean(name = "fixSessionStoreDataSource", destroyMethod = "")
-        DataSource fixSessionStoreDataSourceSameUrlAsMain(DataSource dataSource) {
-            return dataSource;
         }
     }
 

@@ -23,7 +23,7 @@ Every **PASS** or **REJECT** outcome records one row in **`control_decisions`** 
 
 Stale control events still reject with **`RISK_STALE_QUEUE`** and increment **`oms_control_jobs_rejected_stale_total`**.
 
-See [configuration.md](configuration.md) for env keys and [../system-documentation/plans/oms-phase0-interim-decisions.md](../system-documentation/plans/oms-phase0-interim-decisions.md) for interim `OMS_CONTROL_MAX_JOB_AGE_MS`.
+See [configuration.md](configuration.md) for env keys and [../../system-documentation/plans/oms-phase0-interim-decisions.md](../../system-documentation/plans/oms-phase0-interim-decisions.md) for interim `OMS_CONTROL_MAX_JOB_AGE_MS` and **§5** (`OMS_SANCTIONS_CACHE_MAX_AGE_S` baseline for closeout **W3.5**).
 
 ---
 

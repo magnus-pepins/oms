@@ -1,5 +1,6 @@
 package com.balh.oms.config;
 
+import com.zaxxer.hikari.HikariDataSource;
 import com.balh.oms.fix.FixInitiatorManager;
 import com.balh.oms.fix.FixNewOrderSingleBuilder;
 import com.balh.oms.fix.FixOutboundDispatchWorker;
@@ -36,11 +37,17 @@ public class FixAutoStartBeans {
             Environment environment,
             @Autowired(required = false) @Qualifier("fixSessionStoreDataSource") DataSource fixSessionStoreDataSource) {
         DataSource dedicated = fixSessionStoreDataSource;
-        if (dedicated != null
-                && omsConfig.getFix().isJdbcSessionStore()
-                && PostgresJdbcUrlEquivalence.isSameLogicalDatabase(
-                        environment.getProperty("spring.datasource.url"), omsConfig.getFix().getSessionJdbcUrl())) {
-            dedicated = null;
+        if (dedicated != null && omsConfig.getFix().isJdbcSessionStore()) {
+            if (dedicated instanceof HikariDataSource hDedicated && dataSource instanceof HikariDataSource hPrimary) {
+                String u1 = hDedicated.getJdbcUrl();
+                String u2 = hPrimary.getJdbcUrl();
+                if (u1 != null && u2 != null && PostgresJdbcUrlEquivalence.isSameLogicalDatabase(u1, u2)) {
+                    dedicated = null;
+                }
+            } else if (PostgresJdbcUrlEquivalence.isSameLogicalDatabase(
+                    environment.getProperty("spring.datasource.url"), omsConfig.getFix().getSessionJdbcUrl())) {
+                dedicated = null;
+            }
         }
         DataSource jdbcMessageStoreDataSource =
                 omsConfig.getFix().isJdbcSessionStore()

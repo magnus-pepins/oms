@@ -19,6 +19,9 @@ repositories {
 
 val quickfixjVersion = "2.3.2"
 
+/** Spring Test default context cache is 32; cap growth so fewer Hikari pools pin the single Testcontainers Postgres. */
+val springTestContextCacheMaxSize = 24
+
 dependencies {
     // Spring Boot 3 minimal: Web + Actuator + JDBC + Flyway
     implementation("org.springframework.boot:spring-boot-starter-web")
@@ -77,6 +80,7 @@ tasks.withType<Test> {
     useJUnitPlatform()
     // Keep test logs deterministic: do not run integration suites in parallel until we enable Postgres pooling.
     systemProperty("junit.jupiter.execution.parallel.enabled", "false")
+    systemProperty("spring.test.context.cache.maxSize", springTestContextCacheMaxSize.toString())
     testLogging {
         events("failed", "skipped")
         showExceptions = true

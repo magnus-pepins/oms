@@ -25,6 +25,14 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 public abstract class AbstractPostgresIntegrationTest {
 
     /**
+     * GitHub Actions: Spring’s test {@code ApplicationContext} cache can retain many distinct
+     * {@code @SpringBootTest} contexts over one JVM; each context opens a Hikari pool against this
+     * single container. Postgres’ default {@code max_connections=100} is then easy to exhaust,
+     * surfacing as {@code Connection refused} / generic HTTP 500 on the first DB touch.
+     */
+    private static final int POSTGRES_TEST_MAX_CONNECTIONS = 400;
+
+    /**
      * Clears the order graph and slice-6 settlement tables in one statement.
      *
      * <p>{@code TRUNCATE orders CASCADE} alone does not remove {@code positions} (no FK from
@@ -39,7 +47,11 @@ public abstract class AbstractPostgresIntegrationTest {
             new PostgreSQLContainer<>("postgres:16-alpine")
                     .withDatabaseName("oms")
                     .withUsername("oms")
-                    .withPassword("oms");
+                    .withPassword("oms")
+                    .withCommand(
+                            "postgres",
+                            "-c",
+                            "max_connections=" + POSTGRES_TEST_MAX_CONNECTIONS);
 
     @DynamicPropertySource
     static void registerPgProperties(DynamicPropertyRegistry registry) {

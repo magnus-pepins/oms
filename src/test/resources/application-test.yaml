@@ -1,6 +1,17 @@
 spring:
   flyway:
     enabled: true
+  datasource:
+    hikari:
+      # Many cached @SpringBootTest contexts each hold a pool against one Testcontainers Postgres.
+      maximum-pool-size: 4
+      minimum-idle: 0
+
+# Surface real messages in IT failure logs (CI + local); test profile only.
+server:
+  error:
+    include-message: always
+    include-binding-errors: always
 
 oms:
   http:

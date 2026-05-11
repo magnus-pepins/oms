@@ -24,6 +24,24 @@ repositories {
 val quickfixjVersion = "2.3.2"
 
 /**
+ * Chronicle / OpenHFT memory-mapped I/O touches JDK-internal packages; Java 11+ module system
+ * requires these flags (see OpenHFT `docs/Java-Version-Support.adoc`). Without them, `bootRun`
+ * fails on Linux JDK 21 with `IllegalAccessException` / `sun.nio.ch.UnixFileDispatcherImpl`.
+ */
+val chronicleJavaModuleOpens =
+    listOf(
+        "--add-exports=java.base/jdk.internal.ref=ALL-UNNAMED",
+        "--add-exports=java.base/sun.nio.ch=ALL-UNNAMED",
+        "--add-exports=jdk.unsupported/sun.misc=ALL-UNNAMED",
+        "--add-exports=jdk.compiler/com.sun.tools.javac.file=ALL-UNNAMED",
+        "--add-opens=jdk.compiler/com.sun.tools.javac=ALL-UNNAMED",
+        "--add-opens=java.base/java.lang=ALL-UNNAMED",
+        "--add-opens=java.base/java.lang.reflect=ALL-UNNAMED",
+        "--add-opens=java.base/java.io=ALL-UNNAMED",
+        "--add-opens=java.base/java.util=ALL-UNNAMED",
+    )
+
+/**
  * Spring Test default context cache is 32; cap growth so fewer Hikari pools pin the integration
  * Postgres. Keep (this value × primary Hikari `maximum-pool-size` in `application-test.yaml`, plus
  * any second pools such as `oms.fix.session-jdbc-pool-max-size`) under the server `max_connections`
@@ -88,6 +106,7 @@ dependencies {
 
 tasks.withType<Test> {
     useJUnitPlatform()
+    jvmArgs(chronicleJavaModuleOpens)
     // Keep test logs deterministic: do not run integration suites in parallel until we enable Postgres pooling.
     systemProperty("junit.jupiter.execution.parallel.enabled", "false")
     systemProperty("spring.test.context.cache.maxSize", springTestContextCacheMaxSize.toString())
@@ -98,6 +117,10 @@ tasks.withType<Test> {
         showStackTraces = true
         exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
     }
+}
+
+tasks.named<org.springframework.boot.gradle.tasks.run.BootRun>("bootRun") {
+    jvmArgs(chronicleJavaModuleOpens)
 }
 
 tasks.named<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJar") {

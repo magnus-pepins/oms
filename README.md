@@ -112,6 +112,8 @@ OMS_PG_PASSWORD=oms \
 
 Flyway migrations run on startup against that database.
 
+**JDK 21 + Chronicle:** `build.gradle.kts` passes OpenHFT’s `--add-opens` / `--add-exports` to **`bootRun`** and **`test`** (see `chronicleJavaModuleOpens`). If you run the fat JAR with plain `java -jar`, pass the same flags (or set `JAVA_TOOL_OPTIONS`) or Chronicle will fail opening the queue on Linux.
+
 ### Compose Postgres vs integration tests
 
 The Postgres from `docker compose up -d postgres` is what **`bootRun`**

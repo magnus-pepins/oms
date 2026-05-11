@@ -30,6 +30,7 @@ oms:
     reconciler-batch-size: 100
     reconciler-interval-ms: 200
   chronicle:
+    enabled: false
     queue-dir: ./build/test-queues
   events:
     nats:

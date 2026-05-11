@@ -1,24 +1,23 @@
 package com.balh.oms.chronicle;
 
-import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
 /**
- * Provides a no-op journal when no {@link ChronicleControlJournal} is in the context
- * (tests with {@code test} profile, or {@code oms.chronicle.enabled=false} so
- * {@link com.balh.oms.config.ChronicleQueueConfiguration} is not loaded).
+ * Provides {@link NoOpControlJournal} when Chronicle is turned off via
+ * {@code oms.chronicle.enabled=false} (including the {@code test} profile in
+ * {@code application-test.yaml}).
  *
- * <p>Use {@code ChronicleControlJournal} (not {@code ChronicleQueue}) for
- * {@link ConditionalOnMissingBean}: in some startup orders Spring can register the queue
- * bean after this condition is evaluated, which incorrectly left both {@code NoOpControlJournal}
- * and {@code ChronicleControlJournal} active and broke {@code OutboxReconciler} injection.
+ * <p>Do not use {@code @ConditionalOnMissingBean(ChronicleControlJournal)} here: Spring can
+ * register this bean before {@link com.balh.oms.config.ChronicleQueueConfiguration} runs, so both
+ * the no-op and real journal would exist and break {@link com.balh.oms.reconciler.OutboxReconciler}.
  */
 @Configuration
 public class ControlJournalFallbackConfiguration {
 
     @Bean
-    @ConditionalOnMissingBean(ChronicleControlJournal.class)
+    @ConditionalOnProperty(prefix = "oms.chronicle", name = "enabled", havingValue = "false", matchIfMissing = false)
     public NoOpControlJournal noopControlJournal() {
         return new NoOpControlJournal();
     }

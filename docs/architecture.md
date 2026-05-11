@@ -40,7 +40,7 @@ sequenceDiagram
     TLR->>PG: INSERT INTO domain_event_outbox\n(OrderWorking / OrderRejected envelope)
 ```
 
-`control_outbox.payload` is JSONB holding a small wrapper (`v` + base64 protobuf `ControlPendingEvent`); `OutboxReconciler` appends **`OMS\\x01` + protobuf** bytes to Chronicle (`ControlChroniclePayloadCodec`). Legacy flat JSON payloads / Chronicle excerpts remain readable.
+`control_outbox.payload` is JSONB holding a small wrapper (`v` + base64 protobuf `ControlPendingEvent` with **`google.protobuf.Timestamp`** fields for wall times); `OutboxReconciler` appends **`OMS\\x01` + protobuf** bytes to Chronicle. **`chronicle_materialized_at`** is set on the Chronicle message (not the outbox row) when materializing the append, for pipeline / OTel lag. Legacy flat JSON payloads / Chronicle excerpts remain readable.
 
 The four invariants encoded by this diagram:
 

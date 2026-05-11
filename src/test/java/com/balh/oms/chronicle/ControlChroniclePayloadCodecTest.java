@@ -1,6 +1,7 @@
 package com.balh.oms.chronicle;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.datatype.jdk8.Jdk8Module;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import org.junit.jupiter.api.Test;
 
@@ -12,7 +13,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 class ControlChroniclePayloadCodecTest {
 
     private static ObjectMapper objectMapper() {
-        return new ObjectMapper().registerModule(new JavaTimeModule());
+        return new ObjectMapper()
+                .registerModule(new JavaTimeModule())
+                .registerModule(new Jdk8Module());
     }
 
     private final ControlChroniclePayloadCodec codec = new ControlChroniclePayloadCodec(objectMapper());
@@ -30,7 +33,12 @@ class ControlChroniclePayloadCodecTest {
 
         byte[] chronicle = codec.chronicleAppendBytesFromOutboxPayloadText(outbox);
         assertThat(ControlChronicleWireFormat.chronicleExcerptStartsWithProtoPrefix(chronicle)).isTrue();
-        assertThat(codec.decodeChronicleExcerpt(chronicle)).isEqualTo(ev);
+        PendingControlEvent fromChronicle = codec.decodeChronicleExcerpt(chronicle);
+        assertThat(fromChronicle)
+                .usingRecursiveComparison()
+                .ignoringFields("chronicleMaterializedAt")
+                .isEqualTo(ev);
+        assertThat(fromChronicle.chronicleMaterializedAt()).isPresent();
     }
 
     @Test
@@ -43,7 +51,12 @@ class ControlChroniclePayloadCodecTest {
 
         byte[] chronicle = codec.chronicleAppendBytesFromOutboxPayloadText(legacy);
         assertThat(ControlChronicleWireFormat.chronicleExcerptStartsWithProtoPrefix(chronicle)).isTrue();
-        assertThat(codec.decodeChronicleExcerpt(chronicle)).isEqualTo(ev);
+        PendingControlEvent fromChronicle = codec.decodeChronicleExcerpt(chronicle);
+        assertThat(fromChronicle)
+                .usingRecursiveComparison()
+                .ignoringFields("chronicleMaterializedAt")
+                .isEqualTo(ev);
+        assertThat(fromChronicle.chronicleMaterializedAt()).isPresent();
     }
 
     @Test

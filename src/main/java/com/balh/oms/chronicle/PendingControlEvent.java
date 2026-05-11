@@ -1,8 +1,10 @@
 package com.balh.oms.chronicle;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonInclude;
 
 import java.time.Instant;
+import java.util.Optional;
 import java.util.UUID;
 
 /**
@@ -12,6 +14,7 @@ import java.util.UUID;
  * JSON of this record and remain readable.
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
+@JsonInclude(JsonInclude.Include.NON_ABSENT)
 public record PendingControlEvent(
         String type,
         UUID orderId,
@@ -19,5 +22,18 @@ public record PendingControlEvent(
         int shardId,
         String accountIdHash,
         Instant orderTimestamp,
-        Instant enqueuedAt
-) {}
+        Instant enqueuedAt,
+        Optional<Instant> chronicleMaterializedAt
+) {
+    /** Ingress and tests: no Chronicle materialization yet (outbox-only or synthetic tail). */
+    public PendingControlEvent(
+            String type,
+            UUID orderId,
+            int orderVersion,
+            int shardId,
+            String accountIdHash,
+            Instant orderTimestamp,
+            Instant enqueuedAt) {
+        this(type, orderId, orderVersion, shardId, accountIdHash, orderTimestamp, enqueuedAt, Optional.empty());
+    }
+}

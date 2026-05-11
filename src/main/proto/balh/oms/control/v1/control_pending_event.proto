@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package balh.oms.control.v1;
 
+import "google/protobuf/timestamp.proto";
+
 option java_multiple_files = true;
 option java_package = "com.balh.oms.proto.control.v1";
 
@@ -12,6 +14,9 @@ message ControlPendingEvent {
   int32 order_version = 3;
   int32 shard_id = 4;
   string account_id_hash = 5;
-  int64 order_timestamp_unix_millis = 6;
-  int64 enqueued_at_unix_millis = 7;
+  // Wall times for pipeline / OTel correlation (seconds + nanos per google.protobuf.Timestamp).
+  google.protobuf.Timestamp order_timestamp = 6;
+  google.protobuf.Timestamp enqueued_at = 7;
+  // Set only on the Chronicle excerpt (when OutboxReconciler / codec materializes the journal append).
+  google.protobuf.Timestamp chronicle_materialized_at = 8;
 }

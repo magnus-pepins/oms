@@ -97,9 +97,9 @@ def main() -> None:
         return
     if mode == "summary":
         h = parse_histogram(text)
-    if h is None:
-        print("status=NO_HISTOGRAM (no oms_fix_ingress_to_nos_milliseconds_count in scrape — wrong URL or OTel off)")
-        return
+        if h is None:
+            print("status=NO_HISTOGRAM (no oms_fix_ingress_to_nos_milliseconds_count in scrape — wrong URL or OTel off)")
+            return
         mean = h.sum_ms / h.count
         p50 = histogram_quantile(0.50, h)
         p95 = histogram_quantile(0.95, h)

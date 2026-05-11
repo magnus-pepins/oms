@@ -131,7 +131,7 @@ if [[ -n "${SHOOT_OTEL_METRICS_URL:-}" ]]; then
     echo "  No baseline OTel scrape (curl failed at script start)."
   else
     if [[ "$BASELINE_OTEL" == "NA" ]]; then
-      echo "  WARN: could not parse baseline histogram count; assuming 0."
+      echo "  Note: baseline scrape had no ingress_to_nos histogram yet (cold OTel / first scrape) — using baseline count 0."
       BASELINE_OTEL=0
     fi
     target=$((BASELINE_OTEL + created))

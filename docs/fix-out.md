@@ -80,7 +80,7 @@ Use the same QuickFIX loopback pattern as **`FixRoundTripSpringIntegrationTest`*
 
    Defaults: listen **`9876`**, session **`SenderCompID=BROKER_ACCEPT`**, **`TargetCompID=OMS_INIT`** (must match OMS defaults **`oms.fix.sender-comp-id` / `oms.fix.target-comp-id`**). Override with **`FIX_ACCEPTOR_PORT`**, **`FIX_ACCEPTOR_SESSION_SENDER`**, **`FIX_ACCEPTOR_SESSION_TARGET`**, **`FIX_ACCEPTOR_FILE_STORE`** if your OMS env differs.
 
-2. **OMS (terminal B)** — e.g. `OMS_ROUTING_BACKEND=fix`, **`OMS_FIX_AUTO_START=true`**, **`OMS_FIX_SOCKET_CONNECT_HOST=127.0.0.1`**, port aligned with step 1. For unrestricted symbols in dev, set **`OMS_RISK_INSTRUMENT_ALLOWLIST_ENABLED=false`** (or add your symbol to the allowlist). Ensure **`fix_route_state.send_enabled`** is **true** for your route key.
+2. **OMS (terminal B)** — e.g. `OMS_ROUTING_BACKEND=fix`, **`OMS_FIX_AUTO_START=true`** (**required** — default is **`false`**, in which case **no `SocketInitiator` runs** and the loopback acceptor will never see a TCP session), **`OMS_FIX_SOCKET_CONNECT_HOST=127.0.0.1`**, port aligned with step 1. Confirm in OMS logs: **`FIX SocketInitiator started`**. For unrestricted symbols in dev, set **`OMS_RISK_INSTRUMENT_ALLOWLIST_ENABLED=false`** (or add your symbol to the allowlist). Ensure **`fix_route_state.send_enabled`** is **true** for your route key.
 
 3. **HTTP shooter (terminal C)** — many **`POST /internal/v1/orders`** with unique idempotency keys:
 

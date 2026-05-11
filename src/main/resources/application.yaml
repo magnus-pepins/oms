@@ -210,8 +210,6 @@ oms:
     outbound-driver: ${OMS_FIX_OUTBOUND_DRIVER:scheduled}
     outbound-dedicated-idle-park-nanos: ${OMS_FIX_OUTBOUND_DEDICATED_IDLE_PARK_NANOS:100000}
     outbound-dedicated-not-ready-park-nanos: ${OMS_FIX_OUTBOUND_DEDICATED_NOT_READY_PARK_NANOS:50000000}
-    # memory (default) | postgres — durable handoff table for multi-producer → single FIX consumer
-    outbound-handoff-transport: ${OMS_FIX_OUTBOUND_HANDOFF_TRANSPORT:memory}
     max-outbound-job-age-ms: ${OMS_FIX_MAX_OUTBOUND_JOB_AGE_MS:0}
     venue-id-for-executions: ${OMS_FIX_VENUE_ID_FOR_EXECUTIONS:FIX}
     use-data-dictionary: ${OMS_FIX_USE_DATA_DICTIONARY:false}

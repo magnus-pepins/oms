@@ -18,7 +18,7 @@ import java.nio.file.Path;
 
 /**
  * Registers the shared {@link ChronicleQueue} plus append-only journal and
- * scheduled tail reader. Disabled in the {@code test} profile (tests use
+ * {@link ChronicleControlTailReader} (scheduled or dedicated tail driver). Disabled in the {@code test} profile (tests use
  * {@link com.balh.oms.chronicle.NoOpControlJournal} via {@link ControlJournalFallbackConfiguration} instead).
  *
  * <p>Slice 1 tail policy: the tailer starts at the beginning of the queue on

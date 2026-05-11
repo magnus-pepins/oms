@@ -16,7 +16,7 @@ sequenceDiagram
     participant PG as Postgres\n(orders + control_outbox +\ndomain_event_outbox)
     participant REC as OutboxReconciler\n(scheduled)
     participant CHR as Chronicle Queue\n(engineering replay)
-    participant TAIL as ChronicleControlTailReader\n(scheduled)
+    participant TAIL as ChronicleControlTailReader\n(scheduled or dedicated)
     participant TLR as ControlTailer
     participant FAN as DomainFanoutReconciler\n+ FanoutClient\n(NATS optional)
 
@@ -55,6 +55,8 @@ The four invariants encoded by this diagram:
    otherwise a no-op `FanoutClient` counts deliveries only.
 4. **Tailer mutations are CAS on `orders.version`.** Re-applying the same
    payload is a no-op.
+
+`ChronicleControlTailReader` polls Chronicle (`readBytes`); it does not use a push callback from the queue. **Wake latency** (how soon the next `readBytes` runs after an append) depends on `OMS_CHRONICLE_TAIL_DRIVER` (`scheduled` vs `dedicated`) and related settings — see [chronicle-tail-driver.md](chronicle-tail-driver.md). Other pipeline stages (outbox reconciler, FIX outbound poll, etc.) remain separate schedulers or workers.
 
 ## High availability
 

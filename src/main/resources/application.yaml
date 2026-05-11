@@ -64,8 +64,11 @@ oms:
     enabled: ${OMS_CHRONICLE_ENABLED:true}
     queue-dir: ${OMS_CHRONICLE_QUEUE_DIR:./queues/control}
     roll-cycle: ${OMS_CHRONICLE_ROLL_CYCLE:DAILY}
+    # scheduled | dedicated — see docs/chronicle-tail-driver.md
+    tail-driver: ${OMS_CHRONICLE_TAIL_DRIVER:scheduled}
     tail-poll-interval-ms: ${OMS_CHRONICLE_TAIL_POLL_INTERVAL_MS:50}
     tail-batch-max-messages: ${OMS_CHRONICLE_TAIL_BATCH_MAX_MESSAGES:200}
+    tail-dedicated-idle-park-nanos: ${OMS_CHRONICLE_TAIL_DEDICATED_IDLE_PARK_NANOS:100000}
   events:
     nats:
       enabled: ${OMS_NATS_ENABLED:false}

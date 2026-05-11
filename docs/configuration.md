@@ -220,13 +220,17 @@ Used when `OMS_ROUTING_BACKEND=fix`. See [fix-out.md](fix-out.md) for session ma
 
 ## Chronicle
 
+How the control queue is tailed (`scheduled` vs `dedicated`) is documented in **[chronicle-tail-driver.md](chronicle-tail-driver.md)**.
+
 | Key                                   | Default            | Meaning                                                                 |
 |---------------------------------------|--------------------|-------------------------------------------------------------------------|
 | `OMS_CHRONICLE_ENABLED`               | `true`             | When `false`, no `ChronicleQueue` bean; `NoOpControlJournal` is used.    |
 | `OMS_CHRONICLE_QUEUE_DIR`             | `./queues/control` | Directory for Chronicle Queue files.                                    |
 | `OMS_CHRONICLE_ROLL_CYCLE`            | `DAILY`            | `MINUTELY` / `HOURLY` / `DAILY` use `LegacyRollCycles`. Also: `FAST_DAILY`, `DEFAULT`. |
-| `OMS_CHRONICLE_TAIL_POLL_INTERVAL_MS` | `50`             | Delay between scheduled `ChronicleControlTailReader` polls (ms).        |
-| `OMS_CHRONICLE_TAIL_BATCH_MAX_MESSAGES` | `200`          | Max excerpts read per poll tick.                                        |
+| `OMS_CHRONICLE_TAIL_DRIVER`           | `scheduled`        | `scheduled` (Spring fixed-delay `pollBatch`) or `dedicated` (thread + `parkNanos` when idle). See [chronicle-tail-driver.md](chronicle-tail-driver.md). |
+| `OMS_CHRONICLE_TAIL_POLL_INTERVAL_MS` | `50`             | Delay between `pollBatch` runs when **`tail-driver=scheduled`** (ms). Ignored for `dedicated`. |
+| `OMS_CHRONICLE_TAIL_BATCH_MAX_MESSAGES` | `200`          | Max excerpts read per drain pass (both drivers).                         |
+| `OMS_CHRONICLE_TAIL_DEDICATED_IDLE_PARK_NANOS` | `100000`   | When **`tail-driver=dedicated`**, nanoseconds to park after a pass that read nothing (`0` = busy-wait when idle). |
 
 ## NATS (fanout)
 

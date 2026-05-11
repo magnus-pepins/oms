@@ -172,6 +172,7 @@ tests execute instead of being skipped.
   (idempotency, sharding, time policy, etc.).
 - [docs/pii-policy.md](docs/pii-policy.md) — what may appear where.
 - [docs/replay.md](docs/replay.md) — Chronicle's role and how to replay.
+- [docs/chronicle-tail-driver.md](docs/chronicle-tail-driver.md) — `scheduled` vs `dedicated` tail wake / latency tuning.
 - [docs/drop-copy-events.md](docs/drop-copy-events.md) — domain-event
   envelope and emit points.
 - [docs/return-path.md](docs/return-path.md) — executions, simulated routing, idempotency, slice-6 fill→positions.

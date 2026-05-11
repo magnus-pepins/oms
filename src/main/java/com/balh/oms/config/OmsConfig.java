@@ -1,5 +1,6 @@
 package com.balh.oms.config;
 
+import com.balh.oms.chronicle.ChronicleTailDriver;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.context.annotation.Configuration;
 
@@ -102,18 +103,25 @@ public class OmsConfig {
         private boolean enabled = true;
         private String queueDir = "./queues/control";
         private String rollCycle = "DAILY";
+        private ChronicleTailDriver tailDriver = ChronicleTailDriver.SCHEDULED;
         private long tailPollIntervalMs = 50L;
         private int tailBatchMaxMessages = 200;
+        /** Nanoseconds to park the dedicated tail thread when a drain pass finds no data (0 = busy-wait when idle). */
+        private long tailDedicatedIdleParkNanos = 100_000L;
         public boolean isEnabled() { return enabled; }
         public void setEnabled(boolean v) { this.enabled = v; }
         public String getQueueDir() { return queueDir; }
         public void setQueueDir(String v) { this.queueDir = v; }
         public String getRollCycle() { return rollCycle; }
         public void setRollCycle(String v) { this.rollCycle = v; }
+        public ChronicleTailDriver getTailDriver() { return tailDriver; }
+        public void setTailDriver(ChronicleTailDriver v) { this.tailDriver = v; }
         public long getTailPollIntervalMs() { return tailPollIntervalMs; }
         public void setTailPollIntervalMs(long v) { this.tailPollIntervalMs = v; }
         public int getTailBatchMaxMessages() { return tailBatchMaxMessages; }
         public void setTailBatchMaxMessages(int v) { this.tailBatchMaxMessages = v; }
+        public long getTailDedicatedIdleParkNanos() { return tailDedicatedIdleParkNanos; }
+        public void setTailDedicatedIdleParkNanos(long v) { this.tailDedicatedIdleParkNanos = v; }
     }
 
     public static class Events {

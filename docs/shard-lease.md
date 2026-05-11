@@ -3,8 +3,8 @@
 Slice 1 runs **single-instance**. Before running multiple OMS replicas against
 the same Postgres shard, operators need a **single-writer guarantee** for:
 
-- scheduled reconcilers (`OutboxReconciler`, `DomainFanoutReconciler`,
-  `ChronicleControlTailReader`);
+- scheduled reconcilers (`OutboxReconciler`, `DomainFanoutReconciler`);
+- `ChronicleControlTailReader` (Spring-scheduled `pollBatch` when `OMS_CHRONICLE_TAIL_DRIVER=scheduled`, or a dedicated thread when `dedicated` — see repo `docs/chronicle-tail-driver.md`);
 - any future FIX session or control worker that assumes exclusive access.
 
 ## Options (not implemented in this repo slice)

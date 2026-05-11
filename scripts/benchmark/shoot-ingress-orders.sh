@@ -16,6 +16,12 @@
 #   SHOOT_INSTRUMENT     default AAPL
 #   SHOOT_QTY            default 1
 #   SHOOT_LIMIT          default 150
+#   SHOOT_PRINT_EACH     default 0   (set to 1 to print each request's HTTP time on stderr)
+#
+# Latency note:
+#   curl %{time_total} is client wall time until the HTTP response completes (TLS/TCP + server work).
+#   That is NOT the same as OTel histogram oms.fix.ingress_to_nos (accept → FIX NOS on wire), which
+#   can lag after 201. For that, scrape OMS_OTEL_PROMETHEUS_PORT (default 9464) and use histogram_quantile.
 
 set -euo pipefail
 
@@ -39,6 +45,9 @@ LIM="${SHOOT_LIMIT:-150}"
 hinted_401=false
 ok=0
 fail=0
+TIMES_FILE="$(mktemp)"
+trap 'rm -f "$TIMES_FILE"' EXIT
+
 for i in $(seq 1 "$COUNT"); do
   CLIENT_KEY="bench-shoot-$(date +%s)-$i-$RANDOM"
   ACCOUNT_ID="$(random_uuid)"
@@ -49,13 +58,18 @@ for i in $(seq 1 "$COUNT"); do
     --arg qty "$QTY" \
     --arg lim "$LIM" \
     '{accountId:$aid,clientIdempotencyKey:$cid,side:"BUY",instrumentSymbol:$sym,quantity:$qty,limitPrice:$lim,timeInForce:"DAY"}')"
-  code="$(curl -sS -o /tmp/oms-shoot-last.json -w '%{http_code}' \
+  meta="$(curl -sS -o /tmp/oms-shoot-last.json -w '%{http_code}|%{time_total}' \
     -X POST "$OMS_URL/internal/v1/orders" \
     -H "Content-Type: application/json" \
     -H "X-OMS-Internal-Key: $KEY" \
     -d "$BODY")"
+  IFS='|' read -r code time_s <<< "$meta"
   if [[ "$code" == "201" || "$code" == "200" ]]; then
     ok=$((ok + 1))
+    printf '%s\n' "$time_s" >>"$TIMES_FILE"
+    if [[ "${SHOOT_PRINT_EACH:-0}" == "1" ]]; then
+      echo "i=$i http=$code time_total_s=$time_s" >&2
+    fi
   else
     fail=$((fail + 1))
     echo "FAIL i=$i http=$code" >&2
@@ -74,3 +88,36 @@ for i in $(seq 1 "$COUNT"); do
 done
 
 echo "done: ok=$ok fail=$fail (expected 201 for new orders; 200 if you reused idempotency keys accidentally)"
+
+if [[ "$ok" -gt 0 ]]; then
+  echo ""
+  echo "HTTP POST time_total (seconds, curl client wall — see script header for OTel vs HTTP):"
+  python3 - "$TIMES_FILE" <<'PY'
+import sys
+from pathlib import Path
+
+p = Path(sys.argv[1])
+xs = [float(line) for line in p.read_text().splitlines() if line.strip()]
+if not xs:
+    print("  (no samples)")
+    raise SystemExit(0)
+xs.sort()
+n = len(xs)
+
+def pct(q: float) -> float:
+    if n == 1:
+        return xs[0]
+    idx = (n - 1) * q
+    lo = int(idx)
+    hi = min(lo + 1, n - 1)
+    w = idx - lo
+    return xs[lo] * (1 - w) + xs[hi] * w
+
+mean = sum(xs) / n
+print(f"  n={n}  min={xs[0]:.6f}  max={xs[-1]:.6f}  mean={mean:.6f}")
+print(f"  p50={pct(0.50):.6f}  p95={pct(0.95):.6f}  p99={pct(0.99):.6f}")
+PY
+else
+  echo ""
+  echo "No successful responses; skipping HTTP latency summary."
+fi

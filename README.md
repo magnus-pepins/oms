@@ -112,6 +112,8 @@ OMS_PG_PASSWORD=oms \
 
 Flyway migrations run on startup against that database.
 
+**Listen port:** default **8088** (`OMS_HTTP_PORT`) so OMS does not bind **8080** (often used by the marketing website on the same dev host). Override with `OMS_HTTP_PORT` if needed.
+
 **JDK 21 + Chronicle:** `build.gradle.kts` passes OpenHFT’s `--add-opens` / `--add-exports` to **`bootRun`** and **`test`** (see `chronicleJavaModuleOpens`). If you run the fat JAR with plain `java -jar`, pass the same flags (or set `JAVA_TOOL_OPTIONS`) or Chronicle will fail opening the queue on Linux.
 
 ### Compose Postgres vs integration tests
@@ -131,7 +133,7 @@ tests point at it via `OMS_CI_JDBC_URL` (see `AbstractPostgresIntegrationTest`).
 **WireMock** Ledger stub (no separate Ledger container).
 
 ```bash
-curl -s http://localhost:8080/internal/v1/orders \
+curl -s http://localhost:8088/internal/v1/orders \
   -H "X-OMS-Internal-Key: local-key" \
   -H "Content-Type: application/json" \
   -d '{

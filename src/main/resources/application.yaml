@@ -1,5 +1,5 @@
 server:
-  port: ${OMS_HTTP_PORT:8080}
+  port: ${OMS_HTTP_PORT:8088}
   shutdown: graceful
 
 spring:
@@ -168,6 +168,14 @@ oms:
     snapshot-max-age-hours: ${OMS_DESK_SNAPSHOT_MAX_AGE_HOURS:24}
   fx:
     module-enabled: ${OMS_FX_MODULE_ENABLED:false}
+    quote-stub-enabled: ${OMS_FX_QUOTE_STUB_ENABLED:false}
+    quote-stub-schema-version: ${OMS_FX_QUOTE_STUB_SCHEMA_VERSION:1}
+    nostro-read-enabled: ${OMS_FX_NOSTRO_READ_ENABLED:false}
+    nostro-balance-ids-csv: ${OMS_FX_NOSTRO_BALANCE_IDS_CSV:}
+    multi-leg-atomicity-stub-enabled: ${OMS_FX_MULTI_LEG_ATOMICITY_STUB_ENABLED:false}
+    hedge-hooks-enabled: ${OMS_FX_HEDGE_HOOKS_ENABLED:false}
+    eod-flatten-enabled: ${OMS_FX_EOD_FLATTEN_ENABLED:false}
+    eod-flatten-interval-ms: ${OMS_FX_EOD_FLATTEN_INTERVAL_MS:86400000}
   corporate-action:
     processor-enabled: ${OMS_CORPORATE_ACTION_PROCESSOR_ENABLED:false}
     processor-interval-ms: ${OMS_CORPORATE_ACTION_PROCESSOR_INTERVAL_MS:60000}

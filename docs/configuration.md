@@ -11,7 +11,7 @@ new key here when introducing one.
 
 | Key                         | Default | Meaning                                                    |
 |-----------------------------|---------|------------------------------------------------------------|
-| `OMS_HTTP_PORT`             | `8080`  | Bind port for the internal HTTP surface.                   |
+| `OMS_HTTP_PORT`             | `8088`  | Bind port for the internal HTTP surface (default avoids **8080**, used by the marketing site on many dev hosts). |
 | `OMS_INTERNAL_API_KEY`      | (empty) | Shared secret for `/internal/v1/**`. Empty rejects all.    |
 
 ## Postgres
@@ -147,7 +147,15 @@ Transport choice vs MQTT: [marketdata-ingestion-path.md](marketdata-ingestion-pa
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `OMS_FX_MODULE_ENABLED` | `false` | When **`true`**, **`GET /internal/v1/fx/health`** reports **`module_enabled_pending_impl`** until real FX services register; **`false`** → **`not_enabled`**. See [fx-architecture-slice8.md](fx-architecture-slice8.md) and [fx-backend-slice-m3.md](fx-backend-slice-m3.md). |
+| `OMS_FX_MODULE_ENABLED` | `false` | Master flag for internal **`/internal/v1/fx/**`** read surfaces. When **`true`**, **`GET /internal/v1/fx/health`** reports **`module_enabled_pending_impl`** plus a **`tracks`** map (M3 slice). When **`false`** → **`not_enabled`**. See [fx-architecture-slice8.md](fx-architecture-slice8.md) and [fx-backend-slice-m3.md](fx-backend-slice-m3.md). |
+| `OMS_FX_QUOTE_STUB_ENABLED` | `false` | When **`true`** with module on, **`GET /internal/v1/fx/quotes`** returns a versioned **stub** quote row (`schemaVersion` from `OMS_FX_QUOTE_STUB_SCHEMA_VERSION`). |
+| `OMS_FX_QUOTE_STUB_SCHEMA_VERSION` | `1` | Integer echoed on stub quote payload for contract tests. |
+| `OMS_FX_NOSTRO_READ_ENABLED` | `false` | When **`true`** with module on, **`GET /internal/v1/fx/nostro/snapshot`** aggregates Ledger **`GET /balances/{id}`** rows for ids in `OMS_FX_NOSTRO_BALANCE_IDS_CSV` (requires **`OMS_LEDGER_ENABLED=true`**). |
+| `OMS_FX_NOSTRO_BALANCE_IDS_CSV` | (empty) | Comma-separated Ledger `balance_id` values for the nostro snapshot. |
+| `OMS_FX_MULTI_LEG_ATOMICITY_STUB_ENABLED` | `false` | When **`true`**, **`FxMultiLegAtomicityStubService`** may persist two-leg rows in **`fx_stub_leg_*`** (integration / rollback harness only). |
+| `OMS_FX_HEDGE_HOOKS_ENABLED` | `false` | When **`true`**, **`GET /internal/v1/fx/hedge/hooks-status`** returns stub pause/kill-switch JSON and increments **`oms.fx.hedge_hook.probe`**. |
+| `OMS_FX_EOD_FLATTEN_ENABLED` | `false` | When **`true`** with module on, schedules **`FxEodFlattenScheduler`** ticks at `OMS_FX_EOD_FLATTEN_INTERVAL_MS` (finance-gated log only). |
+| `OMS_FX_EOD_FLATTEN_INTERVAL_MS` | `86400000` | Minimum **60000** ms in config clamp; delay between EOD flatten **stub** scheduler invocations. |
 
 ## FIX (slice 4+)
 

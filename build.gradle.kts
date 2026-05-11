@@ -51,6 +51,8 @@ val springTestContextCacheMaxSize =
     System.getenv("SPRING_TEST_CONTEXT_CACHE_MAX_SIZE")?.toIntOrNull()?.coerceIn(1, 64) ?: 10
 
 val openTelemetryVersion = "1.51.0"
+/** Must match OTel prometheus exporter transitive; Micrometer 1.13 pins older 1.2.x without this. */
+val prometheusMetricsBomVersion = "1.3.8"
 
 dependencies {
     // OpenTelemetry metrics (optional; gated by oms.otel.metrics-enabled) — Prometheus scrape for histograms (p50/p95).
@@ -135,4 +137,17 @@ tasks.named<org.springframework.boot.gradle.tasks.run.BootRun>("bootRun") {
 
 tasks.named<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJar") {
     archiveBaseName.set("oms")
+}
+
+/**
+ * Micrometer's prometheus registry pins {@code io.prometheus:prometheus-metrics-*} 1.2.x while the OTel
+ * Prometheus exporter brings 1.3.x textformats — mixed jars cause {@code NoSuchMethodError} at startup.
+ */
+configurations.configureEach {
+    resolutionStrategy.eachDependency {
+        if (requested.group == "io.prometheus" && requested.name.startsWith("prometheus-metrics-")) {
+            useVersion(prometheusMetricsBomVersion)
+            because("Align Prometheus Java metrics libraries for Micrometer registry + OTel exporter")
+        }
+    }
 }

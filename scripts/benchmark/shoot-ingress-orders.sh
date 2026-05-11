@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fire many POST /internal/v1/orders against a running OMS (synthetic load for latency / Prometheus).
+# Fire many POST /internal/v1/orders against a running OMS (synthetic load + latency).
 #
 # Prereqs: curl, jq, python3; OMS up with internal API key; unique idempotency key per iteration.
 #
@@ -17,23 +17,20 @@
 #   SHOOT_QTY            default 1
 #   SHOOT_LIMIT          default 150
 #   SHOOT_PRINT_EACH     default 0   (set to 1 to print each request's HTTP time on stderr)
-#   SHOOT_OTEL_METRICS_URL  optional, e.g. http://127.0.0.1:9464/metrics — after the batch, scrape and print
-#                           lines matching ingress_to_nos. Requires the **running OMS** to have been started with
-#                           OMS_OTEL_METRICS_ENABLED=true (default is false — nothing listens on 9464 until then).
-#   SHOOT_OTEL_SCRAPE_SLEEP_SEC  default 2 — wait before scrape so async tail + FIX can finish.
 #
-# What is measured:
-#   • curl time_total below = HTTP client wall time until the 201/200 response is done. That ends right after
-#     the ingress transaction commits (order + control_outbox rows). It does NOT wait for Chronicle/control,
-#     BuyingPowerAdmission, or FIX send.
-#   • Full path accept → NOS on the wire is the OTel histogram oms.fix.ingress_to_nos (ms), recorded inside OMS
-#     from commit until Session.sendToTarget succeeds. Enable OMS_OTEL_METRICS_ENABLED and fix routing; then set
-#     SHOOT_OTEL_METRICS_URL or scrape :9464/metrics yourself and use histogram_quantile on _bucket series.
+# Full-flow latency (what you want as “the number”):
+#   Set SHOOT_OTEL_METRICS_URL (e.g. http://127.0.0.1:9464/metrics) and run OMS with OMS_OTEL_METRICS_ENABLED=true.
+#   The script snapshots OTel histogram _count before POSTs, waits until count rises by the number of HTTP 201s,
+#   then prints mean / p50 / p95 / p99 in milliseconds (DB commit → FIX NOS sent). That is NOT the same as curl.
 #
-# Buying power: every order still goes through ControlTailer → buyingPower.evaluate before WORKING/FIX. If the
-#   order has no ledgerBalanceId, that gate returns PROCEED without a Ledger HTTP call (nothing to fund-check).
+#   SHOOT_OTEL_WAIT_MAX_SEC     default 120 — max wait for all 201s to show up in the histogram
+#   SHOOT_OTEL_POLL_INTERVAL_SEC default 1 — poll interval while waiting
+#   SHOOT_OTEL_SHOW_RAW         default 0 — set to 1 to dump raw Prometheus lines after the summary
 
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PARSE_PY="$SCRIPT_DIR/parse_otel_ingress_to_nos_histogram.py"
 
 random_uuid() {
   python3 -c "import uuid; print(uuid.uuid4())"
@@ -51,13 +48,24 @@ SLEEP_MS="${SHOOT_SLEEP_MS:-0}"
 SYM="${SHOOT_INSTRUMENT:-AAPL}"
 QTY="${SHOOT_QTY:-1}"
 LIM="${SHOOT_LIMIT:-150}"
-OTEL_SCRAPE_SLEEP_SEC="${SHOOT_OTEL_SCRAPE_SLEEP_SEC:-2}"
+OTEL_WAIT_MAX_SEC="${SHOOT_OTEL_WAIT_MAX_SEC:-120}"
+OTEL_POLL_SEC="${SHOOT_OTEL_POLL_INTERVAL_SEC:-1}"
 
 hinted_401=false
 ok=0
+created=0
 fail=0
 TIMES_FILE="$(mktemp)"
 trap 'rm -f "$TIMES_FILE"' EXIT
+
+BASELINE_OTEL="NA"
+if [[ -n "${SHOOT_OTEL_METRICS_URL:-}" ]]; then
+  if metrics_baseline="$(curl -fsS "${SHOOT_OTEL_METRICS_URL}" 2>/dev/null)"; then
+    BASELINE_OTEL="$(echo "$metrics_baseline" | python3 "$PARSE_PY" count)"
+  else
+    BASELINE_OTEL="NA"
+  fi
+fi
 
 for i in $(seq 1 "$COUNT"); do
   CLIENT_KEY="bench-shoot-$(date +%s)-$i-$RANDOM"
@@ -77,6 +85,9 @@ for i in $(seq 1 "$COUNT"); do
   IFS='|' read -r code time_s <<< "$meta"
   if [[ "$code" == "201" || "$code" == "200" ]]; then
     ok=$((ok + 1))
+    if [[ "$code" == "201" ]]; then
+      created=$((created + 1))
+    fi
     printf '%s\n' "$time_s" >>"$TIMES_FILE"
     if [[ "${SHOOT_PRINT_EACH:-0}" == "1" ]]; then
       echo "i=$i http=$code time_total_s=$time_s" >&2
@@ -98,11 +109,80 @@ for i in $(seq 1 "$COUNT"); do
   fi
 done
 
-echo "done: ok=$ok fail=$fail (expected 201 for new orders; 200 if you reused idempotency keys accidentally)"
+echo "done: ok=$ok (http 201+200)  created=$created (http 201 only; OTel full-flow counts these)  fail=$fail"
 
+# --- FULL FLOW (OTel): committed NEW order → FIX NOS (milliseconds) ---
+if [[ -n "${SHOOT_OTEL_METRICS_URL:-}" ]]; then
+  echo ""
+  echo "======================================================================"
+  echo "FULL FLOW — DB committed (201) → FIX NOS sent  |  unit: milliseconds"
+  echo "======================================================================"
+  if [[ "$created" -eq 0 ]]; then
+    echo "  No HTTP 201 in this run — OTel histogram only records brand-new orders."
+  else
+    if [[ "$BASELINE_OTEL" == "NA" ]]; then
+      echo "  WARN: could not read histogram before POSTs; assuming baseline count 0."
+      BASELINE_OTEL=0
+    fi
+    target=$((BASELINE_OTEL + created))
+    poll_start=$SECONDS
+    poll_deadline=$((SECONDS + OTEL_WAIT_MAX_SEC))
+    last_metrics=""
+    curl_rc=1
+    last_cur="NA"
+    while (( SECONDS < poll_deadline )); do
+      set +e
+      last_metrics="$(curl -fsS "${SHOOT_OTEL_METRICS_URL}" 2>&1)"
+      curl_rc=$?
+      set -e
+      if [[ "$curl_rc" -eq 0 && -n "$last_metrics" ]]; then
+        last_cur="$(echo "$last_metrics" | python3 "$PARSE_PY" count)"
+        if [[ "$last_cur" != "NA" ]] && [[ "$last_cur" -ge "$target" ]]; then
+          break
+        fi
+      fi
+      sleep "$OTEL_POLL_SEC"
+    done
+    waited=$((SECONDS - poll_start))
+    if [[ "$curl_rc" -ne 0 ]]; then
+      echo "  scrape failed (curl exit $curl_rc) — last message:" >&2
+      while IFS= read -r line || [[ -n "$line" ]]; do echo "    $line" >&2; done <<< "${last_metrics:-}"
+      echo "  Fix: OMS_OTEL_METRICS_ENABLED=true and correct SHOOT_OTEL_METRICS_URL (default port 9464)." >&2
+    elif [[ -z "${last_metrics:-}" ]]; then
+      echo "  (empty scrape body)" >&2
+    else
+      if [[ "${last_cur:-NA}" == "NA" ]]; then
+        last_cur=0
+      fi
+      if [[ "$last_cur" -lt "$target" ]]; then
+        echo "  TIMEOUT after ${waited}s: histogram _count is ${last_cur}, expected >= ${target} (baseline ${BASELINE_OTEL} + ${created} new orders)."
+        echo "  Showing stats for what completed so far (not the full batch):"
+      else
+        echo "  All ${created} new orders observed in histogram (waited ${waited}s)."
+      fi
+      echo "$last_metrics" | python3 "$PARSE_PY" summary | while IFS= read -r line; do echo "  $line"; done
+      echo ""
+      echo "  Read as: mean_ms / p50_ms / … = end-to-end server time from commit to NOS on the wire."
+      echo "  (curl section below is only HTTP; it is not this full path.)"
+      if [[ "${SHOOT_OTEL_SHOW_RAW:-0}" == "1" ]]; then
+        echo ""
+        echo "  --- raw OTel lines (ingress_to_nos) ---"
+        echo "$last_metrics" | grep -E 'ingress_to_nos' || true
+      fi
+    fi
+  fi
+else
+  echo ""
+  echo "======================================================================"
+  echo "FULL FLOW — not measured (set SHOOT_OTEL_METRICS_URL + OMS_OTEL_METRICS_ENABLED=true)"
+  echo "======================================================================"
+  echo "  Example:  export SHOOT_OTEL_METRICS_URL='http://127.0.0.1:9464/metrics'"
+fi
+
+# --- HTTP only (curl); seconds; stops at response ---
 if [[ "$ok" -gt 0 ]]; then
   echo ""
-  echo "A) HTTP only — time_total to end of response (seconds). Stops at 201; excludes control + FIX path:"
+  echo "HTTP only — curl time_total until response ends (seconds; NOT full flow to FIX):"
   python3 - "$TIMES_FILE" <<'PY'
 import sys
 from pathlib import Path
@@ -130,27 +210,5 @@ print(f"  p50={pct(0.50):.6f}  p95={pct(0.95):.6f}  p99={pct(0.99):.6f}")
 PY
 else
   echo ""
-  echo "No successful responses; skipping HTTP latency summary."
-fi
-
-if [[ -n "${SHOOT_OTEL_METRICS_URL:-}" ]]; then
-  echo ""
-  echo "B) OTel scrape — oms.fix.ingress_to_nos (committed ingress → FIX NOS sent). Raw exposition lines:"
-  echo "  (requires OMS started with OMS_OTEL_METRICS_ENABLED=true; listener is OMS_OTEL_PROMETHEUS_PORT, default 9464)"
-  sleep "$OTEL_SCRAPE_SLEEP_SEC"
-  set +e
-  metrics="$(curl -sS -f "${SHOOT_OTEL_METRICS_URL}" 2>&1)"
-  curl_rc=$?
-  set -e
-  if [[ "$curl_rc" -ne 0 ]]; then
-    echo "  scrape failed (curl exit $curl_rc):" >&2
-    while IFS= read -r line || [[ -n "$line" ]]; do echo "    $line" >&2; done <<< "$metrics"
-    echo "  Typical fix: export OMS_OTEL_METRICS_ENABLED=true then restart OMS; confirm:" >&2
-    echo "    curl -fsS ${SHOOT_OTEL_METRICS_URL} | head" >&2
-  elif [[ -z "$metrics" ]]; then
-    echo "  (empty body — unexpected)" >&2
-  else
-    echo "$metrics" | grep -E 'ingress_to_nos' || echo "  (no ingress_to_nos lines — non-fix backend, or no NOS completed yet; histogram appears after first send)"
-  fi
-  echo "  For percentiles in Prometheus/Grafana use histogram_quantile on the _bucket series (see docs/configuration.md)."
+  echo "No successful HTTP responses; skipping curl latency summary."
 fi

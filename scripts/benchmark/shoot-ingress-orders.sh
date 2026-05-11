@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Fire many POST /internal/v1/orders against a running OMS (synthetic load for latency / Prometheus).
 #
-# Prereqs: curl, jq, uuidgen; OMS up with internal API key; unique idempotency key per iteration.
+# Prereqs: curl, jq, python3; OMS up with internal API key; unique idempotency key per iteration.
 #
 # Typical local stack (3 terminals):
 #   1) ./gradlew fixLoopbackAcceptor
@@ -19,6 +19,10 @@
 
 set -euo pipefail
 
+random_uuid() {
+  python3 -c "import uuid; print(uuid.uuid4())"
+}
+
 OMS_URL="${OMS_URL:-http://127.0.0.1:8088}"
 KEY="${OMS_INTERNAL_API_KEY:?set OMS_INTERNAL_API_KEY}"
 COUNT="${SHOOT_COUNT:-50}"
@@ -31,7 +35,7 @@ ok=0
 fail=0
 for i in $(seq 1 "$COUNT"); do
   CLIENT_KEY="bench-shoot-$(date +%s)-$i-$RANDOM"
-  ACCOUNT_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+  ACCOUNT_ID="$(random_uuid)"
   BODY="$(jq -nc \
     --arg cid "$CLIENT_KEY" \
     --arg aid "$ACCOUNT_ID" \

@@ -2,6 +2,7 @@
 # Smoke: POST one internal order, then print OpenTelemetry Prometheus lines for ingress→FIX NOS latency.
 # Requires: OMS running with oms.routing.backend=fix, FIX session logged on, OTel metrics enabled, and a broker/acceptor.
 # Local synthetic acceptor: ./gradlew fixLoopbackAcceptor (see docs/fix-out.md).
+# Also: curl, jq, python3 on PATH.
 #
 # Usage:
 #   export OMS_INTERNAL_API_KEY=...
@@ -14,12 +15,16 @@
 
 set -euo pipefail
 
+random_uuid() {
+  python3 -c "import uuid; print(uuid.uuid4())"
+}
+
 OMS_URL="${OMS_URL:-http://127.0.0.1:8088}"
 OTEL_PROMETHEUS_URL="${OTEL_PROMETHEUS_URL:-http://127.0.0.1:9464/metrics}"
 KEY="${OMS_INTERNAL_API_KEY:?set OMS_INTERNAL_API_KEY}"
 
 CLIENT_KEY="bench-smoke-$(date +%s)-$RANDOM"
-ACCOUNT_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+ACCOUNT_ID="$(random_uuid)"
 
 BODY="$(jq -nc \
   --arg cid "$CLIENT_KEY" \

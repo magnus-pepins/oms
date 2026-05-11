@@ -49,7 +49,7 @@ public abstract class AbstractPostgresIntegrationTest {
      * container and default custody account.
      */
     public static final String SQL_TRUNCATE_ORDERS_AND_SETTLEMENT =
-            "TRUNCATE TABLE corporate_action_event, manual_settlement_actions, ledger_settlement_outbox, broker_settlement_confirm, settlement_file_import_batch, position_history, positions, orders CASCADE";
+            "TRUNCATE TABLE corporate_action_event, manual_settlement_actions, ledger_settlement_outbox, broker_settlement_confirm, settlement_file_import_batch, position_history, positions, orders, fx_stub_leg_group CASCADE";
 
     /** Docker / runner flakes: retry container start before failing the JVM test run (Testcontainers path only). */
     private static final int POSTGRES_CONTAINER_STARTUP_ATTEMPTS = 3;

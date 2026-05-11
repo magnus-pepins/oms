@@ -6,12 +6,16 @@ This is the **engineering execution index** for the bank-side FX stack described
 
 | Date | Track | Evidence (link / commit / dashboard) | Sign-off |
 |------|-------|----------------------------------------|----------|
-| *Pending* | Quote / nostro / legs / hedge / EOD | Fill when each track completes in non-prod or UAT | |
+| 2026-05-10 | 1 — quote stub | `oms` `FxQuotesController` + `OMS_FX_QUOTE_*` / `configuration.md` | Pending sign-off |
+| 2026-05-10 | 2 — nostro read | `oms` `GET /internal/v1/fx/nostro/snapshot` + Ledger WireMock IT | Pending sign-off |
+| 2026-05-10 | 3 — multi-leg atomicity stub | `oms` Flyway `V20__fx_stub_multi_leg.sql` + `FxMultiLegAtomicityStubService` rollback IT | Pending sign-off |
+| 2026-05-10 | 4 — hedge hooks | `oms` `GET /internal/v1/fx/hedge/hooks-status` + Micrometer `oms.fx.hedge_hook.probe` | Pending sign-off |
+| 2026-05-10 | 5 — EOD flatten stub | `oms` `FxEodFlattenScheduler` (log-only, finance-gated) | Pending sign-off |
 
 ## Preconditions
 
 - Design sign-off still tracked in product/treasury; code may proceed on **flagged** paths.
-- **`GET /internal/v1/fx/health`** reflects **`OMS_FX_MODULE_ENABLED`** (`not_enabled` vs `module_enabled_pending_impl`) — use it as a **deploy smoke** until real modules register here.
+- **`GET /internal/v1/fx/health`** reflects **`OMS_FX_MODULE_ENABLED`** (`not_enabled` vs `module_enabled_pending_impl`) and a **`tracks`** map (`quoteIngress`, `nostroRead`, `multiLegAtomicity`, `hedgeHooks`, `eodFlatten` — each `off` / `pending` / `stub` / `live`) — use it as a **deploy smoke** until real modules register here.
 
 ## Ordered build / verify tracks
 

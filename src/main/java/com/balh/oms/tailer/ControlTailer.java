@@ -6,6 +6,8 @@ import com.balh.oms.domain.Order;
 import com.balh.oms.domain.OrderStatus;
 import com.balh.oms.domain.RejectCode;
 import com.balh.oms.events.DomainEventEnvelopeCodec;
+import com.balh.oms.observability.otel.IngressToFixNosLatencyLimits;
+import com.balh.oms.observability.otel.IngressToFixNosLatencyRecorder;
 import com.balh.oms.persistence.ControlDecisionsRepository;
 import com.balh.oms.persistence.DomainEventOutboxRepository;
 import com.balh.oms.persistence.OrdersRepository;
@@ -52,6 +54,7 @@ public class ControlTailer {
     private final DomainEventEnvelopeCodec envelopeCodec;
     private final MeterRegistry meterRegistry;
     private final RouteDispatcher routeDispatcher;
+    private final IngressToFixNosLatencyRecorder ingressToFixNosLatencyRecorder;
 
     public ControlTailer(
             OrdersRepository orders,
@@ -63,7 +66,8 @@ public class ControlTailer {
             DomainEventOutboxRepository domainEventOutbox,
             DomainEventEnvelopeCodec envelopeCodec,
             MeterRegistry meterRegistry,
-            RouteDispatcher routeDispatcher) {
+            RouteDispatcher routeDispatcher,
+            IngressToFixNosLatencyRecorder ingressToFixNosLatencyRecorder) {
         this.orders = orders;
         this.stale = stale;
         this.config = config;
@@ -74,6 +78,7 @@ public class ControlTailer {
         this.envelopeCodec = envelopeCodec;
         this.meterRegistry = meterRegistry;
         this.routeDispatcher = routeDispatcher;
+        this.ingressToFixNosLatencyRecorder = ingressToFixNosLatencyRecorder;
     }
 
     @Transactional
@@ -222,6 +227,7 @@ public class ControlTailer {
     }
 
     private void publishRejected(PendingControlEvent event, RejectCode reason) {
+        ingressToFixNosLatencyRecorder.discard(event.orderId(), IngressToFixNosLatencyLimits.REASON_CONTROL_REJECT);
         int newSeq = event.orderVersion() + 1;
         try {
             domainEventOutbox.insert(event.orderId(), envelopeCodec.orderRejected(event, reason, newSeq));

@@ -6,6 +6,7 @@ import org.springframework.context.annotation.Configuration;
 import java.math.BigDecimal;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 import java.util.UUID;
@@ -39,6 +40,7 @@ public class OmsConfig {
     private final CorporateAction corporateAction = new CorporateAction();
     private final Desk desk = new Desk();
     private final Fx fx = new Fx();
+    private final Otel otel = new Otel();
 
     public Http getHttp() { return http; }
     public Shard getShard() { return shard; }
@@ -57,6 +59,7 @@ public class OmsConfig {
     public CorporateAction getCorporateAction() { return corporateAction; }
     public Desk getDesk() { return desk; }
     public Fx getFx() { return fx; }
+    public Otel getOtel() { return otel; }
 
     public static class Http {
         private String internalApiKey = "";
@@ -1211,9 +1214,19 @@ public class OmsConfig {
 
     /**
      * FX module (§11.5) — off by default; health endpoint documents rollout state.
+     * Sub-tracks are gated independently; see {@code oms/docs/fx-backend-slice-m3.md}.
      */
     public static class Fx {
         private boolean moduleEnabled = false;
+        private boolean quoteStubEnabled = false;
+        private int quoteStubSchemaVersion = 1;
+        private boolean nostroReadEnabled = false;
+        /** Comma-separated Ledger {@code balance_id} values for {@code GET /internal/v1/fx/nostro/snapshot}. */
+        private String nostroBalanceIdsCsv = "";
+        private boolean multiLegAtomicityStubEnabled = false;
+        private boolean hedgeHooksEnabled = false;
+        private boolean eodFlattenEnabled = false;
+        private long eodFlattenIntervalMs = 86_400_000L;
 
         public boolean isModuleEnabled() {
             return moduleEnabled;
@@ -1221,6 +1234,80 @@ public class OmsConfig {
 
         public void setModuleEnabled(boolean moduleEnabled) {
             this.moduleEnabled = moduleEnabled;
+        }
+
+        public boolean isQuoteStubEnabled() {
+            return quoteStubEnabled;
+        }
+
+        public void setQuoteStubEnabled(boolean quoteStubEnabled) {
+            this.quoteStubEnabled = quoteStubEnabled;
+        }
+
+        public int getQuoteStubSchemaVersion() {
+            return quoteStubSchemaVersion;
+        }
+
+        public void setQuoteStubSchemaVersion(int quoteStubSchemaVersion) {
+            this.quoteStubSchemaVersion = Math.min(99, Math.max(1, quoteStubSchemaVersion));
+        }
+
+        public boolean isNostroReadEnabled() {
+            return nostroReadEnabled;
+        }
+
+        public void setNostroReadEnabled(boolean nostroReadEnabled) {
+            this.nostroReadEnabled = nostroReadEnabled;
+        }
+
+        public String getNostroBalanceIdsCsv() {
+            return nostroBalanceIdsCsv;
+        }
+
+        public void setNostroBalanceIdsCsv(String nostroBalanceIdsCsv) {
+            this.nostroBalanceIdsCsv = nostroBalanceIdsCsv == null ? "" : nostroBalanceIdsCsv;
+        }
+
+        public List<String> nostroBalanceIds() {
+            if (nostroBalanceIdsCsv == null || nostroBalanceIdsCsv.isBlank()) {
+                return List.of();
+            }
+            return Arrays.stream(nostroBalanceIdsCsv.split(","))
+                    .map(String::trim)
+                    .filter(s -> !s.isEmpty())
+                    .toList();
+        }
+
+        public boolean isMultiLegAtomicityStubEnabled() {
+            return multiLegAtomicityStubEnabled;
+        }
+
+        public void setMultiLegAtomicityStubEnabled(boolean multiLegAtomicityStubEnabled) {
+            this.multiLegAtomicityStubEnabled = multiLegAtomicityStubEnabled;
+        }
+
+        public boolean isHedgeHooksEnabled() {
+            return hedgeHooksEnabled;
+        }
+
+        public void setHedgeHooksEnabled(boolean hedgeHooksEnabled) {
+            this.hedgeHooksEnabled = hedgeHooksEnabled;
+        }
+
+        public boolean isEodFlattenEnabled() {
+            return eodFlattenEnabled;
+        }
+
+        public void setEodFlattenEnabled(boolean eodFlattenEnabled) {
+            this.eodFlattenEnabled = eodFlattenEnabled;
+        }
+
+        public long getEodFlattenIntervalMs() {
+            return eodFlattenIntervalMs;
+        }
+
+        public void setEodFlattenIntervalMs(long eodFlattenIntervalMs) {
+            this.eodFlattenIntervalMs = Math.max(60_000L, eodFlattenIntervalMs);
         }
     }
 
@@ -1392,6 +1479,49 @@ public class OmsConfig {
 
         public void setNbboInMarketContextEnabled(boolean nbboInMarketContextEnabled) {
             this.nbboInMarketContextEnabled = nbboInMarketContextEnabled;
+        }
+    }
+
+    /**
+     * OpenTelemetry SDK metrics (optional). When {@code metrics-enabled=false}, only Micrometer
+     * {@code /actuator/prometheus} is used (default).
+     */
+    public static class Otel {
+        private boolean metricsEnabled = false;
+        private int prometheusPort = 9464;
+        private long ingressToNosSampleTtlMs = 1_800_000L;
+        private long ingressToNosEvictIntervalMs = 60_000L;
+
+        public boolean isMetricsEnabled() {
+            return metricsEnabled;
+        }
+
+        public void setMetricsEnabled(boolean metricsEnabled) {
+            this.metricsEnabled = metricsEnabled;
+        }
+
+        public int getPrometheusPort() {
+            return prometheusPort;
+        }
+
+        public void setPrometheusPort(int prometheusPort) {
+            this.prometheusPort = Math.min(65_535, Math.max(1, prometheusPort));
+        }
+
+        public long getIngressToNosSampleTtlMs() {
+            return ingressToNosSampleTtlMs;
+        }
+
+        public void setIngressToNosSampleTtlMs(long ingressToNosSampleTtlMs) {
+            this.ingressToNosSampleTtlMs = Math.max(60_000L, ingressToNosSampleTtlMs);
+        }
+
+        public long getIngressToNosEvictIntervalMs() {
+            return ingressToNosEvictIntervalMs;
+        }
+
+        public void setIngressToNosEvictIntervalMs(long ingressToNosEvictIntervalMs) {
+            this.ingressToNosEvictIntervalMs = Math.max(5_000L, ingressToNosEvictIntervalMs);
         }
     }
 }

@@ -44,6 +44,30 @@ public final class RestLedgerBalanceClient implements LedgerBalanceClient {
     }
 
     @Override
+    public LedgerBalanceReadModel fetchBalanceReadModel(String balanceId) throws LedgerBalanceClient.LedgerServiceException {
+        try {
+            JsonNode root = fetchBalanceRoot(balanceId);
+            JsonNode ab = root.get("availableBalance");
+            if (ab == null || ab.isNull()) {
+                throw new LedgerBalanceClient.LedgerServiceException("ledger response missing availableBalance");
+            }
+            BigDecimal available = new BigDecimal(ab.asText());
+            JsonNode bb = root.get("balance");
+            BigDecimal booked = bb == null || bb.isNull() ? BigDecimal.ZERO : new BigDecimal(bb.asText());
+            JsonNode cur = root.get("currency");
+            String currency = cur != null && cur.isTextual() ? cur.asText() : "";
+            String identityId = readIdentityId(root);
+            return new LedgerBalanceReadModel(
+                    balanceId, available, booked, currency, identityId == null ? "" : identityId);
+        } catch (LedgerBalanceClient.LedgerServiceException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new LedgerBalanceClient.LedgerServiceException(
+                    "failed to parse ledger balance read model: " + e.getMessage(), e);
+        }
+    }
+
+    @Override
     public String fetchIdentityIdForBalance(String balanceId) throws LedgerBalanceClient.LedgerServiceException {
         try {
             JsonNode root = fetchBalanceRoot(balanceId);

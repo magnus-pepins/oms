@@ -1,5 +1,7 @@
 package com.balh.oms.fix;
 
+import com.balh.oms.observability.otel.IngressToFixNosLatencyLimits;
+import com.balh.oms.observability.otel.IngressToFixNosLatencyRecorder;
 import com.balh.oms.routing.RouteDispatcher;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -19,14 +21,18 @@ public final class FixRouteDispatcher implements RouteDispatcher {
     private static final Logger log = LoggerFactory.getLogger(FixRouteDispatcher.class);
 
     private final BlockingQueue<UUID> pendingOrderIds;
+    private final IngressToFixNosLatencyRecorder ingressToFixNosLatencyRecorder;
 
-    public FixRouteDispatcher(BlockingQueue<UUID> pendingOrderIds) {
+    public FixRouteDispatcher(
+            BlockingQueue<UUID> pendingOrderIds, IngressToFixNosLatencyRecorder ingressToFixNosLatencyRecorder) {
         this.pendingOrderIds = pendingOrderIds;
+        this.ingressToFixNosLatencyRecorder = ingressToFixNosLatencyRecorder;
     }
 
     @Override
     public void enqueueWorkingOrder(UUID orderId) {
         if (!pendingOrderIds.offer(orderId)) {
+            ingressToFixNosLatencyRecorder.discard(orderId, IngressToFixNosLatencyLimits.REASON_QUEUE_FULL);
             log.error("FIX outbound pending queue full; dropping orderId={}", orderId);
             return;
         }

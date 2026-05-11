@@ -275,6 +275,36 @@ These metrics are always registered when the corresponding code paths run; they 
 
 **Clock skew:** there is no `oms_clock_offset_ms` gauge in OMS yet; compare venue **`SendingTime`** / ER timestamps to server clock in logs or derive offset in your metrics stack if you need best-ex wall-clock budgets.
 
+## Observability (OpenTelemetry, optional)
+
+When **`OMS_OTEL_METRICS_ENABLED=true`**, OMS starts an OpenTelemetry **`SdkMeterProvider`** with the **Prometheus** pull exporter (default **`http://0.0.0.0:9464/metrics`**). Micrometer **`/actuator/prometheus`** remains unchanged so existing dashboards keep working.
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `OMS_OTEL_METRICS_ENABLED` | `false` | When **`true`**, bind OTel Prometheus scrape listener. |
+| `OMS_OTEL_PROMETHEUS_PORT` | `9464` | TCP port for **`/metrics`** (OTel-native histograms). |
+| `OMS_OTEL_INGRESS_TO_NOS_SAMPLE_TTL_MS` | `1800000` | Drop unmatched ingress timing samples after this wall time (no histogram; increments discard counter with **`reason=ttl_evict`**). Minimum **`60000`**. |
+| `OMS_OTEL_INGRESS_TO_NOS_EVICT_INTERVAL_MS` | `60000` | **`@Scheduled`** interval for TTL eviction of stale samples. Minimum **`5000`**. |
+
+### Histogram: HTTP accept → FIX `NewOrderSingle` (happy path)
+
+**Instrument:** `oms.fix.ingress_to_nos` (unit **`ms`**). Recorded only when **`oms.routing.backend=fix`**, after a **new** order row commits on internal **`POST /internal/v1/orders`**, until **`Session.sendToTarget`** succeeds for that order’s NOS.
+
+Prometheus scrape text uses underscores (exporter-dependent suffixes such as **`_milliseconds_bucket`** may appear). Discover on your build with:
+
+```bash
+curl -sS http://127.0.0.1:9464/metrics | grep -E 'ingress_to_nos'
+```
+
+**Example PromQL (classic histogram)** — replace **`METRIC_BUCKET`** with the scrape line ending in **`_bucket`** for this instrument (name is exporter-version-specific; it **contains** `ingress_to_nos`):
+
+```promql
+histogram_quantile(0.50, sum(rate(METRIC_BUCKET[5m])) by (le))
+histogram_quantile(0.95, sum(rate(METRIC_BUCKET[5m])) by (le))
+```
+
+**Smoke script:** [`../scripts/benchmark/ingress-to-fix-nos-smoke.sh`](../scripts/benchmark/ingress-to-fix-nos-smoke.sh) — posts one order and greps the OTel scrape (requires FIX path + logon + key env).
+
 ## PII
 
 | Key                              | Default              | Meaning                                                                                  |

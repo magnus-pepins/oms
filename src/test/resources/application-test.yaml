@@ -52,6 +52,8 @@ oms:
   pii:
     audit-trace-enabled: false
     hash-secret: test-secret
+  otel:
+    metrics-enabled: false
 
 management:
   endpoints:

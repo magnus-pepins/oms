@@ -10,6 +10,7 @@ import com.balh.oms.events.DomainEventEnvelopeCodec;
 import com.balh.oms.persistence.ControlOutboxRepository;
 import com.balh.oms.persistence.DomainEventOutboxRepository;
 import com.balh.oms.persistence.LedgerInflightOutboxRepository;
+import com.balh.oms.observability.otel.IngressToFixNosLatencyRecorder;
 import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.domain.Side;
 import com.balh.oms.ledger.LedgerBalanceClient;
@@ -58,6 +59,7 @@ public class OrderIngressService {
     private final ObjectProvider<LedgerBalanceClient> ledgerBalanceClient;
     private final LedgerInflightOutboxRepository ledgerInflightOutbox;
     private final MeterRegistry meterRegistry;
+    private final IngressToFixNosLatencyRecorder ingressToFixNosLatencyRecorder;
 
     public OrderIngressService(
             OrdersRepository orders,
@@ -70,7 +72,8 @@ public class OrderIngressService {
             ObjectProvider<LedgerInflightReservationClient> ledgerInflightReservation,
             ObjectProvider<LedgerBalanceClient> ledgerBalanceClient,
             LedgerInflightOutboxRepository ledgerInflightOutbox,
-            MeterRegistry meterRegistry) {
+            MeterRegistry meterRegistry,
+            IngressToFixNosLatencyRecorder ingressToFixNosLatencyRecorder) {
         this.orders = orders;
         this.outbox = outbox;
         this.domainEventOutbox = domainEventOutbox;
@@ -82,6 +85,7 @@ public class OrderIngressService {
         this.ledgerBalanceClient = ledgerBalanceClient;
         this.ledgerInflightOutbox = ledgerInflightOutbox;
         this.meterRegistry = meterRegistry;
+        this.ingressToFixNosLatencyRecorder = ingressToFixNosLatencyRecorder;
     }
 
     /**
@@ -156,6 +160,7 @@ public class OrderIngressService {
             log.error("Failed to serialise domain fanout envelope for orderId={}", id, e);
             throw new RuntimeException("domain event envelope serialisation failed", e);
         }
+        ingressToFixNosLatencyRecorder.onOrderIngressCommitted(id);
         return new IngressResult(order, true);
     }
 

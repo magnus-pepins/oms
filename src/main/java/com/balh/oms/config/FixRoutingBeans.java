@@ -1,6 +1,7 @@
 package com.balh.oms.config;
 
 import com.balh.oms.fix.FixRouteDispatcher;
+import com.balh.oms.observability.otel.IngressToFixNosLatencyRecorder;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -20,7 +21,9 @@ public class FixRoutingBeans {
     }
 
     @Bean
-    FixRouteDispatcher fixRouteDispatcher(BlockingQueue<UUID> fixOutboundPendingOrderQueue) {
-        return new FixRouteDispatcher(fixOutboundPendingOrderQueue);
+    FixRouteDispatcher fixRouteDispatcher(
+            BlockingQueue<UUID> fixOutboundPendingOrderQueue,
+            IngressToFixNosLatencyRecorder ingressToFixNosLatencyRecorder) {
+        return new FixRouteDispatcher(fixOutboundPendingOrderQueue, ingressToFixNosLatencyRecorder);
     }
 }

@@ -8,6 +8,7 @@ import com.balh.oms.fix.FixOutboundTokenBucket;
 import com.balh.oms.fix.FixRouteDispatcher;
 import com.balh.oms.fix.FixSessionRegistry;
 import com.balh.oms.fix.OmsFixApplication;
+import com.balh.oms.observability.otel.IngressToFixNosLatencyRecorder;
 import com.balh.oms.persistence.FixRouteStateRepository;
 import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.returnpath.ExecutionReportApplier;
@@ -67,7 +68,8 @@ public class FixAutoStartBeans {
             OmsConfig omsConfig,
             ExecutionReportApplier executionReportApplier,
             FixRouteStateRepository fixRouteStateRepository,
-            FixOutboundTokenBucket fixOutboundTokenBucket) {
+            FixOutboundTokenBucket fixOutboundTokenBucket,
+            IngressToFixNosLatencyRecorder ingressToFixNosLatencyRecorder) {
         return new FixOutboundDispatchWorker(
                 fixRouteDispatcher,
                 fixSessionRegistry,
@@ -77,6 +79,7 @@ public class FixAutoStartBeans {
                 omsConfig,
                 executionReportApplier,
                 fixRouteStateRepository,
-                fixOutboundTokenBucket);
+                fixOutboundTokenBucket,
+                ingressToFixNosLatencyRecorder);
     }
 }

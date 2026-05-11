@@ -8,6 +8,8 @@ import com.balh.oms.domain.Side;
 import com.balh.oms.events.DomainEventEnvelopeCodec;
 import com.balh.oms.marketdata.MarketdataNbboQuote;
 import com.balh.oms.marketdata.MarketdataPlatformHttpClient;
+import com.balh.oms.observability.otel.IngressToFixNosLatencyLimits;
+import com.balh.oms.observability.otel.IngressToFixNosLatencyRecorder;
 import com.balh.oms.persistence.DomainEventOutboxRepository;
 import com.balh.oms.persistence.ExecutionsRepository;
 import com.balh.oms.persistence.MarketContextRepository;
@@ -66,6 +68,7 @@ public class ExecutionReportApplier {
     private final MeterRegistry meterRegistry;
     private final PositionsRepository positions;
     private final ObjectProvider<MarketdataPlatformHttpClient> marketdataHttp;
+    private final IngressToFixNosLatencyRecorder ingressToFixNosLatencyRecorder;
 
     public ExecutionReportApplier(
             OrdersRepository orders,
@@ -77,7 +80,8 @@ public class ExecutionReportApplier {
             OmsConfig config,
             MeterRegistry meterRegistry,
             PositionsRepository positions,
-            ObjectProvider<MarketdataPlatformHttpClient> marketdataHttp) {
+            ObjectProvider<MarketdataPlatformHttpClient> marketdataHttp,
+            IngressToFixNosLatencyRecorder ingressToFixNosLatencyRecorder) {
         this.orders = orders;
         this.executions = executions;
         this.marketContext = marketContext;
@@ -88,6 +92,7 @@ public class ExecutionReportApplier {
         this.meterRegistry = meterRegistry;
         this.positions = positions;
         this.marketdataHttp = marketdataHttp;
+        this.ingressToFixNosLatencyRecorder = ingressToFixNosLatencyRecorder;
     }
 
     public enum TradeApplyOutcome {
@@ -326,6 +331,7 @@ public class ExecutionReportApplier {
      */
     @Transactional
     public VenueRejectApplyOutcome applyOutboundJobExpired(UUID orderId) {
+        ingressToFixNosLatencyRecorder.discard(orderId, IngressToFixNosLatencyLimits.REASON_OUTBOUND_EXPIRED);
         String venueId = config.getFix().getVenueIdForExecutions();
         Instant ts = Instant.now();
         String ref = "OMS-OUTBOUND-EXPIRED-" + orderId;

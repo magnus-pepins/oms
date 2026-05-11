@@ -3,6 +3,7 @@ package com.balh.oms.fix;
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.domain.Order;
 import com.balh.oms.domain.OrderStatus;
+import com.balh.oms.observability.otel.IngressToFixNosLatencyRecorder;
 import com.balh.oms.persistence.FixRouteStateRepository;
 import com.balh.oms.persistence.FixRouteStateRow;
 import com.balh.oms.persistence.OrdersRepository;
@@ -35,6 +36,7 @@ public class FixOutboundDispatchWorker {
     private final ExecutionReportApplier executionReportApplier;
     private final FixRouteStateRepository fixRouteStateRepository;
     private final FixOutboundTokenBucket fixOutboundTokenBucket;
+    private final IngressToFixNosLatencyRecorder ingressToFixNosLatencyRecorder;
 
     public FixOutboundDispatchWorker(
             FixRouteDispatcher fixRouteDispatcher,
@@ -45,7 +47,8 @@ public class FixOutboundDispatchWorker {
             OmsConfig omsConfig,
             ExecutionReportApplier executionReportApplier,
             FixRouteStateRepository fixRouteStateRepository,
-            FixOutboundTokenBucket fixOutboundTokenBucket) {
+            FixOutboundTokenBucket fixOutboundTokenBucket,
+            IngressToFixNosLatencyRecorder ingressToFixNosLatencyRecorder) {
         this.fixRouteDispatcher = fixRouteDispatcher;
         this.fixSessionRegistry = fixSessionRegistry;
         this.ordersRepository = ordersRepository;
@@ -55,6 +58,7 @@ public class FixOutboundDispatchWorker {
         this.executionReportApplier = executionReportApplier;
         this.fixRouteStateRepository = fixRouteStateRepository;
         this.fixOutboundTokenBucket = fixOutboundTokenBucket;
+        this.ingressToFixNosLatencyRecorder = ingressToFixNosLatencyRecorder;
     }
 
     @Scheduled(fixedDelayString = "${oms.fix.outbound-poll-interval-ms:100}")
@@ -93,6 +97,7 @@ public class FixOutboundDispatchWorker {
             NewOrderSingle nos = newOrderSingleBuilder.build(order);
             Session.sendToTarget(nos, fixSessionRegistry.sessionOrNull());
             meterRegistry.counter(FixMetrics.METRIC_NOS_SENT).increment();
+            ingressToFixNosLatencyRecorder.recordNewOrderSingleSent(id);
         } catch (SessionNotFound e) {
             log.warn("FIX sendToTarget failed (no session) orderId={}", id, e);
         } catch (Exception e) {

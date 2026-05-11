@@ -50,7 +50,17 @@ val chronicleJavaModuleOpens =
 val springTestContextCacheMaxSize =
     System.getenv("SPRING_TEST_CONTEXT_CACHE_MAX_SIZE")?.toIntOrNull()?.coerceIn(1, 64) ?: 10
 
+val openTelemetryVersion = "1.51.0"
+
 dependencies {
+    // OpenTelemetry metrics (optional; gated by oms.otel.metrics-enabled) — Prometheus scrape for histograms (p50/p95).
+    // Prometheus exporter remains on an -alpha train separate from the stable BOM line.
+    implementation(platform("io.opentelemetry:opentelemetry-bom:$openTelemetryVersion"))
+    implementation("io.opentelemetry:opentelemetry-api")
+    implementation("io.opentelemetry:opentelemetry-sdk")
+    implementation("io.opentelemetry:opentelemetry-sdk-metrics")
+    implementation("io.opentelemetry:opentelemetry-exporter-prometheus:${openTelemetryVersion}-alpha")
+
     // Spring Boot 3 minimal: Web + Actuator + JDBC + Flyway
     implementation("org.springframework.boot:spring-boot-starter-web")
     implementation("org.springframework.boot:spring-boot-starter-actuator")

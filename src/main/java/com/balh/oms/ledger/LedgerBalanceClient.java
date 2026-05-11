@@ -16,6 +16,11 @@ public interface LedgerBalanceClient {
     BigDecimal fetchAvailableBalance(String balanceId) throws LedgerServiceException;
 
     /**
+     * Ledger balance row for FX nostro read model (same GET as {@link #fetchAvailableBalance}).
+     */
+    LedgerBalanceReadModel fetchBalanceReadModel(String balanceId) throws LedgerServiceException;
+
+    /**
      * Ledger {@code identity_id} owning the balance (from GET body {@code identityId} or nested
      * {@code identity.identityId}).
      *

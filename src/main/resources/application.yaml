@@ -42,6 +42,13 @@ management:
 oms:
   http:
     internal-api-key: ${OMS_INTERNAL_API_KEY:}
+  otel:
+    # When true, starts an OpenTelemetry SdkMeterProvider + Prometheus scrape listener (default port 9464).
+    # Micrometer /actuator/prometheus remains available. Use for histogram_quantile(p50/p95) on ingress→FIX NOS.
+    metrics-enabled: ${OMS_OTEL_METRICS_ENABLED:false}
+    prometheus-port: ${OMS_OTEL_PROMETHEUS_PORT:9464}
+    ingress-to-nos-sample-ttl-ms: ${OMS_OTEL_INGRESS_TO_NOS_SAMPLE_TTL_MS:1800000}
+    ingress-to-nos-evict-interval-ms: ${OMS_OTEL_INGRESS_TO_NOS_EVICT_INTERVAL_MS:60000}
   shard:
     id: ${OMS_SHARD_ID:0}
     count: ${OMS_SHARD_COUNT:1}

@@ -7,6 +7,7 @@ import com.balh.oms.domain.OrderStatus;
 import com.balh.oms.domain.RejectCode;
 import com.balh.oms.domain.Side;
 import com.balh.oms.events.DomainEventEnvelopeCodec;
+import com.balh.oms.observability.otel.IngressToFixNosLatencyRecorder;
 import com.balh.oms.persistence.ControlDecisionsRepository;
 import com.balh.oms.persistence.DomainEventOutboxRepository;
 import com.balh.oms.persistence.OrdersRepository;
@@ -51,6 +52,7 @@ class ControlTailerRejectPublisherTest {
     @Mock ControlDecisionsRepository controlDecisions;
     @Mock DomainEventOutboxRepository domainOutbox;
     @Mock RouteDispatcher routeDispatcher;
+    @Mock IngressToFixNosLatencyRecorder ingressToFixNosLatencyRecorder;
 
     private final ObjectMapper objectMapper = new ObjectMapper().registerModule(new JavaTimeModule());
     private final DomainEventEnvelopeCodec codec = new DomainEventEnvelopeCodec(objectMapper);
@@ -70,7 +72,8 @@ class ControlTailerRejectPublisherTest {
                 domainOutbox,
                 codec,
                 meterRegistry,
-                routeDispatcher);
+                routeDispatcher,
+                ingressToFixNosLatencyRecorder);
     }
 
     @Test

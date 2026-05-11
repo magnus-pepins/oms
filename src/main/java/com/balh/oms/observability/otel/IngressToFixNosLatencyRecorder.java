@@ -1,6 +1,8 @@
 package com.balh.oms.observability.otel;
 
 import com.balh.oms.config.OmsConfig;
+import com.balh.oms.observability.metrics.OmsPipelineMetrics;
+import io.micrometer.core.instrument.MeterRegistry;
 import io.opentelemetry.api.OpenTelemetry;
 import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
@@ -19,22 +21,25 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * Tracks wall time from successful internal HTTP order accept (Postgres commit of a new order) until
- * QuickFIX {@code NewOrderSingle} is sent, when {@code oms.routing.backend=fix} and OTel metrics are enabled.
+ * QuickFIX {@code NewOrderSingle} is sent, when {@code oms.routing.backend=fix}.
  *
- * <p>Recorded on the OpenTelemetry {@link DoubleHistogram} {@value IngressToFixNosLatencyLimits#OTEL_HISTOGRAM_NAME}
- * (unit {@code ms}), scraped via {@code oms.otel.metrics-enabled=true} Prometheus listener. Use Prometheus
- * {@code histogram_quantile} on {@code _bucket} series for p50 / p95 load SLOs.
+ * <p>OpenTelemetry {@link DoubleHistogram} {@value IngressToFixNosLatencyLimits#OTEL_HISTOGRAM_NAME} (unit {@code ms})
+ * is recorded when {@code oms.otel.metrics-enabled=true} and an SDK is present. The same duration is always mirrored
+ * to Micrometer {@code oms.pipeline.ingress_to_fix_nos} for {@code /actuator/prometheus} even when OTel is off.
  */
 @Component
 public class IngressToFixNosLatencyRecorder {
 
     private final OmsConfig omsConfig;
+    private final MeterRegistry meterRegistry;
     private final DoubleHistogram ingressToNosMs;
     private final LongCounter samplesDiscarded;
     private final ConcurrentHashMap<UUID, Long> startNanosByOrderId = new ConcurrentHashMap<>();
 
-    public IngressToFixNosLatencyRecorder(OmsConfig omsConfig, ObjectProvider<OpenTelemetry> openTelemetry) {
+    public IngressToFixNosLatencyRecorder(
+            OmsConfig omsConfig, ObjectProvider<OpenTelemetry> openTelemetry, MeterRegistry meterRegistry) {
         this.omsConfig = omsConfig;
+        this.meterRegistry = meterRegistry;
         OpenTelemetry otel = openTelemetry.getIfAvailable();
         if (otel == null) {
             this.ingressToNosMs = null;
@@ -53,11 +58,8 @@ public class IngressToFixNosLatencyRecorder {
                 .build();
     }
 
-    /** After successful insert of a new order; no-op unless routing backend is {@code fix} and OTel histogram is on. */
+    /** After successful insert of a new order; records start time when routing backend is {@code fix}. */
     public void onOrderIngressCommitted(UUID orderId) {
-        if (ingressToNosMs == null) {
-            return;
-        }
         if (!"fix".equalsIgnoreCase(omsConfig.getRouting().getBackend())) {
             return;
         }
@@ -65,31 +67,30 @@ public class IngressToFixNosLatencyRecorder {
     }
 
     public void recordNewOrderSingleSent(UUID orderId) {
-        if (ingressToNosMs == null) {
-            return;
-        }
         Long startNanos = startNanosByOrderId.remove(orderId);
         if (startNanos == null) {
             return;
         }
         double ms = (System.nanoTime() - startNanos) / 1_000_000d;
-        ingressToNosMs.record(ms);
+        if (ingressToNosMs != null) {
+            ingressToNosMs.record(ms);
+        }
+        OmsPipelineMetrics.recordPipelineIngressToFixNos(meterRegistry, ms);
     }
 
     public void discard(UUID orderId, String reason) {
-        if (samplesDiscarded == null) {
-            return;
-        }
         Long removed = startNanosByOrderId.remove(orderId);
         if (removed == null) {
             return;
         }
-        samplesDiscarded.add(1, Attributes.of(AttributeKey.stringKey(IngressToFixNosLatencyLimits.ATTR_REASON), reason));
+        if (samplesDiscarded != null) {
+            samplesDiscarded.add(1, Attributes.of(AttributeKey.stringKey(IngressToFixNosLatencyLimits.ATTR_REASON), reason));
+        }
     }
 
     @Scheduled(fixedDelayString = "${oms.otel.ingress-to-nos-evict-interval-ms:60000}")
     public void evictStaleSamples() {
-        if (ingressToNosMs == null || samplesDiscarded == null) {
+        if (startNanosByOrderId.isEmpty()) {
             return;
         }
         long ttlNanos = TimeUnit.MILLISECONDS.toNanos(omsConfig.getOtel().getIngressToNosSampleTtlMs());
@@ -103,11 +104,13 @@ public class IngressToFixNosLatencyRecorder {
         for (UUID id : stale) {
             Long t = startNanosByOrderId.get(id);
             if (t != null && now - t > ttlNanos && startNanosByOrderId.remove(id, t)) {
-                samplesDiscarded.add(
-                        1,
-                        Attributes.of(
-                                AttributeKey.stringKey(IngressToFixNosLatencyLimits.ATTR_REASON),
-                                IngressToFixNosLatencyLimits.REASON_TTL_EVICT));
+                if (samplesDiscarded != null) {
+                    samplesDiscarded.add(
+                            1,
+                            Attributes.of(
+                                    AttributeKey.stringKey(IngressToFixNosLatencyLimits.ATTR_REASON),
+                                    IngressToFixNosLatencyLimits.REASON_TTL_EVICT));
+                }
             }
         }
     }

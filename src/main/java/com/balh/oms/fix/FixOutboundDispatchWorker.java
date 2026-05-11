@@ -3,12 +3,14 @@ package com.balh.oms.fix;
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.domain.Order;
 import com.balh.oms.domain.OrderStatus;
+import com.balh.oms.observability.metrics.OmsPipelineMetrics;
 import com.balh.oms.observability.otel.IngressToFixNosLatencyRecorder;
 import com.balh.oms.persistence.FixRouteStateRepository;
 import com.balh.oms.persistence.FixRouteStateRow;
 import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.returnpath.ExecutionReportApplier;
 import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -93,14 +95,18 @@ public class FixOutboundDispatchWorker {
             fixRouteDispatcher.enqueueWorkingOrder(id);
             return;
         }
+        Timer.Sample outboundSample = Timer.start(meterRegistry);
         try {
             NewOrderSingle nos = newOrderSingleBuilder.build(order);
             Session.sendToTarget(nos, fixSessionRegistry.sessionOrNull());
             meterRegistry.counter(FixMetrics.METRIC_NOS_SENT).increment();
             ingressToFixNosLatencyRecorder.recordNewOrderSingleSent(id);
+            OmsPipelineMetrics.finishFixOutboundNos(meterRegistry, outboundSample, "success");
         } catch (SessionNotFound e) {
+            OmsPipelineMetrics.finishFixOutboundNos(meterRegistry, outboundSample, "failure");
             log.warn("FIX sendToTarget failed (no session) orderId={}", id, e);
         } catch (Exception e) {
+            OmsPipelineMetrics.finishFixOutboundNos(meterRegistry, outboundSample, "failure");
             log.error("FIX outbound send failed orderId={}", id, e);
         }
     }

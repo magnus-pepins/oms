@@ -10,6 +10,7 @@ import com.balh.oms.events.DomainEventEnvelopeCodec;
 import com.balh.oms.persistence.ControlOutboxRepository;
 import com.balh.oms.persistence.DomainEventOutboxRepository;
 import com.balh.oms.persistence.LedgerInflightOutboxRepository;
+import com.balh.oms.observability.metrics.OmsPipelineMetrics;
 import com.balh.oms.observability.otel.IngressToFixNosLatencyRecorder;
 import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.domain.Side;
@@ -105,6 +106,19 @@ public class OrderIngressService {
      */
     @Transactional
     public IngressResult persistAccepted(CreateOrderRequest req) {
+        Timer.Sample ingressSample = Timer.start(meterRegistry);
+        try {
+            IngressResult result = persistAcceptedBody(req);
+            OmsPipelineMetrics.finishIngressAccept(
+                    meterRegistry, ingressSample, result.created() ? "created" : "duplicate");
+            return result;
+        } catch (RuntimeException e) {
+            OmsPipelineMetrics.finishIngressAccept(meterRegistry, ingressSample, "error");
+            throw e;
+        }
+    }
+
+    private IngressResult persistAcceptedBody(CreateOrderRequest req) {
         maybeVerifyLedgerBalanceBinding(req);
 
         UUID id = UUID.randomUUID();

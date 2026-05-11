@@ -15,7 +15,9 @@ import com.balh.oms.risk.BuyingPowerAdmission;
 import com.balh.oms.risk.ControlRiskEvaluator;
 import com.balh.oms.routing.RouteDispatcher;
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.balh.oms.observability.metrics.OmsPipelineMetrics;
 import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -83,6 +85,18 @@ public class ControlTailer {
 
     @Transactional
     public TailResult apply(PendingControlEvent event) {
+        Timer.Sample sample = Timer.start(meterRegistry);
+        try {
+            TailResult result = applyBody(event);
+            OmsPipelineMetrics.finishControlApply(meterRegistry, sample, result.name());
+            return result;
+        } catch (RuntimeException e) {
+            OmsPipelineMetrics.finishControlApply(meterRegistry, sample, "exception");
+            throw e;
+        }
+    }
+
+    private TailResult applyBody(PendingControlEvent event) {
         if (stale.isStale(event.orderTimestamp())) {
             boolean updated = orders.updateWithCas(
                     event.orderId(),

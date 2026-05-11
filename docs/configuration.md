@@ -273,6 +273,19 @@ These metrics are always registered when the corresponding code paths run; they 
 | `oms.marketdata.nbbo.fetch` | `Timer` (`tag` **`source=http`**) | HTTP NBBO fetch inside **`resolveNbbo`** when **`OMS_MARKETDATA_HTTP_NBBO_IN_MARKET_CONTEXT_ENABLED`** and **`OMS_MARKETDATA_HTTP_ENABLED`** are **`true`**. | **`OMS_MARKETDATA_HTTP_BASE_URL`**, timeouts, **`OMS_MARKETDATA_HTTP_NBBO_PATH`**. |
 | `oms.ledger.settlement.outbox.post` | `Timer` | Per-row **`LedgerSettlementPostingClient.postSettlementOutbox`** plus **`markPosted`** when **`OMS_LEDGER_SETTLEMENT_OUTBOX_RECONCILER_ENABLED`** is **`true`** (success path only; failures increment **`oms_ledger_settlement_outbox_failed_total`**). | **`OMS_LEDGER_SETTLEMENT_OUTBOX_RECONCILER_*`**, **`OMS_LEDGER_SETTLEMENT_OUTBOX_ENABLED`**. |
 
+### Slice-1 order pipeline (Micrometer `Timer`s)
+
+Histograms use **`publishPercentileHistogram()`** with expected bounds **`1 ms`–`120 s`** (see `OmsPipelineLatencyBounds`). On Prometheus these appear as **`oms_pipeline_*_seconds_bucket`** (name dots become underscores).
+
+| Meter name | Tags | What it measures |
+|------------|------|------------------|
+| `oms.pipeline.ingress.accept` | **`outcome`**: `created`, `duplicate`, `error` | **`OrderIngressService.persistAccepted`** Postgres transaction until commit (orders + **`control_outbox`** + **`domain_event_outbox`**). Does **not** include async Chronicle append. |
+| `oms.pipeline.control.outbox_to_chronicle_lag` | — | Wall time from **`control_outbox.enqueued_at`** until **`OutboxReconciler`** successfully appends to Chronicle and **`markAppended`** (queue wait + reconciler tick). |
+| `oms.pipeline.control.chronicle_append` | — | **`journal.append`** + **`markAppended`** for one outbox row (reconciler-local work). |
+| `oms.pipeline.control.apply` | **`result`**: `ControlTailer.TailResult` name or `exception` | **`ControlTailer.apply`** transaction (stale guard, risk, buying power, CAS, domain outbox). |
+| `oms.pipeline.fix.outbound_nos` | **`outcome`**: `success`, `failure` | After token acquire: build **`NewOrderSingle`** + **`Session.sendToTarget`**. |
+| `oms.pipeline.ingress_to_fix_nos` | — | **End-to-end** wall time from committed NEW order (same start as OTel **`oms.fix.ingress_to_nos`**) to successful NOS send. Recorded on **`/actuator/prometheus`** whenever **`oms.routing.backend=fix`**, **without** requiring **`OMS_OTEL_METRICS_ENABLED`**. |
+
 **Clock skew:** there is no `oms_clock_offset_ms` gauge in OMS yet; compare venue **`SendingTime`** / ER timestamps to server clock in logs or derive offset in your metrics stack if you need best-ex wall-clock budgets.
 
 ## Observability (OpenTelemetry, optional)
@@ -288,7 +301,7 @@ When **`OMS_OTEL_METRICS_ENABLED=true`**, OMS starts an OpenTelemetry **`SdkMete
 
 ### Histogram: HTTP accept → FIX `NewOrderSingle` (happy path)
 
-**Instrument:** `oms.fix.ingress_to_nos` (unit **`ms`**). Recorded only when **`oms.routing.backend=fix`**, after a **new** order row commits on internal **`POST /internal/v1/orders`**, until **`Session.sendToTarget`** succeeds for that order’s NOS.
+**Instrument:** `oms.fix.ingress_to_nos` (unit **`ms`**). Recorded only when **`oms.routing.backend=fix`**, after a **new** order row commits on internal **`POST /internal/v1/orders`**, until **`Session.sendToTarget`** succeeds for that order’s NOS. The same duration is also recorded as the Micrometer timer **`oms.pipeline.ingress_to_fix_nos`** on **`/actuator/prometheus`** (no OTel env required).
 
 Prometheus scrape text uses underscores (exporter-dependent suffixes such as **`_milliseconds_bucket`** may appear). Discover on your build with:
 

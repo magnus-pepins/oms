@@ -1,6 +1,7 @@
 package com.balh.oms.config;
 
 import com.balh.oms.chronicle.ChronicleTailDriver;
+import com.balh.oms.fix.FixOutboundDriver;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.context.annotation.Configuration;
 
@@ -618,6 +619,17 @@ public class OmsConfig {
         private String targetCompId = "BROKER_ACCEPT";
         private int heartBtInt = 30;
         private long outboundPollIntervalMs = 100L;
+        private FixOutboundDriver outboundDriver = FixOutboundDriver.SCHEDULED;
+        /**
+         * When {@link #outboundDriver} is {@link FixOutboundDriver#DEDICATED}, max nanoseconds to block on an empty
+         * outbound queue before polling again ({@code 0} uses {@link com.balh.oms.fix.FixOutboundDispatchWorker} minimum wait).
+         */
+        private long outboundDedicatedIdleParkNanos = 100_000L;
+        /**
+         * When {@link #outboundDriver} is {@link FixOutboundDriver#DEDICATED}, park duration when FIX session is not
+         * logged on or route {@code send_enabled} is false.
+         */
+        private long outboundDedicatedNotReadyParkNanos = 50_000_000L;
         /** 0 = disabled; otherwise reject WORKING orders at FIX dequeue when older than this (ms). */
         private long maxOutboundJobAgeMs = 0L;
         /** Venue id stamped on {@code ExecutionTradeCommand} from inbound ERs. */
@@ -711,6 +723,24 @@ public class OmsConfig {
         public long getOutboundPollIntervalMs() { return outboundPollIntervalMs; }
         public void setOutboundPollIntervalMs(long outboundPollIntervalMs) {
             this.outboundPollIntervalMs = Math.max(1L, outboundPollIntervalMs);
+        }
+        public FixOutboundDriver getOutboundDriver() {
+            return outboundDriver;
+        }
+        public void setOutboundDriver(FixOutboundDriver outboundDriver) {
+            this.outboundDriver = outboundDriver;
+        }
+        public long getOutboundDedicatedIdleParkNanos() {
+            return outboundDedicatedIdleParkNanos;
+        }
+        public void setOutboundDedicatedIdleParkNanos(long outboundDedicatedIdleParkNanos) {
+            this.outboundDedicatedIdleParkNanos = Math.max(0L, outboundDedicatedIdleParkNanos);
+        }
+        public long getOutboundDedicatedNotReadyParkNanos() {
+            return outboundDedicatedNotReadyParkNanos;
+        }
+        public void setOutboundDedicatedNotReadyParkNanos(long outboundDedicatedNotReadyParkNanos) {
+            this.outboundDedicatedNotReadyParkNanos = Math.max(0L, outboundDedicatedNotReadyParkNanos);
         }
         public long getMaxOutboundJobAgeMs() {
             return maxOutboundJobAgeMs;

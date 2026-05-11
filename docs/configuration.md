@@ -159,11 +159,11 @@ Transport choice vs MQTT: [marketdata-ingestion-path.md](marketdata-ingestion-pa
 
 ## FIX (slice 4+)
 
-Used when `OMS_ROUTING_BACKEND=fix`. See [fix-out.md](fix-out.md) for session maps and runbooks.
+Used when `OMS_ROUTING_BACKEND=fix`. See [fix-out.md](fix-out.md) for session maps and runbooks. Outbound wake (`scheduled` vs `dedicated`): [fix-outbound-driver.md](fix-outbound-driver.md).
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `OMS_FIX_AUTO_START` | `false` | When `true` (and routing `fix`), starts QuickFIX/J `SocketInitiator` and the outbound drain scheduler. |
+| `OMS_FIX_AUTO_START` | `false` | When `true` (and routing `fix`), starts QuickFIX/J `SocketInitiator` and the outbound drain worker. |
 | `OMS_FIX_OUTBOUND_QUEUE_CAPACITY` | `10000` | Bounded queue for `WORKING` order ids awaiting NOS. |
 | `OMS_FIX_FILE_STORE_PATH` | `./queues/fix` | QuickFIX/J file store path. |
 | `OMS_FIX_SOCKET_CONNECT_HOST` | `127.0.0.1` | Acceptor host. |
@@ -171,7 +171,10 @@ Used when `OMS_ROUTING_BACKEND=fix`. See [fix-out.md](fix-out.md) for session ma
 | `OMS_FIX_SENDER_COMP_ID` | `OMS_INIT` | Session sender comp id. |
 | `OMS_FIX_TARGET_COMP_ID` | `BROKER_ACCEPT` | Session target comp id. |
 | `OMS_FIX_HEART_BT_INT` | `30` | Heartbeat interval (seconds). |
-| `OMS_FIX_OUTBOUND_POLL_INTERVAL_MS` | `100` | Delay between outbound worker ticks. |
+| `OMS_FIX_OUTBOUND_DRIVER` | `scheduled` | `scheduled` (Spring fixed delay) or `dedicated` (thread + `poll` / park). See [fix-outbound-driver.md](fix-outbound-driver.md). |
+| `OMS_FIX_OUTBOUND_POLL_INTERVAL_MS` | `100` | When **`outbound-driver=scheduled`**, delay between `drainPendingOutboundOnce` runs. |
+| `OMS_FIX_OUTBOUND_DEDICATED_IDLE_PARK_NANOS` | `100000` | When **`outbound-driver=dedicated`**, `BlockingQueue.poll` timeout when waiting for work. |
+| `OMS_FIX_OUTBOUND_DEDICATED_NOT_READY_PARK_NANOS` | `50000000` | When **`outbound-driver=dedicated`**, park when session not logged on or route send disabled (`0` → 1 ms floor). |
 | `OMS_FIX_MAX_OUTBOUND_JOB_AGE_MS` | `0` | **0** = off; else reject stale `WORKING` at dequeue (`FIX_OUTBOUND_JOB_EXPIRED`). |
 | `OMS_FIX_VENUE_ID_FOR_EXECUTIONS` | `FIX` | `venue_id` on executions from inbound ERs. |
 | `OMS_FIX_USE_DATA_DICTIONARY` | `false` | QuickFIX/J data dictionary flag. |

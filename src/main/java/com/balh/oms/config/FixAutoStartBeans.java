@@ -4,6 +4,7 @@ import com.zaxxer.hikari.HikariDataSource;
 import com.balh.oms.fix.FixInitiatorManager;
 import com.balh.oms.fix.FixNewOrderSingleBuilder;
 import com.balh.oms.fix.FixOutboundDispatchWorker;
+import com.balh.oms.fix.FixOutboundDriver;
 import com.balh.oms.fix.FixOutboundTokenBucket;
 import com.balh.oms.fix.FixRouteDispatcher;
 import com.balh.oms.fix.FixSessionRegistry;
@@ -19,8 +20,11 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.env.Environment;
+import org.springframework.scheduling.annotation.SchedulingConfigurer;
+import org.springframework.scheduling.config.ScheduledTaskRegistrar;
 
 import javax.sql.DataSource;
+import java.time.Duration;
 
 /**
  * FIX initiator + outbound scheduler when {@code oms.routing.backend=fix} and {@code oms.fix.auto-start=true}.
@@ -28,6 +32,8 @@ import javax.sql.DataSource;
 @Configuration(proxyBeanMethods = false)
 @ConditionalOnProperty(name = "oms.routing.backend", havingValue = "fix")
 public class FixAutoStartBeans {
+
+    private static final long MIN_FIX_OUTBOUND_POLL_INTERVAL_MS = 1L;
 
     @Bean
     @ConditionalOnProperty(name = "oms.fix.auto-start", havingValue = "true")
@@ -81,5 +87,23 @@ public class FixAutoStartBeans {
                 fixRouteStateRepository,
                 fixOutboundTokenBucket,
                 ingressToFixNosLatencyRecorder);
+    }
+
+    /**
+     * Registers fixed-delay {@link FixOutboundDispatchWorker#drainPendingOutboundOnce()} when
+     * {@code oms.fix.outbound-driver=scheduled}. When {@code dedicated}, this configurer is a no-op so we do not
+     * register duplicate @{@link org.springframework.boot.autoconfigure.condition.ConditionalOnProperty} annotations
+     * (not repeatable on the same element).
+     */
+    @Bean
+    @ConditionalOnProperty(name = "oms.fix.auto-start", havingValue = "true")
+    SchedulingConfigurer fixOutboundPollScheduling(FixOutboundDispatchWorker worker, OmsConfig omsConfig) {
+        return registrar -> {
+            if (omsConfig.getFix().getOutboundDriver() != FixOutboundDriver.SCHEDULED) {
+                return;
+            }
+            long ms = Math.max(MIN_FIX_OUTBOUND_POLL_INTERVAL_MS, omsConfig.getFix().getOutboundPollIntervalMs());
+            registrar.addFixedDelayTask(worker::drainPendingOutboundOnce, Duration.ofMillis(ms));
+        };
     }
 }

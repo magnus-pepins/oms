@@ -8,6 +8,7 @@ import org.slf4j.LoggerFactory;
 
 import java.util.UUID;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.TimeUnit;
 
 /**
  * FIX outbound route (slice 4): implements {@link RouteDispatcher} by enqueueing {@code WORKING}
@@ -44,6 +45,13 @@ public final class FixRouteDispatcher implements RouteDispatcher {
      */
     public UUID pollPendingOrNull() {
         return pendingOrderIds.poll();
+    }
+
+    /**
+     * Blocking wait for an id (used by {@link FixOutboundDriver#DEDICATED}). Returns {@code null} on timeout or interrupt.
+     */
+    public UUID pollPending(long timeout, TimeUnit unit) throws InterruptedException {
+        return pendingOrderIds.poll(timeout, unit);
     }
 
     public int pendingCountForTests() {

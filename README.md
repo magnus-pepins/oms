@@ -178,5 +178,6 @@ tests execute instead of being skipped.
 - [docs/return-path.md](docs/return-path.md) — executions, simulated routing, idempotency, slice-6 fill→positions.
 - [docs/settlement.md](docs/settlement.md) — custody, `positions`, broker confirm queue, §12.3 transitions, internal `/internal/v1/settlement/**` (executions list/detail, **manual-actions** stage/list/approve).
 - [docs/fix-out.md](docs/fix-out.md) — FIX slice 4 wiring status.
+- [docs/fix-outbound-driver.md](docs/fix-outbound-driver.md) — `scheduled` vs `dedicated` FIX outbound wake / latency tuning.
 - [docs/configuration.md](docs/configuration.md) — every named limit /
   env key in one place.

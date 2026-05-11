@@ -50,6 +50,7 @@ class FixOutboundRouteDisabledSpringIntegrationTest extends AbstractPostgresInte
         registry.add("oms.fix.sender-comp-id", () -> "INITIATOR");
         registry.add("oms.fix.target-comp-id", () -> "ACCEPTOR");
         registry.add("oms.fix.outbound-poll-interval-ms", () -> "25");
+        registry.add("oms.fix.outbound-driver", () -> "dedicated");
         registry.add("oms.fix.venue-id-for-executions", () -> "FIX_IT");
         registry.add("oms.risk.instrument-allowlist-enabled", () -> "false");
     }

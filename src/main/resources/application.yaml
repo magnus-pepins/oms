@@ -206,6 +206,10 @@ oms:
     target-comp-id: ${OMS_FIX_TARGET_COMP_ID:BROKER_ACCEPT}
     heart-bt-int: ${OMS_FIX_HEART_BT_INT:30}
     outbound-poll-interval-ms: ${OMS_FIX_OUTBOUND_POLL_INTERVAL_MS:100}
+    # scheduled | dedicated — see docs/fix-outbound-driver.md
+    outbound-driver: ${OMS_FIX_OUTBOUND_DRIVER:scheduled}
+    outbound-dedicated-idle-park-nanos: ${OMS_FIX_OUTBOUND_DEDICATED_IDLE_PARK_NANOS:100000}
+    outbound-dedicated-not-ready-park-nanos: ${OMS_FIX_OUTBOUND_DEDICATED_NOT_READY_PARK_NANOS:50000000}
     max-outbound-job-age-ms: ${OMS_FIX_MAX_OUTBOUND_JOB_AGE_MS:0}
     venue-id-for-executions: ${OMS_FIX_VENUE_ID_FOR_EXECUTIONS:FIX}
     use-data-dictionary: ${OMS_FIX_USE_DATA_DICTIONARY:false}

@@ -9,6 +9,7 @@ import com.balh.oms.persistence.FixRouteStateRepository;
 import com.balh.oms.persistence.FixRouteStateRow;
 import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.returnpath.ExecutionReportApplier;
+import com.balh.oms.routing.RouteDispatcher;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
 import jakarta.annotation.PostConstruct;
@@ -27,7 +28,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
 
 /**
- * Drains {@link FixRouteDispatcher} after logon and sends {@link NewOrderSingle} on the active session.
+ * Drains {@link FixOutboundOrderDequeue} after logon and sends {@link NewOrderSingle} on the active session.
  *
  * <p>Drain cadence is either Spring scheduling ({@link FixOutboundDriver#SCHEDULED}) or a dedicated thread
  * ({@link FixOutboundDriver#DEDICATED}); see {@code docs/fix-outbound-driver.md}.
@@ -46,7 +47,8 @@ public class FixOutboundDispatchWorker implements DisposableBean {
     /** Minimum wait when polling the queue with {@code idleParkNanos == 0} to avoid a zero-timeout spin storm. */
     private static final long MIN_QUEUE_POLL_WAIT_NANOS = 1L;
 
-    private final FixRouteDispatcher fixRouteDispatcher;
+    private final RouteDispatcher routeEnqueue;
+    private final FixOutboundOrderDequeue fixOutboundDequeue;
     private final FixSessionRegistry fixSessionRegistry;
     private final OrdersRepository ordersRepository;
     private final FixNewOrderSingleBuilder newOrderSingleBuilder;
@@ -62,7 +64,8 @@ public class FixOutboundDispatchWorker implements DisposableBean {
     private Thread dedicatedThread;
 
     public FixOutboundDispatchWorker(
-            FixRouteDispatcher fixRouteDispatcher,
+            RouteDispatcher routeEnqueue,
+            FixOutboundOrderDequeue fixOutboundDequeue,
             FixSessionRegistry fixSessionRegistry,
             OrdersRepository ordersRepository,
             FixNewOrderSingleBuilder newOrderSingleBuilder,
@@ -72,7 +75,8 @@ public class FixOutboundDispatchWorker implements DisposableBean {
             FixRouteStateRepository fixRouteStateRepository,
             FixOutboundTokenBucket fixOutboundTokenBucket,
             IngressToFixNosLatencyRecorder ingressToFixNosLatencyRecorder) {
-        this.fixRouteDispatcher = fixRouteDispatcher;
+        this.routeEnqueue = routeEnqueue;
+        this.fixOutboundDequeue = fixOutboundDequeue;
         this.fixSessionRegistry = fixSessionRegistry;
         this.ordersRepository = ordersRepository;
         this.newOrderSingleBuilder = newOrderSingleBuilder;
@@ -113,7 +117,7 @@ public class FixOutboundDispatchWorker implements DisposableBean {
             meterRegistry.counter(FixMetrics.METRIC_OUTBOUND_ROUTE_DISABLED_SKIPS).increment();
             return;
         }
-        UUID id = fixRouteDispatcher.pollPendingOrNull();
+        UUID id = fixOutboundDequeue.pollOrNull();
         if (id == null) {
             return;
         }
@@ -134,7 +138,7 @@ public class FixOutboundDispatchWorker implements DisposableBean {
                 }
                 long waitNanos = Math.max(
                         MIN_QUEUE_POLL_WAIT_NANOS, omsConfig.getFix().getOutboundDedicatedIdleParkNanos());
-                UUID id = fixRouteDispatcher.pollPending(waitNanos, TimeUnit.NANOSECONDS);
+                UUID id = fixOutboundDequeue.poll(waitNanos, TimeUnit.NANOSECONDS);
                 if (id == null) {
                     continue;
                 }
@@ -168,7 +172,7 @@ public class FixOutboundDispatchWorker implements DisposableBean {
         }
         if (!fixOutboundTokenBucket.tryAcquire()) {
             meterRegistry.counter(FixMetrics.METRIC_OUTBOUND_THROTTLED_REQUEUES).increment();
-            fixRouteDispatcher.enqueueWorkingOrder(id);
+            routeEnqueue.enqueueWorkingOrder(id);
             return;
         }
         Timer.Sample outboundSample = Timer.start(meterRegistry);

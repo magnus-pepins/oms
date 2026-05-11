@@ -2,6 +2,7 @@ package com.balh.oms.config;
 
 import com.balh.oms.chronicle.ChronicleTailDriver;
 import com.balh.oms.fix.FixOutboundDriver;
+import com.balh.oms.fix.FixOutboundHandoffTransport;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.context.annotation.Configuration;
 
@@ -630,6 +631,7 @@ public class OmsConfig {
          * logged on or route {@code send_enabled} is false.
          */
         private long outboundDedicatedNotReadyParkNanos = 50_000_000L;
+        private FixOutboundHandoffTransport outboundHandoffTransport = FixOutboundHandoffTransport.MEMORY;
         /** 0 = disabled; otherwise reject WORKING orders at FIX dequeue when older than this (ms). */
         private long maxOutboundJobAgeMs = 0L;
         /** Venue id stamped on {@code ExecutionTradeCommand} from inbound ERs. */
@@ -741,6 +743,12 @@ public class OmsConfig {
         }
         public void setOutboundDedicatedNotReadyParkNanos(long outboundDedicatedNotReadyParkNanos) {
             this.outboundDedicatedNotReadyParkNanos = Math.max(0L, outboundDedicatedNotReadyParkNanos);
+        }
+        public FixOutboundHandoffTransport getOutboundHandoffTransport() {
+            return outboundHandoffTransport;
+        }
+        public void setOutboundHandoffTransport(FixOutboundHandoffTransport outboundHandoffTransport) {
+            this.outboundHandoffTransport = outboundHandoffTransport;
         }
         public long getMaxOutboundJobAgeMs() {
             return maxOutboundJobAgeMs;

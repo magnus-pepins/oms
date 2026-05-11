@@ -172,6 +172,7 @@ Used when `OMS_ROUTING_BACKEND=fix`. See [fix-out.md](fix-out.md) for session ma
 | `OMS_FIX_TARGET_COMP_ID` | `BROKER_ACCEPT` | Session target comp id. |
 | `OMS_FIX_HEART_BT_INT` | `30` | Heartbeat interval (seconds). |
 | `OMS_FIX_OUTBOUND_DRIVER` | `scheduled` | `scheduled` (Spring fixed delay) or `dedicated` (thread + `poll` / park). See [fix-outbound-driver.md](fix-outbound-driver.md). |
+| `OMS_FIX_OUTBOUND_HANDOFF_TRANSPORT` | `memory` | `memory` — in-process `BlockingQueue`. **`postgres`** — table `fix_outbound_handoff` with `SKIP LOCKED` pop (multi-producer → single consumer). |
 | `OMS_FIX_OUTBOUND_POLL_INTERVAL_MS` | `100` | When **`outbound-driver=scheduled`**, delay between `drainPendingOutboundOnce` runs. |
 | `OMS_FIX_OUTBOUND_DEDICATED_IDLE_PARK_NANOS` | `100000` | When **`outbound-driver=dedicated`**, `BlockingQueue.poll` timeout when waiting for work. |
 | `OMS_FIX_OUTBOUND_DEDICATED_NOT_READY_PARK_NANOS` | `50000000` | When **`outbound-driver=dedicated`**, park when session not logged on or route send disabled (`0` → 1 ms floor). |

@@ -1,5 +1,7 @@
 package com.balh.oms.config;
 
+import com.balh.oms.fix.FixRouteDispatcher;
+import com.balh.oms.fix.PostgresFixHandoffRouteDispatcher;
 import com.balh.oms.routing.RouteDispatcher;
 import com.balh.oms.routing.SimulatedBrokerDispatcher;
 import org.springframework.beans.factory.ObjectProvider;
@@ -16,7 +18,8 @@ public class RoutingDispatchConfiguration {
     public RouteDispatcher routeDispatcher(
             @Value("${oms.routing.backend:noop}") String backend,
             ObjectProvider<SimulatedBrokerDispatcher> simulatedDispatcher,
-            ObjectProvider<com.balh.oms.fix.FixRouteDispatcher> fixDispatcher) {
+            ObjectProvider<PostgresFixHandoffRouteDispatcher> postgresFixHandoffDispatcher,
+            ObjectProvider<FixRouteDispatcher> fixRouteDispatcher) {
         if ("simulated".equalsIgnoreCase(backend)) {
             SimulatedBrokerDispatcher dispatcher = simulatedDispatcher.getIfAvailable();
             if (dispatcher == null) {
@@ -26,10 +29,14 @@ public class RoutingDispatchConfiguration {
             return dispatcher;
         }
         if ("fix".equalsIgnoreCase(backend)) {
-            com.balh.oms.fix.FixRouteDispatcher fix = fixDispatcher.getIfAvailable();
+            PostgresFixHandoffRouteDispatcher pg = postgresFixHandoffDispatcher.getIfAvailable();
+            if (pg != null) {
+                return pg;
+            }
+            FixRouteDispatcher fix = fixRouteDispatcher.getIfAvailable();
             if (fix == null) {
                 throw new IllegalStateException(
-                        "oms.routing.backend=fix requires FixRouteDispatcher (check FixRoutingBeans wiring)");
+                        "oms.routing.backend=fix requires FixRouteDispatcher or PostgresFixHandoffRouteDispatcher (check FixRoutingBeans wiring)");
             }
             return fix;
         }

@@ -5,14 +5,15 @@ import com.balh.oms.fix.FixInitiatorManager;
 import com.balh.oms.fix.FixNewOrderSingleBuilder;
 import com.balh.oms.fix.FixOutboundDispatchWorker;
 import com.balh.oms.fix.FixOutboundDriver;
+import com.balh.oms.fix.FixOutboundOrderDequeue;
 import com.balh.oms.fix.FixOutboundTokenBucket;
-import com.balh.oms.fix.FixRouteDispatcher;
 import com.balh.oms.fix.FixSessionRegistry;
 import com.balh.oms.fix.OmsFixApplication;
 import com.balh.oms.observability.otel.IngressToFixNosLatencyRecorder;
 import com.balh.oms.persistence.FixRouteStateRepository;
 import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.returnpath.ExecutionReportApplier;
+import com.balh.oms.routing.RouteDispatcher;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -66,7 +67,8 @@ public class FixAutoStartBeans {
     @Bean
     @ConditionalOnProperty(name = "oms.fix.auto-start", havingValue = "true")
     FixOutboundDispatchWorker fixOutboundDispatchWorker(
-            FixRouteDispatcher fixRouteDispatcher,
+            RouteDispatcher routeDispatcher,
+            FixOutboundOrderDequeue fixOutboundOrderDequeue,
             FixSessionRegistry fixSessionRegistry,
             OrdersRepository ordersRepository,
             FixNewOrderSingleBuilder newOrderSingleBuilder,
@@ -77,7 +79,8 @@ public class FixAutoStartBeans {
             FixOutboundTokenBucket fixOutboundTokenBucket,
             IngressToFixNosLatencyRecorder ingressToFixNosLatencyRecorder) {
         return new FixOutboundDispatchWorker(
-                fixRouteDispatcher,
+                routeDispatcher,
+                fixOutboundOrderDequeue,
                 fixSessionRegistry,
                 ordersRepository,
                 newOrderSingleBuilder,

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Smoke: POST one internal order, then print OpenTelemetry Prometheus lines for ingress→FIX NOS latency.
 # Requires: OMS running with oms.routing.backend=fix, FIX session logged on, OTel metrics enabled, and a broker/acceptor.
+# Local synthetic acceptor: ./gradlew fixLoopbackAcceptor (see docs/fix-out.md).
 #
 # Usage:
 #   export OMS_INTERNAL_API_KEY=...

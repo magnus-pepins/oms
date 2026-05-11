@@ -68,6 +68,29 @@ Broker day-rollover and test acceptors often require **`ResetOnLogon=Y`** (Quick
 - **Inbound `ExecutionReport`:** `ClOrdID` → order id (UUID); `ExecID` → `venue_exec_ref`; `TransactTime` → `venueTs` (fallback `Instant.now()`); **Fill / Partial fill:** `LastQty`, `LastPx` (optional → `0`), `LeavesQty`, `CumQty`; **Canceled:** `ExecType=CANCELED`; **Rejected (new order):** `ExecType=Rejected` → `OrderRejected` / `terminal_reason=VENUE_REJECT`.
 - **Inbound `OrderCancelReject` (9):** `OrigClOrdID` (else `ClOrdID`) → order id; `venue_exec_ref` = `ocr-{OrderID}-{CxlRejReason}`; same **`OrderRejected`** path as ER reject.
 
+## Local synthetic traffic (no real broker)
+
+Use the same QuickFIX loopback pattern as **`FixRoundTripSpringIntegrationTest`**, but as **two processes** so you can drive **HTTP** load while watching **Micrometer** (`/actuator/prometheus`) or **OTel** (`:9464/metrics` when `OMS_OTEL_METRICS_ENABLED=true`).
+
+1. **Acceptor (terminal A)** — auto-replies to each **`D`** with a synthetic full-fill **`ExecutionReport`** (same handler as the IT, **`FixRoundTripAcceptorApplication`**):
+
+   ```bash
+   ./gradlew fixLoopbackAcceptor
+   ```
+
+   Defaults: listen **`9876`**, session **`SenderCompID=BROKER_ACCEPT`**, **`TargetCompID=OMS_INIT`** (must match OMS defaults **`oms.fix.sender-comp-id` / `oms.fix.target-comp-id`**). Override with **`FIX_ACCEPTOR_PORT`**, **`FIX_ACCEPTOR_SESSION_SENDER`**, **`FIX_ACCEPTOR_SESSION_TARGET`**, **`FIX_ACCEPTOR_FILE_STORE`** if your OMS env differs.
+
+2. **OMS (terminal B)** — e.g. `OMS_ROUTING_BACKEND=fix`, **`OMS_FIX_AUTO_START=true`**, **`OMS_FIX_SOCKET_CONNECT_HOST=127.0.0.1`**, port aligned with step 1. For unrestricted symbols in dev, set **`OMS_RISK_INSTRUMENT_ALLOWLIST_ENABLED=false`** (or add your symbol to the allowlist). Ensure **`fix_route_state.send_enabled`** is **true** for your route key.
+
+3. **HTTP shooter (terminal C)** — many **`POST /internal/v1/orders`** with unique idempotency keys:
+
+   ```bash
+   export OMS_INTERNAL_API_KEY=…
+   ./scripts/benchmark/shoot-ingress-orders.sh   # SHOOT_COUNT=200 SHOOT_SLEEP_MS=10 env optional
+   ```
+
+See also **`scripts/benchmark/ingress-to-fix-nos-smoke.sh`** (single POST + optional OTel scrape grep).
+
 ## Runbook notes
 
 - With **`OMS_ROUTING_BACKEND=fix`** and **`OMS_FIX_AUTO_START=false`**, the app loads FIX beans but does **not** open a TCP session — useful for integration tests and staged deploys.

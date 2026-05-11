@@ -139,6 +139,15 @@ tasks.named<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJar") {
     archiveBaseName.set("oms")
 }
 
+/** Minimal FIX 4.4 loopback acceptor for local OMS + HTTP load scripts (see docs/fix-out.md § synthetic traffic). */
+tasks.register<JavaExec>("fixLoopbackAcceptor") {
+    group = "development"
+    description =
+        "Start QuickFIX loopback acceptor (auto-fill ER). Env: FIX_ACCEPTOR_PORT, FIX_ACCEPTOR_FILE_STORE, FIX_ACCEPTOR_SESSION_*"
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("com.balh.oms.fix.dev.FixLoopbackAcceptorMain")
+}
+
 /**
  * Micrometer's prometheus registry pins {@code io.prometheus:prometheus-metrics-*} 1.2.x while the OTel
  * Prometheus exporter brings 1.3.x textformats — mixed jars cause {@code NoSuchMethodError} at startup.

@@ -22,6 +22,10 @@ random_uuid() {
 OMS_URL="${OMS_URL:-http://127.0.0.1:8088}"
 OTEL_PROMETHEUS_URL="${OTEL_PROMETHEUS_URL:-http://127.0.0.1:9464/metrics}"
 KEY="${OMS_INTERNAL_API_KEY:?set OMS_INTERNAL_API_KEY}"
+if [[ "$KEY" == *"…"* || "$KEY" == "replace-me-internal-key" ]]; then
+  echo "Refusing to run: OMS_INTERNAL_API_KEY looks like a documentation placeholder." >&2
+  exit 1
+fi
 
 CLIENT_KEY="bench-smoke-$(date +%s)-$RANDOM"
 ACCOUNT_ID="$(random_uuid)"

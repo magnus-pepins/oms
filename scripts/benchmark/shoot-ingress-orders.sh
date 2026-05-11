@@ -9,7 +9,7 @@
 #   3) ./scripts/benchmark/shoot-ingress-orders.sh
 #
 # Env:
-#   OMS_INTERNAL_API_KEY (required)
+#   OMS_INTERNAL_API_KEY (required — must match running OMS, same as OMS_INTERNAL_API_KEY on bootRun)
 #   OMS_URL              default http://127.0.0.1:8088
 #   SHOOT_COUNT          default 50
 #   SHOOT_SLEEP_MS       default 0   (sleep between POSTs)
@@ -24,13 +24,19 @@ random_uuid() {
 }
 
 OMS_URL="${OMS_URL:-http://127.0.0.1:8088}"
-KEY="${OMS_INTERNAL_API_KEY:?set OMS_INTERNAL_API_KEY}"
+KEY="${OMS_INTERNAL_API_KEY:?set OMS_INTERNAL_API_KEY (must match the running OMS process — same value as bootRun / OMS_INTERNAL_API_KEY)}"
+if [[ "$KEY" == *"…"* || "$KEY" == "replace-me-internal-key" ]]; then
+  echo "Refusing to run: OMS_INTERNAL_API_KEY looks like a documentation placeholder." >&2
+  echo "Set a real secret and use the identical value when starting OMS (oms.http.internal-api-key)." >&2
+  exit 1
+fi
 COUNT="${SHOOT_COUNT:-50}"
 SLEEP_MS="${SHOOT_SLEEP_MS:-0}"
 SYM="${SHOOT_INSTRUMENT:-AAPL}"
 QTY="${SHOOT_QTY:-1}"
 LIM="${SHOOT_LIMIT:-150}"
 
+hinted_401=false
 ok=0
 fail=0
 for i in $(seq 1 "$COUNT"); do
@@ -53,6 +59,12 @@ for i in $(seq 1 "$COUNT"); do
   else
     fail=$((fail + 1))
     echo "FAIL i=$i http=$code" >&2
+    if [[ "$code" == "401" && "$hinted_401" == "false" ]]; then
+      hinted_401=true
+      echo "  401: header X-OMS-Internal-Key must exactly match OMS_INTERNAL_API_KEY on the running OMS." >&2
+      echo "  If OMS was started without OMS_INTERNAL_API_KEY, oms.http.internal-api-key is empty and every request is rejected." >&2
+      echo "  Restart OMS with the same export you use here, e.g. export OMS_INTERNAL_API_KEY='your-secret'" >&2
+    fi
     head -c 500 /tmp/oms-shoot-last.json >&2 || true
     echo >&2
   fi

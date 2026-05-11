@@ -17,11 +17,20 @@
 #   SHOOT_QTY            default 1
 #   SHOOT_LIMIT          default 150
 #   SHOOT_PRINT_EACH     default 0   (set to 1 to print each request's HTTP time on stderr)
+#   SHOOT_OTEL_METRICS_URL  optional, e.g. http://127.0.0.1:9464/metrics — after the batch, scrape and print
+#                           lines matching ingress_to_nos (server histogram: committed accept → FIX NOS sent).
+#   SHOOT_OTEL_SCRAPE_SLEEP_SEC  default 2 — wait before scrape so async tail + FIX can finish.
 #
-# Latency note:
-#   curl %{time_total} is client wall time until the HTTP response completes (TLS/TCP + server work).
-#   That is NOT the same as OTel histogram oms.fix.ingress_to_nos (accept → FIX NOS on wire), which
-#   can lag after 201. For that, scrape OMS_OTEL_PROMETHEUS_PORT (default 9464) and use histogram_quantile.
+# What is measured:
+#   • curl time_total below = HTTP client wall time until the 201/200 response is done. That ends right after
+#     the ingress transaction commits (order + control_outbox rows). It does NOT wait for Chronicle/control,
+#     BuyingPowerAdmission, or FIX send.
+#   • Full path accept → NOS on the wire is the OTel histogram oms.fix.ingress_to_nos (ms), recorded inside OMS
+#     from commit until Session.sendToTarget succeeds. Enable OMS_OTEL_METRICS_ENABLED and fix routing; then set
+#     SHOOT_OTEL_METRICS_URL or scrape :9464/metrics yourself and use histogram_quantile on _bucket series.
+#
+# Buying power: every order still goes through ControlTailer → buyingPower.evaluate before WORKING/FIX. If the
+#   order has no ledgerBalanceId, that gate returns PROCEED without a Ledger HTTP call (nothing to fund-check).
 
 set -euo pipefail
 
@@ -41,6 +50,7 @@ SLEEP_MS="${SHOOT_SLEEP_MS:-0}"
 SYM="${SHOOT_INSTRUMENT:-AAPL}"
 QTY="${SHOOT_QTY:-1}"
 LIM="${SHOOT_LIMIT:-150}"
+OTEL_SCRAPE_SLEEP_SEC="${SHOOT_OTEL_SCRAPE_SLEEP_SEC:-2}"
 
 hinted_401=false
 ok=0
@@ -91,7 +101,7 @@ echo "done: ok=$ok fail=$fail (expected 201 for new orders; 200 if you reused id
 
 if [[ "$ok" -gt 0 ]]; then
   echo ""
-  echo "HTTP POST time_total (seconds, curl client wall — see script header for OTel vs HTTP):"
+  echo "A) HTTP only — time_total to end of response (seconds). Stops at 201; excludes control + FIX path:"
   python3 - "$TIMES_FILE" <<'PY'
 import sys
 from pathlib import Path
@@ -120,4 +130,17 @@ PY
 else
   echo ""
   echo "No successful responses; skipping HTTP latency summary."
+fi
+
+if [[ -n "${SHOOT_OTEL_METRICS_URL:-}" ]]; then
+  echo ""
+  echo "B) OTel scrape — oms.fix.ingress_to_nos (committed ingress → FIX NOS sent). Raw exposition lines:"
+  sleep "$OTEL_SCRAPE_SLEEP_SEC"
+  metrics="$(curl -fsS "${SHOOT_OTEL_METRICS_URL}" 2>/dev/null || true)"
+  if [[ -z "$metrics" ]]; then
+    echo "  (scrape failed or empty URL response — check OMS_OTEL_METRICS_ENABLED and port 9464)" >&2
+  else
+    echo "$metrics" | grep -E 'ingress_to_nos' || echo "  (no ingress_to_nos lines yet — OTel off, non-fix backend, or no NOS completed)"
+  fi
+  echo "  For percentiles in Prometheus/Grafana use histogram_quantile on the _bucket series (see docs/configuration.md)."
 fi

@@ -18,7 +18,8 @@
 #   SHOOT_LIMIT          default 150
 #   SHOOT_PRINT_EACH     default 0   (set to 1 to print each request's HTTP time on stderr)
 #   SHOOT_OTEL_METRICS_URL  optional, e.g. http://127.0.0.1:9464/metrics — after the batch, scrape and print
-#                           lines matching ingress_to_nos (server histogram: committed accept → FIX NOS sent).
+#                           lines matching ingress_to_nos. Requires the **running OMS** to have been started with
+#                           OMS_OTEL_METRICS_ENABLED=true (default is false — nothing listens on 9464 until then).
 #   SHOOT_OTEL_SCRAPE_SLEEP_SEC  default 2 — wait before scrape so async tail + FIX can finish.
 #
 # What is measured:
@@ -135,12 +136,21 @@ fi
 if [[ -n "${SHOOT_OTEL_METRICS_URL:-}" ]]; then
   echo ""
   echo "B) OTel scrape — oms.fix.ingress_to_nos (committed ingress → FIX NOS sent). Raw exposition lines:"
+  echo "  (requires OMS started with OMS_OTEL_METRICS_ENABLED=true; listener is OMS_OTEL_PROMETHEUS_PORT, default 9464)"
   sleep "$OTEL_SCRAPE_SLEEP_SEC"
-  metrics="$(curl -fsS "${SHOOT_OTEL_METRICS_URL}" 2>/dev/null || true)"
-  if [[ -z "$metrics" ]]; then
-    echo "  (scrape failed or empty URL response — check OMS_OTEL_METRICS_ENABLED and port 9464)" >&2
+  set +e
+  metrics="$(curl -sS -f "${SHOOT_OTEL_METRICS_URL}" 2>&1)"
+  curl_rc=$?
+  set -e
+  if [[ "$curl_rc" -ne 0 ]]; then
+    echo "  scrape failed (curl exit $curl_rc):" >&2
+    while IFS= read -r line || [[ -n "$line" ]]; do echo "    $line" >&2; done <<< "$metrics"
+    echo "  Typical fix: export OMS_OTEL_METRICS_ENABLED=true then restart OMS; confirm:" >&2
+    echo "    curl -fsS ${SHOOT_OTEL_METRICS_URL} | head" >&2
+  elif [[ -z "$metrics" ]]; then
+    echo "  (empty body — unexpected)" >&2
   else
-    echo "$metrics" | grep -E 'ingress_to_nos' || echo "  (no ingress_to_nos lines yet — OTel off, non-fix backend, or no NOS completed)"
+    echo "$metrics" | grep -E 'ingress_to_nos' || echo "  (no ingress_to_nos lines — non-fix backend, or no NOS completed yet; histogram appears after first send)"
   fi
   echo "  For percentiles in Prometheus/Grafana use histogram_quantile on the _bucket series (see docs/configuration.md)."
 fi

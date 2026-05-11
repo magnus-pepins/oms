@@ -1,5 +1,6 @@
 plugins {
     java
+    id("com.google.protobuf") version "0.9.4"
     id("org.springframework.boot") version "3.3.4"
     id("io.spring.dependency-management") version "1.1.6"
 }
@@ -49,6 +50,9 @@ val chronicleJavaModuleOpens =
  */
 val springTestContextCacheMaxSize =
     System.getenv("SPRING_TEST_CONTEXT_CACHE_MAX_SIZE")?.toIntOrNull()?.coerceIn(1, 64) ?: 10
+
+/** Protobuf compiler + runtime (control_outbox + Chronicle wire format). */
+val protobufJavaVersion = "4.29.3"
 
 val openTelemetryVersion = "1.51.0"
 /** Must match OTel prometheus exporter transitive; Micrometer 1.13 pins older 1.2.x without this. */
@@ -104,6 +108,8 @@ dependencies {
     implementation("com.fasterxml.jackson.module:jackson-module-parameter-names")
     implementation("com.fasterxml.jackson.datatype:jackson-datatype-jsr310")
 
+    implementation("com.google.protobuf:protobuf-java:$protobufJavaVersion")
+
     // Test
     testImplementation("org.springframework.boot:spring-boot-starter-test")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
@@ -112,8 +118,16 @@ dependencies {
     testImplementation("org.testcontainers:junit-jupiter:1.20.3")
     testImplementation("org.assertj:assertj-core:3.26.3")
     testImplementation("org.awaitility:awaitility:4.2.2")
+
+    testImplementation("com.google.protobuf:protobuf-java:$protobufJavaVersion")
     // WireMock 3 core does not ship an HTTP server; Jetty 12 extension is required on the test classpath.
     testImplementation("org.wiremock:wiremock-jetty12:3.9.1")
+}
+
+protobuf {
+    protoc {
+        artifact = "com.google.protobuf:protoc:$protobufJavaVersion"
+    }
 }
 
 tasks.withType<Test> {

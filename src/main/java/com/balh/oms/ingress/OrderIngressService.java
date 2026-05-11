@@ -1,5 +1,6 @@
 package com.balh.oms.ingress;
 
+import com.balh.oms.chronicle.ControlChroniclePayloadCodec;
 import com.balh.oms.chronicle.PendingControlEvent;
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.domain.Order;
@@ -54,6 +55,7 @@ public class OrderIngressService {
     private final DomainEventOutboxRepository domainEventOutbox;
     private final DomainEventEnvelopeCodec domainEventEnvelopeCodec;
     private final OmsConfig config;
+    private final ControlChroniclePayloadCodec controlPayloadCodec;
     private final ObjectMapper objectMapper;
     private final PiiHash piiHash;
     private final ObjectProvider<LedgerInflightReservationClient> ledgerInflightReservation;
@@ -68,6 +70,7 @@ public class OrderIngressService {
             DomainEventOutboxRepository domainEventOutbox,
             DomainEventEnvelopeCodec domainEventEnvelopeCodec,
             OmsConfig config,
+            ControlChroniclePayloadCodec controlPayloadCodec,
             ObjectMapper objectMapper,
             PiiHash piiHash,
             ObjectProvider<LedgerInflightReservationClient> ledgerInflightReservation,
@@ -80,6 +83,7 @@ public class OrderIngressService {
         this.domainEventOutbox = domainEventOutbox;
         this.domainEventEnvelopeCodec = domainEventEnvelopeCodec;
         this.config = config;
+        this.controlPayloadCodec = controlPayloadCodec;
         this.objectMapper = objectMapper;
         this.piiHash = piiHash;
         this.ledgerInflightReservation = ledgerInflightReservation;
@@ -262,12 +266,7 @@ public class OrderIngressService {
     }
 
     private String serializePayload(PendingControlEvent ev) {
-        try {
-            return objectMapper.writeValueAsString(ev);
-        } catch (JsonProcessingException e) {
-            log.error("Failed to serialise PendingControlEvent for orderId={}", ev.orderId(), e);
-            throw new RuntimeException("payload serialisation failed", e);
-        }
+        return controlPayloadCodec.outboxPayloadJson(ev);
     }
 
     private static String normalizeLedgerBalanceId(String raw) {

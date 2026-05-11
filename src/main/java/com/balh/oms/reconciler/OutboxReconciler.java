@@ -1,5 +1,6 @@
 package com.balh.oms.reconciler;
 
+import com.balh.oms.chronicle.ControlChroniclePayloadCodec;
 import com.balh.oms.chronicle.ControlJournal;
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.observability.metrics.OmsPipelineMetrics;
@@ -12,7 +13,6 @@ import org.slf4j.LoggerFactory;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
-import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
@@ -39,6 +39,7 @@ public class OutboxReconciler {
 
     private final ControlOutboxRepository outbox;
     private final ControlJournal journal;
+    private final ControlChroniclePayloadCodec controlPayloadCodec;
     private final OmsConfig config;
     private final MeterRegistry meterRegistry;
     private final Counter appended;
@@ -47,10 +48,12 @@ public class OutboxReconciler {
     public OutboxReconciler(
             ControlOutboxRepository outbox,
             ControlJournal journal,
+            ControlChroniclePayloadCodec controlPayloadCodec,
             OmsConfig config,
             MeterRegistry registry) {
         this.outbox = outbox;
         this.journal = journal;
+        this.controlPayloadCodec = controlPayloadCodec;
         this.config = config;
         this.meterRegistry = registry;
         this.appended = Counter.builder("oms_control_outbox_appended_total")
@@ -70,7 +73,7 @@ public class OutboxReconciler {
         for (var row : rows) {
             try {
                 Timer.Sample appendSample = Timer.start(meterRegistry);
-                journal.append(row.payload().getBytes(StandardCharsets.UTF_8));
+                journal.append(controlPayloadCodec.chronicleAppendBytesFromOutboxPayloadText(row.payload()));
                 Instant appendedAt = Instant.now();
                 outbox.markAppended(row.id(), appendedAt);
                 OmsPipelineMetrics.finishChronicleAppend(meterRegistry, appendSample);

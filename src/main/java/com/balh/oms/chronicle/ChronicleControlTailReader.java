@@ -1,8 +1,8 @@
 package com.balh.oms.chronicle;
 
+import com.balh.oms.chronicle.ControlChroniclePayloadCodec;
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.tailer.ControlTailer;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.annotation.PostConstruct;
@@ -41,7 +41,7 @@ public class ChronicleControlTailReader implements DisposableBean {
 
     private final ChronicleQueue queue;
     private final ControlTailer controlTailer;
-    private final ObjectMapper objectMapper;
+    private final ControlChroniclePayloadCodec controlPayloadCodec;
     private final OmsConfig config;
     private final Counter appliedCounter;
     private final Counter skippedCounter;
@@ -56,12 +56,12 @@ public class ChronicleControlTailReader implements DisposableBean {
     public ChronicleControlTailReader(
             ChronicleQueue queue,
             ControlTailer controlTailer,
-            ObjectMapper objectMapper,
+            ControlChroniclePayloadCodec controlPayloadCodec,
             OmsConfig config,
             MeterRegistry meterRegistry) {
         this.queue = queue;
         this.controlTailer = controlTailer;
-        this.objectMapper = objectMapper;
+        this.controlPayloadCodec = controlPayloadCodec;
         this.config = config;
         this.appliedCounter = Counter.builder("oms_control_chronicle_tail_applied_total")
                 .description("Chronicle control messages applied to Postgres via CAS")
@@ -147,7 +147,7 @@ public class ChronicleControlTailReader implements DisposableBean {
 
     private void dispatch(byte[] payload) {
         try {
-            PendingControlEvent event = objectMapper.readValue(payload, PendingControlEvent.class);
+            PendingControlEvent event = controlPayloadCodec.decodeChronicleExcerpt(payload);
             if (!EVENT_ORDER_ACCEPTED.equals(event.type())) {
                 log.warn("Ignoring unknown Chronicle control type: {}", event.type());
                 skippedCounter.increment();

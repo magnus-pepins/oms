@@ -1,10 +1,10 @@
 package com.balh.oms.reconciler;
 
 import com.balh.oms.AbstractPostgresIntegrationTest;
+import com.balh.oms.chronicle.ControlChroniclePayloadCodec;
 import com.balh.oms.chronicle.PendingControlEvent;
 import com.balh.oms.domain.OrderStatus;
 import com.balh.oms.tailer.ControlTailer;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
@@ -37,7 +37,7 @@ class DomainFanoutOutboxIntegrationTest extends AbstractPostgresIntegrationTest 
     @Autowired DomainFanoutReconciler domainFanoutReconciler;
     @Autowired OutboxReconciler controlOutboxReconciler;
     @Autowired ControlTailer controlTailer;
-    @Autowired ObjectMapper objectMapper;
+    @Autowired ControlChroniclePayloadCodec controlPayloadCodec;
 
     @Test
     void orderAcceptedEnvelopeIsMarkedPublishedAfterFanoutReconciler() {
@@ -72,7 +72,7 @@ class DomainFanoutOutboxIntegrationTest extends AbstractPostgresIntegrationTest 
                 "SELECT payload::text FROM control_outbox WHERE order_id = ? ORDER BY id LIMIT 1",
                 String.class,
                 orderId);
-        PendingControlEvent ev = objectMapper.readValue(payload, PendingControlEvent.class);
+        PendingControlEvent ev = controlPayloadCodec.decodeFromOutboxPayloadText(payload);
         assertThat(controlTailer.apply(ev)).isEqualTo(ControlTailer.TailResult.APPLIED);
         assertThat(jdbc.queryForObject("SELECT status::text FROM orders WHERE id = ?", String.class, orderId))
                 .isEqualTo(OrderStatus.WORKING.name());

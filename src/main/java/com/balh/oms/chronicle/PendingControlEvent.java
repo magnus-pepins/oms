@@ -6,11 +6,10 @@ import java.time.Instant;
 import java.util.UUID;
 
 /**
- * Control-plane payload written to {@code control_outbox.payload} and replayed
- * onto Chronicle by the reconciler as <strong>UTF-8 JSON</strong> of this record
- * (Jackson {@code ObjectMapper} in {@link ChronicleControlTailReader}) — not Protocol Buffers today.
- * Designed to be self-describing so the tailer can apply CAS updates without re-reading anything
- * other than the orders row at {@link #orderVersion()}.
+ * In-memory domain view of a control-plane event. Persisted in {@code control_outbox.payload} as JSONB wrapping
+ * base64 {@link com.balh.oms.proto.control.v1.ControlPendingEvent} (see {@link ControlChroniclePayloadCodec}); appended
+ * to Chronicle as {@link ControlChronicleWireFormat#CHRONICLE_PROTO_PREFIX} + protobuf. Legacy rows/excerpts used flat
+ * JSON of this record and remain readable.
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
 public record PendingControlEvent(

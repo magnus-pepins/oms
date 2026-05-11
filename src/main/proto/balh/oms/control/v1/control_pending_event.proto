@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package balh.oms.control.v1;
+
+option java_multiple_files = true;
+option java_package = "com.balh.oms.proto.control.v1";
+
+// Control-plane event appended to Chronicle (after outbox) and wrapped in Postgres outbox JSONB; see ControlChroniclePayloadCodec.
+message ControlPendingEvent {
+  string type = 1;
+  string order_id = 2;
+  int32 order_version = 3;
+  int32 shard_id = 4;
+  string account_id_hash = 5;
+  int64 order_timestamp_unix_millis = 6;
+  int64 enqueued_at_unix_millis = 7;
+}

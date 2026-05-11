@@ -4,7 +4,6 @@ import com.balh.oms.AbstractPostgresIntegrationTest;
 import com.balh.oms.domain.OrderStatus;
 import com.balh.oms.reconciler.OutboxReconciler;
 import com.balh.oms.tailer.ControlTailer;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
@@ -44,7 +43,7 @@ class ControlPipelineInvariantTest extends AbstractPostgresIntegrationTest {
     @Autowired OutboxReconciler reconciler;
     @Autowired JdbcTemplate jdbc;
     @Autowired ControlTailer controlTailer;
-    @Autowired ObjectMapper objectMapper;
+    @Autowired ControlChroniclePayloadCodec controlPayloadCodec;
 
     @Test
     void chronicleAppendOnlyHappensAfterPostgresCommitAndOutboxRowExists() throws Exception {
@@ -93,7 +92,7 @@ class ControlPipelineInvariantTest extends AbstractPostgresIntegrationTest {
                 "SELECT payload::text FROM control_outbox WHERE order_id = ? ORDER BY id LIMIT 1",
                 String.class,
                 orderId);
-        PendingControlEvent ev = objectMapper.readValue(payload, PendingControlEvent.class);
+        PendingControlEvent ev = controlPayloadCodec.decodeFromOutboxPayloadText(payload);
         assertThat(controlTailer.apply(ev)).isEqualTo(ControlTailer.TailResult.APPLIED);
         var order = jdbc.queryForObject(
                 "SELECT status::text FROM orders WHERE id = ?",

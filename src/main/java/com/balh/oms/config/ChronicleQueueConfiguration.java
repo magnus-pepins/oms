@@ -2,8 +2,8 @@ package com.balh.oms.config;
 
 import com.balh.oms.chronicle.ChronicleControlJournal;
 import com.balh.oms.chronicle.ChronicleControlTailReader;
+import com.balh.oms.chronicle.ControlChroniclePayloadCodec;
 import com.balh.oms.tailer.ControlTailer;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micrometer.core.instrument.MeterRegistry;
 import net.openhft.chronicle.queue.ChronicleQueue;
 import net.openhft.chronicle.queue.RollCycle;
@@ -52,11 +52,11 @@ public class ChronicleQueueConfiguration {
     public ChronicleControlTailReader chronicleControlTailReader(
             ChronicleQueue controlChronicleQueue,
             ControlTailer controlTailer,
-            ObjectMapper objectMapper,
+            ControlChroniclePayloadCodec controlChroniclePayloadCodec,
             OmsConfig config,
             MeterRegistry meterRegistry) {
         return new ChronicleControlTailReader(
-                controlChronicleQueue, controlTailer, objectMapper, config, meterRegistry);
+                controlChronicleQueue, controlTailer, controlChroniclePayloadCodec, config, meterRegistry);
     }
 
     /**

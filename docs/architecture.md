@@ -40,6 +40,8 @@ sequenceDiagram
     TLR->>PG: INSERT INTO domain_event_outbox\n(OrderWorking / OrderRejected envelope)
 ```
 
+`control_outbox.payload` is JSONB holding a small wrapper (`v` + base64 protobuf `ControlPendingEvent`); `OutboxReconciler` appends **`OMS\\x01` + protobuf** bytes to Chronicle (`ControlChroniclePayloadCodec`). Legacy flat JSON payloads / Chronicle excerpts remain readable.
+
 The four invariants encoded by this diagram:
 
 1. **Postgres COMMIT happens before any Chronicle append.** Always.

@@ -1,13 +1,13 @@
 package com.balh.oms.fix.it;
 
 import com.balh.oms.AbstractPostgresIntegrationTest;
+import com.balh.oms.chronicle.ControlChroniclePayloadCodec;
 import com.balh.oms.chronicle.PendingControlEvent;
 import com.balh.oms.fix.FixMetrics;
 import com.balh.oms.reconciler.OutboxReconciler;
 import com.balh.oms.settlement.SettlementConfirmProcessor;
 import com.balh.oms.tailer.ControlTailer;
 import com.balh.oms.test.SettlementBrokerDrainAssertions;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -50,7 +50,7 @@ class FixIngressRoundTripSpringIntegrationTest extends AbstractPostgresIntegrati
     @Autowired private JdbcTemplate jdbc;
     @Autowired private OutboxReconciler controlOutboxReconciler;
     @Autowired private ControlTailer controlTailer;
-    @Autowired private ObjectMapper objectMapper;
+    @Autowired private ControlChroniclePayloadCodec controlPayloadCodec;
     @Autowired private MeterRegistry meterRegistry;
     @Autowired private SettlementConfirmProcessor settlementConfirmProcessor;
 
@@ -86,7 +86,7 @@ class FixIngressRoundTripSpringIntegrationTest extends AbstractPostgresIntegrati
                 "SELECT payload::text FROM control_outbox WHERE order_id = ? ORDER BY id LIMIT 1",
                 String.class,
                 orderId);
-        PendingControlEvent ev = objectMapper.readValue(payload, PendingControlEvent.class);
+        PendingControlEvent ev = controlPayloadCodec.decodeFromOutboxPayloadText(payload);
         assertThat(controlTailer.apply(ev)).isEqualTo(ControlTailer.TailResult.APPLIED);
 
         await().atMost(Duration.ofSeconds(45))

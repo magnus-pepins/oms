@@ -13,8 +13,10 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Profile;
+import org.springframework.scheduling.annotation.SchedulingConfigurer;
 
 import java.nio.file.Path;
+import java.time.Duration;
 
 /**
  * Registers the shared {@link ChronicleQueue} plus append-only journal and
@@ -30,6 +32,8 @@ import java.nio.file.Path;
 @Profile("!test")
 @ConditionalOnProperty(prefix = "oms.chronicle", name = "enabled", havingValue = "true", matchIfMissing = true)
 public class ChronicleQueueConfiguration {
+
+    private static final long MIN_TAIL_POLL_INTERVAL_MS = 1L;
 
     @Bean(destroyMethod = "close")
     public ChronicleQueue controlChronicleQueue(OmsConfig config) {
@@ -53,6 +57,23 @@ public class ChronicleQueueConfiguration {
             MeterRegistry meterRegistry) {
         return new ChronicleControlTailReader(
                 controlChronicleQueue, controlTailer, objectMapper, config, meterRegistry);
+    }
+
+    /**
+     * Registers fixed-delay {@link ChronicleControlTailReader#pollBatch()} when {@code tail-driver=scheduled}.
+     * Defined here (not a separate {@code @Configuration} with {@code @ConditionalOnBean}) so the bean is always
+     * created after {@link #chronicleControlTailReader}; {@code @ConditionalOnBean(ChronicleControlTailReader)} on
+     * another configuration class can evaluate too early and skip scheduling entirely.
+     */
+    @Bean
+    @ConditionalOnProperty(prefix = "oms.chronicle", name = "tail-driver", havingValue = "scheduled", matchIfMissing = true)
+    public SchedulingConfigurer chronicleControlTailPollScheduling(
+            ChronicleControlTailReader chronicleControlTailReader,
+            OmsConfig omsConfig) {
+        return registrar -> {
+            long ms = Math.max(MIN_TAIL_POLL_INTERVAL_MS, omsConfig.getChronicle().getTailPollIntervalMs());
+            registrar.addFixedDelayTask(chronicleControlTailReader::pollBatch, Duration.ofMillis(ms));
+        };
     }
 
     private static RollCycle resolveRollCycle(String configured) {

@@ -101,7 +101,7 @@ public class ChronicleControlTailReader implements DisposableBean {
 
     /**
      * One scheduled tick: drain up to {@link OmsConfig.Chronicle#getTailBatchMaxMessages()} messages.
-     * Used only when {@link ChronicleTailDriver#SCHEDULED} (see {@code ChronicleControlTailSchedulingConfiguration}).
+     * Used only when {@link ChronicleTailDriver#SCHEDULED} (see {@code ChronicleQueueConfiguration#chronicleControlTailPollScheduling}).
      */
     public void pollBatch() {
         int max = config.getChronicle().getTailBatchMaxMessages();

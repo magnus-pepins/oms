@@ -8,7 +8,7 @@ This is **not** a Chronicle-provided push callback into application code. The ta
 
 | Value | Env | Behaviour |
 |--------|-----|------------|
-| `scheduled` (default) | `OMS_CHRONICLE_TAIL_DRIVER=scheduled` | Spring runs `pollBatch()` on a **fixed delay** after each completion (`ChronicleControlTailSchedulingConfiguration`). Interval: `OMS_CHRONICLE_TAIL_POLL_INTERVAL_MS`. Worst-case additional latency after an append is roughly **one poll interval** (plus scheduler jitter), before `readBytes` runs again. |
+| `scheduled` (default) | `OMS_CHRONICLE_TAIL_DRIVER=scheduled` | Spring runs `pollBatch()` on a **fixed delay** after each completion (`SchedulingConfigurer` bean `chronicleControlTailPollScheduling` in `ChronicleQueueConfiguration`). Interval: `OMS_CHRONICLE_TAIL_POLL_INTERVAL_MS`. Worst-case additional latency after an append is roughly **one poll interval** (plus scheduler jitter), before `readBytes` runs again. |
 | `dedicated` | `OMS_CHRONICLE_TAIL_DRIVER=dedicated` | A **non-daemon** thread named `oms-chronicle-control-tail` loops: drain up to `OMS_CHRONICLE_TAIL_BATCH_MAX_MESSAGES` per inner pass; when a full pass reads nothing, park for `OMS_CHRONICLE_TAIL_DEDICATED_IDLE_PARK_NANOS`. **No** Spring scheduled task is registered for the tail. |
 
 ### Why use `dedicated`?
@@ -39,7 +39,7 @@ In `dedicated` mode, graceful shutdown sets a stop flag, **interrupts** the tail
 ## Related code
 
 - `com.balh.oms.chronicle.ChronicleControlTailReader` — tail creation, `pollBatch`, dedicated loop, `DisposableBean`.
-- `com.balh.oms.config.ChronicleControlTailSchedulingConfiguration` — registers fixed-delay `pollBatch` when `tail-driver=scheduled`.
+- `com.balh.oms.config.ChronicleQueueConfiguration#chronicleControlTailPollScheduling` — registers fixed-delay `pollBatch` when `tail-driver=scheduled` (bean lives in the same configuration class as the tail reader so scheduling is never skipped due to `@ConditionalOnBean` ordering).
 - `com.balh.oms.chronicle.ChronicleTailDriver` — enum.
 - `com.balh.oms.config.OmsConfig.Chronicle` — bound properties.
 

@@ -10,7 +10,7 @@
 #
 # Env:
 #   OMS_INTERNAL_API_KEY (required — must match running OMS, same as OMS_INTERNAL_API_KEY on bootRun)
-#   OMS_URL              default http://127.0.0.1:8088
+#   OMS_URL              default http://127.0.0.1:8088  (used for default actuator URL)
 #   SHOOT_COUNT          default 50
 #   SHOOT_SLEEP_MS       default 0   (sleep between POSTs)
 #   SHOOT_INSTRUMENT     default AAPL
@@ -18,25 +18,29 @@
 #   SHOOT_LIMIT          default 150
 #   SHOOT_PRINT_EACH     default 0   (set to 1 to print each request's HTTP time on stderr)
 #
-# Full-flow latency (what you want as “the number”):
-#   Set SHOOT_OTEL_METRICS_URL (e.g. http://127.0.0.1:9464/metrics) and run OMS with OMS_OTEL_METRICS_ENABLED=true.
-#   The script snapshots OTel histogram _count before POSTs, waits until count rises by the number of HTTP 201s,
-#   then prints mean / p50 / p95 / p99 in milliseconds (DB commit → FIX NOS sent). That is NOT the same as curl.
+# Full-flow (THIS BATCH only):
+#   SHOOT_OTEL_METRICS_URL — e.g. http://127.0.0.1:9464/metrics with OMS_OTEL_METRICS_ENABLED=true.
+#   The script saves OTel scrape before POSTs and after the wait; printed mean/pXX are **deltas**, not lifetime.
 #
-#   SHOOT_OTEL_WAIT_MAX_SEC     default 120 — max wait for all 201s to show up in the histogram
-#   SHOOT_OTEL_POLL_INTERVAL_SEC default 1 — poll interval while waiting
-#   SHOOT_OTEL_SHOW_RAW         default 0 — set to 1 to dump raw Prometheus lines after the summary
+#   SHOOT_PROMETHEUS_URL — default ${OMS_URL}/actuator/prometheus for Micrometer oms.pipeline.* breakdown
+#   (where time went: ingress vs outbox→Chronicle vs control.apply vs FIX).
+#
+#   SHOOT_OTEL_WAIT_MAX_SEC      default 120
+#   SHOOT_OTEL_POLL_INTERVAL_SEC default 1
+#   SHOOT_OTEL_SHOW_RAW          default 0 — dump raw OTel histogram lines
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PARSE_PY="$SCRIPT_DIR/parse_otel_ingress_to_nos_histogram.py"
+DELTA_PROM_PY="$SCRIPT_DIR/summarize_micrometer_pipeline_deltas.py"
 
 random_uuid() {
   python3 -c "import uuid; print(uuid.uuid4())"
 }
 
 OMS_URL="${OMS_URL:-http://127.0.0.1:8088}"
+PROM_URL="${SHOOT_PROMETHEUS_URL:-${OMS_URL%/}/actuator/prometheus}"
 KEY="${OMS_INTERNAL_API_KEY:?set OMS_INTERNAL_API_KEY (must match the running OMS process — same value as bootRun / OMS_INTERNAL_API_KEY)}"
 if [[ "$KEY" == *"…"* || "$KEY" == "replace-me-internal-key" ]]; then
   echo "Refusing to run: OMS_INTERNAL_API_KEY looks like a documentation placeholder." >&2
@@ -51,19 +55,23 @@ LIM="${SHOOT_LIMIT:-150}"
 OTEL_WAIT_MAX_SEC="${SHOOT_OTEL_WAIT_MAX_SEC:-120}"
 OTEL_POLL_SEC="${SHOOT_OTEL_POLL_INTERVAL_SEC:-1}"
 
+TIMES_FILE="$(mktemp)"
+SCRATCH="$(mktemp -d)"
+trap 'rm -rf "$SCRATCH" "$TIMES_FILE"' EXIT
+
+curl -fsS "$PROM_URL" -o "$SCRATCH/prom_before.txt" 2>/dev/null || true
+
 hinted_401=false
 ok=0
 created=0
 fail=0
-TIMES_FILE="$(mktemp)"
-trap 'rm -f "$TIMES_FILE"' EXIT
 
 BASELINE_OTEL="NA"
 if [[ -n "${SHOOT_OTEL_METRICS_URL:-}" ]]; then
-  if metrics_baseline="$(curl -fsS "${SHOOT_OTEL_METRICS_URL}" 2>/dev/null)"; then
-    BASELINE_OTEL="$(echo "$metrics_baseline" | python3 "$PARSE_PY" count)"
+  if curl -fsS "${SHOOT_OTEL_METRICS_URL}" -o "$SCRATCH/otel_before.txt" 2>/dev/null; then
+    BASELINE_OTEL="$(python3 "$PARSE_PY" count <"$SCRATCH/otel_before.txt")"
   else
-    BASELINE_OTEL="NA"
+    rm -f "$SCRATCH/otel_before.txt"
   fi
 fi
 
@@ -111,17 +119,19 @@ done
 
 echo "done: ok=$ok (http 201+200)  created=$created (http 201 only; OTel full-flow counts these)  fail=$fail"
 
-# --- FULL FLOW (OTel): committed NEW order → FIX NOS (milliseconds) ---
+# --- FULL FLOW OTel: THIS BATCH (delta before vs after scrape), ms ---
 if [[ -n "${SHOOT_OTEL_METRICS_URL:-}" ]]; then
   echo ""
   echo "======================================================================"
-  echo "FULL FLOW — DB committed (201) → FIX NOS sent  |  unit: milliseconds"
+  echo "FULL FLOW (this batch) — DB commit (201) → FIX NOS  |  OTel, ms, Δ scrapes"
   echo "======================================================================"
   if [[ "$created" -eq 0 ]]; then
-    echo "  No HTTP 201 in this run — OTel histogram only records brand-new orders."
+    echo "  No HTTP 201 in this run — OTel histogram only starts on new orders."
+  elif [[ ! -f "$SCRATCH/otel_before.txt" ]]; then
+    echo "  No baseline OTel scrape (curl failed at script start)."
   else
     if [[ "$BASELINE_OTEL" == "NA" ]]; then
-      echo "  WARN: could not read histogram before POSTs; assuming baseline count 0."
+      echo "  WARN: could not parse baseline histogram count; assuming 0."
       BASELINE_OTEL=0
     fi
     target=$((BASELINE_OTEL + created))
@@ -138,48 +148,56 @@ if [[ -n "${SHOOT_OTEL_METRICS_URL:-}" ]]; then
       if [[ "$curl_rc" -eq 0 && -n "$last_metrics" ]]; then
         last_cur="$(echo "$last_metrics" | python3 "$PARSE_PY" count)"
         if [[ "$last_cur" != "NA" ]] && [[ "$last_cur" -ge "$target" ]]; then
+          printf '%s\n' "$last_metrics" >"$SCRATCH/otel_after.txt"
           break
         fi
       fi
       sleep "$OTEL_POLL_SEC"
     done
     waited=$((SECONDS - poll_start))
+    if [[ ! -f "$SCRATCH/otel_after.txt" ]]; then
+      printf '%s\n' "${last_metrics:-}" >"$SCRATCH/otel_after.txt" || true
+    fi
     if [[ "$curl_rc" -ne 0 ]]; then
       echo "  scrape failed (curl exit $curl_rc) — last message:" >&2
       while IFS= read -r line || [[ -n "$line" ]]; do echo "    $line" >&2; done <<< "${last_metrics:-}"
-      echo "  Fix: OMS_OTEL_METRICS_ENABLED=true and correct SHOOT_OTEL_METRICS_URL (default port 9464)." >&2
-    elif [[ -z "${last_metrics:-}" ]]; then
-      echo "  (empty scrape body)" >&2
+      echo "  Fix: OMS_OTEL_METRICS_ENABLED=true and SHOOT_OTEL_METRICS_URL (default :9464/metrics)." >&2
+    elif [[ ! -s "$SCRATCH/otel_after.txt" ]]; then
+      echo "  (empty OTel scrape after run)" >&2
     else
       if [[ "${last_cur:-NA}" == "NA" ]]; then
         last_cur=0
       fi
       if [[ "$last_cur" -lt "$target" ]]; then
-        echo "  TIMEOUT after ${waited}s: histogram _count is ${last_cur}, expected >= ${target} (baseline ${BASELINE_OTEL} + ${created} new orders)."
-        echo "  Showing stats for what completed so far (not the full batch):"
+        echo "  TIMEOUT after ${waited}s: global _count is ${last_cur}, need >= ${target} (baseline ${BASELINE_OTEL} + ${created})."
+        echo "  Using last scrape for delta anyway (partial batch):"
       else
-        echo "  All ${created} new orders observed in histogram (waited ${waited}s)."
+        echo "  Histogram global count reached ${target} (waited ${waited}s)."
       fi
-      echo "$last_metrics" | python3 "$PARSE_PY" summary | while IFS= read -r line; do echo "  $line"; done
       echo ""
-      echo "  Read as: mean_ms / p50_ms / … = end-to-end server time from commit to NOS on the wire."
-      echo "  (curl section below is only HTTP; it is not this full path.)"
+      python3 "$PARSE_PY" delta-summary "$SCRATCH/otel_before.txt" "$SCRATCH/otel_after.txt" | while IFS= read -r line; do echo "  $line"; done
+      echo ""
+      echo "  count_this_run = new observations between first and last scrape (should match created=${created})."
       if [[ "${SHOOT_OTEL_SHOW_RAW:-0}" == "1" ]]; then
         echo ""
-        echo "  --- raw OTel lines (ingress_to_nos) ---"
-        echo "$last_metrics" | grep -E 'ingress_to_nos' || true
+        echo "  --- raw OTel lines (ingress_to_nos) from last scrape ---"
+        grep -E 'ingress_to_nos' "$SCRATCH/otel_after.txt" || true
       fi
     fi
   fi
 else
   echo ""
   echo "======================================================================"
-  echo "FULL FLOW — not measured (set SHOOT_OTEL_METRICS_URL + OMS_OTEL_METRICS_ENABLED=true)"
+  echo "FULL FLOW OTel — skipped (set SHOOT_OTEL_METRICS_URL + OMS_OTEL_METRICS_ENABLED=true)"
   echo "======================================================================"
-  echo "  Example:  export SHOOT_OTEL_METRICS_URL='http://127.0.0.1:9464/metrics'"
+  echo "  Example: export SHOOT_OTEL_METRICS_URL='http://127.0.0.1:9464/metrics'"
 fi
 
-# --- HTTP only (curl); seconds; stops at response ---
+# --- Micrometer pipeline (THIS BATCH): where time went ---
+curl -fsS "$PROM_URL" -o "$SCRATCH/prom_after.txt" 2>/dev/null || true
+python3 "$DELTA_PROM_PY" "$SCRATCH/prom_before.txt" "$SCRATCH/prom_after.txt" || true
+
+# --- HTTP only (curl); seconds ---
 if [[ "$ok" -gt 0 ]]; then
   echo ""
   echo "HTTP only — curl time_total until response ends (seconds; NOT full flow to FIX):"

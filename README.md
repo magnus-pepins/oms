@@ -7,9 +7,17 @@ Order Management System for the Balh financial platform ecosystem.
 This is the slice-1 bootstrap. It is a runnable Spring Boot 3 application
 backed by Postgres + Flyway, with the Postgres-first / Chronicle-after
 control-plane pattern wired end-to-end (outbox reconciler → Chronicle append →
-tail reader → `ControlTailer` CAS updates).
+tail reader → `ControlTailer` CAS updates). Optional **`oms.control.postgres-write-path=ingress`**
+(`OMS_CONTROL_POSTGRES_WRITE_PATH`): CAS + `OrderWorking` / `OrderRejected` run in **`OrderIngressService`**;
+Chronicle tail only enqueues outbound routing (see `plans/oms-ingress-control-fix-topology.md` P1).
 
-**CI:** GitHub Actions runs `./gradlew clean test` against a **job-level Postgres service** (see `services:` in `.github/workflows/ci.yml` and env `OMS_CI_JDBC_*` in `AbstractPostgresIntegrationTest`), then `./gradlew bootJar` on pushes and PRs to `main` / `master`, and can be triggered manually (`workflow_dispatch`). Testcontainers is still used on CI for other images (e.g. NATS). Failed runs upload an **`oms-test-reports`** artifact (JUnit XML + HTML under `build/`). If the job log is not visible, download that artifact or run `./gradlew clean test --no-daemon --no-build-cache` locally (**Docker required** for Testcontainers Postgres and NATS-backed ITs).
+**P3 prep — `oms-control-worker` profile:** `./gradlew bootRunControlWorker` (or `./scripts/oms-control-worker.sh`), or **`./gradlew bootJarControlWorker`** → `build/libs/oms-*-SNAPSHOT-control-worker.jar` (`Start-Class` **`OmsControlWorkerBootstrap`**), or set `SPRING_PROFILES_ACTIVE` to include `oms-control-worker` on the monolith JAR. That profile **forces `reconciler`** Chronicle append (`application-oms-control-worker.yaml`) so `OutboxReconciler` drains peers’ `control_outbox`. **Actuator** binds **`management.server.port`** (default **8089**, override **`OMS_CONTROL_WORKER_MANAGEMENT_SERVER_PORT`**) so health/prometheus do not share **`OMS_HTTP_PORT`**. Monolith **default** is **`ingress-after-commit`**. Incompatible: **`ingress-after-commit`** on control-worker (validator); **`oms.routing.backend=fix` + `oms.fix.auto-start=true`** on control-worker — use **`oms-fix-worker`** for QuickFIX (validator). Runbook: [`docs/runbooks/oms-control-worker.md`](docs/runbooks/oms-control-worker.md).
+
+**P4 prep — `oms-fix-worker` profile:** `./gradlew bootRunFixWorker` (or `./scripts/oms-fix-worker.sh`), or **`./gradlew bootJarFixWorker`** → `build/libs/oms-*-SNAPSHOT-fix-worker.jar` (`Start-Class` **`OmsFixWorkerBootstrap`**). Same no–order-accept ingress as control-worker, but **`application-oms-fix-worker.yaml`** sets **`oms.routing.backend=fix`**, **`oms.fix.auto-start=true`**, and **`oms.control.postgres-write-path=ingress`** (FIX-out JVM has no `OrderIngressService`; admission runs on ingress replicas — enforced by **`FixWorkerTopologyValidator`**). Single initiator per route; do not run two replicas with the same FIX session store. Actuator default **`8090`** (`OMS_FIX_WORKER_MANAGEMENT_SERVER_PORT`). Runbook: [`docs/runbooks/oms-fix-worker.md`](docs/runbooks/oms-fix-worker.md). See `plans/oms-ingress-control-fix-topology.md` in system-documentation.
+
+**P5 prep — `oms-ingress-replica` profile:** horizontal **ingress** only — same new-order HTTP/gRPC as the monolith; **`application-oms-ingress-replica.yaml`** sets **`oms.control.postgres-write-path=ingress`**, **`oms.chronicle.control-tail-enabled=false`** (append only; workers tail). **`./gradlew bootRunIngressReplica`** (or `./scripts/oms-ingress-replica.sh`), or **`./gradlew bootJarIngressReplica`** → `build/libs/oms-*-SNAPSHOT-ingress-replica.jar` (`Start-Class` **`OmsIngressReplicaBootstrap`**). Mutually exclusive with **`oms-control-worker`** / **`oms-fix-worker`** on the same JVM (`TopologyWorkerProfiles`, **`IngressReplicaTopologyValidator`**). Actuator default **`8087`** (`OMS_INGRESS_REPLICA_MANAGEMENT_SERVER_PORT`). Runbook: [`docs/runbooks/oms-ingress-replica.md`](docs/runbooks/oms-ingress-replica.md).
+
+**CI:** GitHub Actions runs `./gradlew clean test` against a **job-level Postgres service** (see `services:` in `.github/workflows/ci.yml` and env `OMS_CI_JDBC_*` in `AbstractPostgresIntegrationTest`), then **`./gradlew bootJar bootJarControlWorker bootJarFixWorker bootJarIngressReplica`** on pushes and PRs to `main` / `master`, and can be triggered manually (`workflow_dispatch`). Testcontainers is still used on CI for other images (e.g. NATS). Failed runs upload an **`oms-test-reports`** artifact (JUnit XML + HTML under `build/`). If the job log is not visible, download that artifact or run `./gradlew clean test --no-daemon --no-build-cache` locally (**Docker required** for Testcontainers Postgres and NATS-backed ITs).
 
 The product / architecture decisions that shaped this code live in the
 [system-documentation](../system-documentation) workspace — primarily
@@ -20,11 +28,11 @@ and the milestone plan it links to. **Phase 1 exit (UAT soak, §16 #3, prod sess
 ## What is in slice 1
 
 - `POST /internal/v1/orders` and `GET /internal/v1/orders/{id}` (HTTP, internal
-  API key auth).
+  API key auth; **not registered** when Spring profile **`oms-control-worker`** or **`oms-fix-worker`** is active — **registered** on **`oms-ingress-replica`**).
 - Idempotent inserts on `(account_id, client_idempotency_key)`.
 - `domain_event_outbox` table; canonical JSON **envelopes** are written in the
   same Postgres transaction as the originating change (`OrderAccepted` on
-  ingress; `OrderWorking` / `OrderRejected` in `ControlTailer` after CAS).
+  ingress; `OrderWorking` / `OrderRejected` after CAS — default: in `ControlTailer`; with **`postgres-write-path=ingress`**: in `OrderIngressService`).
 - `ledger_inflight_outbox` table (Flyway **V4**): optional **post-commit** path for
   the Ledger BUY sync inflight hold when `OMS_LEDGER_INFLIGHT_ASYNC_ENABLED=true`
   (default **false** — synchronous `POST /transactions` in the accept transaction

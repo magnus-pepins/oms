@@ -1,6 +1,7 @@
 package com.balh.oms.config;
 
 import com.balh.oms.fix.FixOutboundOrderDequeue;
+import com.balh.oms.fix.FixOutboundWireJob;
 import com.balh.oms.fix.FixRouteDispatcher;
 import com.balh.oms.fix.QueueFixOutboundOrderDequeue;
 import com.balh.oms.observability.otel.IngressToFixNosLatencyRecorder;
@@ -8,7 +9,6 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
-import java.util.UUID;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 
@@ -17,14 +17,14 @@ import java.util.concurrent.LinkedBlockingQueue;
 public class FixRoutingBeans {
 
     @Bean
-    BlockingQueue<UUID> fixOutboundPendingOrderQueue(OmsConfig omsConfig) {
+    BlockingQueue<FixOutboundWireJob> fixOutboundPendingOrderQueue(OmsConfig omsConfig) {
         int cap = Math.max(1, omsConfig.getFix().getOutboundQueueCapacity());
         return new LinkedBlockingQueue<>(cap);
     }
 
     @Bean
     FixRouteDispatcher fixRouteDispatcher(
-            BlockingQueue<UUID> fixOutboundPendingOrderQueue,
+            BlockingQueue<FixOutboundWireJob> fixOutboundPendingOrderQueue,
             IngressToFixNosLatencyRecorder ingressToFixNosLatencyRecorder) {
         return new FixRouteDispatcher(fixOutboundPendingOrderQueue, ingressToFixNosLatencyRecorder);
     }

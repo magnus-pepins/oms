@@ -1,0 +1,21 @@
+# P4 prep: same “no new-order ingress” as oms-control-worker, but this JVM owns QuickFIX outbound (single initiator).
+# Use with N ingress + N oms-control-worker replicas + exactly one oms-fix-worker per FIX route / session store.
+#
+# Example: SPRING_PROFILES_ACTIVE=oms-fix-worker,test   (test profile only for local harnesses)
+#
+# Do not combine oms-control-worker and oms-fix-worker on the same process (TopologyWorkerProfiles).
+oms:
+  grpc:
+    enabled: false
+  control:
+    chronicle-append-mode: reconciler
+    # FIX-out JVM has no OrderIngress — admission runs on ingress replicas; tail must be dispatch-only (validator).
+    postgres-write-path: ingress
+  routing:
+    backend: fix
+  fix:
+    auto-start: true
+
+management:
+  server:
+    port: ${OMS_FIX_WORKER_MANAGEMENT_SERVER_PORT:8090}

@@ -1,0 +1,29 @@
+---
+description: When the operator states a concrete risk (Docker, Kong, prod), verify or defer—do not dismiss without evidence.
+alwaysApply: true
+---
+
+# Respect operator warnings
+
+Works with [helper-calibration-and-sibling-parity.mdc](helper-calibration-and-sibling-parity.mdc) and [serious-debugging.mdc](serious-debugging.mdc).
+
+## 1) Stated risks are first-class
+
+If you **warn** about a **specific operational consequence** (examples: “recreating Kong will land it on another network”, “this compose path will duplicate the stack”, “that will wipe X”, “auth will lose `db` DNS”), the agent must **not**:
+
+- brush it off as unlikely without **checking** the relevant compose, scripts, or runbook, or  
+- push a procedure that **contradicts** your warning **unless** the same message includes **evidence** (file + line, or a command you asked to run and its output) that the warning does not apply **in your setup**.
+
+Default bias: **follow your procedure** or **read the config first**, then speak.
+
+## 2) If the agent disagrees, the bar is higher
+
+Disagreement is allowed only as **`Hypothesis:`** plus **what would falsify it** (e.g. “if `docker inspect` shows a single network for kong and db, the split-network fear is ruled out”) — not as flat “no, that won’t happen.”
+
+## 3) Time cost
+
+If adopting your warning means an **extra safe step** (e.g. `docker inspect` networks before `rm`, or using the runbook’s `down`/`up` path), that is **preferable** to saving a minute of typing and costing you **recovery time**.
+
+## Copying
+
+Copy into app repos’ `.cursor/rules/` when those workspaces are opened without system-documentation.

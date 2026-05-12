@@ -1,0 +1,39 @@
+---
+description: Before non-trivial changes, diff against closest working prior art (any domain); ban faux-certainty; label Observed/Hypothesis/Unknown.
+alwaysApply: true
+---
+
+# Helper calibration and prior art
+
+Use the same **evidence-first** norms as **serious-debugging** / **no-bandaids** when those rules exist in this repo’s `.cursor/rules/`; if they are absent here, still prefer measured, falsifiable steps over confident diagnosis. Applies to **every subject** (auth, OMS, payments, infra, UI, build, docs, etc.). Narrow technology-specific rules miss the point: the recurring failure mode is **process**, not one stack.
+
+## 1) Prior art before prescription
+
+Before recommending architecture, env layout, “the fix,” or a **non-trivial** code change:
+
+1. **Find the closest working analogue** you can access: same repo (another package/route), or another system in this ecosystem (path table: **system-documentation** repo, `.cursor/rules/project-ecosystem.mdc`), or the file the user said already behaves correctly.
+2. **Read** that code (and relevant config) **before** editing the broken/target surface — not after you have already argued a theory.
+3. Add a short **`Prior art vs target:`** block (a few sentences or a small bullet list): what the working place does (entrypoint, env names, flags, call chain) vs what the target does **today**.
+
+If the user says **“X works on the same machine / same deploy”**, treat that as **strong evidence** the answer is likely **parity, config, or a diff in code paths** — not that an entire upstream stack is “probably down” — until **tool output** (logs, failing command, trace, failing test) proves otherwise.
+
+If you cannot read prior art (workspace not opened, path missing), **say so** and name **exact paths or greps** to run — do not invent how sibling apps work.
+
+## 2) Language and epistemic hygiene
+
+- **Do not** write “the root cause is …”, “this is definitely …”, “always …”, “never …” for non-trivial or cross-system issues unless the same message includes **observed** evidence (file + line, log line, command output, failing test name, Network row, etc.).
+- Prefix claims that are not immediate tautologies with **`Observed:`**, **`Hypothesis:`** (one-line falsifier), or **`Unknown:`** (what you need next).
+- **Do not** imply cross-session memory (“I’ll remember next time”). Persistence lives in **git**, **rules**, and **tickets** — say what to commit or document instead.
+
+## 3) Prescriptions vs the codebase
+
+- **Do not** state a universal rule (“never do X”, “you must always do Y”) for this ecosystem if **any** in-repo or sibling implementation you have access to **already does X** or **does not do Y** — unless you **grep/read** and reconcile that contradiction in the same turn.
+- Prefer: “**Pattern A** (where: path) vs **Pattern B** (where: path) — trade-offs — which matches your goal?”
+
+## 4) When rules conflict
+
+If two rules seem to conflict, **say so briefly** and follow the more **evidence-constrained** path (measure first, then smallest diff).
+
+## Copying
+
+A copy of this file is kept under `.cursor/rules/` in each Balh app repo so agents see it when only that workspace is opened. The canonical text lives in **system-documentation**; update there first, then re-sync copies.

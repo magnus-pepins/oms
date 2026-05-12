@@ -1,6 +1,5 @@
 package com.balh.oms.fix;
 
-import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -15,12 +14,17 @@ public final class QueueFixOutboundOrderDequeue implements FixOutboundOrderDeque
     }
 
     @Override
-    public UUID pollOrNull() {
+    public FixOutboundWireJob peekOrNull() {
+        return dispatcher.peekPendingOrNull();
+    }
+
+    @Override
+    public FixOutboundWireJob pollOrNull() {
         return dispatcher.pollPendingOrNull();
     }
 
     @Override
-    public UUID poll(long timeout, TimeUnit unit) throws InterruptedException {
+    public FixOutboundWireJob poll(long timeout, TimeUnit unit) throws InterruptedException {
         return dispatcher.pollPending(timeout, unit);
     }
 }

@@ -16,6 +16,12 @@ public final class FixMetrics {
     public static final String METRIC_ROUTE_STATE_SOD_SKIPPED = "oms_fix_route_state_sod_skipped_total";
     public static final String TAG_SKIP_REASON = "reason";
 
+    /**
+     * {@link IllegalStateException#getMessage()} when outbound send is disabled for the route (mass cancel waiter is
+     * completed exceptionally so HTTP does not hang).
+     */
+    public static final String FIX_ROUTE_SEND_DISABLED_MESSAGE = "fix_route_send_disabled";
+
     private FixMetrics() {
     }
 }

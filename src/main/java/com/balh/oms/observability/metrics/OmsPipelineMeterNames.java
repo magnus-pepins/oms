@@ -32,6 +32,12 @@ public final class OmsPipelineMeterNames {
     public static final String CONTROL_APPLY = "oms.pipeline.control.apply";
 
     /**
+     * Counter when ingress dispatch-only tail skips {@code RouteDispatcher.enqueueWorkingOrder} because
+     * {@code fix_nos_route_enqueue_claim} already contained the order (replay / duplicate delivery).
+     */
+    public static final String CONTROL_INGRESS_DISPATCH_ENQUEUE_CLAIM_SKIP = "oms.pipeline.control.ingress_dispatch.enqueue_claim_skip";
+
+    /**
      * FIX worker: build NOS + {@code Session.sendToTarget} after token acquired (WORKING order only).
      * Tag {@code outcome}: {@code success}, {@code failure}.
      */

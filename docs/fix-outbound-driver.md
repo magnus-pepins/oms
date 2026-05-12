@@ -1,6 +1,6 @@
 # FIX outbound driver (`scheduled` vs `dedicated`)
 
-When `oms.routing.backend=fix` and `oms.fix.auto-start=true`, `FixRouteDispatcher` stores **WORKING** order ids in an **in-process** `BlockingQueue`. `FixOutboundDispatchWorker` dequeues and calls `Session.sendToTarget` for each `NewOrderSingle`.
+When `oms.routing.backend=fix` and `oms.fix.auto-start=true`, `FixRouteDispatcher` stores **WORKING** order ids and **wired manual mass cancel** jobs in an **in-process** `BlockingQueue`. `FixOutboundDispatchWorker` dequeues and sends each **`NewOrderSingle`** or **`OrderMassCancelRequest`** through **`FixOutboundSessionSend`** (QuickFIX `Session.sendToTarget`).
 
 That worker must **wake** somehow. The driver chooses between Spring scheduling and a dedicated thread (same idea as Chronicle `tail-driver`; see [chronicle-tail-driver.md](chronicle-tail-driver.md)).
 

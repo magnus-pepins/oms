@@ -1,21 +1,15 @@
 package com.balh.oms.tailer;
 
 import com.balh.oms.chronicle.PendingControlEvent;
+import com.balh.oms.config.ControlPostgresWritePath;
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.domain.Order;
 import com.balh.oms.domain.OrderStatus;
-import com.balh.oms.domain.RejectCode;
-import com.balh.oms.events.DomainEventEnvelopeCodec;
-import com.balh.oms.observability.otel.IngressToFixNosLatencyLimits;
-import com.balh.oms.observability.otel.IngressToFixNosLatencyRecorder;
-import com.balh.oms.persistence.ControlDecisionsRepository;
-import com.balh.oms.persistence.DomainEventOutboxRepository;
-import com.balh.oms.persistence.OrdersRepository;
-import com.balh.oms.risk.BuyingPowerAdmission;
-import com.balh.oms.risk.ControlRiskEvaluator;
-import com.balh.oms.routing.RouteDispatcher;
-import com.fasterxml.jackson.core.JsonProcessingException;
+import com.balh.oms.observability.metrics.OmsPipelineMeterNames;
 import com.balh.oms.observability.metrics.OmsPipelineMetrics;
+import com.balh.oms.persistence.FixNosRouteEnqueueClaimRepository;
+import com.balh.oms.persistence.OrdersRepository;
+import com.balh.oms.routing.RouteDispatcher;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
 import org.slf4j.Logger;
@@ -25,13 +19,16 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
-import java.time.Instant;
 import java.util.UUID;
 
 /**
  * Applies a control-plane event to Postgres after it has been read off the
  * Chronicle journal (slice 1) or — earlier in the lifecycle — directly from a
  * Disruptor handler. Both paths converge here.
+ *
+ * <p>When {@code oms.control.postgres-write-path=ingress}, Postgres mutations for {@code OrderAccepted} run in
+ * {@link com.balh.oms.ingress.OrderIngressService}; this component only enqueues outbound routing after Chronicle
+ * delivery when the order is already {@code WORKING} at the expected version.
  *
  * <p>Idempotent: every update goes through CAS on
  * {@code orders.version}. Re-applying the same event is a no-op.
@@ -41,46 +38,29 @@ public class ControlTailer {
 
     private static final Logger log = LoggerFactory.getLogger(ControlTailer.class);
 
-    private static final String METRIC_REJECT_EVENTS = "oms_order_rejected_events_published_total";
-    private static final String TAG_REJECT_CODE = "reject_code";
-    private static final String METRIC_WORKING_EVENTS = "oms_order_working_events_published_total";
-    private static final String METRIC_STALE_REJECTS = "oms_control_jobs_rejected_stale_total";
-
+    private final OrderControlAdmission orderControlAdmission;
     private final OrdersRepository orders;
     private final StaleJobGuard stale;
     private final OmsConfig config;
-    private final BuyingPowerAdmission buyingPower;
-    private final ControlRiskEvaluator controlRisk;
-    private final ControlDecisionsRepository controlDecisions;
-    private final DomainEventOutboxRepository domainEventOutbox;
-    private final DomainEventEnvelopeCodec envelopeCodec;
     private final MeterRegistry meterRegistry;
     private final RouteDispatcher routeDispatcher;
-    private final IngressToFixNosLatencyRecorder ingressToFixNosLatencyRecorder;
+    private final FixNosRouteEnqueueClaimRepository fixNosRouteEnqueueClaimRepository;
 
     public ControlTailer(
+            OrderControlAdmission orderControlAdmission,
             OrdersRepository orders,
             StaleJobGuard stale,
             OmsConfig config,
-            BuyingPowerAdmission buyingPower,
-            ControlRiskEvaluator controlRisk,
-            ControlDecisionsRepository controlDecisions,
-            DomainEventOutboxRepository domainEventOutbox,
-            DomainEventEnvelopeCodec envelopeCodec,
             MeterRegistry meterRegistry,
             RouteDispatcher routeDispatcher,
-            IngressToFixNosLatencyRecorder ingressToFixNosLatencyRecorder) {
+            FixNosRouteEnqueueClaimRepository fixNosRouteEnqueueClaimRepository) {
+        this.orderControlAdmission = orderControlAdmission;
         this.orders = orders;
         this.stale = stale;
         this.config = config;
-        this.buyingPower = buyingPower;
-        this.controlRisk = controlRisk;
-        this.controlDecisions = controlDecisions;
-        this.domainEventOutbox = domainEventOutbox;
-        this.envelopeCodec = envelopeCodec;
         this.meterRegistry = meterRegistry;
         this.routeDispatcher = routeDispatcher;
-        this.ingressToFixNosLatencyRecorder = ingressToFixNosLatencyRecorder;
+        this.fixNosRouteEnqueueClaimRepository = fixNosRouteEnqueueClaimRepository;
     }
 
     @Transactional
@@ -97,134 +77,61 @@ public class ControlTailer {
     }
 
     private TailResult applyBody(PendingControlEvent event) {
-        if (stale.isStale(event.orderTimestamp())) {
-            boolean updated = orders.updateWithCas(
-                    event.orderId(),
-                    event.orderVersion(),
-                    OrderStatus.REJECTED,
-                    RejectCode.RISK_STALE_QUEUE,
-                    null,
-                    Instant.now()
-            );
-            if (updated) {
-                meterRegistry.counter(METRIC_STALE_REJECTS).increment();
-                controlDecisions.record(
-                        event.orderId(),
-                        event.orderVersion(),
-                        "REJECT",
-                        RejectCode.RISK_STALE_QUEUE,
-                        ControlRiskEvaluator.STAGE_CONTROL,
-                        null);
-                publishRejected(event, RejectCode.RISK_STALE_QUEUE);
-            }
-            return updated ? TailResult.STALE_REJECTED : TailResult.SKIPPED_VERSION_MISMATCH;
+        if (config.getControl().getPostgresWritePath() == ControlPostgresWritePath.INGRESS) {
+            return applyIngressTailDispatchOnly(event);
         }
+        TailResult result = orderControlAdmission.persistAdmission(event);
+        if (result == TailResult.APPLIED) {
+            registerRouteDispatch(event.orderId());
+        }
+        return result;
+    }
 
+    /**
+     * Chronicle tail path when ingress already performed CAS, {@code control_decisions}, and domain fanout rows.
+     * Enqueues routing only when the order is {@code WORKING} at {@code event.orderVersion() + 1}.
+     */
+    private TailResult applyIngressTailDispatchOnly(PendingControlEvent event) {
+        if (stale.isStale(event.orderTimestamp())) {
+            log.debug(
+                    "postgres-write-path=ingress: stale Chronicle event at tail orderId={} — skipping dispatch (no tail Postgres writes)",
+                    event.orderId());
+            return TailResult.SKIPPED_VERSION_MISMATCH;
+        }
         var row = orders.findById(event.orderId());
         if (row.isEmpty()) {
             log.warn("Control event references unknown orderId={}", event.orderId());
             return TailResult.UNKNOWN_ORDER;
         }
         Order order = row.get();
-
-        var riskReject = controlRisk.evaluate(order);
-        if (riskReject.isPresent()) {
-            RejectCode code = riskReject.get();
-            boolean updated = orders.updateWithCas(
-                    event.orderId(),
-                    event.orderVersion(),
-                    OrderStatus.REJECTED,
-                    code,
-                    null,
-                    Instant.now()
-            );
-            if (updated) {
-                controlDecisions.record(
-                        event.orderId(),
-                        event.orderVersion(),
-                        "REJECT",
-                        code,
-                        ControlRiskEvaluator.STAGE_CONTROL,
-                        null);
-                publishRejected(event, code);
-            }
-            return updated ? TailResult.RISK_PIPELINE_REJECTED : TailResult.SKIPPED_VERSION_MISMATCH;
-        }
-
-        if (config.getLedger().isEnabled()) {
-            switch (buyingPower.evaluate(order)) {
-                case REJECT_INSUFFICIENT -> {
-                    boolean updated = orders.updateWithCas(
-                            event.orderId(),
-                            event.orderVersion(),
-                            OrderStatus.REJECTED,
-                            RejectCode.RISK_BUYING_POWER,
-                            null,
-                            Instant.now()
-                    );
-                    if (updated) {
-                        controlDecisions.record(
-                                event.orderId(),
-                                event.orderVersion(),
-                                "REJECT",
-                                RejectCode.RISK_BUYING_POWER,
-                                ControlRiskEvaluator.STAGE_CONTROL,
-                                null);
-                        publishRejected(event, RejectCode.RISK_BUYING_POWER);
-                    }
-                    return updated ? TailResult.BUYING_POWER_REJECTED : TailResult.SKIPPED_VERSION_MISMATCH;
+        if (order.status() == OrderStatus.WORKING && order.version() == event.orderVersion() + 1) {
+            if (shouldDedupOutboundEnqueueWithClaim()) {
+                if (!fixNosRouteEnqueueClaimRepository.tryClaim(event.orderId())) {
+                    meterRegistry.counter(OmsPipelineMeterNames.CONTROL_INGRESS_DISPATCH_ENQUEUE_CLAIM_SKIP).increment();
+                    return TailResult.SKIPPED_VERSION_MISMATCH;
                 }
-                case REJECT_LEDGER_UNAVAILABLE -> {
-                    boolean updated = orders.updateWithCas(
-                            event.orderId(),
-                            event.orderVersion(),
-                            OrderStatus.REJECTED,
-                            RejectCode.INTERNAL_ERROR,
-                            null,
-                            Instant.now()
-                    );
-                    if (updated) {
-                        controlDecisions.record(
-                                event.orderId(),
-                                event.orderVersion(),
-                                "REJECT",
-                                RejectCode.INTERNAL_ERROR,
-                                ControlRiskEvaluator.STAGE_CONTROL,
-                                null);
-                        publishRejected(event, RejectCode.INTERNAL_ERROR);
-                    }
-                    return updated ? TailResult.LEDGER_SERVICE_REJECTED : TailResult.SKIPPED_VERSION_MISMATCH;
-                }
-                case PROCEED -> { /* fall through */ }
             }
+            registerRouteDispatch(event.orderId());
+            return TailResult.APPLIED;
         }
-
-        boolean updated = orders.updateWithCas(
-                event.orderId(),
-                event.orderVersion(),
-                OrderStatus.WORKING,
-                null,
-                event.orderTimestamp(),
-                null
-        );
-        if (!updated) {
-            log.debug("CAS skipped for orderId={} expectedVersion={} (someone else won the race)",
-                    event.orderId(), event.orderVersion());
+        if (order.status() == OrderStatus.REJECTED) {
             return TailResult.SKIPPED_VERSION_MISMATCH;
         }
-        int newSeq = event.orderVersion() + 1;
-        controlDecisions.record(
+        log.warn(
+                "postgres-write-path=ingress: unexpected order state at tail orderId={} status={} version={} eventVersion={}",
                 event.orderId(),
-                event.orderVersion(),
-                "PASS",
-                null,
-                ControlRiskEvaluator.STAGE_CONTROL,
-                null);
-        orders.findById(event.orderId()).ifPresentOrElse(
-                o -> publishWorking(event, o, newSeq),
-                () -> log.warn("WORKING CAS succeeded but order {} not found for event publish", event.orderId()));
-        registerRouteDispatch(event.orderId());
-        return TailResult.APPLIED;
+                order.status(),
+                order.version(),
+                event.orderVersion());
+        return TailResult.SKIPPED_VERSION_MISMATCH;
+    }
+
+    /**
+     * When {@code noop} routing there is no outbound queue to pollute; skip claim inserts.
+     */
+    private boolean shouldDedupOutboundEnqueueWithClaim() {
+        String b = config.getRouting().getBackend();
+        return "fix".equalsIgnoreCase(b) || "simulated".equalsIgnoreCase(b);
     }
 
     private void registerRouteDispatch(UUID orderId) {
@@ -238,26 +145,6 @@ public class ControlTailer {
                 routeDispatcher.enqueueWorkingOrder(orderId);
             }
         });
-    }
-
-    private void publishRejected(PendingControlEvent event, RejectCode reason) {
-        ingressToFixNosLatencyRecorder.discard(event.orderId(), IngressToFixNosLatencyLimits.REASON_CONTROL_REJECT);
-        int newSeq = event.orderVersion() + 1;
-        try {
-            domainEventOutbox.insert(event.orderId(), envelopeCodec.orderRejected(event, reason, newSeq));
-            meterRegistry.counter(METRIC_REJECT_EVENTS, TAG_REJECT_CODE, reason.name()).increment();
-        } catch (JsonProcessingException e) {
-            throw new IllegalStateException("domain event envelope serialisation failed", e);
-        }
-    }
-
-    private void publishWorking(PendingControlEvent event, Order order, int newSeq) {
-        try {
-            domainEventOutbox.insert(order.id(), envelopeCodec.orderWorking(event, order, newSeq));
-            meterRegistry.counter(METRIC_WORKING_EVENTS).increment();
-        } catch (JsonProcessingException e) {
-            throw new IllegalStateException("domain event envelope serialisation failed", e);
-        }
     }
 
     public enum TailResult {

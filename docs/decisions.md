@@ -5,6 +5,12 @@ this directory once any of them is revisited). They mirror the milestone plan
 at [.cursor/plans/oms_first_milestone_701a63c0.plan.md](../../.cursor/plans/oms_first_milestone_701a63c0.plan.md)
 and v1.15 of [plans/oms-fix-gateway-and-settlement.md](../../system-documentation/plans/oms-fix-gateway-and-settlement.md).
 
+> **Superseded sections:** §1 (Posture A — Chronicle Queue OSS) and §8 (Chronicle's role)
+> are superseded by [`adr/0001-aeron-cluster-substrate.md`](adr/0001-aeron-cluster-substrate.md).
+> Aeron Cluster replaces Chronicle as the journal substrate; Postgres becomes a downstream
+> projection. The text in §1 and §8 below remains as historical context for the slice-1
+> decision; the live decision is in the ADR.
+
 ## 1. Posture and runtime
 
 - Posture **A** — Java 21 + Spring Boot 3 minimal + Chronicle Queue OSS +

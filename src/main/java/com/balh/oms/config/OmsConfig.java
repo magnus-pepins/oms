@@ -1,6 +1,7 @@
 package com.balh.oms.config;
 
 import com.balh.oms.chronicle.ChronicleTailDriver;
+import com.balh.oms.chronicle.ControlChronicleAppendMode;
 import com.balh.oms.fix.FixOutboundDriver;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.context.annotation.Configuration;
@@ -26,6 +27,7 @@ import java.util.stream.Collectors;
 public class OmsConfig {
 
     private final Http http = new Http();
+    private final Grpc grpc = new Grpc();
     private final Shard shard = new Shard();
     private final Control control = new Control();
     private final Outbox outbox = new Outbox();
@@ -45,6 +47,7 @@ public class OmsConfig {
     private final Otel otel = new Otel();
 
     public Http getHttp() { return http; }
+    public Grpc getGrpc() { return grpc; }
     public Shard getShard() { return shard; }
     public Control getControl() { return control; }
     public Outbox getOutbox() { return outbox; }
@@ -69,6 +72,16 @@ public class OmsConfig {
         public void setInternalApiKey(String v) { this.internalApiKey = v; }
     }
 
+    /** Optional gRPC ingress (same order accept semantics as HTTP). */
+    public static class Grpc {
+        private boolean enabled = false;
+        private int port = 9099;
+        public boolean isEnabled() { return enabled; }
+        public void setEnabled(boolean v) { this.enabled = v; }
+        public int getPort() { return port; }
+        public void setPort(int port) { this.port = Math.max(1, Math.min(port, 65535)); }
+    }
+
     public static class Shard {
         private int id = 0;
         private int count = 1;
@@ -82,10 +95,40 @@ public class OmsConfig {
         /** Default 5 minutes — see plans/oms-phase0-interim-decisions.md until trading-ops signs a stricter value. */
         private long maxJobAgeMs = 300_000L;
         private int tailerBatchSize = 100;
+        /**
+         * Default {@value ControlChronicleAppendMode#INGRESS_AFTER_COMMIT}; override with
+         * {@value ControlChronicleAppendMode#RECONCILER} for control-worker JVM, tests, or recovery — see
+         * {@code plans/oms-ingress-control-fix-topology.md}.
+         */
+        private String chronicleAppendMode = ControlChronicleAppendMode.INGRESS_AFTER_COMMIT;
+        /**
+         * {@code tail} (default): {@link com.balh.oms.tailer.ControlTailer} applies CAS + fanout when consuming Chronicle.
+         * {@code ingress}: same writes run in the ingress accept transaction; tail is routing dispatch only — see
+         * {@code plans/oms-ingress-control-fix-topology.md} P1.
+         */
+        private ControlPostgresWritePath postgresWritePath = ControlPostgresWritePath.TAIL;
         public long getMaxJobAgeMs() { return maxJobAgeMs; }
         public void setMaxJobAgeMs(long v) { this.maxJobAgeMs = v; }
         public int getTailerBatchSize() { return tailerBatchSize; }
         public void setTailerBatchSize(int v) { this.tailerBatchSize = v; }
+        public String getChronicleAppendMode() { return chronicleAppendMode; }
+        public void setChronicleAppendMode(String raw) {
+            String n = ControlChronicleAppendMode.normalize(raw);
+            ControlChronicleAppendMode.validate(n);
+            this.chronicleAppendMode = n;
+        }
+        /** When true, {@link com.balh.oms.reconciler.OutboxReconciler} must stay off for control (ingress publishes). */
+        public boolean isChronicleAppendIngressAfterCommit() {
+            return ControlChronicleAppendMode.INGRESS_AFTER_COMMIT.equals(chronicleAppendMode);
+        }
+
+        public ControlPostgresWritePath getPostgresWritePath() {
+            return postgresWritePath;
+        }
+
+        public void setPostgresWritePath(String raw) {
+            this.postgresWritePath = ControlPostgresWritePath.fromProperty(raw);
+        }
     }
 
     public static class Outbox {
@@ -101,18 +144,89 @@ public class OmsConfig {
     }
 
     public static class Chronicle {
+        /** Max length for {@link #setControlTailId(String)} after trim (Chronicle tailer metadata file names). */
+        private static final int CONTROL_TAIL_ID_MAX_CHARS = 128;
+
         private boolean enabled = true;
+        /**
+         * When {@code false}, this JVM does not register {@link com.balh.oms.chronicle.ChronicleControlTailReader}
+         * (no local consume of the control Chronicle). Use for <strong>ingress-only</strong> replicas in a split
+         * topology; keep {@code true} on control / FIX workers. When order accept is enabled, disabling the tail
+         * requires {@link com.balh.oms.config.ControlPostgresWritePath#INGRESS} — see
+         * {@link com.balh.oms.config.IngressChronicleTailTopologyValidator}.
+         */
+        private boolean controlTailEnabled = true;
         private String queueDir = "./queues/control";
         private String rollCycle = "DAILY";
+        /**
+         * Chronicle excerpt tailer id under {@link #queueDir} (see OpenHFT {@code ExcerptTailer}). Default
+         * {@code oms-control}. For **one** active control tail per shared queue directory in production; use distinct
+         * ids only when you intentionally partition readers (separate dirs or an agreed sharding story).
+         */
+        private String controlTailId = "oms-control";
         private ChronicleTailDriver tailDriver = ChronicleTailDriver.SCHEDULED;
         private long tailPollIntervalMs = 50L;
         private int tailBatchMaxMessages = 200;
         /** Nanoseconds to park the dedicated tail thread when a drain pass finds no data (0 = busy-wait when idle). */
         private long tailDedicatedIdleParkNanos = 100_000L;
-        public boolean isEnabled() { return enabled; }
-        public void setEnabled(boolean v) { this.enabled = v; }
+        /**
+         * When {@code true} (default), {@link com.balh.oms.chronicle.ChronicleControlTailReader} calls
+         * {@code ExcerptTailer.toStart()} on boot (full replay from the queue start for {@link #controlTailId}).
+         * When {@code false}, resumes the persisted Chronicle tail index for that id.
+         */
+        private boolean controlTailReplayFromStartOnBoot = true;
+
+        public boolean isEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(boolean v) {
+            this.enabled = v;
+        }
+
+        public boolean isControlTailEnabled() {
+            return controlTailEnabled;
+        }
+
+        public void setControlTailEnabled(boolean controlTailEnabled) {
+            this.controlTailEnabled = controlTailEnabled;
+        }
+
         public String getQueueDir() { return queueDir; }
         public void setQueueDir(String v) { this.queueDir = v; }
+        public String getControlTailId() {
+            return controlTailId;
+        }
+
+        /**
+         * Sets {@link #controlTailId}. Blank/null resets to {@code oms-control}. Must match {@code [a-zA-Z0-9_.-]+}
+         * and be at most {@value #CONTROL_TAIL_ID_MAX_CHARS} characters after trim.
+         */
+        public void setControlTailId(String raw) {
+            if (raw == null || raw.isBlank()) {
+                this.controlTailId = "oms-control";
+                return;
+            }
+            String t = raw.trim();
+            if (t.length() > CONTROL_TAIL_ID_MAX_CHARS) {
+                throw new IllegalArgumentException(
+                        "oms.chronicle.control-tail-id exceeds " + CONTROL_TAIL_ID_MAX_CHARS + " characters");
+            }
+            if (!t.matches("[a-zA-Z0-9_.-]+")) {
+                throw new IllegalArgumentException(
+                        "oms.chronicle.control-tail-id must match [a-zA-Z0-9_.-]+ (got characters outside that set)");
+            }
+            this.controlTailId = t;
+        }
+
+        public boolean isControlTailReplayFromStartOnBoot() {
+            return controlTailReplayFromStartOnBoot;
+        }
+
+        public void setControlTailReplayFromStartOnBoot(boolean controlTailReplayFromStartOnBoot) {
+            this.controlTailReplayFromStartOnBoot = controlTailReplayFromStartOnBoot;
+        }
+
         public String getRollCycle() { return rollCycle; }
         public void setRollCycle(String v) { this.rollCycle = v; }
         public ChronicleTailDriver getTailDriver() { return tailDriver; }
@@ -699,6 +813,11 @@ public class OmsConfig {
         private boolean manualMassCancelWireEnabled = false;
         /** Max UTF-16 length for optional {@code reason} on manual mass-cancel POST. */
         private int manualMassCancelReasonMaxChars = 512;
+        /**
+         * When {@link #manualMassCancelWireEnabled} and {@link #autoStart}, max wait (ms) for {@code OrderMassCancelRequest}
+         * to be sent by {@link com.balh.oms.fix.FixOutboundDispatchWorker} via the shared outbound queue.
+         */
+        private long manualMassCancelWireQueueWaitMs = 30_000L;
 
         public boolean isAutoStart() { return autoStart; }
         public void setAutoStart(boolean autoStart) { this.autoStart = autoStart; }
@@ -985,6 +1104,15 @@ public class OmsConfig {
 
         public void setManualMassCancelReasonMaxChars(int manualMassCancelReasonMaxChars) {
             this.manualMassCancelReasonMaxChars = Math.min(4000, Math.max(32, manualMassCancelReasonMaxChars));
+        }
+
+        public long getManualMassCancelWireQueueWaitMs() {
+            return manualMassCancelWireQueueWaitMs;
+        }
+
+        public void setManualMassCancelWireQueueWaitMs(long manualMassCancelWireQueueWaitMs) {
+            this.manualMassCancelWireQueueWaitMs =
+                    Math.min(600_000L, Math.max(1_000L, manualMassCancelWireQueueWaitMs));
         }
     }
 

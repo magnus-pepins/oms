@@ -37,6 +37,9 @@ new key here when introducing one.
 | Key                                | Default | Meaning                                                                                              |
 |------------------------------------|---------|------------------------------------------------------------------------------------------------------|
 | `OMS_CONTROL_MAX_JOB_AGE_MS`       | `300000` | If a control event sits unprocessed past this (ms), reject with `RISK_STALE_QUEUE`. Interim default 5 min — [oms-phase0-interim-decisions.md](../../system-documentation/plans/oms-phase0-interim-decisions.md). |
+| `OMS_CONTROL_CHRONICLE_APPEND_MODE` | `ingress-after-commit` | **`ingress-after-commit`** (default monolith) — ingress JVM appends + marks in `afterCommit` (`IngressControlChroniclePublisher`); **disables** `OutboxReconciler` for control. Requires **`OMS_CHRONICLE_ENABLED=true`**. **`reconciler`** — `OutboxReconciler` after `OMS_OUTBOX_RECONCILER_AGE_MS` (required for **`oms-control-worker`**, **`test`** profile, recovery). See [oms-ingress-control-fix-topology.md](../../system-documentation/plans/oms-ingress-control-fix-topology.md). |
+| `SPRING_PROFILES_ACTIVE` | (unset) | Include **`oms-control-worker`** for P3 prep: no new-order HTTP/gRPC ingress (`OmsProfiles`); incompatible with **`ingress-after-commit`** on that JVM (`ControlWorkerTopologyValidator`). Topology: same plan link. |
+| `OMS_CONTROL_WORKER_MANAGEMENT_SERVER_PORT` | `8089` | With profile **`oms-control-worker`**, Spring **`management.server.port`** (Actuator/health/prometheus) so it does not share **`OMS_HTTP_PORT`**. Set when running control-worker beside another OMS on the same host. |
 | `OMS_TAILER_BATCH_SIZE`            | `100`   | Reserved for future control-plane batching (Disruptor slice); Chronicle tail batch uses `OMS_CHRONICLE_TAIL_BATCH_MAX_MESSAGES`. |
 
 ## Risk (slice 2)
@@ -128,7 +131,7 @@ Transport choice vs MQTT: [marketdata-ingestion-path.md](marketdata-ingestion-pa
 |-----|---------|---------|
 | `OMS_CORPORATE_ACTION_PROCESSOR_ENABLED` | `false` | When **`true`**, **`CorporateActionProcessorJob`** marks unprocessed **`corporate_action_event`** rows **`processed_at`** (no-op stub; increments **`oms_corporate_action_events_processed_total`**). |
 | `OMS_CORPORATE_ACTION_PROCESSOR_INTERVAL_MS` | `60000` | Fixed delay between processor wakes (minimum **5000**). |
-| `OMS_CORPORATE_ACTION_PROCESSOR_BATCH_SIZE` | `50` | Max rows examined per wake (capped at **500**). |
+| `OMS_CORPORATE_ACTION_PROCESSOR_BATCH_SIZE` | `50` | Max rows examined per wake (capped at **500**); fetch uses **`FOR UPDATE SKIP LOCKED`** inside one DB transaction per wake (fetch + **`markProcessedIfPending`**). |
 | `OMS_CORPORATE_ACTION_INGEST_INSTRUMENT_SYMBOL_MAX_LENGTH` | `64` | Max **`instrument_symbol`** on **`POST /internal/v1/corporate-action-events`**. |
 | `OMS_CORPORATE_ACTION_INGEST_ACTION_TYPE_MAX_LENGTH` | `64` | Max **`action_type`** on ingest. |
 | `OMS_CORPORATE_ACTION_INGEST_PAYLOAD_JSON_MAX_CHARS` | `16000` | Max serialized **`payloadJson`** characters on ingest. |
@@ -193,6 +196,7 @@ Used when `OMS_ROUTING_BACKEND=fix`. See [fix-out.md](fix-out.md) for session ma
 | `OMS_FIX_MANUAL_MASS_CANCEL_ENABLED` | `false` | When **`true`**, **`POST /internal/v1/fix/mass-cancel-request`** is accepted (records intent + metrics; default **does not** wire QuickFIX **`MassCancelRequest`** until **`OMS_FIX_MANUAL_MASS_CANCEL_WIRE_ENABLED=true`**). |
 | `OMS_FIX_MANUAL_MASS_CANCEL_WIRE_ENABLED` | `false` | When **`true`** (and manual mass cancel enabled), service may emit venue mass cancel (broker contract required in prod). |
 | `OMS_FIX_MANUAL_MASS_CANCEL_REASON_MAX_CHARS` | `512` | Max **`reason`** length on manual mass cancel body (config clamps **32–4000**). |
+| `OMS_FIX_MANUAL_MASS_CANCEL_WIRE_QUEUE_WAIT_MS` | `30000` | When **`OMS_FIX_AUTO_START=true`**, max wait (ms) for HTTP handler until **`OrderMassCancelRequest`** is sent via the shared outbound queue (clamped **1000–600000**). |
 | `OMS_FIX_ROUTE_STATE_SOD_ENABLED` | `false` | When **`true`**, cron job sets `fix_route_state.send_enabled=true` on all rows (`FixRouteStateSodScheduler`). |
 | `OMS_FIX_ROUTE_STATE_SOD_CRON` | `0 0 6 * * *` | Spring six-field cron for SOD reconciliation (only when SOD enabled). |
 | `OMS_FIX_ROUTE_STATE_SOD_POLICY_MODE` | `always` | **`always`** — every cron tick runs SOD (legacy). **`weekdays`** — Mon–Fri only in **`OMS_FIX_ROUTE_STATE_SOD_POLICY_ZONE_ID`**. **`region_calendar`** — JSON **`OMS_FIX_ROUTE_STATE_SOD_POLICY_CALENDAR_JSON`** (`FixSodPolicyEngine`). Skips increment **`oms_fix_route_state_sod_skipped_total`** with tag **`reason`**. |
@@ -210,7 +214,7 @@ Used when `OMS_ROUTING_BACKEND=fix`. See [fix-out.md](fix-out.md) for session ma
 | Key                                   | Default | Meaning                                                                            |
 |---------------------------------------|---------|------------------------------------------------------------------------------------|
 | `OMS_OUTBOX_RECONCILER_AGE_MS`        | `2000`  | Minimum age before a control outbox row is eligible for Chronicle append (avoids races).  |
-| `OMS_OUTBOX_RECONCILER_BATCH_SIZE`    | `100`   | Rows fetched per reconciler tick.                                                  |
+| `OMS_OUTBOX_RECONCILER_BATCH_SIZE`    | `100`   | Rows fetched per reconciler tick (claimed with **`FOR UPDATE SKIP LOCKED`** inside one DB transaction per **`OutboxReconciler.runOnce()`**, so multiple reconciler JVMs can share **`control_outbox`** without claiming the same row). |
 | `OMS_OUTBOX_RECONCILER_INTERVAL_MS`   | `500`   | Scheduled-task interval. Drives `oms_control_outbox_appended_total` cadence.       |
 
 ## Domain fanout outbox
@@ -218,7 +222,7 @@ Used when `OMS_ROUTING_BACKEND=fix`. See [fix-out.md](fix-out.md) for session ma
 | Key                                      | Default | Meaning                                                                 |
 |------------------------------------------|---------|-------------------------------------------------------------------------|
 | `OMS_DOMAIN_EVENTS_RECONCILER_AGE_MS`    | `2000`  | Minimum age before a `domain_event_outbox` row is eligible for NATS delivery. |
-| `OMS_DOMAIN_EVENTS_RECONCILER_BATCH_SIZE` | `100` | Rows fetched per `DomainFanoutReconciler` tick.                         |
+| `OMS_DOMAIN_EVENTS_RECONCILER_BATCH_SIZE` | `100` | Rows fetched per `DomainFanoutReconciler` tick (**`FOR UPDATE SKIP LOCKED`**; one DB transaction per tick spans fetch + **`FanoutClient.deliver`** + mark). |
 | `OMS_DOMAIN_EVENTS_RECONCILER_INTERVAL_MS` | `500` | `@Scheduled` fixed delay for domain fanout drain.                       |
 
 ## Chronicle
@@ -229,6 +233,8 @@ How the control queue is tailed (`scheduled` vs `dedicated`) is documented in **
 |---------------------------------------|--------------------|-------------------------------------------------------------------------|
 | `OMS_CHRONICLE_ENABLED`               | `true`             | When `false`, no `ChronicleQueue` bean; `NoOpControlJournal` is used.    |
 | `OMS_CHRONICLE_QUEUE_DIR`             | `./queues/control` | Directory for Chronicle Queue files.                                    |
+| `OMS_CHRONICLE_CONTROL_TAIL_ID`       | `oms-control`      | `ExcerptTailer` id under `OMS_CHRONICLE_QUEUE_DIR`. One active tail per shared dir in prod unless sharded by design — [chronicle-tail-driver.md](chronicle-tail-driver.md). |
+| `OMS_CHRONICLE_CONTROL_TAIL_REPLAY_FROM_START_ON_BOOT` | `true` | `true`: `toStart()` on boot (full replay for that tailer id). `false`: resume persisted tail index — [chronicle-tail-driver.md](chronicle-tail-driver.md). |
 | `OMS_CHRONICLE_ROLL_CYCLE`            | `DAILY`            | `MINUTELY` / `HOURLY` / `DAILY` use `LegacyRollCycles`. Also: `FAST_DAILY`, `DEFAULT`. |
 | `OMS_CHRONICLE_TAIL_DRIVER`           | `scheduled`        | `scheduled` (Spring fixed-delay `pollBatch`) or `dedicated` (thread + `parkNanos` when idle). See [chronicle-tail-driver.md](chronicle-tail-driver.md). |
 | `OMS_CHRONICLE_TAIL_POLL_INTERVAL_MS` | `50`             | Delay between `pollBatch` runs when **`tail-driver=scheduled`** (ms). Ignored for `dedicated`. |
@@ -257,7 +263,7 @@ How the control queue is tailed (`scheduled` vs `dedicated`) is documented in **
 | `OMS_LEDGER_INFLIGHT_RESERVATION_ENABLED` | `false`          | When true, OMS places a Ledger BUY inflight hold at order accept (idempotent `reference` `oms:order:{uuid}`). Requires `OMS_LEDGER_INFLIGHT_HOLD_DESTINATION_BALANCE_ID`. |
 | `OMS_LEDGER_INFLIGHT_ASYNC_ENABLED` | `false` | When **true** (and inflight reservation enabled), the hold is **written to `ledger_inflight_outbox` in the same Postgres transaction** as the order; `LedgerInflightOutboxReconciler` calls Ledger **after** commit. When **false**, the Ledger HTTP call runs **synchronously inside** the accept transaction (default). |
 | `OMS_LEDGER_INFLIGHT_OUTBOX_RECONCILER_AGE_MS` | `2000` | Only process outbox rows with `created_at` at least this old (avoids racing uncommitted readers). |
-| `OMS_LEDGER_INFLIGHT_OUTBOX_RECONCILER_BATCH_SIZE` | `50` | Max rows per reconciler tick. |
+| `OMS_LEDGER_INFLIGHT_OUTBOX_RECONCILER_BATCH_SIZE` | `50` | Max rows per reconciler tick (**`FOR UPDATE SKIP LOCKED`**; one DB transaction per tick spans fetch + Ledger HTTP + mark). |
 | `OMS_LEDGER_INFLIGHT_OUTBOX_RECONCILER_INTERVAL_MS` | `500` | `fixedDelay` between reconciler runs (Spring `@Scheduled`). |
 | `OMS_LEDGER_INFLIGHT_HOLD_DESTINATION_BALANCE_ID` | (empty) | Ledger `balance_id` for the hold leg (bank suspense / OMS hold account). Required when inflight reservation is enabled. |
 | `OMS_LEDGER_INFLIGHT_RESERVATION_CURRENCY` | `EUR`        | ISO currency code for the inflight hold `amount`.                        |

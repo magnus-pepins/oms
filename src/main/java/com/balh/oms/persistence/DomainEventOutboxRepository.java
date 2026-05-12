@@ -34,6 +34,10 @@ public class DomainEventOutboxRepository {
             VALUES (:order_id, CAST(:envelope AS jsonb), :created_at)
             """;
 
+    /**
+     * {@code FOR UPDATE SKIP LOCKED} — callers must run inside a Spring transaction that spans fetch +
+     * {@link #markPublished}/{@link #markFailed} (see {@link com.balh.oms.reconciler.DomainFanoutReconciler}).
+     */
     private static final String FETCH_PENDING_SQL = """
             SELECT id, order_id, envelope_json::text AS envelope_json, created_at, attempts
             FROM domain_event_outbox
@@ -41,6 +45,7 @@ public class DomainEventOutboxRepository {
               AND created_at <= :older_than
             ORDER BY id
             LIMIT :batch_size
+            FOR UPDATE SKIP LOCKED
             """;
 
     private static final String MARK_PUBLISHED_SQL = """

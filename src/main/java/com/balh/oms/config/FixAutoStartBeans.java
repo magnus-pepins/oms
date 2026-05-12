@@ -6,8 +6,8 @@ import com.balh.oms.fix.FixNewOrderSingleBuilder;
 import com.balh.oms.fix.FixOutboundDispatchWorker;
 import com.balh.oms.fix.FixOutboundDriver;
 import com.balh.oms.fix.FixOutboundOrderDequeue;
+import com.balh.oms.fix.FixOutboundSessionSend;
 import com.balh.oms.fix.FixOutboundTokenBucket;
-import com.balh.oms.fix.FixSessionRegistry;
 import com.balh.oms.fix.OmsFixApplication;
 import com.balh.oms.observability.otel.IngressToFixNosLatencyRecorder;
 import com.balh.oms.persistence.FixRouteStateRepository;
@@ -69,7 +69,7 @@ public class FixAutoStartBeans {
     FixOutboundDispatchWorker fixOutboundDispatchWorker(
             RouteDispatcher routeDispatcher,
             FixOutboundOrderDequeue fixOutboundOrderDequeue,
-            FixSessionRegistry fixSessionRegistry,
+            FixOutboundSessionSend fixOutboundSessionSend,
             OrdersRepository ordersRepository,
             FixNewOrderSingleBuilder newOrderSingleBuilder,
             MeterRegistry meterRegistry,
@@ -81,7 +81,7 @@ public class FixAutoStartBeans {
         return new FixOutboundDispatchWorker(
                 routeDispatcher,
                 fixOutboundOrderDequeue,
-                fixSessionRegistry,
+                fixOutboundSessionSend,
                 ordersRepository,
                 newOrderSingleBuilder,
                 meterRegistry,

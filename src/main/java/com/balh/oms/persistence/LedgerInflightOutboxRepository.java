@@ -31,6 +31,10 @@ public class LedgerInflightOutboxRepository {
             VALUES (:order_id, CAST(:payload AS jsonb), :created_at)
             """;
 
+    /**
+     * {@code FOR UPDATE SKIP LOCKED} — callers must run inside a Spring transaction that spans fetch +
+     * {@link #markPublished}/{@link #markFailed} (see {@link com.balh.oms.reconciler.LedgerInflightOutboxReconciler}).
+     */
     private static final String FETCH_PENDING_SQL = """
             SELECT id, order_id, payload_json::text AS payload_json, created_at, attempts
             FROM ledger_inflight_outbox
@@ -38,6 +42,7 @@ public class LedgerInflightOutboxRepository {
               AND created_at <= :older_than
             ORDER BY id
             LIMIT :batch_size
+            FOR UPDATE SKIP LOCKED
             """;
 
     private static final String MARK_PUBLISHED_SQL = """

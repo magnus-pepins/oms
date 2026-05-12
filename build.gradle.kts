@@ -1,3 +1,5 @@
+import org.gradle.api.JavaVersion
+
 plugins {
     java
     id("com.google.protobuf") version "0.9.4"
@@ -25,11 +27,18 @@ repositories {
 val quickfixjVersion = "2.3.2"
 
 /**
- * Chronicle / OpenHFT memory-mapped I/O touches JDK-internal packages; Java 11+ module system
- * requires these flags (see OpenHFT `docs/Java-Version-Support.adoc`). Without them, `bootRun`
- * fails on Linux JDK 21 with `IllegalAccessException` / `sun.nio.ch.UnixFileDispatcherImpl`.
+ * JVM `--add-opens` / `--add-exports` for low-latency JDK-internals access.
+ *
+ * Used by both Chronicle Queue (OpenHFT memory-mapped I/O — `docs/Java-Version-Support.adoc`)
+ * and Aeron / Agrona (off-heap buffers, atomic ops on `Unsafe`). Without them, the relevant
+ * `bootRun` / cluster-node JVM fails on JDK 21 with `IllegalAccessException` against
+ * `sun.nio.ch.*`, `jdk.internal.misc.*`, or `sun.misc.Unsafe`.
+ *
+ * Kept under one name to avoid drift between Chronicle and Aeron flag lists. Chronicle is
+ * being removed per ADR 0001 (`docs/adr/0001-aeron-cluster-substrate.md`); this list will
+ * lose the `jdk.compiler` / `java.io` exports when Chronicle goes.
  */
-val chronicleJavaModuleOpens =
+val lowLatencyJvmModuleOpens =
     listOf(
         "--add-exports=java.base/jdk.internal.ref=ALL-UNNAMED",
         "--add-exports=java.base/sun.nio.ch=ALL-UNNAMED",
@@ -40,6 +49,7 @@ val chronicleJavaModuleOpens =
         "--add-opens=java.base/java.lang.reflect=ALL-UNNAMED",
         "--add-opens=java.base/java.io=ALL-UNNAMED",
         "--add-opens=java.base/java.util=ALL-UNNAMED",
+        "--add-opens=java.base/jdk.internal.misc=ALL-UNNAMED",
     )
 
 /**
@@ -54,9 +64,25 @@ val springTestContextCacheMaxSize =
 /** Protobuf compiler + runtime (control_outbox + Chronicle wire format). */
 val protobufJavaVersion = "4.29.3"
 
+/** gRPC Java stack (ingress); keep aligned with protoc-gen-grpc-java. */
+val grpcJavaVersion = "1.68.2"
+
 val openTelemetryVersion = "1.51.0"
 /** Must match OTel prometheus exporter transitive; Micrometer 1.13 pins older 1.2.x without this. */
 val prometheusMetricsBomVersion = "1.3.8"
+
+/**
+ * Aeron family — substrate for the cluster (replaces Chronicle per ADR 0001).
+ *
+ * `io.aeron:aeron-cluster` transitively pulls in `aeron-archive`, `aeron-driver`, `aeron-client`,
+ * and `agrona`. We pin Agrona explicitly for reproducibility and to keep IDE navigation clean.
+ *
+ * `1.48.0` is the latest stable on Maven Central as of the ADR. Phase 0 spike confirms or updates.
+ */
+val aeronVersion = "1.48.0"
+
+/** Agrona — off-heap buffers, primitive collections (`Long2ObjectHashMap`, `DirectBuffer`). */
+val agronaVersion = "2.2.1"
 
 dependencies {
     // OpenTelemetry metrics (optional; gated by oms.otel.metrics-enabled) — Prometheus scrape for histograms (p50/p95).
@@ -83,10 +109,24 @@ dependencies {
 
     // Chronicle Queue OSS — durable shard-local journal.
     // 2026.2 is the latest stable on Maven Central as of this bootstrap.
+    //
+    // TRANSITIONAL per ADR 0001 (Aeron Cluster substrate). Removed when each phase of the plan
+    // deletes the Chronicle code path it replaces. Do not add new call sites.
     implementation("net.openhft:chronicle-queue:2026.2") {
         // Avoid the OpenHFT slf4j shim; let Spring Boot's logback own slf4j-api.
         exclude(group = "org.slf4j", module = "slf4j-api")
     }
+
+    // Aeron family — substrate for the clustered state machine (ADR 0001).
+    //
+    // `aeron-cluster` pulls in `aeron-archive`, `aeron-driver`, `aeron-client` transitively;
+    // listed explicitly here so navigation and compile-time visibility don't depend on the
+    // transitive graph.
+    implementation("io.aeron:aeron-cluster:$aeronVersion")
+    implementation("io.aeron:aeron-archive:$aeronVersion")
+    implementation("io.aeron:aeron-driver:$aeronVersion")
+    implementation("io.aeron:aeron-client:$aeronVersion")
+    implementation("org.agrona:agrona:$agronaVersion")
 
     // LMAX Disruptor — in-process pipelining (used post-PG-commit only)
     implementation("com.lmax:disruptor:4.0.0")
@@ -110,6 +150,11 @@ dependencies {
 
     implementation("com.google.protobuf:protobuf-java:$protobufJavaVersion")
 
+    implementation("io.grpc:grpc-netty-shaded:$grpcJavaVersion")
+    implementation("io.grpc:grpc-protobuf:$grpcJavaVersion")
+    implementation("io.grpc:grpc-stub:$grpcJavaVersion")
+    implementation("javax.annotation:javax.annotation-api:1.3.2")
+
     // Test
     testImplementation("org.springframework.boot:spring-boot-starter-test")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
@@ -128,11 +173,23 @@ protobuf {
     protoc {
         artifact = "com.google.protobuf:protoc:$protobufJavaVersion"
     }
+    plugins {
+        create("grpc") {
+            artifact = "io.grpc:protoc-gen-grpc-java:$grpcJavaVersion"
+        }
+    }
+    generateProtoTasks {
+        all().forEach { task ->
+            task.plugins {
+                create("grpc")
+            }
+        }
+    }
 }
 
 tasks.withType<Test> {
     useJUnitPlatform()
-    jvmArgs(chronicleJavaModuleOpens)
+    jvmArgs(lowLatencyJvmModuleOpens)
     // Keep test logs deterministic: do not run integration suites in parallel until we enable Postgres pooling.
     systemProperty("junit.jupiter.execution.parallel.enabled", "false")
     systemProperty("spring.test.context.cache.maxSize", springTestContextCacheMaxSize.toString())
@@ -146,11 +203,126 @@ tasks.withType<Test> {
 }
 
 tasks.named<org.springframework.boot.gradle.tasks.run.BootRun>("bootRun") {
-    jvmArgs(chronicleJavaModuleOpens)
+    jvmArgs(lowLatencyJvmModuleOpens)
+}
+
+/** P3 prep: same app as bootRun with Spring profile oms-control-worker (see OmsControlWorkerBootstrap). */
+tasks.register<org.springframework.boot.gradle.tasks.run.BootRun>("bootRunControlWorker") {
+    group = "application"
+    description =
+        "Run OMS with oms-control-worker profile (no new-order ingress; reconciler Chronicle append per application-oms-control-worker.yaml)."
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.balh.oms.OmsControlWorkerBootstrap")
+    jvmArgs(lowLatencyJvmModuleOpens)
 }
 
 tasks.named<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJar") {
     archiveBaseName.set("oms")
+}
+
+/**
+ * Second fat JAR: same BOOT-INF layout as bootJar, {@code Start-Class} {@link com.balh.oms.OmsControlWorkerBootstrap}.
+ * Requires {@code targetJavaVersion} (Spring Boot 3 BootJar) so the task is wired like the default {@code bootJar}.
+ */
+tasks.register<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJarControlWorker") {
+    group = "build"
+    description =
+        "Executable JAR for control-worker entry (Start-Class OmsControlWorkerBootstrap; classifier control-worker)."
+    mainClass.set("com.balh.oms.OmsControlWorkerBootstrap")
+    archiveClassifier.set("control-worker")
+    archiveBaseName.set("oms")
+    targetJavaVersion.set(JavaVersion.VERSION_21)
+    classpath = sourceSets["main"].runtimeClasspath
+}
+
+tasks.named<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJarControlWorker").configure {
+    shouldRunAfter(tasks.named("bootJar"))
+    duplicatesStrategy = org.gradle.api.file.DuplicatesStrategy.EXCLUDE
+}
+
+/** P4 prep: same app as bootRun with Spring profile oms-fix-worker (FIX initiator + outbound; see OmsFixWorkerBootstrap). */
+tasks.register<org.springframework.boot.gradle.tasks.run.BootRun>("bootRunFixWorker") {
+    group = "application"
+    description =
+        "Run OMS with oms-fix-worker profile (no new-order ingress; reconciler Chronicle append; oms.routing.backend=fix and oms.fix.auto-start=true per application-oms-fix-worker.yaml)."
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.balh.oms.OmsFixWorkerBootstrap")
+    jvmArgs(lowLatencyJvmModuleOpens)
+}
+
+tasks.register<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJarFixWorker") {
+    group = "build"
+    description =
+        "Executable JAR for FIX-worker entry (Start-Class OmsFixWorkerBootstrap; classifier fix-worker)."
+    mainClass.set("com.balh.oms.OmsFixWorkerBootstrap")
+    archiveClassifier.set("fix-worker")
+    archiveBaseName.set("oms")
+    targetJavaVersion.set(JavaVersion.VERSION_21)
+    classpath = sourceSets["main"].runtimeClasspath
+}
+
+tasks.named<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJarFixWorker").configure {
+    shouldRunAfter(tasks.named("bootJar"))
+    duplicatesStrategy = org.gradle.api.file.DuplicatesStrategy.EXCLUDE
+}
+
+/** P5 prep: same app as bootRun with Spring profile oms-ingress-replica (order accept + ingress admission; no local control tail; see OmsIngressReplicaBootstrap). */
+tasks.register<org.springframework.boot.gradle.tasks.run.BootRun>("bootRunIngressReplica") {
+    group = "application"
+    description =
+        "Run OMS with oms-ingress-replica profile (horizontal ingress; application-oms-ingress-replica.yaml)."
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.balh.oms.OmsIngressReplicaBootstrap")
+    jvmArgs(lowLatencyJvmModuleOpens)
+}
+
+tasks.register<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJarIngressReplica") {
+    group = "build"
+    description =
+        "Executable JAR for ingress-replica entry (Start-Class OmsIngressReplicaBootstrap; classifier ingress-replica)."
+    mainClass.set("com.balh.oms.OmsIngressReplicaBootstrap")
+    archiveClassifier.set("ingress-replica")
+    archiveBaseName.set("oms")
+    targetJavaVersion.set(JavaVersion.VERSION_21)
+    classpath = sourceSets["main"].runtimeClasspath
+}
+
+tasks.named<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJarIngressReplica").configure {
+    shouldRunAfter(tasks.named("bootJar"))
+    duplicatesStrategy = org.gradle.api.file.DuplicatesStrategy.EXCLUDE
+}
+
+/**
+ * ADR 0001 / topology-aeron-cluster Phase 1: cluster-node JVM.
+ *
+ * Boots an Aeron MediaDriver + Archive + ConsensusModule + ClusteredServiceContainer hosting
+ * `OmsAdmissionClusteredService`. **Do not** combine on the same JVM with the legacy worker
+ * profiles (`oms-control-worker`, `oms-fix-worker`, `oms-ingress-replica`) — those go away
+ * once Phases 2-3 of the plan complete.
+ */
+tasks.register<org.springframework.boot.gradle.tasks.run.BootRun>("bootRunClusterNode") {
+    group = "application"
+    description =
+        "Run OMS cluster-node JVM (Aeron Cluster, OmsAdmissionClusteredService; ADR 0001)."
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.balh.oms.OmsClusterNodeBootstrap")
+    jvmArgs(lowLatencyJvmModuleOpens)
+}
+
+tasks.register<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJarClusterNode") {
+    group = "build"
+    description =
+        "Executable JAR for cluster-node entry (Start-Class OmsClusterNodeBootstrap; classifier cluster-node)."
+    mainClass.set("com.balh.oms.OmsClusterNodeBootstrap")
+    archiveClassifier.set("cluster-node")
+    archiveBaseName.set("oms")
+    targetJavaVersion.set(JavaVersion.VERSION_21)
+    classpath = sourceSets["main"].runtimeClasspath
+}
+
+tasks.named<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJarClusterNode").configure {
+    shouldRunAfter(tasks.named("bootJar"))
+    duplicatesStrategy = org.gradle.api.file.DuplicatesStrategy.EXCLUDE
 }
 
 /** Minimal FIX 4.4 loopback acceptor for local OMS + HTTP load scripts (see docs/fix-out.md § synthetic traffic). */

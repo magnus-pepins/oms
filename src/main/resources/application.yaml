@@ -42,6 +42,10 @@ management:
 oms:
   http:
     internal-api-key: ${OMS_INTERNAL_API_KEY:}
+  # Internal order ingress over gRPC (OrderIngress.CreateOrder). Metadata: x-oms-internal-key = same value as oms.http.internal-api-key.
+  grpc:
+    enabled: ${OMS_GRPC_ENABLED:false}
+    port: ${OMS_GRPC_PORT:9099}
   otel:
     # When true, starts an OpenTelemetry SdkMeterProvider + Prometheus scrape listener (default port 9464).
     # Micrometer /actuator/prometheus remains available. Use for histogram_quantile(p50/p95) on ingress→FIX NOS.
@@ -56,13 +60,23 @@ oms:
     # Interim default 5 min — plans/oms-phase0-interim-decisions.md; tune per env.
     max-job-age-ms: ${OMS_CONTROL_MAX_JOB_AGE_MS:300000}
     tailer-batch-size: ${OMS_TAILER_BATCH_SIZE:100}
+    # ingress-after-commit (default): append + mark in ingress JVM after commit (disables OutboxReconciler for control); requires oms.chronicle.enabled=true.
+    # reconciler: OutboxReconciler drains control_outbox → Chronicle (control-worker JVM, integration tests, recovery).
+    # tail (default): Chronicle tail applies CAS + fanout. ingress: same writes in the accept transaction; tail dispatches routing only (P1).
+    postgres-write-path: ${OMS_CONTROL_POSTGRES_WRITE_PATH:tail}
   outbox:
     reconciler-age-ms: ${OMS_OUTBOX_RECONCILER_AGE_MS:2000}
     reconciler-batch-size: ${OMS_OUTBOX_RECONCILER_BATCH_SIZE:100}
     reconciler-interval-ms: ${OMS_OUTBOX_RECONCILER_INTERVAL_MS:500}
   chronicle:
     enabled: ${OMS_CHRONICLE_ENABLED:true}
+    # When false, omit ChronicleControlTailReader on this JVM (ingress-only replica in split topology; workers keep true).
+    control-tail-enabled: ${OMS_CHRONICLE_CONTROL_TAIL_ENABLED:true}
     queue-dir: ${OMS_CHRONICLE_QUEUE_DIR:./queues/control}
+    # Tailer id under queue-dir (Chronicle metadata). One active tail per shared dir in prod unless sharded by design.
+    control-tail-id: ${OMS_CHRONICLE_CONTROL_TAIL_ID:oms-control}
+    # When true (default), tail calls toStart() on boot (full journal replay for that tailer id). When false, resumes persisted index.
+    control-tail-replay-from-start-on-boot: ${OMS_CHRONICLE_CONTROL_TAIL_REPLAY_FROM_START_ON_BOOT:true}
     roll-cycle: ${OMS_CHRONICLE_ROLL_CYCLE:DAILY}
     # scheduled | dedicated — see docs/chronicle-tail-driver.md
     tail-driver: ${OMS_CHRONICLE_TAIL_DRIVER:scheduled}
@@ -242,6 +256,7 @@ oms:
     manual-mass-cancel-enabled: ${OMS_FIX_MANUAL_MASS_CANCEL_ENABLED:false}
     manual-mass-cancel-wire-enabled: ${OMS_FIX_MANUAL_MASS_CANCEL_WIRE_ENABLED:false}
     manual-mass-cancel-reason-max-chars: ${OMS_FIX_MANUAL_MASS_CANCEL_REASON_MAX_CHARS:512}
+    manual-mass-cancel-wire-queue-wait-ms: ${OMS_FIX_MANUAL_MASS_CANCEL_WIRE_QUEUE_WAIT_MS:30000}
 
 logging:
   level:

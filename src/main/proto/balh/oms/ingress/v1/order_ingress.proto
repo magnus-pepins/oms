@@ -1,0 +1,46 @@
+syntax = "proto3";
+
+package balh.oms.ingress.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option java_multiple_files = true;
+option java_package = "com.balh.oms.proto.ingress.v1";
+
+// Internal order ingress (same contract as HTTP POST /internal/v1/orders). Metadata must carry x-oms-internal-key.
+service OrderIngress {
+  rpc CreateOrder(CreateOrderRequest) returns (CreateOrderResponse);
+}
+
+message CreateOrderRequest {
+  string account_id = 1;
+  string client_idempotency_key = 2;
+  string side = 3;
+  string instrument_symbol = 4;
+  string quantity = 5;
+  string limit_price = 6;
+  string time_in_force = 7;
+  string ledger_balance_id = 8;
+  string ledger_identity_id = 9;
+}
+
+message CreateOrderResponse {
+  string id = 1;
+  string account_id = 2;
+  string client_idempotency_key = 3;
+  int32 shard_id = 4;
+  int32 version = 5;
+  string status = 6;
+  string terminal_reason = 7;
+  string side = 8;
+  string instrument_symbol = 9;
+  string quantity = 10;
+  string limit_price = 11;
+  string time_in_force = 12;
+  google.protobuf.Timestamp received_at = 13;
+  google.protobuf.Timestamp accepted_at = 14;
+  google.protobuf.Timestamp terminal_at = 15;
+  string ledger_balance_id = 16;
+  string settlement_status = 17;
+  bool created = 18;
+}

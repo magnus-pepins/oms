@@ -10,7 +10,8 @@ import net.openhft.chronicle.queue.ExcerptAppender;
  * <p>Shares a single {@link ChronicleQueue} instance with
  * {@link ChronicleControlTailReader} (see {@code ChronicleQueueConfiguration}).
  * Excerpt bytes are {@link ControlChronicleWireFormat#CHRONICLE_PROTO_PREFIX} + protobuf
- * {@link com.balh.oms.proto.control.v1.ControlPendingEvent}, or legacy UTF-8 JSON of {@link PendingControlEvent}.
+ * {@link com.balh.oms.proto.control.v1.ControlPendingEvent} (e.g. {@link ControlChronicleEventTypes#ORDER_ACCEPTED},
+ * {@link ControlChronicleEventTypes#CONTROL_PIPELINE_TELEMETRY}).
  */
 public class ChronicleControlJournal implements ControlJournal {
 

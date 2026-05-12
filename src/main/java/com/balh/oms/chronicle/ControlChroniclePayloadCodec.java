@@ -1,6 +1,7 @@
 package com.balh.oms.chronicle;
 
 import com.balh.oms.proto.control.v1.ControlPendingEvent;
+import com.balh.oms.proto.control.v1.TelemetryHop;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -11,6 +12,7 @@ import org.springframework.stereotype.Component;
 import java.time.Instant;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -23,8 +25,7 @@ import static com.balh.oms.chronicle.ControlChronicleWireFormat.chronicleExcerpt
 
 /**
  * Encodes/decodes control payloads: {@code control_outbox} stores JSONB with a base64 protobuf body; Chronicle stores
- * {@link ControlChronicleWireFormat#CHRONICLE_PROTO_PREFIX} + protobuf. Legacy UTF-8 JSON excerpts and flat JSON outbox
- * rows are still readable.
+ * {@link ControlChronicleWireFormat#CHRONICLE_PROTO_PREFIX} + protobuf.
  */
 @Component
 public final class ControlChroniclePayloadCodec {
@@ -38,7 +39,7 @@ public final class ControlChroniclePayloadCodec {
     /** JSON string suitable for {@code CAST(:payload AS jsonb)} — wrapped protobuf. */
     public String outboxPayloadJson(PendingControlEvent event) {
         try {
-            String b64 = Base64.getEncoder().encodeToString(controlPendingEventToBytes(toProtoForOutbox(event)));
+            String b64 = Base64.getEncoder().encodeToString(toProtoForOutbox(event).toByteArray());
             ObjectNode n = objectMapper.createObjectNode();
             n.put(OUTBOX_JSON_KEY_FORMAT, OUTBOX_PAYLOAD_FORMAT_PROTO_WRAPPED);
             n.put(OUTBOX_JSON_KEY_PROTO_BASE64, b64);
@@ -49,22 +50,18 @@ public final class ControlChroniclePayloadCodec {
     }
 
     /**
-     * Bytes appended to Chronicle for this outbox row (prefix + protobuf). Accepts wrapped JSON outbox text or legacy
-     * flat {@link PendingControlEvent} JSON. Stamps {@code chronicle_materialized_at} on the protobuf for telemetry.
+     * Bytes appended to Chronicle for this outbox row (prefix + protobuf). Expects v2 wrapped JSON only; stamps
+     * {@code chronicle_materialized_at} and a reconciler telemetry hop.
      */
     public byte[] chronicleAppendBytesFromOutboxPayloadText(String outboxPayloadText) {
         try {
             JsonNode root = objectMapper.readTree(outboxPayloadText);
-            if (root.isObject()
-                    && root.path(OUTBOX_JSON_KEY_FORMAT).isInt()
-                    && root.path(OUTBOX_JSON_KEY_FORMAT).asInt() == OUTBOX_PAYLOAD_FORMAT_PROTO_WRAPPED
-                    && root.path(OUTBOX_JSON_KEY_PROTO_BASE64).isTextual()) {
-                byte[] body = Base64.getDecoder().decode(root.path(OUTBOX_JSON_KEY_PROTO_BASE64).asText());
-                ControlPendingEvent parsed = ControlPendingEvent.parseFrom(body);
-                return chronicleBytesWithMaterialization(parsed);
-            }
-            PendingControlEvent legacy = objectMapper.treeToValue(root, PendingControlEvent.class);
-            return chronicleBytesWithMaterialization(toProtoForOutbox(legacy));
+            requireWrappedProtoOutbox(root);
+            byte[] body = Base64.getDecoder().decode(root.path(OUTBOX_JSON_KEY_PROTO_BASE64).asText());
+            ControlPendingEvent parsed = ControlPendingEvent.parseFrom(body);
+            return chronicleBytesWithMaterialization(parsed);
+        } catch (IllegalStateException e) {
+            throw e;
         } catch (Exception e) {
             throw new IllegalStateException("control outbox payload decode failed", e);
         }
@@ -74,47 +71,91 @@ public final class ControlChroniclePayloadCodec {
     public PendingControlEvent decodeFromOutboxPayloadText(String outboxPayloadText) {
         try {
             JsonNode root = objectMapper.readTree(outboxPayloadText);
-            if (root.isObject()
-                    && root.path(OUTBOX_JSON_KEY_FORMAT).isInt()
-                    && root.path(OUTBOX_JSON_KEY_FORMAT).asInt() == OUTBOX_PAYLOAD_FORMAT_PROTO_WRAPPED
-                    && root.path(OUTBOX_JSON_KEY_PROTO_BASE64).isTextual()) {
-                byte[] body = Base64.getDecoder().decode(root.path(OUTBOX_JSON_KEY_PROTO_BASE64).asText());
-                return fromProto(ControlPendingEvent.parseFrom(body));
-            }
-            return objectMapper.treeToValue(root, PendingControlEvent.class);
+            requireWrappedProtoOutbox(root);
+            byte[] body = Base64.getDecoder().decode(root.path(OUTBOX_JSON_KEY_PROTO_BASE64).asText());
+            return fromProto(ControlPendingEvent.parseFrom(body));
+        } catch (IllegalStateException e) {
+            throw e;
         } catch (Exception e) {
             throw new IllegalStateException("control outbox payload decode failed", e);
         }
     }
 
-    /** Chronicle bytes for a domain event (stamps {@code chronicle_materialized_at}). */
+    /** Chronicle bytes for a domain event (stamps materialization + reconciler hop). */
     public byte[] chronicleAppendBytes(PendingControlEvent event) {
         return chronicleBytesWithMaterialization(toProtoForOutbox(event));
     }
 
+    /**
+     * Second Chronicle frame after a successful {@link ControlChronicleEventTypes#ORDER_ACCEPTED} tail apply: same
+     * correlation fields and cumulative {@code telemetry_hops} as {@code appliedOrderAccepted}, plus
+     * {@link PipelineTelemetryStages#CONTROL_TAIL_APPLY} at {@code tailObservedAt}. Not written to {@code control_outbox}.
+     */
+    public byte[] chronicleAppendAfterControlTailApply(PendingControlEvent appliedOrderAccepted, Instant tailObservedAt) {
+        if (!ControlChronicleEventTypes.ORDER_ACCEPTED.equals(appliedOrderAccepted.type())) {
+            throw new IllegalArgumentException(
+                    "chronicleAppendAfterControlTailApply expects type OrderAccepted, got " + appliedOrderAccepted.type());
+        }
+        ControlPendingEvent.Builder b = ControlPendingEvent.newBuilder()
+                .setType(ControlChronicleEventTypes.CONTROL_PIPELINE_TELEMETRY)
+                .setOrderId(appliedOrderAccepted.orderId().toString())
+                .setOrderVersion(appliedOrderAccepted.orderVersion())
+                .setShardId(appliedOrderAccepted.shardId())
+                .setAccountIdHash(appliedOrderAccepted.accountIdHash())
+                .setOrderTimestamp(instantToTimestamp(appliedOrderAccepted.orderTimestamp()))
+                .setEnqueuedAt(instantToTimestamp(appliedOrderAccepted.enqueuedAt()));
+        appliedOrderAccepted
+                .chronicleMaterializedAt()
+                .ifPresent(i -> b.setChronicleMaterializedAt(instantToTimestamp(i)));
+        for (ControlTelemetryHop h : appliedOrderAccepted.telemetryHops()) {
+            b.addTelemetryHops(TelemetryHop.newBuilder()
+                    .setStage(h.stage())
+                    .setObservedAt(instantToTimestamp(h.observedAt()))
+                    .build());
+        }
+        b.addTelemetryHops(TelemetryHop.newBuilder()
+                .setStage(PipelineTelemetryStages.CONTROL_TAIL_APPLY)
+                .setObservedAt(instantToTimestamp(tailObservedAt))
+                .build());
+        return withChroniclePrefix(b.build().toByteArray());
+    }
+
     public PendingControlEvent decodeChronicleExcerpt(byte[] excerpt) {
+        if (!chronicleExcerptStartsWithProtoPrefix(excerpt)) {
+            throw new IllegalStateException(
+                    "Chronicle control excerpt must start with OMS proto prefix (length>=" + CHRONICLE_PROTO_PREFIX_LENGTH + ")");
+        }
         try {
-            if (chronicleExcerptStartsWithProtoPrefix(excerpt)) {
-                byte[] body = Arrays.copyOfRange(excerpt, CHRONICLE_PROTO_PREFIX_LENGTH, excerpt.length);
-                return fromProto(ControlPendingEvent.parseFrom(body));
-            }
-            return objectMapper.readValue(excerpt, PendingControlEvent.class);
+            byte[] body = Arrays.copyOfRange(excerpt, CHRONICLE_PROTO_PREFIX_LENGTH, excerpt.length);
+            return fromProto(ControlPendingEvent.parseFrom(body));
         } catch (InvalidProtocolBufferException e) {
-            try {
-                return objectMapper.readValue(excerpt, PendingControlEvent.class);
-            } catch (Exception e2) {
-                e2.addSuppressed(e);
-                throw new IllegalStateException("Chronicle excerpt is neither valid proto nor JSON", e2);
-            }
-        } catch (Exception e) {
-            throw new IllegalStateException("Chronicle excerpt decode failed", e);
+            throw new IllegalStateException("Chronicle control protobuf decode failed", e);
+        }
+    }
+
+    private static void requireWrappedProtoOutbox(JsonNode root) {
+        if (!root.isObject()
+                || !root.path(OUTBOX_JSON_KEY_FORMAT).isInt()
+                || root.path(OUTBOX_JSON_KEY_FORMAT).asInt() != OUTBOX_PAYLOAD_FORMAT_PROTO_WRAPPED
+                || !root.path(OUTBOX_JSON_KEY_PROTO_BASE64).isTextual()) {
+            throw new IllegalStateException(
+                    "control outbox payload must be v%d proto-wrapped (keys %s, %s); legacy flat JSON is not supported"
+                            .formatted(
+                                    OUTBOX_PAYLOAD_FORMAT_PROTO_WRAPPED,
+                                    OUTBOX_JSON_KEY_FORMAT,
+                                    OUTBOX_JSON_KEY_PROTO_BASE64));
         }
     }
 
     private static byte[] chronicleBytesWithMaterialization(ControlPendingEvent base) {
-        ControlPendingEvent stamped =
-                base.toBuilder().setChronicleMaterializedAt(instantToTimestamp(Instant.now())).build();
-        return withChroniclePrefix(stamped.toByteArray());
+        Instant now = Instant.now();
+        Timestamp t = instantToTimestamp(now);
+        ControlPendingEvent.Builder b = base.toBuilder().setChronicleMaterializedAt(t);
+        b.addTelemetryHops(TelemetryHop.newBuilder()
+                .setStage(PipelineTelemetryStages.RECONCILER_CHRONICLE_APPEND)
+                .setObservedAt(t)
+                .build());
+        return withChroniclePrefix(b.build().toByteArray());
     }
 
     private static byte[] withChroniclePrefix(byte[] protoBody) {
@@ -128,7 +169,7 @@ public final class ControlChroniclePayloadCodec {
         return p.toByteArray();
     }
 
-    /** Protobuf for outbox / base64 (no {@code chronicle_materialized_at}). */
+    /** Protobuf for outbox / base64 (no {@code chronicle_materialized_at}; ingress hop on {@code telemetry_hops}). */
     private static ControlPendingEvent toProtoForOutbox(PendingControlEvent e) {
         ControlPendingEvent.Builder b = ControlPendingEvent.newBuilder()
                 .setType(e.type())
@@ -140,6 +181,16 @@ public final class ControlChroniclePayloadCodec {
                 .setEnqueuedAt(instantToTimestamp(e.enqueuedAt()));
         e.chronicleMaterializedAt()
                 .ifPresent(i -> b.setChronicleMaterializedAt(instantToTimestamp(i)));
+        b.addTelemetryHops(TelemetryHop.newBuilder()
+                .setStage(PipelineTelemetryStages.INGRESS)
+                .setObservedAt(instantToTimestamp(e.enqueuedAt()))
+                .build());
+        for (ControlTelemetryHop hop : e.telemetryHops()) {
+            b.addTelemetryHops(TelemetryHop.newBuilder()
+                    .setStage(hop.stage())
+                    .setObservedAt(instantToTimestamp(hop.observedAt()))
+                    .build());
+        }
         return b.build();
     }
 
@@ -147,6 +198,9 @@ public final class ControlChroniclePayloadCodec {
         Optional<Instant> materialized = p.hasChronicleMaterializedAt()
                 ? Optional.of(timestampToInstant(p.getChronicleMaterializedAt()))
                 : Optional.empty();
+        List<ControlTelemetryHop> hops = p.getTelemetryHopsList().stream()
+                .map(ControlChroniclePayloadCodec::mapProtoHop)
+                .toList();
         return new PendingControlEvent(
                 p.getType(),
                 UUID.fromString(p.getOrderId()),
@@ -155,7 +209,12 @@ public final class ControlChroniclePayloadCodec {
                 p.getAccountIdHash(),
                 timestampToInstant(p.getOrderTimestamp()),
                 timestampToInstant(p.getEnqueuedAt()),
-                materialized);
+                materialized,
+                hops);
+    }
+
+    private static ControlTelemetryHop mapProtoHop(TelemetryHop h) {
+        return new ControlTelemetryHop(h.getStage(), timestampToInstant(h.getObservedAt()));
     }
 
     private static Timestamp instantToTimestamp(Instant i) {

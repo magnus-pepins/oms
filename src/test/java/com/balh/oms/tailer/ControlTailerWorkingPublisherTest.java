@@ -1,6 +1,7 @@
 package com.balh.oms.tailer;
 
 import com.balh.oms.chronicle.PendingControlEvent;
+import com.balh.oms.config.ControlPostgresWritePath;
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.domain.Order;
 import com.balh.oms.domain.OrderStatus;
@@ -9,6 +10,7 @@ import com.balh.oms.events.DomainEventEnvelopeCodec;
 import com.balh.oms.observability.otel.IngressToFixNosLatencyRecorder;
 import com.balh.oms.persistence.ControlDecisionsRepository;
 import com.balh.oms.persistence.DomainEventOutboxRepository;
+import com.balh.oms.persistence.FixNosRouteEnqueueClaimRepository;
 import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.risk.BuyingPowerAdmission;
 import com.balh.oms.risk.ControlRiskEvaluator;
@@ -41,6 +43,7 @@ class ControlTailerWorkingPublisherTest {
     @Mock OrdersRepository orders;
     @Mock StaleJobGuard stale;
     @Mock OmsConfig config;
+    @Mock OmsConfig.Control controlCfg;
     @Mock OmsConfig.Ledger ledgerCfg;
     @Mock BuyingPowerAdmission buyingPower;
     @Mock ControlRiskEvaluator controlRisk;
@@ -48,6 +51,7 @@ class ControlTailerWorkingPublisherTest {
     @Mock DomainEventOutboxRepository domainOutbox;
     @Mock RouteDispatcher routeDispatcher;
     @Mock IngressToFixNosLatencyRecorder ingressToFixNosLatencyRecorder;
+    @Mock FixNosRouteEnqueueClaimRepository fixNosRouteEnqueueClaimRepository;
 
     private final ObjectMapper objectMapper = new ObjectMapper().registerModule(new JavaTimeModule());
     private final DomainEventEnvelopeCodec codec = new DomainEventEnvelopeCodec(objectMapper);
@@ -57,7 +61,9 @@ class ControlTailerWorkingPublisherTest {
 
     @BeforeEach
     void setUp() {
-        tailer = new ControlTailer(
+        when(config.getControl()).thenReturn(controlCfg);
+        when(controlCfg.getPostgresWritePath()).thenReturn(ControlPostgresWritePath.TAIL);
+        OrderControlAdmission admission = new OrderControlAdmission(
                 orders,
                 stale,
                 config,
@@ -67,8 +73,9 @@ class ControlTailerWorkingPublisherTest {
                 domainOutbox,
                 codec,
                 meterRegistry,
-                routeDispatcher,
                 ingressToFixNosLatencyRecorder);
+        tailer = new ControlTailer(
+                admission, orders, stale, config, meterRegistry, routeDispatcher, fixNosRouteEnqueueClaimRepository);
     }
 
     @Test

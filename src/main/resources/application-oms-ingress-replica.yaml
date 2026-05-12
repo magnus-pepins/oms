@@ -1,0 +1,16 @@
+# P5 prep: horizontal ingress replica — same order-accept surface as the monolith, but no local Chronicle control tail.
+# Admission runs in the accept transaction; workers (oms-control-worker / oms-fix-worker) consume the shared journal.
+#
+# Do not combine oms-ingress-replica with oms-control-worker or oms-fix-worker on the same process (TopologyWorkerProfiles).
+oms:
+  control:
+    postgres-write-path: ingress
+    # Each ingress replica appends its own control_outbox rows after the accept transaction (OutboxReconciler stays off).
+    # Workers use reconciler mode to drain peers' backlog from shared Postgres — not this role.
+    chronicle-append-mode: ingress-after-commit
+  chronicle:
+    control-tail-enabled: false
+
+management:
+  server:
+    port: ${OMS_INGRESS_REPLICA_MANAGEMENT_SERVER_PORT:8087}

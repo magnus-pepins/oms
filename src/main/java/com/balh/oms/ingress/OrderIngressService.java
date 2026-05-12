@@ -2,7 +2,9 @@ package com.balh.oms.ingress;
 
 import com.balh.oms.chronicle.ControlChroniclePayloadCodec;
 import com.balh.oms.chronicle.PendingControlEvent;
+import com.balh.oms.config.ControlPostgresWritePath;
 import com.balh.oms.config.OmsConfig;
+import com.balh.oms.config.OmsProfiles;
 import com.balh.oms.domain.Order;
 import com.balh.oms.domain.OrderStatus;
 import com.balh.oms.domain.ShardKey;
@@ -14,6 +16,8 @@ import com.balh.oms.persistence.LedgerInflightOutboxRepository;
 import com.balh.oms.observability.metrics.OmsPipelineMetrics;
 import com.balh.oms.observability.otel.IngressToFixNosLatencyRecorder;
 import com.balh.oms.persistence.OrdersRepository;
+import com.balh.oms.tailer.ControlTailer;
+import com.balh.oms.tailer.OrderControlAdmission;
 import com.balh.oms.domain.Side;
 import com.balh.oms.ledger.LedgerBalanceClient;
 import com.balh.oms.ledger.LedgerInflightReservationClient;
@@ -25,9 +29,12 @@ import io.micrometer.core.instrument.Timer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.context.annotation.Profile;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.math.BigDecimal;
 import java.time.Instant;
@@ -43,6 +50,7 @@ import java.util.UUID;
  * actually opens the transaction at the right boundary.
  */
 @Service
+@Profile(OmsProfiles.ORDER_ACCEPT_PROFILE)
 public class OrderIngressService {
 
     private static final Logger log = LoggerFactory.getLogger(OrderIngressService.class);
@@ -63,6 +71,8 @@ public class OrderIngressService {
     private final LedgerInflightOutboxRepository ledgerInflightOutbox;
     private final MeterRegistry meterRegistry;
     private final IngressToFixNosLatencyRecorder ingressToFixNosLatencyRecorder;
+    private final ObjectProvider<IngressControlChroniclePublisher> ingressControlChroniclePublisher;
+    private final OrderControlAdmission orderControlAdmission;
 
     public OrderIngressService(
             OrdersRepository orders,
@@ -77,7 +87,9 @@ public class OrderIngressService {
             ObjectProvider<LedgerBalanceClient> ledgerBalanceClient,
             LedgerInflightOutboxRepository ledgerInflightOutbox,
             MeterRegistry meterRegistry,
-            IngressToFixNosLatencyRecorder ingressToFixNosLatencyRecorder) {
+            IngressToFixNosLatencyRecorder ingressToFixNosLatencyRecorder,
+            ObjectProvider<IngressControlChroniclePublisher> ingressControlChroniclePublisher,
+            OrderControlAdmission orderControlAdmission) {
         this.orders = orders;
         this.outbox = outbox;
         this.domainEventOutbox = domainEventOutbox;
@@ -91,6 +103,8 @@ public class OrderIngressService {
         this.ledgerInflightOutbox = ledgerInflightOutbox;
         this.meterRegistry = meterRegistry;
         this.ingressToFixNosLatencyRecorder = ingressToFixNosLatencyRecorder;
+        this.ingressControlChroniclePublisher = ingressControlChroniclePublisher;
+        this.orderControlAdmission = orderControlAdmission;
     }
 
     /**
@@ -163,20 +177,32 @@ public class OrderIngressService {
 
         maybePlaceBuyLedgerInflightHold(order);
 
-        outbox.insert(id, order.version(),
-                serializePayload(new PendingControlEvent(
-                        "OrderAccepted",
-                        id,
-                        order.version(),
-                        order.shardId(),
-                        order.accountIdHash(),
-                        order.acceptedAt(),
-                        Instant.now())));
+        Instant controlOutboxEnqueuedAt = Instant.now();
+        PendingControlEvent controlEvent = new PendingControlEvent(
+                "OrderAccepted",
+                id,
+                order.version(),
+                order.shardId(),
+                order.accountIdHash(),
+                order.acceptedAt(),
+                controlOutboxEnqueuedAt);
+        String controlPayload = serializePayload(controlEvent);
+        ControlOutboxRepository.InsertResult controlOutboxRow =
+                outbox.insert(id, order.version(), controlPayload, controlOutboxEnqueuedAt);
+        registerIngressChronicleAfterCommit(controlOutboxRow.id(), controlPayload, controlOutboxRow.enqueuedAt());
         try {
             domainEventOutbox.insert(id, domainEventEnvelopeCodec.orderAccepted(order));
         } catch (JsonProcessingException e) {
             log.error("Failed to serialise domain fanout envelope for orderId={}", id, e);
             throw new RuntimeException("domain event envelope serialisation failed", e);
+        }
+        if (config.getControl().getPostgresWritePath() == ControlPostgresWritePath.INGRESS) {
+            ControlTailer.TailResult admission = orderControlAdmission.persistAdmission(controlEvent);
+            Order latest = orders.findById(id).orElse(order);
+            if (admission == ControlTailer.TailResult.APPLIED) {
+                ingressToFixNosLatencyRecorder.onOrderIngressCommitted(id);
+            }
+            return new IngressResult(latest, true);
         }
         ingressToFixNosLatencyRecorder.onOrderIngressCommitted(id);
         return new IngressResult(order, true);
@@ -267,6 +293,22 @@ public class OrderIngressService {
 
     private String serializePayload(PendingControlEvent ev) {
         return controlPayloadCodec.outboxPayloadJson(ev);
+    }
+
+    private void registerIngressChronicleAfterCommit(long outboxId, String controlPayload, Instant enqueuedAt) {
+        IngressControlChroniclePublisher publisher = ingressControlChroniclePublisher.getIfAvailable();
+        if (publisher == null) {
+            return;
+        }
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            throw new IllegalStateException("ingress Chronicle hook requires an active Spring transaction");
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                publisher.appendMarkMetrics(outboxId, controlPayload, enqueuedAt);
+            }
+        });
     }
 
     private static String normalizeLedgerBalanceId(String raw) {

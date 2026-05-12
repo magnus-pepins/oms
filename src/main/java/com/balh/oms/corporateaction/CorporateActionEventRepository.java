@@ -19,12 +19,17 @@ public class CorporateActionEventRepository {
             RETURNING id
             """;
 
+    /**
+     * {@code FOR UPDATE SKIP LOCKED} — callers must run inside a Spring transaction that spans this fetch and
+     * {@link #markProcessedIfPending(long)} (see {@link CorporateActionProcessorJob}).
+     */
     private static final String SELECT_UNPROCESSED_SQL = """
             SELECT id, instrument_symbol, action_type, effective_date::text AS effective_date
             FROM corporate_action_event
             WHERE processed_at IS NULL
             ORDER BY id ASC
             LIMIT :limit
+            FOR UPDATE SKIP LOCKED
             """;
 
     private static final String MARK_PROCESSED_SQL = """
@@ -67,7 +72,7 @@ public class CorporateActionEventRepository {
         return ids.getFirst();
     }
 
-    public List<UnprocessedRow> findUnprocessed(int limit) {
+    public List<UnprocessedRow> findUnprocessedForUpdateSkipLocked(int limit) {
         return jdbc.query(
                 SELECT_UNPROCESSED_SQL,
                 new MapSqlParameterSource("limit", limit),

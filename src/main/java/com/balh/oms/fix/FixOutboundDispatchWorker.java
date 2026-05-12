@@ -16,7 +16,6 @@ import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.DisposableBean;
-import quickfix.Session;
 import quickfix.SessionNotFound;
 import quickfix.fix44.NewOrderSingle;
 
@@ -28,7 +27,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
 
 /**
- * Drains {@link FixOutboundOrderDequeue} after logon and sends {@link NewOrderSingle} on the active session.
+ * Drains {@link FixOutboundOrderDequeue} after logon and sends outbound QuickFIX messages on the active session
+ * ({@link NewOrderSingle} and {@link quickfix.fix44.OrderMassCancelRequest}).
  *
  * <p>Drain cadence is either Spring scheduling ({@link FixOutboundDriver#SCHEDULED}) or a dedicated thread
  * ({@link FixOutboundDriver#DEDICATED}); see {@code docs/fix-outbound-driver.md}.
@@ -49,7 +49,7 @@ public class FixOutboundDispatchWorker implements DisposableBean {
 
     private final RouteDispatcher routeEnqueue;
     private final FixOutboundOrderDequeue fixOutboundDequeue;
-    private final FixSessionRegistry fixSessionRegistry;
+    private final FixOutboundSessionSend fixOutboundSessionSend;
     private final OrdersRepository ordersRepository;
     private final FixNewOrderSingleBuilder newOrderSingleBuilder;
     private final MeterRegistry meterRegistry;
@@ -63,10 +63,37 @@ public class FixOutboundDispatchWorker implements DisposableBean {
 
     private Thread dedicatedThread;
 
+    /**
+     * While {@link #isFixRouteSendEnabled()} is false, remove {@link FixOutboundWireJob.MassCancelWire} jobs from the
+     * head of the queue and complete their waiters exceptionally so HTTP threads do not hang indefinitely.
+     *
+     * @return {@code true} if at least one mass-cancel waiter was released
+     */
+    private boolean drainMassCancelsAtHeadWhileRouteDisabled() {
+        boolean any = false;
+        while (!isFixRouteSendEnabled()) {
+            FixOutboundWireJob head = fixOutboundDequeue.peekOrNull();
+            if (!(head instanceof FixOutboundWireJob.MassCancelWire)) {
+                break;
+            }
+            FixOutboundWireJob job = fixOutboundDequeue.pollOrNull();
+            if (job instanceof FixOutboundWireJob.MassCancelWire mc) {
+                log.warn("FIX outbound mass cancel rejected while route send is disabled");
+                mc.completion()
+                        .completeExceptionally(
+                                new IllegalStateException(FixMetrics.FIX_ROUTE_SEND_DISABLED_MESSAGE));
+                any = true;
+            } else if (job == null) {
+                break;
+            }
+        }
+        return any;
+    }
+
     public FixOutboundDispatchWorker(
             RouteDispatcher routeEnqueue,
             FixOutboundOrderDequeue fixOutboundDequeue,
-            FixSessionRegistry fixSessionRegistry,
+            FixOutboundSessionSend fixOutboundSessionSend,
             OrdersRepository ordersRepository,
             FixNewOrderSingleBuilder newOrderSingleBuilder,
             MeterRegistry meterRegistry,
@@ -77,7 +104,7 @@ public class FixOutboundDispatchWorker implements DisposableBean {
             IngressToFixNosLatencyRecorder ingressToFixNosLatencyRecorder) {
         this.routeEnqueue = routeEnqueue;
         this.fixOutboundDequeue = fixOutboundDequeue;
-        this.fixSessionRegistry = fixSessionRegistry;
+        this.fixOutboundSessionSend = fixOutboundSessionSend;
         this.ordersRepository = ordersRepository;
         this.newOrderSingleBuilder = newOrderSingleBuilder;
         this.meterRegistry = meterRegistry;
@@ -110,39 +137,63 @@ public class FixOutboundDispatchWorker implements DisposableBean {
      * (see {@code FixAutoStartBeans#fixOutboundPollScheduling}).
      */
     public void drainPendingOutboundOnce() {
-        if (!fixSessionRegistry.hasLoggedOnSession()) {
+        if (!fixOutboundSessionSend.hasActiveSession()) {
             return;
         }
+        boolean drainedMassCancel = drainMassCancelsAtHeadWhileRouteDisabled();
         if (!isFixRouteSendEnabled()) {
-            meterRegistry.counter(FixMetrics.METRIC_OUTBOUND_ROUTE_DISABLED_SKIPS).increment();
+            if (!drainedMassCancel) {
+                meterRegistry.counter(FixMetrics.METRIC_OUTBOUND_ROUTE_DISABLED_SKIPS).increment();
+            }
             return;
         }
-        UUID id = fixOutboundDequeue.pollOrNull();
-        if (id == null) {
+        FixOutboundWireJob job = fixOutboundDequeue.pollOrNull();
+        if (job == null) {
             return;
         }
-        dispatchOutboundForOrderId(id);
+        dispatchJob(job);
+    }
+
+    private void dispatchJob(FixOutboundWireJob job) {
+        switch (job) {
+            case FixOutboundWireJob.NosOrder nos -> dispatchOutboundForOrderId(nos.orderId());
+            case FixOutboundWireJob.MassCancelWire mc -> dispatchMassCancelWire(mc);
+        }
+    }
+
+    private void dispatchMassCancelWire(FixOutboundWireJob.MassCancelWire mc) {
+        try {
+            fixOutboundSessionSend.send(mc.message());
+            mc.completion().complete(null);
+        } catch (SessionNotFound e) {
+            mc.completion().completeExceptionally(e);
+        } catch (Exception e) {
+            mc.completion().completeExceptionally(e);
+        }
     }
 
     private void runDedicatedLoop() {
         while (!dedicatedStop.get()) {
             try {
-                if (!fixSessionRegistry.hasLoggedOnSession()) {
+                if (!fixOutboundSessionSend.hasActiveSession()) {
                     LockSupport.parkNanos(notReadyParkNanos());
                     continue;
                 }
+                boolean drainedMassCancel = drainMassCancelsAtHeadWhileRouteDisabled();
                 if (!isFixRouteSendEnabled()) {
-                    meterRegistry.counter(FixMetrics.METRIC_OUTBOUND_ROUTE_DISABLED_SKIPS).increment();
+                    if (!drainedMassCancel) {
+                        meterRegistry.counter(FixMetrics.METRIC_OUTBOUND_ROUTE_DISABLED_SKIPS).increment();
+                    }
                     LockSupport.parkNanos(notReadyParkNanos());
                     continue;
                 }
                 long waitNanos = Math.max(
                         MIN_QUEUE_POLL_WAIT_NANOS, omsConfig.getFix().getOutboundDedicatedIdleParkNanos());
-                UUID id = fixOutboundDequeue.poll(waitNanos, TimeUnit.NANOSECONDS);
-                if (id == null) {
+                FixOutboundWireJob job = fixOutboundDequeue.poll(waitNanos, TimeUnit.NANOSECONDS);
+                if (job == null) {
                     continue;
                 }
-                dispatchOutboundForOrderId(id);
+                dispatchJob(job);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 if (dedicatedStop.get()) {
@@ -178,7 +229,7 @@ public class FixOutboundDispatchWorker implements DisposableBean {
         Timer.Sample outboundSample = Timer.start(meterRegistry);
         try {
             NewOrderSingle nos = newOrderSingleBuilder.build(order);
-            Session.sendToTarget(nos, fixSessionRegistry.sessionOrNull());
+            fixOutboundSessionSend.send(nos);
             meterRegistry.counter(FixMetrics.METRIC_NOS_SENT).increment();
             ingressToFixNosLatencyRecorder.recordNewOrderSingleSent(id);
             OmsPipelineMetrics.finishFixOutboundNos(meterRegistry, outboundSample, "success");

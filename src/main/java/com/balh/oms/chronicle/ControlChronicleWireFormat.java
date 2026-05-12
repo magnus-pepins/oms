@@ -9,7 +9,7 @@ public final class ControlChronicleWireFormat {
 
     /**
      * Magic bytes prepended to {@link com.balh.oms.proto.control.v1.ControlPendingEvent} protobuf body on Chronicle
-     * (distinguishes from legacy UTF-8 JSON excerpts during replay).
+     * ({@code OrderAccepted}, {@code ControlPipelineTelemetry}, …).
      */
     public static final byte[] CHRONICLE_PROTO_PREFIX = new byte[] {'O', 'M', 'S', 0x01};
 
@@ -25,11 +25,15 @@ public final class ControlChronicleWireFormat {
     public static final String OUTBOX_JSON_KEY_PROTO_BASE64 = "d";
 
     public static boolean chronicleExcerptStartsWithProtoPrefix(byte[] excerpt) {
-        if (excerpt == null || excerpt.length < CHRONICLE_PROTO_PREFIX_LENGTH) {
+        return startsWithPrefix(excerpt, CHRONICLE_PROTO_PREFIX);
+    }
+
+    private static boolean startsWithPrefix(byte[] excerpt, byte[] prefix) {
+        if (excerpt == null || excerpt.length < prefix.length) {
             return false;
         }
-        for (int i = 0; i < CHRONICLE_PROTO_PREFIX_LENGTH; i++) {
-            if (excerpt[i] != CHRONICLE_PROTO_PREFIX[i]) {
+        for (int i = 0; i < prefix.length; i++) {
+            if (excerpt[i] != prefix[i]) {
                 return false;
             }
         }

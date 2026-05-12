@@ -99,4 +99,13 @@ jobs:
             build/test-results/
 
       - name: Assemble
-        run: ./gradlew bootJar --no-daemon --no-build-cache
+        run: ./gradlew bootJar bootJarControlWorker bootJarFixWorker bootJarIngressReplica --no-daemon --no-build-cache
+
+      - name: Verify control-worker entrypoints
+        run: ./gradlew help --task bootRunControlWorker --no-daemon --no-build-cache
+
+      - name: Verify fix-worker entrypoints
+        run: ./gradlew help --task bootRunFixWorker --no-daemon --no-build-cache
+
+      - name: Verify ingress-replica entrypoints
+        run: ./gradlew help --task bootRunIngressReplica --no-daemon --no-build-cache

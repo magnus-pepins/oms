@@ -25,6 +25,8 @@ oms:
     # GHA runners can schedule the full IT suite over several minutes; a short window caused
     # RISK_STALE_QUEUE flakes when control events were still valid. Override via OMS_CONTROL_MAX_JOB_AGE_MS in CI if needed.
     max-job-age-ms: ${OMS_CONTROL_MAX_JOB_AGE_MS:600000}
+    # NoOpControlJournal + chronicle disabled: ingress-after-commit would fail startup validation.
+    chronicle-append-mode: reconciler
   outbox:
     reconciler-age-ms: 0
     reconciler-batch-size: 100

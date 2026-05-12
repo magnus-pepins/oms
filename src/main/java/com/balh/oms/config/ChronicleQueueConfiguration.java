@@ -9,6 +9,7 @@ import net.openhft.chronicle.queue.ChronicleQueue;
 import net.openhft.chronicle.queue.RollCycle;
 import net.openhft.chronicle.queue.RollCycles;
 import net.openhft.chronicle.queue.rollcycles.LegacyRollCycles;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -20,7 +21,8 @@ import java.time.Duration;
 
 /**
  * Registers the shared {@link ChronicleQueue} plus append-only journal and
- * {@link ChronicleControlTailReader} (scheduled or dedicated tail driver). Disabled in the {@code test} profile (tests use
+ * optionally {@link ChronicleControlTailReader} (scheduled or dedicated tail driver) when
+ * {@code oms.chronicle.control-tail-enabled=true}. Disabled in the {@code test} profile (tests use
  * {@link com.balh.oms.chronicle.NoOpControlJournal} via {@link ControlJournalFallbackConfiguration} instead).
  *
  * <p>Slice 1 tail policy: the tailer starts at the beginning of the queue on
@@ -49,14 +51,21 @@ public class ChronicleQueueConfiguration {
     }
 
     @Bean
+    @ConditionalOnProperty(prefix = "oms.chronicle", name = "control-tail-enabled", havingValue = "true", matchIfMissing = true)
     public ChronicleControlTailReader chronicleControlTailReader(
             ChronicleQueue controlChronicleQueue,
+            ChronicleControlJournal chronicleControlJournal,
             ControlTailer controlTailer,
             ControlChroniclePayloadCodec controlChroniclePayloadCodec,
             OmsConfig config,
             MeterRegistry meterRegistry) {
         return new ChronicleControlTailReader(
-                controlChronicleQueue, controlTailer, controlChroniclePayloadCodec, config, meterRegistry);
+                controlChronicleQueue,
+                chronicleControlJournal,
+                controlTailer,
+                controlChroniclePayloadCodec,
+                config,
+                meterRegistry);
     }
 
     /**
@@ -66,6 +75,7 @@ public class ChronicleQueueConfiguration {
      * another configuration class can evaluate too early and skip scheduling entirely.
      */
     @Bean
+    @ConditionalOnBean(ChronicleControlTailReader.class)
     @ConditionalOnProperty(prefix = "oms.chronicle", name = "tail-driver", havingValue = "scheduled", matchIfMissing = true)
     public SchedulingConfigurer chronicleControlTailPollScheduling(
             ChronicleControlTailReader chronicleControlTailReader,

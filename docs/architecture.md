@@ -40,11 +40,13 @@ sequenceDiagram
     TLR->>PG: INSERT INTO domain_event_outbox\n(OrderWorking / OrderRejected envelope)
 ```
 
-`control_outbox.payload` is JSONB holding a small wrapper (`v` + base64 protobuf `ControlPendingEvent` with **`google.protobuf.Timestamp`** fields for wall times); `OutboxReconciler` appends **`OMS\\x01` + protobuf** bytes to Chronicle. **`chronicle_materialized_at`** is set on the Chronicle message (not the outbox row) when materializing the append, for pipeline / OTel lag. Legacy flat JSON payloads / Chronicle excerpts remain readable.
+**Diagram scope:** the **REC** ↔ **PG** / **CHR** block is the **`reconciler`** append path (`OutboxReconciler`). **Monolith default** is **`ingress-after-commit`** instead (ingress `afterCommit` → CHR → `markAppended`). With **`oms.control.chronicle-append-mode=ingress-after-commit`**, omit or replace the REC block accordingly. Spring profile **`oms-control-worker`** removes the **Client → API** accept path; it **forces `reconciler`** so REC drains shared Postgres; **`management.server.port`** defaults to **8089** (`OMS_CONTROL_WORKER_MANAGEMENT_SERVER_PORT`) so Actuator is off the main HTTP port. **`oms.grpc.enabled` must be `false`** on that JVM (validator). Runbook: [runbooks/oms-control-worker.md](../runbooks/oms-control-worker.md). **`test`** profile also uses **`reconciler`** (NoOp journal).
+
+`control_outbox.payload` is JSONB holding a small wrapper (`v` + base64 protobuf `ControlPendingEvent` with **`google.protobuf.Timestamp`** fields for wall times). Chronicle excerpts are **`OMS\\x01` + protobuf** only. **`chronicle_materialized_at`** is set on the Chronicle message (not the outbox row) when materializing the append, for pipeline / OTel lag. **Monolith default:** **`ingress-after-commit`** — ingress JVM appends and marks in **`afterCommit`** (`IngressControlChroniclePublisher`); **`OutboxReconciler`** is off. With **`oms.control.chronicle-append-mode=reconciler`**, **`OutboxReconciler`** performs the append after `reconciler-age-ms` (see topology plan).
 
 The four invariants encoded by this diagram:
 
-1. **Postgres COMMIT happens before any Chronicle append.** Always.
+1. **Postgres COMMIT happens before any Chronicle append.** Always (ingress `afterCommit` when default **`ingress-after-commit`**, or via **`OutboxReconciler`** after `reconciler-age-ms` when **`reconciler`**).
 2. **The control outbox row is inside the same transaction** as the orders row, so
    crash recovery is trivial: anything visible in `orders` has a matching
    `control_outbox` row (or a `chronicle_enqueued_at` timestamp). **`OrderAccepted`**
@@ -58,7 +60,7 @@ The four invariants encoded by this diagram:
 4. **Tailer mutations are CAS on `orders.version`.** Re-applying the same
    payload is a no-op.
 
-`ChronicleControlTailReader` polls Chronicle (`readBytes`); it does not use a push callback from the queue. **Wake latency** (how soon the next `readBytes` runs after an append) depends on `OMS_CHRONICLE_TAIL_DRIVER` (`scheduled` vs `dedicated`) and related settings — see [chronicle-tail-driver.md](chronicle-tail-driver.md). Other pipeline stages (outbox reconciler, FIX outbound poll, etc.) remain separate schedulers or workers.
+`ChronicleControlTailReader` polls Chronicle (`readBytes`); it does not use a push callback from the queue. Tailer identity is **`OMS_CHRONICLE_CONTROL_TAIL_ID`** (default `oms-control`); run **one** active tail per shared **`OMS_CHRONICLE_QUEUE_DIR`** in production unless you have an explicit multi-reader design — see [chronicle-tail-driver.md](chronicle-tail-driver.md). **Horizontal ingress** JVMs (`oms-ingress-replica`) omit the tail reader (`oms.chronicle.control-tail-enabled=false`) and use **`oms.control.postgres-write-path=ingress`** for admission in the accept transaction — see [runbooks/oms-ingress-replica.md](runbooks/oms-ingress-replica.md). **Wake latency** (how soon the next `readBytes` runs after an append) depends on `OMS_CHRONICLE_TAIL_DRIVER` (`scheduled` vs `dedicated`) and related settings — see that doc. Other pipeline stages (outbox reconciler, FIX outbound poll, etc.) remain separate schedulers or workers.
 
 ## High availability
 

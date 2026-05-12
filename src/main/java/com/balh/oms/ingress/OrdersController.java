@@ -1,5 +1,6 @@
 package com.balh.oms.ingress;
 
+import com.balh.oms.config.OmsProfiles;
 import com.balh.oms.domain.Order;
 import com.balh.oms.persistence.ExecutionsRepository;
 import com.balh.oms.persistence.OrdersRepository;
@@ -7,6 +8,7 @@ import com.balh.oms.settlement.OrderAggregateSettlementStatus;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.validation.Valid;
+import org.springframework.context.annotation.Profile;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -28,8 +30,12 @@ import java.util.UUID;
  *       {@code domain_event_outbox} insert + COMMIT).</li>
  *   <li>{@link com.balh.oms.reconciler.DomainFanoutReconciler} delivers domain
  *       envelopes to NATS (or no-op) strictly after commit.</li>
- *   <li>The Chronicle append happens asynchronously in
- *       {@code OutboxReconciler}, also strictly after commit.</li>
+ *   <li>Chronicle append + {@code control_outbox.chronicle_enqueued_at}: default — asynchronous
+ *       {@link com.balh.oms.reconciler.OutboxReconciler} after {@code oms.outbox.reconciler-age-ms};
+ *       alternate — {@link com.balh.oms.ingress.IngressControlChroniclePublisher} after commit when
+ *       {@code oms.control.chronicle-append-mode=ingress-after-commit}. This controller is not registered
+ *       on Spring profiles {@value com.balh.oms.config.OmsProfiles#CONTROL_WORKER} or
+ *       {@value com.balh.oms.config.OmsProfiles#FIX_WORKER}.</li>
  * </ol>
  *
  * <p>Idempotent re-submissions return {@code 200 OK} with the existing order;
@@ -39,6 +45,7 @@ import java.util.UUID;
  */
 @RestController
 @RequestMapping("/internal/v1/orders")
+@Profile(OmsProfiles.ORDER_ACCEPT_PROFILE)
 public class OrdersController {
 
     private final OrderIngressService ingress;

@@ -356,6 +356,39 @@ tasks.named<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJarPost
     duplicatesStrategy = org.gradle.api.file.DuplicatesStrategy.EXCLUDE
 }
 
+/**
+ * Phase 3 of `system-documentation/plans/oms-aeron-cluster-substrate.md`: oms-fix-egress JVM.
+ *
+ * Mirrors `oms-postgres-projector` on the FIX side. Subscribes to the cluster events recording via Aeron Archive
+ * replay (slice 3b) and owns the QuickFIX/J SocketInitiator that ships NewOrderSingle to the broker (slices 3b/3d).
+ * Slice 3a is a skeleton — the bean activates the role but does not consume events yet, mirroring the
+ * postgres-projector cadence so each slice is independently shippable.
+ */
+tasks.register<org.springframework.boot.gradle.tasks.run.BootRun>("bootRunFixEgress") {
+    group = "application"
+    description =
+        "Run OMS with oms-fix-egress profile (Phase 3 cluster→FIX egress; application-oms-fix-egress.yaml)."
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.balh.oms.OmsFixEgressBootstrap")
+    jvmArgs(lowLatencyJvmModuleOpens)
+}
+
+tasks.register<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJarFixEgress") {
+    group = "build"
+    description =
+        "Executable JAR for fix-egress entry (Start-Class OmsFixEgressBootstrap; classifier fix-egress)."
+    mainClass.set("com.balh.oms.OmsFixEgressBootstrap")
+    archiveClassifier.set("fix-egress")
+    archiveBaseName.set("oms")
+    targetJavaVersion.set(JavaVersion.VERSION_21)
+    classpath = sourceSets["main"].runtimeClasspath
+}
+
+tasks.named<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJarFixEgress").configure {
+    shouldRunAfter(tasks.named("bootJar"))
+    duplicatesStrategy = org.gradle.api.file.DuplicatesStrategy.EXCLUDE
+}
+
 /** Minimal FIX 4.4 loopback acceptor for local OMS + HTTP load scripts (see docs/fix-out.md § synthetic traffic). */
 tasks.register<JavaExec>("fixLoopbackAcceptor") {
     group = "development"

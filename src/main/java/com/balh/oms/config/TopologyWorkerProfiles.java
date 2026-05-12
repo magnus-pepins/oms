@@ -18,6 +18,14 @@ public final class TopologyWorkerProfiles {
         rejectPair(environment, OmsProfiles.POSTGRES_PROJECTOR, OmsProfiles.CONTROL_WORKER);
         rejectPair(environment, OmsProfiles.POSTGRES_PROJECTOR, OmsProfiles.FIX_WORKER);
         rejectPair(environment, OmsProfiles.POSTGRES_PROJECTOR, OmsProfiles.INGRESS_REPLICA);
+        // oms-fix-egress (Phase 3 slice 3a of the Aeron Cluster substrate plan): the FIX-out JVM that owns QuickFIX
+        // and reads the cluster events recording directly. It replaces oms-fix-worker once Phase 3 lands; mutex with
+        // every other role profile because it owns the singleton FIX SocketInitiator (broker constraint: one initiator
+        // per route) and runs the egress-cursor replay loop, neither of which can share a JVM with the other roles.
+        rejectPair(environment, OmsProfiles.FIX_EGRESS, OmsProfiles.CONTROL_WORKER);
+        rejectPair(environment, OmsProfiles.FIX_EGRESS, OmsProfiles.FIX_WORKER);
+        rejectPair(environment, OmsProfiles.FIX_EGRESS, OmsProfiles.INGRESS_REPLICA);
+        rejectPair(environment, OmsProfiles.FIX_EGRESS, OmsProfiles.POSTGRES_PROJECTOR);
     }
 
     private static void rejectPair(Environment environment, String profileA, String profileB) {

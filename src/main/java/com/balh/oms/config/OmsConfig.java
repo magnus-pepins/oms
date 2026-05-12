@@ -1691,9 +1691,31 @@ public class OmsConfig {
 
         private final Client client = new Client();
         private final Projector projector = new Projector();
+        private final FixEgress fixEgress = new FixEgress();
 
         public Client getClient() { return client; }
         public Projector getProjector() { return projector; }
+        public FixEgress getFixEgress() { return fixEgress; }
+
+        /**
+         * Phase 3 of the Aeron Cluster substrate plan: configuration for the
+         * {@code oms-fix-egress} JVM. Mirrors {@link Projector} on the FIX-side: subscribes to
+         * the same cluster events recording (Aeron Archive replay), translates admitted /
+         * working orders into QuickFIX {@code NewOrderSingle}, and (Phase 3 slice 3d) submits
+         * inbound {@code ExecutionReport} back to the cluster as an {@code ApplyExecutionReport}
+         * command.
+         *
+         * <p>Slice 3a (this revision) ships only the topology scaffold — {@link #isEnabled()}
+         * gates whether the skeleton bean activates. Slice 3b adds the replay-channel /
+         * archive-control fields needed to actually consume.
+         */
+        public static class FixEgress {
+
+            private boolean enabled = false;
+
+            public boolean isEnabled() { return enabled; }
+            public void setEnabled(boolean enabled) { this.enabled = enabled; }
+        }
 
         /**
          * Phase 2 of the Aeron Cluster substrate plan: configuration for {@code OmsPostgresProjector}.

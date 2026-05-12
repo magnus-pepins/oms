@@ -30,11 +30,11 @@ public final class OmsProfiles {
 
     /**
      * Spring {@code @Profile} expression: load order-accept beans only on the monolith / ingress JVM (not on
-     * {@value #CONTROL_WORKER}, {@value #FIX_WORKER}, or {@value #POSTGRES_PROJECTOR}). {@value #INGRESS_REPLICA}
-     * is an ingress JVM and therefore <strong>does</strong> load order-accept beans.
+     * {@value #CONTROL_WORKER}, {@value #FIX_WORKER}, {@value #POSTGRES_PROJECTOR}, or {@value #FIX_EGRESS}).
+     * {@value #INGRESS_REPLICA} is an ingress JVM and therefore <strong>does</strong> load order-accept beans.
      */
     public static final String ORDER_ACCEPT_PROFILE =
-            "!oms-control-worker & !oms-fix-worker & !oms-postgres-projector";
+            "!oms-control-worker & !oms-fix-worker & !oms-postgres-projector & !oms-fix-egress";
 
     // ------------------------------------------------------------------------
     // ADR 0001 / topology-aeron-cluster — new role profiles.

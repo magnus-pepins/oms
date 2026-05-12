@@ -1,0 +1,39 @@
+# Phase 3 of system-documentation/plans/oms-aeron-cluster-substrate.md: oms-fix-egress role.
+#
+# This JVM consumes the cluster events recording (OmsClusterWireFormat.EVENTS_CHANNEL /
+# EVENTS_STREAM_ID) via Aeron Archive replay (mirrors oms-postgres-projector on the FIX side) and
+# owns the QuickFIX/J SocketInitiator that ships NewOrderSingle to the broker. It must NOT run
+# order-accept HTTP/gRPC (ORDER_ACCEPT_PROFILE excludes oms-fix-egress) and is mutex with every
+# other role profile (TopologyWorkerProfiles + FixEgressTopologyValidator).
+#
+# Slice 3a (current): skeleton bean only. Slice 3b adds the Aeron + replay-thread + NewOrderSingle
+# send. Slice 3d adds inbound ER → ApplyExecutionReportCommand (turns the cluster client back on
+# at that point).
+#
+# Example: SPRING_PROFILES_ACTIVE=oms-fix-egress
+#
+# Production: set OMS_FIX_EGRESS_AERON_DIR (slice 3b) to the cluster member's media-driver
+# directory. As with oms-postgres-projector, multi-host deploys either co-locate this JVM on each
+# cluster member (recommended for low-latency reads) or wire AeronArchive remote replay over UDP
+# in Phase 5.
+
+oms:
+  grpc:
+    enabled: false
+  cluster:
+    client:
+      # Slice 3a/3b: FIX-egress reads from the events recording, not via the cluster client.
+      # Slice 3d will flip this to true so the JVM can offer ApplyExecutionReportCommand back
+      # to the cluster on inbound ExecutionReport.
+      enabled: false
+    fix-egress:
+      enabled: ${OMS_FIX_EGRESS_ENABLED:true}
+  routing:
+    backend: fix
+  fix:
+    auto-start: ${OMS_FIX_EGRESS_AUTO_START:true}
+
+# Separate management port so probes/metrics do not share the main HTTP connector with other roles deployed nearby.
+management:
+  server:
+    port: ${OMS_FIX_EGRESS_MANAGEMENT_SERVER_PORT:8091}

@@ -4,7 +4,7 @@
 
 **Supersedes:** [`docs/decisions.md`](../decisions.md) §1 (Posture A — Chronicle Queue OSS) and §8 (Chronicle's role).
 
-**Plan:** [system-documentation/.cursor/plans/finish_oms_topology_aeron_cluster_9ae3ce16.plan.md](../../../system-documentation/.cursor/plans/finish_oms_topology_aeron_cluster_9ae3ce16.plan.md).
+**Plan:** [system-documentation/plans/oms-aeron-cluster-substrate.md](../../../system-documentation/plans/oms-aeron-cluster-substrate.md).
 
 ## Context
 

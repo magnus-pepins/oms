@@ -29,7 +29,6 @@ import org.springframework.http.HttpStatus;
 
 import java.math.BigDecimal;
 import java.time.Duration;
-import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.TimeoutException;
 
@@ -43,17 +42,15 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * Phase 1b unit test: verifies {@link OrderIngressService} routes admission
- * through {@link OmsClusterIngressClient} when the cluster bean is present,
- * and surfaces cluster failures as the right
+ * Phase 1c slice B unit test: verifies {@link OrderIngressService} routes admission through the
+ * (now mandatory) {@link OmsClusterIngressClient} and surfaces cluster failures as the right
  * {@link ClusterAdmissionException} HTTP status.
  *
- * <p>Plan: {@code system-documentation/plans/oms-aeron-cluster-substrate.md}
- * §Phase 1. The full HTTP + Postgres + cluster integration test rides on
- * Postgres testcontainers and lives in
- * {@link OrderIngressLedgerInflightIntegrationTest}-style setups in CI; this
- * test exercises the cluster-gate logic in process so it runs locally without
- * Docker and gives fast feedback on the gate semantics.
+ * <p>Plan: {@code system-documentation/plans/oms-aeron-cluster-substrate.md} §Phase 1c. The
+ * "cluster absent" case from slice B's predecessor (Phase 1b) is gone: the cluster bean is now
+ * a hard dependency injected directly. The full HTTP + Postgres + cluster integration test
+ * lives in {@link com.balh.oms.cluster.OrderIngressClusterIntegrationTest}; this test exercises
+ * the cluster-gate logic in-process for fast feedback without Docker.
  */
 class OrderIngressServiceClusterGateTest {
 
@@ -103,12 +100,6 @@ class OrderIngressServiceClusterGateTest {
         ObjectProvider<LedgerBalanceClient> ledgerBalance =
                 (ObjectProvider<LedgerBalanceClient>) mock(ObjectProvider.class);
         when(ledgerBalance.getIfAvailable()).thenReturn(null);
-        ObjectProvider<IngressControlChroniclePublisher> chroniclePublisher =
-                (ObjectProvider<IngressControlChroniclePublisher>) mock(ObjectProvider.class);
-        when(chroniclePublisher.getIfAvailable()).thenReturn(null);
-        ObjectProvider<OmsClusterIngressClient> clusterProvider =
-                (ObjectProvider<OmsClusterIngressClient>) mock(ObjectProvider.class);
-        when(clusterProvider.getIfAvailable()).thenReturn(cluster);
 
         service = new OrderIngressService(
                 orders,
@@ -124,9 +115,8 @@ class OrderIngressServiceClusterGateTest {
                 ledgerInflightOutbox,
                 new SimpleMeterRegistry(),
                 ingressToFixNosLatencyRecorder,
-                chroniclePublisher,
                 orderControlAdmission,
-                clusterProvider);
+                cluster);
     }
 
     @Test
@@ -223,51 +213,6 @@ class OrderIngressServiceClusterGateTest {
                     assertThat(e.getErrorCode()).isEqualTo("cluster_unavailable");
                 });
         verify(orders, never()).insert(any());
-    }
-
-    @Test
-    void clusterAbsent_doesNotConsultCluster() throws Exception {
-        @SuppressWarnings("unchecked")
-        ObjectProvider<OmsClusterIngressClient> emptyProvider =
-                (ObjectProvider<OmsClusterIngressClient>) mock(ObjectProvider.class);
-        when(emptyProvider.getIfAvailable()).thenReturn(null);
-        @SuppressWarnings("unchecked")
-        ObjectProvider<LedgerInflightReservationClient> ledgerInflight =
-                (ObjectProvider<LedgerInflightReservationClient>) mock(ObjectProvider.class);
-        when(ledgerInflight.getIfAvailable()).thenReturn(null);
-        @SuppressWarnings("unchecked")
-        ObjectProvider<LedgerBalanceClient> ledgerBalance =
-                (ObjectProvider<LedgerBalanceClient>) mock(ObjectProvider.class);
-        when(ledgerBalance.getIfAvailable()).thenReturn(null);
-        @SuppressWarnings("unchecked")
-        ObjectProvider<IngressControlChroniclePublisher> chroniclePublisher =
-                (ObjectProvider<IngressControlChroniclePublisher>) mock(ObjectProvider.class);
-        when(chroniclePublisher.getIfAvailable()).thenReturn(null);
-
-        OrderIngressService noCluster = new OrderIngressService(
-                orders,
-                controlOutbox,
-                domainEventOutbox,
-                domainEventEnvelopeCodec,
-                config,
-                controlPayloadCodec,
-                objectMapper,
-                piiHash,
-                ledgerInflight,
-                ledgerBalance,
-                ledgerInflightOutbox,
-                new SimpleMeterRegistry(),
-                ingressToFixNosLatencyRecorder,
-                chroniclePublisher,
-                orderControlAdmission,
-                emptyProvider);
-
-        when(orders.findByIdempotency(any(), any())).thenReturn(Optional.empty());
-
-        noCluster.persistAccepted(buyRequest());
-
-        verify(cluster, never()).submitAcceptOrder(any(), any());
-        verify(orders).insert(any());
     }
 
     private static CreateOrderRequest buyRequest() {

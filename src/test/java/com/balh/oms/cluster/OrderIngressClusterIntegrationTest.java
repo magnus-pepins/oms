@@ -13,8 +13,6 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.test.context.DynamicPropertyRegistry;
-import org.springframework.test.context.DynamicPropertySource;
 
 import java.util.Map;
 import java.util.UUID;
@@ -46,17 +44,6 @@ import static org.assertj.core.api.Assertions.assertThat;
  * Cluster + Postgres end-to-end.
  */
 class OrderIngressClusterIntegrationTest extends AbstractPostgresIntegrationTest {
-
-    @DynamicPropertySource
-    static void clusterClientProps(DynamicPropertyRegistry registry) {
-        registry.add("oms.cluster.client.enabled", () -> "true");
-        registry.add(
-                "oms.cluster.client.aeron-directory",
-                AbstractPostgresIntegrationTest::testClusterAeronDirectory);
-        registry.add(
-                "oms.cluster.client.ingress-endpoints",
-                AbstractPostgresIntegrationTest::testClusterIngressEndpoints);
-    }
 
     @LocalServerPort int port;
     @Autowired TestRestTemplate http;

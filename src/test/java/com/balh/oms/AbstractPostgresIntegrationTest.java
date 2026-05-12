@@ -37,32 +37,20 @@ import java.util.concurrent.TimeUnit;
  *       demand. Tests are skipped if Docker is not reachable from the JVM.</li>
  * </ul>
  *
- * <h2>Aeron Cluster (Phase 1c slice A)</h2>
+ * <h2>Aeron Cluster (Phase 1c slices A + B)</h2>
  *
  * <p>Phase 1c of {@code system-documentation/plans/oms-aeron-cluster-substrate.md} makes the
- * cluster the only admission path. Slice 1c-A (this class) provides the <strong>infrastructure
- * only</strong>: a JVM-wide singleton in-process Aeron Cluster, started <em>lazily</em> the
- * first time {@link #testClusterAeronDirectory()} is read by an opt-in test, and closed via a
- * JVM shutdown hook. Tests that want the cluster path register their own
- * {@link DynamicPropertySource} pointing at the singleton:
+ * cluster the only admission path. Slice A provided the infrastructure (JVM-wide singleton
+ * cluster, heartbeat, max-sessions). Slice B (this revision) moves the cluster opt-in
+ * <em>into</em> this base class: every Spring context loaded via
+ * {@link SpringBootTest @SpringBootTest} that activates
+ * {@link com.balh.oms.config.OmsProfiles#ORDER_ACCEPT_PROFILE} now boots a connected
+ * {@code OmsClusterIngressClient} pointing at the singleton. Control-worker / fix-worker
+ * profiles deactivate that profile, so they get the cluster as harmless background overhead
+ * without loading the client.
  *
- * <pre>{@code
- * @DynamicPropertySource
- * static void clusterProps(DynamicPropertyRegistry registry) {
- *     registry.add("oms.cluster.client.enabled", () -> "true");
- *     registry.add("oms.cluster.client.aeron-directory",
- *             AbstractPostgresIntegrationTest::testClusterAeronDirectory);
- *     registry.add("oms.cluster.client.ingress-endpoints",
- *             AbstractPostgresIntegrationTest::testClusterIngressEndpoints);
- * }
- * }</pre>
- *
- * <p>Slice 1c-B will move that opt-in into this base class once {@code OrderIngressService} is
- * cluster-only and the matching tests have been adapted; this slice keeps the test suite's
- * existing chronicle-based tests untouched.
- *
- * <p>Cluster shutdown is handled by a JVM shutdown hook so test classes can come and go without
- * tearing the cluster down. Spring closes per-context {@code AeronCluster} clients via
+ * <p>The singleton starts lazily on the first {@link DynamicPropertySource} resolution and
+ * closes via a JVM shutdown hook. Spring closes per-context {@code AeronCluster} clients via
  * {@code @PreDestroy} <em>before</em> the JVM hook fires the cluster node shutdown, so client
  * close always sees a live driver (no {@code DriverTimeoutException} on graceful shutdown).
  *
@@ -119,21 +107,29 @@ public abstract class AbstractPostgresIntegrationTest {
     }
 
     /**
+     * Cluster opt-in moved here in Phase 1c slice B: every order-accept Spring context now boots
+     * a connected {@code OmsClusterIngressClient} pointing at the JVM-wide singleton cluster.
+     * Tests that don't activate {@link com.balh.oms.config.OmsProfiles#ORDER_ACCEPT_PROFILE}
+     * still resolve these properties (so they're cheap), but the
+     * {@code @ConditionalOnProperty} on {@code OmsClusterIngressClient} only loads the client
+     * for order-accept contexts.
+     */
+    @DynamicPropertySource
+    static void registerClusterClientProperties(DynamicPropertyRegistry registry) {
+        registry.add("oms.cluster.client.enabled", () -> "true");
+        registry.add("oms.cluster.client.aeron-directory", () -> testClusterAeronDirectory());
+        registry.add("oms.cluster.client.ingress-endpoints", () -> testClusterIngressEndpoints());
+    }
+
+    /**
      * Lazily starts (if needed) the JVM-wide {@link TestAeronClusterSingleton} and returns its
-     * {@code aeron} working directory. Use from a test's
-     * {@link DynamicPropertySource @DynamicPropertySource} as the value for
-     * {@code oms.cluster.client.aeron-directory}.
+     * {@code aeron} working directory.
      */
     public static String testClusterAeronDirectory() {
         return TestAeronClusterSingleton.startedInstance().aeronDirectory();
     }
 
-    /**
-     * Ingress endpoints string for the JVM-wide {@link TestAeronClusterSingleton}. Use from a
-     * test's {@link DynamicPropertySource @DynamicPropertySource} as the value for
-     * {@code oms.cluster.client.ingress-endpoints}. Pure constant; does <em>not</em> start the
-     * cluster.
-     */
+    /** Ingress endpoints string for the JVM-wide {@link TestAeronClusterSingleton}. */
     public static String testClusterIngressEndpoints() {
         return TestAeronClusterSingleton.INGRESS_ENDPOINTS;
     }

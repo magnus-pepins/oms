@@ -36,8 +36,6 @@ import org.springframework.context.annotation.Profile;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.transaction.support.TransactionSynchronization;
-import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.math.BigDecimal;
 import java.time.Duration;
@@ -47,7 +45,17 @@ import java.util.concurrent.TimeoutException;
 
 /**
  * Owns the single Postgres transaction that inserts an order and matching
- * {@code control_outbox} and {@code domain_event_outbox} rows.
+ * {@code control_outbox} and {@code domain_event_outbox} rows, after
+ * <em>mandatory</em> admission through Aeron Cluster.
+ *
+ * <p>Phase 1c slice B (Aeron Cluster substrate plan) made the cluster the
+ * only admission path. {@link OmsClusterIngressClient} is a hard required
+ * dependency: every accept call submits an {@link AcceptOrderCommand} and
+ * blocks until the cluster emits {@code OrderAccepted} or
+ * {@code OrderRejected}. Postgres rows are written only after the cluster
+ * accepts the order. The {@code IngressControlChroniclePublisher}
+ * after-commit hook that previously wrote to Chronicle is gone (slice C
+ * deletes the publisher class itself).
  *
  * <p>This is a separate Spring bean (not a controller method) because Spring's
  * {@code @Transactional} relies on AOP proxies and self-invocation through
@@ -76,9 +84,8 @@ public class OrderIngressService {
     private final LedgerInflightOutboxRepository ledgerInflightOutbox;
     private final MeterRegistry meterRegistry;
     private final IngressToFixNosLatencyRecorder ingressToFixNosLatencyRecorder;
-    private final ObjectProvider<IngressControlChroniclePublisher> ingressControlChroniclePublisher;
     private final OrderControlAdmission orderControlAdmission;
-    private final ObjectProvider<OmsClusterIngressClient> clusterIngressClient;
+    private final OmsClusterIngressClient clusterIngressClient;
 
     public OrderIngressService(
             OrdersRepository orders,
@@ -94,9 +101,8 @@ public class OrderIngressService {
             LedgerInflightOutboxRepository ledgerInflightOutbox,
             MeterRegistry meterRegistry,
             IngressToFixNosLatencyRecorder ingressToFixNosLatencyRecorder,
-            ObjectProvider<IngressControlChroniclePublisher> ingressControlChroniclePublisher,
             OrderControlAdmission orderControlAdmission,
-            ObjectProvider<OmsClusterIngressClient> clusterIngressClient) {
+            OmsClusterIngressClient clusterIngressClient) {
         this.orders = orders;
         this.outbox = outbox;
         this.domainEventOutbox = domainEventOutbox;
@@ -110,7 +116,6 @@ public class OrderIngressService {
         this.ledgerInflightOutbox = ledgerInflightOutbox;
         this.meterRegistry = meterRegistry;
         this.ingressToFixNosLatencyRecorder = ingressToFixNosLatencyRecorder;
-        this.ingressControlChroniclePublisher = ingressControlChroniclePublisher;
         this.orderControlAdmission = orderControlAdmission;
         this.clusterIngressClient = clusterIngressClient;
     }
@@ -174,33 +179,29 @@ public class OrderIngressService {
                 BigDecimal.ZERO
         );
 
-        OmsClusterIngressClient cluster = clusterIngressClient.getIfAvailable();
-        boolean clusterGateActive = cluster != null;
-        if (clusterGateActive) {
-            AdmissionResult ar = submitToClusterOrThrow(cluster, order, accountIdHash, now);
-            AdmissionResult.Accepted accepted = (AdmissionResult.Accepted) ar;
-            if (accepted.event().duplicate() && !accepted.event().orderId().equals(id)) {
-                id = accepted.event().orderId();
-                order = new Order(
-                        id,
-                        req.accountId(),
-                        req.clientIdempotencyKey(),
-                        shardId,
-                        0,
-                        OrderStatus.NEW,
-                        null,
-                        req.side(),
-                        req.instrumentSymbol(),
-                        req.quantity(),
-                        req.limitPrice(),
-                        req.timeInForce(),
-                        now,
-                        now,
-                        null,
-                        accountIdHash,
-                        ledgerBalanceId,
-                        BigDecimal.ZERO);
-            }
+        AdmissionResult ar = submitToClusterOrThrow(clusterIngressClient, order, accountIdHash, now);
+        AdmissionResult.Accepted accepted = (AdmissionResult.Accepted) ar;
+        if (accepted.event().duplicate() && !accepted.event().orderId().equals(id)) {
+            id = accepted.event().orderId();
+            order = new Order(
+                    id,
+                    req.accountId(),
+                    req.clientIdempotencyKey(),
+                    shardId,
+                    0,
+                    OrderStatus.NEW,
+                    null,
+                    req.side(),
+                    req.instrumentSymbol(),
+                    req.quantity(),
+                    req.limitPrice(),
+                    req.timeInForce(),
+                    now,
+                    now,
+                    null,
+                    accountIdHash,
+                    ledgerBalanceId,
+                    BigDecimal.ZERO);
         }
 
         try {
@@ -224,11 +225,7 @@ public class OrderIngressService {
                 order.acceptedAt(),
                 controlOutboxEnqueuedAt);
         String controlPayload = serializePayload(controlEvent);
-        ControlOutboxRepository.InsertResult controlOutboxRow =
-                outbox.insert(id, order.version(), controlPayload, controlOutboxEnqueuedAt);
-        if (!clusterGateActive) {
-            registerIngressChronicleAfterCommit(controlOutboxRow.id(), controlPayload, controlOutboxRow.enqueuedAt());
-        }
+        outbox.insert(id, order.version(), controlPayload, controlOutboxEnqueuedAt);
         try {
             domainEventOutbox.insert(id, domainEventEnvelopeCodec.orderAccepted(order));
         } catch (JsonProcessingException e) {
@@ -430,22 +427,6 @@ public class OrderIngressService {
 
     private String serializePayload(PendingControlEvent ev) {
         return controlPayloadCodec.outboxPayloadJson(ev);
-    }
-
-    private void registerIngressChronicleAfterCommit(long outboxId, String controlPayload, Instant enqueuedAt) {
-        IngressControlChroniclePublisher publisher = ingressControlChroniclePublisher.getIfAvailable();
-        if (publisher == null) {
-            return;
-        }
-        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
-            throw new IllegalStateException("ingress Chronicle hook requires an active Spring transaction");
-        }
-        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
-            @Override
-            public void afterCommit() {
-                publisher.appendMarkMetrics(outboxId, controlPayload, enqueuedAt);
-            }
-        });
     }
 
     private static String normalizeLedgerBalanceId(String raw) {

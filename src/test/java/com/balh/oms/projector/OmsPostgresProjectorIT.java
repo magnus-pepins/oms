@@ -24,9 +24,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 
 /**
- * Phase 2 slice 2b-2 end-to-end: projector subscribes to the cluster's events recording, decodes
- * {@link com.balh.oms.cluster.OrderAdmittedEvent} fragments, idempotently writes {@code orders}
- * rows, and advances the cursor.
+ * Phase 2 slice 2d end-to-end: projector subscribes to the cluster's events recording, decodes
+ * {@link com.balh.oms.cluster.OrderAdmittedEvent} fragments, and per event writes the {@code orders}
+ * row + runs control admission ({@code control_decisions} + {@code domain_event_outbox}) + advances
+ * the cursor — all inside a single Postgres transaction.
  *
  * <p>Boots a Spring context with {@value OmsProfiles#POSTGRES_PROJECTOR} active — order-accept
  * beans (controller, service, gRPC, FIX) are excluded — and manually wires an
@@ -139,6 +140,38 @@ class OmsPostgresProjectorIT extends AbstractPostgresIntegrationTest {
                 "SELECT shard_id FROM orders WHERE id = ?", Integer.class, orderId);
         assertThat(shardId).isZero();
 
+        // Slice 2d: control admission ran inside the projector transaction. The orders row
+        // advanced from NEW (version 0, fresh insert) to WORKING (version 1, CAS) and a
+        // control_decisions PASS row + domain_event_outbox OrderWorking envelope were written.
+        await()
+                .atMost(ROW_VISIBLE_TIMEOUT)
+                .pollInterval(Duration.ofMillis(50))
+                .untilAsserted(() -> {
+                    String status = jdbc.queryForObject(
+                            "SELECT status::text FROM orders WHERE id = ?", String.class, orderId);
+                    assertThat(status).isEqualTo("WORKING");
+                });
+        Integer version = jdbc.queryForObject(
+                "SELECT version FROM orders WHERE id = ?", Integer.class, orderId);
+        assertThat(version).isEqualTo(1);
+
+        Long passDecisions = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM control_decisions WHERE order_id = ? AND outcome = 'PASS'",
+                Long.class,
+                orderId);
+        assertThat(passDecisions)
+                .as("projector recorded a PASS control_decisions row for the admitted order")
+                .isEqualTo(1L);
+
+        Long workingEnvelopes = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM domain_event_outbox WHERE order_id = ?"
+                        + " AND envelope_json->>'type' = 'OrderWorking'",
+                Long.class,
+                orderId);
+        assertThat(workingEnvelopes)
+                .as("projector enqueued an OrderWorking domain envelope for the admitted order")
+                .isEqualTo(1L);
+
         // Cursor advanced past zero (the recording carries cluster-internal frames so position is
         // non-trivial; we only assert it moved forward).
         Long cursorPos = cursorRepository
@@ -191,6 +224,22 @@ class OmsPostgresProjectorIT extends AbstractPostgresIntegrationTest {
                 accountId,
                 idemKey);
         assertThat(count).isEqualTo(1L);
+
+        // Slice 2d: idempotency on the projector side too — exactly one PASS control_decisions row
+        // and exactly one OrderWorking domain_event_outbox envelope, even though the duplicate
+        // submission re-routed through the cluster.
+        Long passDecisions = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM control_decisions WHERE order_id = ? AND outcome = 'PASS'",
+                Long.class,
+                orderId);
+        assertThat(passDecisions).isEqualTo(1L);
+
+        Long workingEnvelopes = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM domain_event_outbox WHERE order_id = ?"
+                        + " AND envelope_json->>'type' = 'OrderWorking'",
+                Long.class,
+                orderId);
+        assertThat(workingEnvelopes).isEqualTo(1L);
     }
 
     private AcceptOrderCommand sample(UUID orderId, UUID accountId, String idemKey) {

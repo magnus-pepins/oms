@@ -65,6 +65,33 @@ public class OrdersRepository {
             ON CONFLICT (account_id, client_idempotency_key) DO NOTHING
             """;
 
+    /**
+     * Projector-only insert (slice 2d). Bare {@code ON CONFLICT DO NOTHING} swallows any unique
+     * constraint violation — pkey OR {@code (account_id, client_idempotency_key)} — because the
+     * projector is purely idempotent on replay and may race a concurrent writer (test
+     * {@code TestPostgresProjectorSingleton}, sibling Spring context, restart-from-cursor) that
+     * already committed the same row. The legacy ingress path keeps {@link #INSERT_SQL} and its
+     * targeted {@code (account_id, client_idempotency_key)} arbiter so callers there can
+     * distinguish duplicate idempotency-key submissions from other constraint failures.
+     */
+    private static final String PROJECTOR_INSERT_SQL = """
+            INSERT INTO orders (
+                id, account_id, client_idempotency_key, shard_id, version,
+                status, terminal_reason, side, instrument_symbol,
+                quantity, limit_price, time_in_force,
+                received_at, accepted_at, terminal_at, account_id_hash, ledger_balance_id,
+                cum_filled_quantity
+            ) VALUES (
+                :id, :account_id, :client_idempotency_key, :shard_id, 0,
+                CAST(:status AS order_status), CAST(:terminal_reason AS reject_code),
+                CAST(:side AS order_side), :instrument_symbol,
+                :quantity, :limit_price, :time_in_force,
+                :received_at, :accepted_at, :terminal_at, :account_id_hash, :ledger_balance_id,
+                :cum_filled_quantity
+            )
+            ON CONFLICT DO NOTHING
+            """;
+
     private static final String SELECT_BY_ID_SQL = """
             SELECT id, account_id, client_idempotency_key, shard_id, version,
                    status::text AS status,
@@ -131,14 +158,19 @@ public class OrdersRepository {
      * Phase 2 projector path: idempotent insert from a cluster-emitted {@link OrderAdmittedEvent}.
      *
      * <p>Unlike {@link #insert(Order)}, this method does not throw on duplicates — the projector reaches
-     * here on every fresh admission, and a duplicate is the expected outcome whenever the slice 2c-pre
-     * dual-write with {@code OrderIngressService} has already run, or when the projector replays past
-     * its cursor on restart. ON CONFLICT suppresses the insert in both cases.
+     * here on every fresh admission, and a duplicate is the expected outcome whenever the projector
+     * replays past its cursor on restart, or when an integration-test
+     * {@code TestPostgresProjectorSingleton} has already projected the same event. {@link #INSERT_SQL}
+     * arbitrates on {@code (account_id, client_idempotency_key)}, which is the canonical duplicate
+     * check, but a concurrent insert that has already committed the matching pkey row first can race
+     * past that arbiter and surface as an {@code orders_pkey} violation. We use a separate
+     * {@code INSERT ... ON CONFLICT DO NOTHING} (no target) here so any unique-constraint
+     * violation — pkey or {@code (account_id, client_idempotency_key)} — is suppressed idempotently.
      *
      * <p>Returns {@code true} when the row was inserted, {@code false} when ON CONFLICT swallowed it.
      */
     public boolean insertFromAdmittedEvent(OrderAdmittedEvent ev) {
-        return jdbc.update(INSERT_SQL, projectorParams(ev)) == 1;
+        return jdbc.update(PROJECTOR_INSERT_SQL, projectorParams(ev)) == 1;
     }
 
     private static MapSqlParameterSource projectorParams(OrderAdmittedEvent ev) {

@@ -109,8 +109,20 @@ public abstract class AbstractPostgresIntegrationTest {
      * positions to orders), which can leak state across integration tests that reuse the same
      * container and default custody account.
      */
+    /**
+     * Per-test truncate list. Phase 2 slice 2c (V25) dropped the FK constraints from the
+     * control / outbox / domain / execution side-tables back to {@code orders(id)} because the
+     * projector now writes those rows asynchronously, so {@code TRUNCATE orders CASCADE} no
+     * longer reaches them. Enumerate the side-tables explicitly here so the per-{@code @BeforeEach}
+     * clean stays comprehensive — otherwise control_decisions / domain_event_outbox / executions
+     * leak across test classes inside the JVM-wide Spring context cache.
+     */
     public static final String SQL_TRUNCATE_ORDERS_AND_SETTLEMENT =
-            "TRUNCATE TABLE corporate_action_event, manual_settlement_actions, ledger_settlement_outbox, broker_settlement_confirm, settlement_file_import_batch, position_history, positions, orders, fx_stub_leg_group CASCADE";
+            "TRUNCATE TABLE control_decisions, control_outbox, domain_event_outbox,"
+                    + " ledger_inflight_outbox, executions, market_context,"
+                    + " corporate_action_event, manual_settlement_actions, ledger_settlement_outbox,"
+                    + " broker_settlement_confirm, settlement_file_import_batch, position_history,"
+                    + " positions, orders, fx_stub_leg_group CASCADE";
 
     /** Docker / runner flakes: retry container start before failing the JVM test run (Testcontainers path only). */
     private static final int POSTGRES_CONTAINER_STARTUP_ATTEMPTS = 3;

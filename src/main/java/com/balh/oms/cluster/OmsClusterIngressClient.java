@@ -4,10 +4,12 @@ import com.balh.oms.config.OmsConfig;
 import io.aeron.cluster.client.AeronCluster;
 import io.aeron.cluster.client.EgressListener;
 import io.aeron.cluster.codecs.EventCode;
+import io.aeron.exceptions.DriverTimeoutException;
 import io.aeron.logbuffer.Header;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import org.agrona.DirectBuffer;
+import org.agrona.ErrorHandler;
 import org.agrona.ExpandableArrayBuffer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -57,6 +59,25 @@ import java.util.concurrent.locks.LockSupport;
 public class OmsClusterIngressClient {
 
     private static final Logger log = LoggerFactory.getLogger(OmsClusterIngressClient.class);
+
+    /**
+     * Error handler installed on the underlying {@link AeronCluster} (and via it, on the internal
+     * {@link io.aeron.Aeron}). Aeron's stock {@code DEFAULT_ERROR_HANDLER} calls {@code System.exit(-1)}
+     * on {@link DriverTimeoutException}, which would tear down the OMS Spring Boot JVM whenever the
+     * cluster's MediaDriver disappears (planned shutdown, network blip, restart). For a managed
+     * Spring bean we want a transient driver loss to surface as a {@link io.aeron.exceptions.AeronException}
+     * on the next {@code submitAcceptOrder} (mapped to {@link com.balh.oms.ingress.ClusterAdmissionException}
+     * 503 by the controller), <em>not</em> a process exit. Logging only, never {@code System.exit}.
+     */
+    private static final ErrorHandler LOGGING_ERROR_HANDLER = (Throwable t) -> {
+        if (t instanceof DriverTimeoutException) {
+            log.warn(
+                    "OMS cluster client lost MediaDriver heartbeat (driver timeout); subsequent submits will fail with cluster_unavailable until the cluster is reachable again",
+                    t);
+        } else {
+            log.error("OMS cluster client background error", t);
+        }
+    };
 
     private final OmsConfig.Cluster.Client config;
     private final AtomicLong correlationIds = new AtomicLong(1);
@@ -161,6 +182,7 @@ public class OmsClusterIngressClient {
                     .ingressEndpoints(config.getIngressEndpoints())
                     .egressChannel(config.getEgressChannel())
                     .egressListener(egressListener)
+                    .errorHandler(LOGGING_ERROR_HANDLER)
                     .messageTimeoutNs(TimeUnit.MILLISECONDS.toNanos(config.getMessageTimeoutMs()));
 
             long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(config.getConnectTimeoutMs());

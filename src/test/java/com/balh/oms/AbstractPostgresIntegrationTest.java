@@ -4,32 +4,32 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
-import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.PostgreSQLContainer;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.junit.jupiter.Testcontainers;
-import org.testcontainers.utility.DockerImageName;
 
 /**
  * Base class for integration tests that need a real Postgres instance.
  *
- * <p><strong>Local / IDE:</strong> starts {@link PostgreSQLContainer} (Testcontainers) unless Docker is
- * unavailable — then tests are skipped ({@code disabledWithoutDocker = true}).
+ * <p>Two paths, mutually exclusive:
  *
- * <p><strong>GitHub Actions CI:</strong> when {@code OMS_CI_JDBC_URL} is set (see {@code .github/workflows/ci.yml}),
- * the workflow {@code services: postgres} provides the database; this class still starts a tiny
- * no-op {@link GenericContainer} so the Testcontainers JUnit extension remains satisfied for other
- * tests (e.g. NATS) while JDBC points at the service URL instead of Testcontainers Postgres.
+ * <ul>
+ *   <li><strong>Externally-managed Postgres</strong> (preferred when available):
+ *       set {@code OMS_CI_JDBC_URL} (and optionally {@code OMS_CI_JDBC_USER} /
+ *       {@code OMS_CI_JDBC_PASSWORD}). Used by GitHub Actions {@code services: postgres},
+ *       and equivalently by a developer running OMS Postgres via {@code docker compose}
+ *       (see {@code oms/docker-compose.yml}). No Testcontainers / Docker probe is performed.</li>
+ *   <li><strong>Testcontainers Postgres</strong> (default for IDE/dev): when {@code OMS_CI_JDBC_URL}
+ *       is unset, a singleton {@link PostgreSQLContainer} is started on demand. Tests are skipped
+ *       if Docker is not reachable from the JVM.</li>
+ * </ul>
  *
- * <p>To run the OMS against Compose Postgres instead, use {@code ./gradlew bootRun} with
+ * <p>To run the OMS app itself against compose Postgres, use {@code ./gradlew bootRun} with
  * {@code OMS_PG_URL} / {@code OMS_PG_USER} / {@code OMS_PG_PASSWORD}; see README.
  */
-@Testcontainers(disabledWithoutDocker = true)
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @ActiveProfiles("test")
 public abstract class AbstractPostgresIntegrationTest {
 
-    /** Env var: JDBC URL of CI-managed Postgres (GitHub Actions {@code services: postgres}). */
+    /** Env var: JDBC URL of an externally-managed Postgres (CI service or local docker compose). */
     static final String ENV_OMS_CI_JDBC_URL = "OMS_CI_JDBC_URL";
 
     private static final String ENV_OMS_CI_JDBC_USER = "OMS_CI_JDBC_USER";
@@ -55,30 +55,12 @@ public abstract class AbstractPostgresIntegrationTest {
     private static final int POSTGRES_CONTAINER_STARTUP_ATTEMPTS = 3;
 
     /**
-     * Either {@link PostgreSQLContainer} (local) or a tiny Alpine container (CI — Postgres comes from
-     * {@value #ENV_OMS_CI_JDBC_URL}).
+     * Singleton Testcontainers Postgres for the externally-unmanaged path. Started lazily on first
+     * access; Testcontainers' Ryuk reaper handles cleanup at JVM exit.
+     *
+     * <p>{@code null} when {@link #useCiManagedPostgres()} is true.
      */
-    @Container
-    @SuppressWarnings("resource")
-    protected static final GenericContainer<?> POSTGRES_TEST_CONTAINER = createPostgresOrCiAuxiliary();
-
-    private static GenericContainer<?> createPostgresOrCiAuxiliary() {
-        if (useCiManagedPostgres()) {
-            return new GenericContainer<>(DockerImageName.parse("alpine:3.19"))
-                    .withCommand("sleep", "3600")
-                    .withLabel("oms.test.role", "ci-postgres-placeholder");
-        }
-        return new PostgreSQLContainer<>("postgres:16-alpine")
-                .withDatabaseName("oms")
-                .withUsername("oms")
-                .withPassword("oms")
-                .withStartupAttempts(POSTGRES_CONTAINER_STARTUP_ATTEMPTS);
-    }
-
-    private static boolean useCiManagedPostgres() {
-        String url = System.getenv(ENV_OMS_CI_JDBC_URL);
-        return url != null && !url.isBlank();
-    }
+    private static volatile PostgreSQLContainer<?> testcontainersPostgres;
 
     @DynamicPropertySource
     static void registerPgProperties(DynamicPropertyRegistry registry) {
@@ -88,12 +70,12 @@ public abstract class AbstractPostgresIntegrationTest {
         registry.add("spring.datasource.hikari.connection-timeout", () -> HIKARI_CONNECTION_TIMEOUT_MS);
     }
 
-    /** JDBC URL for the shared integration Postgres (CI service or Testcontainers). */
+    /** JDBC URL for the shared integration Postgres (env-driven or Testcontainers-driven). */
     public static String integrationTestJdbcUrl() {
         if (useCiManagedPostgres()) {
             return requireEnv(ENV_OMS_CI_JDBC_URL);
         }
-        return postgresContainer().getJdbcUrl();
+        return testcontainersPostgres().getJdbcUrl();
     }
 
     /** Username for {@link #integrationTestJdbcUrl()}. */
@@ -101,7 +83,7 @@ public abstract class AbstractPostgresIntegrationTest {
         if (useCiManagedPostgres()) {
             return firstNonBlank(System.getenv(ENV_OMS_CI_JDBC_USER), "oms");
         }
-        return postgresContainer().getUsername();
+        return testcontainersPostgres().getUsername();
     }
 
     /** Password for {@link #integrationTestJdbcUrl()}. */
@@ -109,14 +91,32 @@ public abstract class AbstractPostgresIntegrationTest {
         if (useCiManagedPostgres()) {
             return firstNonBlank(System.getenv(ENV_OMS_CI_JDBC_PASSWORD), "oms");
         }
-        return postgresContainer().getPassword();
+        return testcontainersPostgres().getPassword();
     }
 
-    private static PostgreSQLContainer<?> postgresContainer() {
-        if (!(POSTGRES_TEST_CONTAINER instanceof PostgreSQLContainer<?> pg)) {
-            throw new IllegalStateException("Expected PostgreSQLContainer when " + ENV_OMS_CI_JDBC_URL + " is unset");
+    private static boolean useCiManagedPostgres() {
+        String url = System.getenv(ENV_OMS_CI_JDBC_URL);
+        return url != null && !url.isBlank();
+    }
+
+    @SuppressWarnings("resource")
+    private static PostgreSQLContainer<?> testcontainersPostgres() {
+        PostgreSQLContainer<?> local = testcontainersPostgres;
+        if (local != null) {
+            return local;
         }
-        return pg;
+        synchronized (AbstractPostgresIntegrationTest.class) {
+            if (testcontainersPostgres == null) {
+                PostgreSQLContainer<?> pg = new PostgreSQLContainer<>("postgres:16-alpine")
+                        .withDatabaseName("oms")
+                        .withUsername("oms")
+                        .withPassword("oms")
+                        .withStartupAttempts(POSTGRES_CONTAINER_STARTUP_ATTEMPTS);
+                pg.start();
+                testcontainersPostgres = pg;
+            }
+            return testcontainersPostgres;
+        }
     }
 
     private static String requireEnv(String name) {

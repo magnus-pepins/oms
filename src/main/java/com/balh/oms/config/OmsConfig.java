@@ -45,6 +45,7 @@ public class OmsConfig {
     private final Desk desk = new Desk();
     private final Fx fx = new Fx();
     private final Otel otel = new Otel();
+    private final Cluster cluster = new Cluster();
 
     public Http getHttp() { return http; }
     public Grpc getGrpc() { return grpc; }
@@ -65,6 +66,7 @@ public class OmsConfig {
     public Desk getDesk() { return desk; }
     public Fx getFx() { return fx; }
     public Otel getOtel() { return otel; }
+    public Cluster getCluster() { return cluster; }
 
     public static class Http {
         private String internalApiKey = "";
@@ -1688,6 +1690,104 @@ public class OmsConfig {
 
         public void setIngressToNosEvictIntervalMs(long ingressToNosEvictIntervalMs) {
             this.ingressToNosEvictIntervalMs = Math.max(5_000L, ingressToNosEvictIntervalMs);
+        }
+    }
+
+    /**
+     * Aeron Cluster substrate config (ADR 0001 / plan
+     * {@code system-documentation/plans/oms-aeron-cluster-substrate.md}).
+     *
+     * <p>Phase 1a wires only the cluster <em>client</em> half (Spring bean
+     * {@code OmsClusterIngressClient}). The cluster <em>node</em> reads its own
+     * config from environment variables in {@code OmsClusterNodeBootstrap} —
+     * cluster nodes are plain-Java mains, not Spring apps.
+     */
+    public static class Cluster {
+
+        private final Client client = new Client();
+
+        public Client getClient() { return client; }
+
+        public static class Client {
+
+            /** Default per-call timeout for {@code submitAcceptOrder}. */
+            private static final long DEFAULT_SUBMIT_TIMEOUT_MS = 5_000L;
+            /** Default Aeron message timeout (single-node startup needs >= 5s in cold-start). */
+            private static final long DEFAULT_AERON_MESSAGE_TIMEOUT_MS = 10_000L;
+            /** Default initial-connect retry budget. */
+            private static final long DEFAULT_CONNECT_TIMEOUT_MS = 30_000L;
+            /** Park between back-pressure retries on cluster offer. */
+            private static final long DEFAULT_OFFER_BACKPRESSURE_PARK_NANOS = 100_000L;
+            /** Park between egress poll passes when waiting for our correlation id. */
+            private static final long DEFAULT_EGRESS_POLL_PARK_NANOS = 100_000L;
+
+            private boolean enabled = false;
+            private String aeronDirectory = "";
+            private String ingressEndpoints = "0=localhost:20110";
+            private String ingressChannel = "aeron:udp?endpoint=localhost:0";
+            private String egressChannel = "aeron:udp?endpoint=localhost:0";
+            private long submitTimeoutMs = DEFAULT_SUBMIT_TIMEOUT_MS;
+            private long messageTimeoutMs = DEFAULT_AERON_MESSAGE_TIMEOUT_MS;
+            private long connectTimeoutMs = DEFAULT_CONNECT_TIMEOUT_MS;
+            private long offerBackpressureParkNanos = DEFAULT_OFFER_BACKPRESSURE_PARK_NANOS;
+            private long egressPollParkNanos = DEFAULT_EGRESS_POLL_PARK_NANOS;
+
+            public boolean isEnabled() { return enabled; }
+            public void setEnabled(boolean enabled) { this.enabled = enabled; }
+
+            public String getAeronDirectory() { return aeronDirectory; }
+            public void setAeronDirectory(String aeronDirectory) {
+                this.aeronDirectory = aeronDirectory == null ? "" : aeronDirectory.trim();
+            }
+
+            public String getIngressEndpoints() { return ingressEndpoints; }
+            public void setIngressEndpoints(String ingressEndpoints) {
+                this.ingressEndpoints =
+                        ingressEndpoints == null || ingressEndpoints.isBlank()
+                                ? "0=localhost:20110"
+                                : ingressEndpoints.trim();
+            }
+
+            public String getIngressChannel() { return ingressChannel; }
+            public void setIngressChannel(String ingressChannel) {
+                this.ingressChannel =
+                        ingressChannel == null || ingressChannel.isBlank()
+                                ? "aeron:udp?endpoint=localhost:0"
+                                : ingressChannel.trim();
+            }
+
+            public String getEgressChannel() { return egressChannel; }
+            public void setEgressChannel(String egressChannel) {
+                this.egressChannel =
+                        egressChannel == null || egressChannel.isBlank()
+                                ? "aeron:udp?endpoint=localhost:0"
+                                : egressChannel.trim();
+            }
+
+            public long getSubmitTimeoutMs() { return submitTimeoutMs; }
+            public void setSubmitTimeoutMs(long submitTimeoutMs) {
+                this.submitTimeoutMs = Math.max(100L, submitTimeoutMs);
+            }
+
+            public long getMessageTimeoutMs() { return messageTimeoutMs; }
+            public void setMessageTimeoutMs(long messageTimeoutMs) {
+                this.messageTimeoutMs = Math.max(1_000L, messageTimeoutMs);
+            }
+
+            public long getConnectTimeoutMs() { return connectTimeoutMs; }
+            public void setConnectTimeoutMs(long connectTimeoutMs) {
+                this.connectTimeoutMs = Math.max(1_000L, connectTimeoutMs);
+            }
+
+            public long getOfferBackpressureParkNanos() { return offerBackpressureParkNanos; }
+            public void setOfferBackpressureParkNanos(long offerBackpressureParkNanos) {
+                this.offerBackpressureParkNanos = Math.max(1_000L, offerBackpressureParkNanos);
+            }
+
+            public long getEgressPollParkNanos() { return egressPollParkNanos; }
+            public void setEgressPollParkNanos(long egressPollParkNanos) {
+                this.egressPollParkNanos = Math.max(1_000L, egressPollParkNanos);
+            }
         }
     }
 }

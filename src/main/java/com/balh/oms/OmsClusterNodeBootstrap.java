@@ -158,7 +158,7 @@ public final class OmsClusterNodeBootstrap {
         }
     }
 
-    static MediaDriver.Context buildMediaDriverContext(ClusterNodePaths paths) {
+    public static MediaDriver.Context buildMediaDriverContext(ClusterNodePaths paths) {
         return new MediaDriver.Context()
                 .aeronDirectoryName(paths.aeronDirectory())
                 .threadingMode(ThreadingMode.SHARED)
@@ -166,7 +166,7 @@ public final class OmsClusterNodeBootstrap {
                 .dirDeleteOnShutdown(false);
     }
 
-    static Archive.Context buildArchiveContext(ClusterNodePaths paths) {
+    public static Archive.Context buildArchiveContext(ClusterNodePaths paths) {
         return new Archive.Context()
                 .aeronDirectoryName(paths.aeronDirectory())
                 .archiveDir(new File(paths.archiveDir()))
@@ -178,7 +178,7 @@ public final class OmsClusterNodeBootstrap {
                 .deleteArchiveOnStart(false);
     }
 
-    static ConsensusModule.Context buildConsensusModuleContext(
+    public static ConsensusModule.Context buildConsensusModuleContext(
             ClusterNodePaths paths, int memberId, String clusterMembers) {
         return new ConsensusModule.Context()
                 .aeronDirectoryName(paths.aeronDirectory())
@@ -193,7 +193,7 @@ public final class OmsClusterNodeBootstrap {
                         .controlResponseChannel("aeron:ipc?term-length=64k"));
     }
 
-    static ClusteredServiceContainer.Context buildServiceContainerContext(ClusterNodePaths paths) {
+    public static ClusteredServiceContainer.Context buildServiceContainerContext(ClusterNodePaths paths) {
         return new ClusteredServiceContainer.Context()
                 .aeronDirectoryName(paths.aeronDirectory())
                 .clusterDir(new File(paths.clusterServicesDir()))
@@ -258,7 +258,7 @@ public final class OmsClusterNodeBootstrap {
      *
      * <p>Visible for tests; not part of any public API contract.
      */
-    record ClusterNodePaths(
+    public record ClusterNodePaths(
             String aeronDirBase,
             String aeronDirectory,
             String archiveDir,

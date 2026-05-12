@@ -325,6 +325,37 @@ tasks.named<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJarClus
     duplicatesStrategy = org.gradle.api.file.DuplicatesStrategy.EXCLUDE
 }
 
+/**
+ * Phase 2 of `system-documentation/plans/oms-aeron-cluster-substrate.md`: oms-postgres-projector JVM.
+ *
+ * Subscribes to the cluster log and writes Postgres projection rows. Slice 2a is a skeleton — the bean
+ * activates the role but does not consume events yet. Slice 2b wires consumption.
+ */
+tasks.register<org.springframework.boot.gradle.tasks.run.BootRun>("bootRunPostgresProjector") {
+    group = "application"
+    description =
+        "Run OMS with oms-postgres-projector profile (Phase 2 cluster→Postgres projector; application-oms-postgres-projector.yaml)."
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.balh.oms.OmsPostgresProjectorBootstrap")
+    jvmArgs(lowLatencyJvmModuleOpens)
+}
+
+tasks.register<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJarPostgresProjector") {
+    group = "build"
+    description =
+        "Executable JAR for postgres-projector entry (Start-Class OmsPostgresProjectorBootstrap; classifier postgres-projector)."
+    mainClass.set("com.balh.oms.OmsPostgresProjectorBootstrap")
+    archiveClassifier.set("postgres-projector")
+    archiveBaseName.set("oms")
+    targetJavaVersion.set(JavaVersion.VERSION_21)
+    classpath = sourceSets["main"].runtimeClasspath
+}
+
+tasks.named<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJarPostgresProjector").configure {
+    shouldRunAfter(tasks.named("bootJar"))
+    duplicatesStrategy = org.gradle.api.file.DuplicatesStrategy.EXCLUDE
+}
+
 /** Minimal FIX 4.4 loopback acceptor for local OMS + HTTP load scripts (see docs/fix-out.md § synthetic traffic). */
 tasks.register<JavaExec>("fixLoopbackAcceptor") {
     group = "development"

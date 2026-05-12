@@ -1,0 +1,26 @@
+# Phase 2 of system-documentation/plans/oms-aeron-cluster-substrate.md: oms-postgres-projector role.
+#
+# This JVM consumes the cluster log and writes Postgres projection rows. It must NOT run order-accept HTTP/gRPC
+# (ORDER_ACCEPT_PROFILE excludes oms-postgres-projector) and must NOT run a FIX SocketInitiator (one initiator per
+# route lives on oms-fix-worker / oms-fix-egress).
+#
+# Slice 2a: skeleton only — the projector bean exists, the cursor table is provisioned (V24), but no events are
+# consumed yet. Slice 2b wires consumption.
+#
+# Example: SPRING_PROFILES_ACTIVE=oms-postgres-projector
+
+oms:
+  grpc:
+    enabled: false
+  fix:
+    auto-start: false
+  cluster:
+    client:
+      # Slice 2a does not yet open a cluster connection from the projector. Slice 2b will set this true and point at
+      # the cluster ingress endpoints (or open an Archive replay subscription, depending on consumption design).
+      enabled: false
+
+# Separate management port so probes/metrics do not share the main HTTP connector with other roles deployed nearby.
+management:
+  server:
+    port: ${OMS_POSTGRES_PROJECTOR_MANAGEMENT_SERVER_PORT:8090}

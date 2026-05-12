@@ -36,6 +36,14 @@ public class AeronProjectorCursorRepository {
              WHERE aeron_projector_cursor.last_applied_position < EXCLUDED.last_applied_position
             """;
 
+    private static final String RESET_SQL = """
+            INSERT INTO aeron_projector_cursor (projector_id, stream_id, last_applied_position, last_applied_at)
+            VALUES (:projector_id, :stream_id, :last_applied_position, NOW())
+            ON CONFLICT (projector_id, stream_id) DO UPDATE
+               SET last_applied_position = EXCLUDED.last_applied_position,
+                   last_applied_at = EXCLUDED.last_applied_at
+            """;
+
     private final NamedParameterJdbcTemplate jdbc;
 
     public AeronProjectorCursorRepository(NamedParameterJdbcTemplate jdbc) {
@@ -79,5 +87,24 @@ public class AeronProjectorCursorRepository {
     public Optional<Long> findLastAppliedPositionBoxed(String projectorId, int streamId) {
         OptionalLong opt = findLastAppliedPosition(projectorId, streamId);
         return opt.isPresent() ? Optional.of(opt.getAsLong()) : Optional.empty();
+    }
+
+    /**
+     * Force the cursor to {@code newPosition}, bypassing the monotonic guard used by {@link #advance}.
+     *
+     * <p>Reserved for the projector's <em>recording-clamp</em> path: when the persisted cursor is
+     * outside the current recording's {@code [startPosition, stopPosition]} range — typically after
+     * the recording has been recreated — the projector resets the cursor to the recording's
+     * {@code startPosition} so replay can resume against the new recording. This is the only place
+     * the cursor moves backwards. Callers must guarantee the new position is consistent with the
+     * recording it pairs with; otherwise downstream events will be re-applied against an idempotent
+     * Postgres write (which is fine) but observed cursors lose their monotonicity property.
+     */
+    public void reset(String projectorId, int streamId, long newPosition) {
+        var params = new MapSqlParameterSource()
+                .addValue("projector_id", projectorId)
+                .addValue("stream_id", streamId)
+                .addValue("last_applied_position", newPosition);
+        jdbc.update(RESET_SQL, params);
     }
 }

@@ -1,13 +1,19 @@
 # Phase 2 of system-documentation/plans/oms-aeron-cluster-substrate.md: oms-postgres-projector role.
 #
-# This JVM consumes the cluster log and writes Postgres projection rows. It must NOT run order-accept HTTP/gRPC
-# (ORDER_ACCEPT_PROFILE excludes oms-postgres-projector) and must NOT run a FIX SocketInitiator (one initiator per
-# route lives on oms-fix-worker / oms-fix-egress).
+# This JVM consumes the cluster events recording (OmsClusterWireFormat.EVENTS_CHANNEL /
+# EVENTS_STREAM_ID) via Aeron Archive replay and writes Postgres projection rows. It must NOT run
+# order-accept HTTP/gRPC (ORDER_ACCEPT_PROFILE excludes oms-postgres-projector) and must NOT run a
+# FIX SocketInitiator (one initiator per route lives on oms-fix-worker / oms-fix-egress).
 #
-# Slice 2a: skeleton only — the projector bean exists, the cursor table is provisioned (V24), but no events are
-# consumed yet. Slice 2b wires consumption.
+# Slice 2b-2 (now): replay subscription + idempotent orders writes + monotonic cursor advance.
+# Slice 2c will remove the parallel orders write from OrderIngressService.
 #
 # Example: SPRING_PROFILES_ACTIVE=oms-postgres-projector
+#
+# Production: set OMS_POSTGRES_PROJECTOR_AERON_DIR to the cluster member's media-driver directory.
+# In a multi-host deployment this requires either co-locating the projector JVM on each cluster
+# member (recommended for low-latency reads) or using AeronArchive remote replay over UDP — slice
+# 2b-2 ships the IPC defaults; UDP variants lift in Phase 5 alongside k8s networking.
 
 oms:
   grpc:
@@ -16,9 +22,16 @@ oms:
     auto-start: false
   cluster:
     client:
-      # Slice 2a does not yet open a cluster connection from the projector. Slice 2b will set this true and point at
-      # the cluster ingress endpoints (or open an Archive replay subscription, depending on consumption design).
       enabled: false
+    projector:
+      enabled: ${OMS_POSTGRES_PROJECTOR_ENABLED:true}
+      aeron-directory: ${OMS_POSTGRES_PROJECTOR_AERON_DIR:}
+      archive-control-request-channel: ${OMS_POSTGRES_PROJECTOR_ARCHIVE_REQ:aeron:ipc?term-length=64k}
+      archive-control-response-channel: ${OMS_POSTGRES_PROJECTOR_ARCHIVE_RESP:aeron:ipc?term-length=64k}
+      replay-channel: ${OMS_POSTGRES_PROJECTOR_REPLAY_CHANNEL:aeron:ipc?term-length=64k}
+      # Replay stream id MUST differ from EVENTS_STREAM_ID (2000) — Aeron Archive replays the
+      # recording onto a fresh subscription stream, not the original publication stream.
+      replay-stream-id: ${OMS_POSTGRES_PROJECTOR_REPLAY_STREAM_ID:4321}
 
 # Separate management port so probes/metrics do not share the main HTTP connector with other roles deployed nearby.
 management:

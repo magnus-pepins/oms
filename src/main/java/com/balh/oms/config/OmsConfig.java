@@ -1690,8 +1690,99 @@ public class OmsConfig {
     public static class Cluster {
 
         private final Client client = new Client();
+        private final Projector projector = new Projector();
 
         public Client getClient() { return client; }
+        public Projector getProjector() { return projector; }
+
+        /**
+         * Phase 2 of the Aeron Cluster substrate plan: configuration for {@code OmsPostgresProjector}.
+         *
+         * <p>Used only by JVMs running the {@code oms-postgres-projector} profile. The projector connects
+         * to the cluster member's local Aeron MediaDriver via {@link #aeronDirectory}, opens an
+         * {@code AeronArchive} session via {@link #archiveControlRequestChannel} /
+         * {@link #archiveControlResponseChannel}, locates the recording for
+         * {@code OmsClusterWireFormat.EVENTS_CHANNEL}/{@code EVENTS_STREAM_ID}, and replays from the
+         * cursor stored in {@code aeron_projector_cursor}.
+         */
+        public static class Projector {
+
+            /** Default poll cadence inside the projector replay loop. */
+            private static final long DEFAULT_POLL_PARK_NANOS = 1_000_000L;
+
+            /** Default fragment limit per replay poll. Keeps a single poll bounded. */
+            private static final int DEFAULT_FRAGMENT_LIMIT = 64;
+
+            /** Default backoff between {@code listRecordings} retries while waiting for the recording to appear. */
+            private static final long DEFAULT_RECORDING_LOOKUP_PARK_MS = 100L;
+
+            private boolean enabled = false;
+            private String aeronDirectory = "";
+            private String archiveControlRequestChannel = "aeron:ipc?term-length=64k";
+            private String archiveControlResponseChannel = "aeron:ipc?term-length=64k";
+            private String replayChannel = "aeron:ipc?term-length=64k";
+            private int replayStreamId = 4321;
+            private long pollParkNanos = DEFAULT_POLL_PARK_NANOS;
+            private int fragmentLimit = DEFAULT_FRAGMENT_LIMIT;
+            private long recordingLookupParkMs = DEFAULT_RECORDING_LOOKUP_PARK_MS;
+
+            public boolean isEnabled() { return enabled; }
+            public void setEnabled(boolean enabled) { this.enabled = enabled; }
+
+            public String getAeronDirectory() { return aeronDirectory; }
+            public void setAeronDirectory(String aeronDirectory) {
+                this.aeronDirectory = aeronDirectory == null ? "" : aeronDirectory.trim();
+            }
+
+            public String getArchiveControlRequestChannel() { return archiveControlRequestChannel; }
+            public void setArchiveControlRequestChannel(String archiveControlRequestChannel) {
+                this.archiveControlRequestChannel =
+                        archiveControlRequestChannel == null || archiveControlRequestChannel.isBlank()
+                                ? "aeron:ipc?term-length=64k"
+                                : archiveControlRequestChannel.trim();
+            }
+
+            public String getArchiveControlResponseChannel() { return archiveControlResponseChannel; }
+            public void setArchiveControlResponseChannel(String archiveControlResponseChannel) {
+                this.archiveControlResponseChannel =
+                        archiveControlResponseChannel == null || archiveControlResponseChannel.isBlank()
+                                ? "aeron:ipc?term-length=64k"
+                                : archiveControlResponseChannel.trim();
+            }
+
+            public String getReplayChannel() { return replayChannel; }
+            public void setReplayChannel(String replayChannel) {
+                this.replayChannel =
+                        replayChannel == null || replayChannel.isBlank()
+                                ? "aeron:ipc?term-length=64k"
+                                : replayChannel.trim();
+            }
+
+            public int getReplayStreamId() { return replayStreamId; }
+            public void setReplayStreamId(int replayStreamId) {
+                if (replayStreamId == com.balh.oms.cluster.OmsClusterWireFormat.EVENTS_STREAM_ID) {
+                    throw new IllegalArgumentException(
+                            "oms.cluster.projector.replay-stream-id must differ from EVENTS_STREAM_ID="
+                                    + com.balh.oms.cluster.OmsClusterWireFormat.EVENTS_STREAM_ID);
+                }
+                this.replayStreamId = replayStreamId;
+            }
+
+            public long getPollParkNanos() { return pollParkNanos; }
+            public void setPollParkNanos(long pollParkNanos) {
+                this.pollParkNanos = Math.max(1_000L, pollParkNanos);
+            }
+
+            public int getFragmentLimit() { return fragmentLimit; }
+            public void setFragmentLimit(int fragmentLimit) {
+                this.fragmentLimit = Math.max(1, fragmentLimit);
+            }
+
+            public long getRecordingLookupParkMs() { return recordingLookupParkMs; }
+            public void setRecordingLookupParkMs(long recordingLookupParkMs) {
+                this.recordingLookupParkMs = Math.max(10L, recordingLookupParkMs);
+            }
+        }
 
         public static class Client {
 

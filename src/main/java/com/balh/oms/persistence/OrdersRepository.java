@@ -1,5 +1,7 @@
 package com.balh.oms.persistence;
 
+import com.balh.oms.cluster.AcceptOrderCommand;
+import com.balh.oms.cluster.OrderAdmittedEvent;
 import com.balh.oms.domain.Order;
 import com.balh.oms.domain.OrderStatus;
 import com.balh.oms.domain.RejectCode;
@@ -10,6 +12,7 @@ import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.List;
@@ -122,6 +125,74 @@ public class OrdersRepository {
                     "duplicate order for account=%s key=%s".formatted(
                             o.accountId(), o.clientIdempotencyKey()));
         }
+    }
+
+    /**
+     * Phase 2 projector path: idempotent insert from a cluster-emitted {@link OrderAdmittedEvent}.
+     *
+     * <p>Unlike {@link #insert(Order)}, this method does not throw on duplicates — the projector reaches
+     * here on every fresh admission, and a duplicate is the expected outcome whenever the slice 2c-pre
+     * dual-write with {@code OrderIngressService} has already run, or when the projector replays past
+     * its cursor on restart. ON CONFLICT suppresses the insert in both cases.
+     *
+     * <p>Returns {@code true} when the row was inserted, {@code false} when ON CONFLICT swallowed it.
+     */
+    public boolean insertFromAdmittedEvent(OrderAdmittedEvent ev) {
+        return jdbc.update(INSERT_SQL, projectorParams(ev)) == 1;
+    }
+
+    private static MapSqlParameterSource projectorParams(OrderAdmittedEvent ev) {
+        BigDecimal quantity = BigDecimal.valueOf(ev.quantityScaled())
+                .divide(BigDecimal.valueOf(AcceptOrderCommand.QUANTITY_SCALE), 10, RoundingMode.UNNECESSARY);
+        BigDecimal limitPrice = ev.limitPriceScaledOrZero() == 0L
+                ? null
+                : BigDecimal.valueOf(ev.limitPriceScaledOrZero())
+                        .divide(BigDecimal.valueOf(AcceptOrderCommand.PRICE_SCALE), 10, RoundingMode.UNNECESSARY);
+        Instant receivedAt = nanosToInstant(ev.clientTimestampNanos());
+        Instant acceptedAt = nanosToInstant(ev.acceptedAtNanos());
+        UUID accountId = UUID.fromString(ev.accountId());
+        return new MapSqlParameterSource()
+                .addValue("id", ev.orderId())
+                .addValue("account_id", accountId)
+                .addValue("client_idempotency_key", ev.clientIdempotencyKey())
+                .addValue("shard_id", ev.shardId())
+                .addValue("status", OrderStatus.NEW.name())
+                .addValue("terminal_reason", null)
+                .addValue("side", sideName(ev.side()))
+                .addValue("instrument_symbol", ev.instrumentSymbol())
+                .addValue("quantity", quantity)
+                .addValue("limit_price", limitPrice)
+                .addValue("time_in_force", timeInForceName(ev.timeInForceCode()))
+                .addValue("received_at", Timestamp.from(receivedAt))
+                .addValue("accepted_at", Timestamp.from(acceptedAt))
+                .addValue("terminal_at", null)
+                .addValue("account_id_hash", ev.accountIdHash())
+                .addValue("ledger_balance_id", ev.ledgerBalanceIdOrNull())
+                .addValue("cum_filled_quantity", BigDecimal.ZERO);
+    }
+
+    private static Instant nanosToInstant(long epochNanos) {
+        long seconds = Math.floorDiv(epochNanos, 1_000_000_000L);
+        long nanoAdjustment = Math.floorMod(epochNanos, 1_000_000_000L);
+        return Instant.ofEpochSecond(seconds, nanoAdjustment);
+    }
+
+    private static String sideName(byte sideCode) {
+        return switch (sideCode) {
+            case AcceptOrderCommand.SIDE_BUY -> Side.BUY.name();
+            case AcceptOrderCommand.SIDE_SELL -> Side.SELL.name();
+            default -> throw new IllegalArgumentException("unknown side code: " + sideCode);
+        };
+    }
+
+    private static String timeInForceName(byte tif) {
+        return switch (tif) {
+            case AcceptOrderCommand.TIF_DAY -> "DAY";
+            case AcceptOrderCommand.TIF_IOC -> "IOC";
+            case AcceptOrderCommand.TIF_FOK -> "FOK";
+            case AcceptOrderCommand.TIF_GTC -> "GTC";
+            default -> throw new IllegalArgumentException("unknown time-in-force code: " + tif);
+        };
     }
 
     public Optional<Order> findById(UUID id) {

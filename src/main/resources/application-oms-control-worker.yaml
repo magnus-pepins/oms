@@ -1,6 +1,6 @@
 # P3 prep: order-accept ingress is off (see OmsProfiles.ORDER_ACCEPT_PROFILE on OrdersController, OrderIngressService,
-# OrderIngressGrpcServiceImpl, OmsGrpcConfiguration). Remote ingress instances write control_outbox; this JVM must
-# drain them with OutboxReconciler → Chronicle (ingress-after-commit is invalid here — no local OrderIngressService).
+# OrderIngressGrpcServiceImpl, OmsGrpcConfiguration). Remote ingress instances write control_outbox; this JVM drains
+# them with OutboxReconciler → Chronicle.
 #
 # Example: SPRING_PROFILES_ACTIVE=oms-control-worker,test   (test profile only for local harnesses)
 #
@@ -8,8 +8,6 @@
 oms:
   grpc:
     enabled: false
-  control:
-    chronicle-append-mode: reconciler
 
 # Separate management port so probes/metrics do not share the main HTTP connector (P3 split-prep).
 management:

@@ -41,11 +41,10 @@ docker build -f docker/Dockerfile.control-worker --build-arg JAR_FILE=build/libs
 
 ## Verify effective topology
 
-`GET` **`/actuator/info`** on the management port includes **`oms-topology`** (`OmsTopologyInfoContributor`): `control.postgres-write-path`, `chronicle.control-tail-enabled`, `control.chronicle-append-mode`, `grpc.enabled`, etc.
+`GET` **`/actuator/info`** on the management port includes **`oms-topology`** (`OmsTopologyInfoContributor`): `control.postgres-write-path`, `chronicle.control-tail-enabled`, `grpc.enabled`, etc.
 
 ## Preconditions
 
 - Postgres reachable; peers’ `control_outbox` rows to drain.
-- **`oms.control.chronicle-append-mode=reconciler`** on this JVM (forced in `application-oms-control-worker.yaml`; validator rejects `ingress-after-commit` + this profile).
 - **`oms.grpc.enabled=false`** on this JVM (validator rejects gRPC on with this profile).
 - **Chronicle:** `OMS_CHRONICLE_QUEUE_DIR` must be a **shared** directory reachable from every ingress and every control/FIX JVM that participates in the same shard (NFS / PVC / host bind mount). Run **one** active `ChronicleControlTailReader` per queue directory unless you have an explicit multi-reader design (distinct `OMS_CHRONICLE_CONTROL_TAIL_ID` **and** separate queue paths or proven sharding — see `docs/chronicle-tail-driver.md`). Same tailer id on the same path from two processes can corrupt Chronicle tailer metadata.

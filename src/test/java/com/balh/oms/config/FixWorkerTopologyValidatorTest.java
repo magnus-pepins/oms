@@ -1,6 +1,5 @@
 package com.balh.oms.config;
 
-import com.balh.oms.chronicle.ControlChronicleAppendMode;
 import org.junit.jupiter.api.Test;
 import org.springframework.mock.env.MockEnvironment;
 
@@ -10,24 +9,10 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class FixWorkerTopologyValidatorTest {
 
     @Test
-    void fixWorker_withIngressAfterCommit_throws() {
-        MockEnvironment env = new MockEnvironment();
-        env.setActiveProfiles(OmsProfiles.FIX_WORKER);
-        OmsConfig cfg = new OmsConfig();
-        cfg.getControl().setChronicleAppendMode(ControlChronicleAppendMode.INGRESS_AFTER_COMMIT);
-        cfg.getRouting().setBackend("fix");
-        cfg.getFix().setAutoStart(true);
-        assertThatThrownBy(() -> FixWorkerTopologyValidator.validateFixWorkerTopology(env, cfg))
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining(ControlChronicleAppendMode.INGRESS_AFTER_COMMIT);
-    }
-
-    @Test
     void fixWorker_withGrpcEnabled_throws() {
         MockEnvironment env = new MockEnvironment();
         env.setActiveProfiles(OmsProfiles.FIX_WORKER);
         OmsConfig cfg = new OmsConfig();
-        cfg.getControl().setChronicleAppendMode(ControlChronicleAppendMode.RECONCILER);
         cfg.getGrpc().setEnabled(true);
         cfg.getRouting().setBackend("fix");
         cfg.getFix().setAutoStart(true);
@@ -41,7 +26,6 @@ class FixWorkerTopologyValidatorTest {
         MockEnvironment env = new MockEnvironment();
         env.setActiveProfiles(OmsProfiles.FIX_WORKER);
         OmsConfig cfg = new OmsConfig();
-        cfg.getControl().setChronicleAppendMode(ControlChronicleAppendMode.RECONCILER);
         cfg.getGrpc().setEnabled(false);
         cfg.getRouting().setBackend("noop");
         cfg.getFix().setAutoStart(true);
@@ -55,7 +39,6 @@ class FixWorkerTopologyValidatorTest {
         MockEnvironment env = new MockEnvironment();
         env.setActiveProfiles(OmsProfiles.FIX_WORKER);
         OmsConfig cfg = new OmsConfig();
-        cfg.getControl().setChronicleAppendMode(ControlChronicleAppendMode.RECONCILER);
         cfg.getControl().setPostgresWritePath("ingress");
         cfg.getGrpc().setEnabled(false);
         cfg.getRouting().setBackend("fix");
@@ -66,11 +49,10 @@ class FixWorkerTopologyValidatorTest {
     }
 
     @Test
-    void fixWorker_reconcilerGrpcOffFixAuto_ok() {
+    void fixWorker_grpcOffFixAuto_ok() {
         MockEnvironment env = new MockEnvironment();
         env.setActiveProfiles(OmsProfiles.FIX_WORKER);
         OmsConfig cfg = new OmsConfig();
-        cfg.getControl().setChronicleAppendMode(ControlChronicleAppendMode.RECONCILER);
         cfg.getControl().setPostgresWritePath("ingress");
         cfg.getGrpc().setEnabled(false);
         cfg.getRouting().setBackend("fix");
@@ -83,7 +65,6 @@ class FixWorkerTopologyValidatorTest {
         MockEnvironment env = new MockEnvironment();
         env.setActiveProfiles(OmsProfiles.FIX_WORKER);
         OmsConfig cfg = new OmsConfig();
-        cfg.getControl().setChronicleAppendMode(ControlChronicleAppendMode.RECONCILER);
         cfg.getControl().setPostgresWritePath("tail");
         cfg.getGrpc().setEnabled(false);
         cfg.getRouting().setBackend("fix");
@@ -98,7 +79,6 @@ class FixWorkerTopologyValidatorTest {
         MockEnvironment env = new MockEnvironment();
         env.setActiveProfiles(OmsProfiles.FIX_WORKER);
         OmsConfig cfg = new OmsConfig();
-        cfg.getControl().setChronicleAppendMode(ControlChronicleAppendMode.RECONCILER);
         cfg.getGrpc().setEnabled(false);
         cfg.getRouting().setBackend("fix");
         cfg.getFix().setAutoStart(true);
@@ -114,7 +94,6 @@ class FixWorkerTopologyValidatorTest {
     void bothWorkerProfiles_throws() {
         MockEnvironment env = new MockEnvironment();
         env.setActiveProfiles(OmsProfiles.CONTROL_WORKER, OmsProfiles.FIX_WORKER);
-        OmsConfig cfg = new OmsConfig();
         assertThatThrownBy(() -> TopologyWorkerProfiles.validateNoConflictingWorkerProfiles(env))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("Cannot activate");

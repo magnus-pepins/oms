@@ -79,24 +79,8 @@ class IngressReplicaTopologyValidatorTest {
         cfg.getChronicle().setEnabled(true);
         cfg.getChronicle().setControlTailEnabled(false);
         cfg.getControl().setPostgresWritePath("ingress");
-        cfg.getControl().setChronicleAppendMode("ingress-after-commit");
         cfg.getRouting().setBackend("noop");
         assertThatCode(() -> IngressReplicaTopologyValidator.validateIngressReplicaTopology(env, cfg))
                 .doesNotThrowAnyException();
-    }
-
-    @Test
-    void ingressReplica_reconcilerAppendMode_throws() {
-        MockEnvironment env = new MockEnvironment();
-        env.setActiveProfiles(OmsProfiles.INGRESS_REPLICA);
-        OmsConfig cfg = new OmsConfig();
-        cfg.getChronicle().setEnabled(true);
-        cfg.getChronicle().setControlTailEnabled(false);
-        cfg.getControl().setPostgresWritePath("ingress");
-        cfg.getControl().setChronicleAppendMode("reconciler");
-        assertThatThrownBy(() -> IngressReplicaTopologyValidator.validateIngressReplicaTopology(env, cfg))
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("chronicle-append-mode")
-                .hasMessageContaining("ingress-after-commit");
     }
 }

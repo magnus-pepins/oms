@@ -1,7 +1,6 @@
 package com.balh.oms.config;
 
 import com.balh.oms.chronicle.ChronicleTailDriver;
-import com.balh.oms.chronicle.ControlChronicleAppendMode;
 import com.balh.oms.fix.FixOutboundDriver;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.context.annotation.Configuration;
@@ -98,31 +97,17 @@ public class OmsConfig {
         private long maxJobAgeMs = 300_000L;
         private int tailerBatchSize = 100;
         /**
-         * Default {@value ControlChronicleAppendMode#INGRESS_AFTER_COMMIT}; override with
-         * {@value ControlChronicleAppendMode#RECONCILER} for control-worker JVM, tests, or recovery — see
-         * {@code plans/oms-ingress-control-fix-topology.md}.
-         */
-        private String chronicleAppendMode = ControlChronicleAppendMode.INGRESS_AFTER_COMMIT;
-        /**
          * {@code tail} (default): {@link com.balh.oms.tailer.ControlTailer} applies CAS + fanout when consuming Chronicle.
          * {@code ingress}: same writes run in the ingress accept transaction; tail is routing dispatch only — see
-         * {@code plans/oms-ingress-control-fix-topology.md} P1.
+         * {@code plans/oms-ingress-control-fix-topology.md} P1. (Phase 2 of the Aeron Cluster
+         * substrate plan replaces this dimension with a cluster-egress projector; until then the
+         * existing {@code TAIL}/{@code INGRESS} switch stays.)
          */
         private ControlPostgresWritePath postgresWritePath = ControlPostgresWritePath.TAIL;
         public long getMaxJobAgeMs() { return maxJobAgeMs; }
         public void setMaxJobAgeMs(long v) { this.maxJobAgeMs = v; }
         public int getTailerBatchSize() { return tailerBatchSize; }
         public void setTailerBatchSize(int v) { this.tailerBatchSize = v; }
-        public String getChronicleAppendMode() { return chronicleAppendMode; }
-        public void setChronicleAppendMode(String raw) {
-            String n = ControlChronicleAppendMode.normalize(raw);
-            ControlChronicleAppendMode.validate(n);
-            this.chronicleAppendMode = n;
-        }
-        /** When true, {@link com.balh.oms.reconciler.OutboxReconciler} must stay off for control (ingress publishes). */
-        public boolean isChronicleAppendIngressAfterCommit() {
-            return ControlChronicleAppendMode.INGRESS_AFTER_COMMIT.equals(chronicleAppendMode);
-        }
 
         public ControlPostgresWritePath getPostgresWritePath() {
             return postgresWritePath;

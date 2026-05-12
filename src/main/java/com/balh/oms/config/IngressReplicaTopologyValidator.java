@@ -1,6 +1,5 @@
 package com.balh.oms.config;
 
-import com.balh.oms.chronicle.ControlChronicleAppendMode;
 import jakarta.annotation.PostConstruct;
 import org.springframework.context.annotation.Profile;
 import org.springframework.core.env.Environment;
@@ -52,20 +51,6 @@ public class IngressReplicaTopologyValidator {
                             + OmsProfiles.INGRESS_REPLICA
                             + " requires oms.control.postgres-write-path=ingress "
                             + "(admission must run in the ingress transaction; see application-oms-ingress-replica.yaml).");
-        }
-        if (!ControlChronicleAppendMode.INGRESS_AFTER_COMMIT.equals(omsConfig.getControl().getChronicleAppendMode())) {
-            throw new IllegalStateException(
-                    "Spring profile "
-                            + OmsProfiles.INGRESS_REPLICA
-                            + " requires oms.control.chronicle-append-mode="
-                            + ControlChronicleAppendMode.INGRESS_AFTER_COMMIT
-                            + " (this JVM must append its own outbox after accept; use "
-                            + ControlChronicleAppendMode.RECONCILER
-                            + " only on "
-                            + OmsProfiles.CONTROL_WORKER
-                            + " / "
-                            + OmsProfiles.FIX_WORKER
-                            + " to drain peers' control_outbox).");
         }
         if ("fix".equalsIgnoreCase(omsConfig.getRouting().getBackend()) && omsConfig.getFix().isAutoStart()) {
             throw new IllegalStateException(

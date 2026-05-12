@@ -25,16 +25,15 @@ import java.util.UUID;
  *
  * <p>The {@link #createOrder} flow enforces the slice-1 invariant:
  * <ol>
- *   <li>{@link OrderIngressService#persistAccepted} runs the single Postgres
- *       transaction (orders insert + {@code control_outbox} insert +
- *       {@code domain_event_outbox} insert + COMMIT).</li>
+ *   <li>{@link OrderIngressService#persistAccepted} runs the mandatory cluster admission and
+ *       (only then) the single Postgres transaction (orders insert +
+ *       {@code control_outbox} insert + {@code domain_event_outbox} insert + COMMIT).</li>
  *   <li>{@link com.balh.oms.reconciler.DomainFanoutReconciler} delivers domain
  *       envelopes to NATS (or no-op) strictly after commit.</li>
- *   <li>Chronicle append + {@code control_outbox.chronicle_enqueued_at}: default — asynchronous
- *       {@link com.balh.oms.reconciler.OutboxReconciler} after {@code oms.outbox.reconciler-age-ms};
- *       alternate — {@link com.balh.oms.ingress.IngressControlChroniclePublisher} after commit when
- *       {@code oms.control.chronicle-append-mode=ingress-after-commit}. This controller is not registered
- *       on Spring profiles {@value com.balh.oms.config.OmsProfiles#CONTROL_WORKER} or
+ *   <li>Chronicle append + {@code control_outbox.chronicle_enqueued_at}: asynchronous
+ *       {@link com.balh.oms.reconciler.OutboxReconciler} after {@code oms.outbox.reconciler-age-ms}.
+ *       This controller is not registered on Spring profiles
+ *       {@value com.balh.oms.config.OmsProfiles#CONTROL_WORKER} or
  *       {@value com.balh.oms.config.OmsProfiles#FIX_WORKER}.</li>
  * </ol>
  *

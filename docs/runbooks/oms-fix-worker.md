@@ -36,7 +36,7 @@ docker build -f docker/Dockerfile.fix-worker --build-arg JAR_FILE=build/libs/oms
 ## Preconditions
 
 - Postgres + shared Chronicle queue dir (same as control path).
-- **`oms.control.chronicle-append-mode=reconciler`**, **`oms.control.postgres-write-path=ingress`** (YAML default; no `OrderIngressService` here — admission runs on ingress replicas; tail is dispatch-only + **`fix_nos_route_enqueue_claim`** dedupe for first NOS enqueue), **`oms.grpc.enabled=false`** (forced in YAML; same validators as control-worker plus FIX-specific rules in `FixWorkerTopologyValidator`).
+- **`oms.control.postgres-write-path=ingress`** (YAML default; no `OrderIngressService` here — admission runs on ingress replicas; tail is dispatch-only + **`fix_nos_route_enqueue_claim`** dedupe for first NOS enqueue), **`oms.grpc.enabled=false`** (forced in YAML; same validators as control-worker plus FIX-specific rules in `FixWorkerTopologyValidator`).
 - **Exactly one** active `oms-fix-worker` instance per FIX route / session store (two initiators = split-brain).
 - Do **not** activate **`oms-control-worker`** and **`oms-fix-worker`** on the same process.
 

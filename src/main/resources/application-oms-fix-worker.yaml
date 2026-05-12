@@ -8,7 +8,6 @@ oms:
   grpc:
     enabled: false
   control:
-    chronicle-append-mode: reconciler
     # FIX-out JVM has no OrderIngress — admission runs on ingress replicas; tail must be dispatch-only (validator).
     postgres-write-path: ingress
   routing:

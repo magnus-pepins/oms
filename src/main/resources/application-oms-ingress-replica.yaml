@@ -5,9 +5,6 @@
 oms:
   control:
     postgres-write-path: ingress
-    # Each ingress replica appends its own control_outbox rows after the accept transaction (OutboxReconciler stays off).
-    # Workers use reconciler mode to drain peers' backlog from shared Postgres — not this role.
-    chronicle-append-mode: ingress-after-commit
   chronicle:
     control-tail-enabled: false
 

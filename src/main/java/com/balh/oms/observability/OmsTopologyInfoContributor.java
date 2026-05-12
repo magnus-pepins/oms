@@ -31,7 +31,6 @@ public class OmsTopologyInfoContributor implements InfoContributor {
         topology.put(
                 "control.postgres-write-path",
                 omsConfig.getControl().getPostgresWritePath().name().toLowerCase());
-        topology.put("control.chronicle-append-mode", omsConfig.getControl().getChronicleAppendMode());
         topology.put("chronicle.enabled", omsConfig.getChronicle().isEnabled());
         topology.put("chronicle.control-tail-enabled", omsConfig.getChronicle().isControlTailEnabled());
         topology.put("routing.backend", omsConfig.getRouting().getBackend());

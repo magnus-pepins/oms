@@ -15,9 +15,8 @@ import java.util.UUID;
  * Postgres-backed repository for {@code control_outbox}.
  *
  * <p>{@link #insert(UUID, int, String, Instant)} runs inside the same transaction as the
- * {@code orders} insert/update. Only after Postgres commits does either the
- * {@code OutboxReconciler} (default) or {@link com.balh.oms.ingress.IngressControlChroniclePublisher}
- * ({@code ingress-after-commit}) append and {@link #markAppended(long, Instant)} close the loop.
+ * {@code orders} insert/update. Only after Postgres commits does {@code OutboxReconciler}
+ * append the row to the control journal and {@link #markAppended(long, Instant)} close the loop.
  */
 @Repository
 public class ControlOutboxRepository {

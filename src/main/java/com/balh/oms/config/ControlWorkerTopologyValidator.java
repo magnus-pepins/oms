@@ -1,14 +1,15 @@
 package com.balh.oms.config;
 
-import com.balh.oms.chronicle.ControlChronicleAppendMode;
 import jakarta.annotation.PostConstruct;
 import org.springframework.core.env.Environment;
 import org.springframework.core.env.Profiles;
 import org.springframework.stereotype.Component;
 
 /**
- * {@value OmsProfiles#CONTROL_WORKER} has no {@link com.balh.oms.ingress.OrderIngressService}, so
- * {@value ControlChronicleAppendMode#INGRESS_AFTER_COMMIT} would never append and would disable {@code OutboxReconciler}.
+ * Fail-fast rules for the {@value OmsProfiles#CONTROL_WORKER} JVM (no {@link
+ * com.balh.oms.ingress.OrderIngressService}). Phase 1c slice C deletes the
+ * {@code chronicle-append-mode} switch this validator used to gate on; the remaining checks
+ * below are now the only invariants.
  */
 @Component
 public class ControlWorkerTopologyValidator {
@@ -33,15 +34,6 @@ public class ControlWorkerTopologyValidator {
         TopologyWorkerProfiles.validateNoConflictingWorkerProfiles(environment);
         if (!environment.acceptsProfiles(Profiles.of(OmsProfiles.CONTROL_WORKER))) {
             return;
-        }
-        if (omsConfig.getControl().isChronicleAppendIngressAfterCommit()) {
-            throw new IllegalStateException(
-                    "Spring profile "
-                            + OmsProfiles.CONTROL_WORKER
-                            + " is incompatible with oms.control.chronicle-append-mode="
-                            + ControlChronicleAppendMode.INGRESS_AFTER_COMMIT
-                            + " (no local order accept to run afterCommit); use "
-                            + ControlChronicleAppendMode.RECONCILER);
         }
         if (omsConfig.getGrpc().isEnabled()) {
             throw new IllegalStateException(

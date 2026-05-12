@@ -36,7 +36,7 @@ After boot, **`GET http://127.0.0.1:${OMS_INGRESS_REPLICA_MANAGEMENT_SERVER_PORT
 ## Preconditions
 
 - Postgres + **same** Chronicle queue directory and **`postgres-write-path`** as the rest of the cluster (see [plans/oms-ingress-control-fix-topology.md](../../../system-documentation/plans/oms-ingress-control-fix-topology.md) P1).
-- **`oms.chronicle.enabled=true`**, **`oms.chronicle.control-tail-enabled=false`**, **`oms.control.postgres-write-path=ingress`**, **`oms.control.chronicle-append-mode=ingress-after-commit`** (YAML default; **`IngressReplicaTopologyValidator`** rejects **`reconciler`** on this profile — that mode is for worker JVMs draining peers’ `control_outbox`).
+- **`oms.chronicle.enabled=true`**, **`oms.chronicle.control-tail-enabled=false`**, **`oms.control.postgres-write-path=ingress`** (YAML default).
 - Do **not** activate **`oms-ingress-replica`** together with **`oms-control-worker`** or **`oms-fix-worker`** on the same process (`TopologyWorkerProfiles`).
 - Do **not** run QuickFIX **`SocketInitiator`** here (`oms.routing.backend=fix` + **`oms.fix.auto-start=true`**); use **`oms-fix-worker`** for FIX-out.
 

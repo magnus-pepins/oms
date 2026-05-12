@@ -1,6 +1,5 @@
 package com.balh.oms.reconciler;
 
-import com.balh.oms.chronicle.ControlChronicleAppendMode;
 import com.balh.oms.chronicle.ControlChroniclePayloadCodec;
 import com.balh.oms.chronicle.ControlJournal;
 import com.balh.oms.config.OmsConfig;
@@ -11,7 +10,6 @@ import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
@@ -40,7 +38,6 @@ import java.util.List;
  * (topology: N ingress + shared Postgres + multiple control workers using {@code reconciler} append mode).
  */
 @Component
-@ConditionalOnProperty(prefix = "oms.control", name = "chronicle-append-mode", havingValue = ControlChronicleAppendMode.RECONCILER, matchIfMissing = true)
 public class OutboxReconciler {
 
     private static final Logger log = LoggerFactory.getLogger(OutboxReconciler.class);

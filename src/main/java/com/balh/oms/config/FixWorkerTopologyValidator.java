@@ -1,6 +1,5 @@
 package com.balh.oms.config;
 
-import com.balh.oms.chronicle.ControlChronicleAppendMode;
 import jakarta.annotation.PostConstruct;
 import org.springframework.context.annotation.Profile;
 import org.springframework.core.env.Environment;
@@ -34,15 +33,6 @@ public class FixWorkerTopologyValidator {
         TopologyWorkerProfiles.validateNoConflictingWorkerProfiles(environment);
         if (!environment.acceptsProfiles(Profiles.of(OmsProfiles.FIX_WORKER))) {
             return;
-        }
-        if (omsConfig.getControl().isChronicleAppendIngressAfterCommit()) {
-            throw new IllegalStateException(
-                    "Spring profile "
-                            + OmsProfiles.FIX_WORKER
-                            + " is incompatible with oms.control.chronicle-append-mode="
-                            + ControlChronicleAppendMode.INGRESS_AFTER_COMMIT
-                            + " (no local order accept to run afterCommit); use "
-                            + ControlChronicleAppendMode.RECONCILER);
         }
         if (omsConfig.getGrpc().isEnabled()) {
             throw new IllegalStateException(

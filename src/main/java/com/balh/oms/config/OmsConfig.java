@@ -1719,6 +1719,13 @@ public class OmsConfig {
             private static final int DEFAULT_FRAGMENT_LIMIT = 64;
             private static final long DEFAULT_RECORDING_LOOKUP_PARK_MS = 100L;
             private static final int DEFAULT_REPLAY_STREAM_ID = 4323;
+            /**
+             * Default park between {@code Session.sendToTarget} retry attempts while the FIX
+             * session is reconnecting / re-logging-on. Same shape as
+             * {@code oms.fix.outbound-dedicated-not-ready-park-nanos} on the legacy dispatch
+             * worker; named separately so the egress JVM can be tuned independently.
+             */
+            private static final long DEFAULT_SESSION_NOT_READY_PARK_NANOS = 50_000_000L;
 
             private boolean enabled = false;
             private String aeronDirectory = "";
@@ -1729,6 +1736,7 @@ public class OmsConfig {
             private long pollParkNanos = DEFAULT_POLL_PARK_NANOS;
             private int fragmentLimit = DEFAULT_FRAGMENT_LIMIT;
             private long recordingLookupParkMs = DEFAULT_RECORDING_LOOKUP_PARK_MS;
+            private long sessionNotReadyParkNanos = DEFAULT_SESSION_NOT_READY_PARK_NANOS;
 
             public boolean isEnabled() { return enabled; }
             public void setEnabled(boolean enabled) { this.enabled = enabled; }
@@ -1785,6 +1793,11 @@ public class OmsConfig {
             public long getRecordingLookupParkMs() { return recordingLookupParkMs; }
             public void setRecordingLookupParkMs(long recordingLookupParkMs) {
                 this.recordingLookupParkMs = Math.max(10L, recordingLookupParkMs);
+            }
+
+            public long getSessionNotReadyParkNanos() { return sessionNotReadyParkNanos; }
+            public void setSessionNotReadyParkNanos(long sessionNotReadyParkNanos) {
+                this.sessionNotReadyParkNanos = Math.max(1_000L, sessionNotReadyParkNanos);
             }
         }
 

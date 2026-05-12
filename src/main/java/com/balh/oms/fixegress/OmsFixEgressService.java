@@ -4,6 +4,8 @@ import com.balh.oms.cluster.OmsClusterWireFormat;
 import com.balh.oms.cluster.OrderAdmittedEvent;
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.config.OmsProfiles;
+import com.balh.oms.fix.FixNewOrderSingleBuilder;
+import com.balh.oms.fix.FixOutboundSessionSend;
 import io.aeron.Aeron;
 import io.aeron.Subscription;
 import io.aeron.archive.client.AeronArchive;
@@ -13,9 +15,12 @@ import jakarta.annotation.PreDestroy;
 import org.agrona.CloseHelper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Profile;
 import org.springframework.stereotype.Component;
+import quickfix.SessionNotFound;
+import quickfix.fix44.NewOrderSingle;
 
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -25,30 +30,72 @@ import java.util.concurrent.locks.LockSupport;
  * Phase 3 of {@code system-documentation/plans/oms-aeron-cluster-substrate.md}: the FIX-egress
  * role.
  *
- * <p><strong>Slice 3b-1 scope.</strong> Adds the replay infrastructure: connects {@code Aeron}
- * + {@code AeronArchive} against the cluster member's media driver + archive, polls
- * {@link AeronArchive#listRecordingsForUri} for the events recording, opens a replay
- * subscription from the persisted cursor (with {@link #clampToRecording} +
- * recording-recreation-rewind, mirroring {@link com.balh.oms.projector.OmsPostgresProjector}),
- * decodes each {@link OrderAdmittedEvent}, and advances the
- * {@code oms_fix_egress_cursor} after each fragment. <em>Slice 3b-1 does not send
- * {@code NewOrderSingle}</em>: that lands in slice 3b-2 together with the legacy
- * {@code FixOutboundDispatchWorker} exclusion + the restart-from-cursor IT against a broker
- * mock. Splitting 3b in two keeps each diff reviewable and lets the replay infrastructure land
- * before any FIX wire side-effect goes through it.
+ * <p><strong>Slice 3b-2 scope.</strong> Folds the FIX wire side effect into the slice 3b-1 replay
+ * loop: each {@link OrderAdmittedEvent} fragment is decoded, translated to FIX
+ * {@link NewOrderSingle} via {@link FixNewOrderSingleBuilder#build(OrderAdmittedEvent)}, sent
+ * through {@link FixOutboundSessionSend#send(quickfix.Message)}, and only then advances the
+ * {@code oms_fix_egress_cursor}. The hot send path is {@code AeronArchive.replay} → builder →
+ * {@code Session.sendToTarget}: no Postgres lookup, no in-memory queue.
  *
  * <h2>Lifecycle</h2>
  *
  * <ol>
  *   <li>{@link #init()}: read cursor, log resume position, start the replay thread.</li>
  *   <li>Replay thread: connect Aeron + AeronArchive, locate the recording for the events
- *       stream, open a replay subscription from the cursor position, poll-decode-advance until
- *       interrupted.</li>
+ *       stream, open a replay subscription from the cursor position, poll-decode-send-advance
+ *       until interrupted.</li>
  *   <li>{@link #close()}: signal shutdown, join the thread, close the Aeron stack in reverse.
  *       </li>
  * </ol>
  *
- * <h2>Failure handling</h2>
+ * <h2>Deduplication semantics (option 1: cursor-only, "at-least-once at broker")</h2>
+ *
+ * <p>The cursor is advanced <strong>after</strong> {@code Session.sendToTarget} returns, in a
+ * separate Postgres write. If the JVM dies between the FIX send and the cursor SQL UPDATE, the
+ * persisted cursor still points at the byte boundary of the previously-sent fragment; on
+ * restart the replay loop redelivers <em>this</em> fragment and we send a duplicate
+ * {@code NewOrderSingle} for the same {@code orderId}. The broker then rejects on
+ * {@code DupClOrdID} per FIX 4.4 spec — an operationally noisy outcome, but message-loss-free
+ * (no NOS is ever silently dropped) and exactly-once on the projector side because
+ * {@code OrderAdmittedEvent} is emitted only once per fresh admission.
+ *
+ * <p>The chosen trade-off matches the user-facing latency budget: option 1 lands one Postgres
+ * UPDATE per cursor advance and zero extra reads on the hot path. The discarded alternatives
+ * are documented here so the decision is reversible without re-deriving the trade-offs:
+ *
+ * <ul>
+ *   <li><strong>Option 2 — sent-set table (read-before-send dedupe).</strong> Persist
+ *       {@code (orderId, version)} keys after each successful send and probe before sending. Adds
+ *       one Postgres SELECT per fragment (the path becomes Aeron→Postgres→FIX→Postgres) and
+ *       gives exactly-once at the broker even after a crash mid-window. Worth revisiting if
+ *       broker-side duplicate alerts become operationally expensive (e.g. a venue that flags
+ *       suspect-duplicate dropping the session) or if we move to a venue that does not honour
+ *       {@code DupClOrdID}. Re-uses {@code oms_fix_egress_cursor} unchanged; adds a sibling
+ *       {@code oms_fix_egress_sent_orders(order_id, version, sent_at)} table.</li>
+ *   <li><strong>Option 3 — two-phase commit (XA across Postgres + QuickFIX message store).</strong>
+ *       Strongest correctness (no broker-side duplicates ever) but highest latency and most
+ *       moving parts: requires QuickFIX/J's JDBC store, an XA-capable Postgres pool, and bumps
+ *       the per-fragment cost from one async UPDATE to a coordinated two-phase commit. Reserved
+ *       for a hypothetical regulatory regime that prohibits {@code DupClOrdID} resends; not on
+ *       the OMS roadmap as of slice 3b-2.</li>
+ * </ul>
+ *
+ * <p>Option choice landed in slice 3b-2 as a documented decision; flipping to options 2 or 3
+ * is a future-slice change with a single diff (add the dedupe write before
+ * {@link #applyAdmittedEvent}'s cursor advance).
+ *
+ * <h2>FIX session reconnection</h2>
+ *
+ * <p>{@link FixOutboundSessionSend#send} throws {@link SessionNotFound} when the QuickFIX
+ * initiator is mid-reconnect (TCP gap, broker logout). In that case we park
+ * {@link OmsConfig.Cluster.FixEgress#getSessionNotReadyParkNanos()} ns and retry the same
+ * fragment without advancing the cursor — Aeron has already delivered the fragment to the
+ * fragment handler, so retrying inside {@link #applyAdmittedEvent} keeps the message in flight
+ * without forcing a replay-loop teardown. If the running flag flips false during the wait, we
+ * exit without advancing; restart redelivers the fragment from the persisted cursor (one
+ * fragment behind the failed send, since slice 3b-1's cursor advance is post-send).
+ *
+ * <h2>Failure handling (replay infrastructure, unchanged from slice 3b-1)</h2>
  *
  * <p>If the recording does not yet exist (cluster startup race), the thread polls every
  * {@link OmsConfig.Cluster.FixEgress#getRecordingLookupParkMs()} ms until it appears. If the
@@ -56,9 +103,17 @@ import java.util.concurrent.locks.LockSupport;
  * cluster incarnations), {@link #clampToRecording} rewinds to {@code startPosition} and
  * {@link OmsFixEgressCursorRepository#reset} persists the rewind. If Aeron rejects a replay
  * position as not frame-aligned, {@link #openReplay} retries from {@code startPosition}.
- * Postgres write failures bubble up as runtime exceptions and stop the egress loop —
- * operators must see them in logs and fix the connectivity / schema issue rather than
- * silently skipping events.
+ *
+ * <h2>Optional FIX dependencies</h2>
+ *
+ * <p>{@link FixNewOrderSingleBuilder} and {@link FixOutboundSessionSend} are both gated on
+ * {@code oms.routing.backend=fix}. They are autowired with {@code required = false} so this
+ * service still loads in context-only ITs that set {@code oms.routing.backend=noop} (e.g.
+ * {@code OmsFixEgressApplicationIT}, {@code OmsFixEgressReplayIT}). When either is absent the
+ * loop runs in slice-3b-1 mode (cursor advance only) — that path is exercised by the slice 3b-1
+ * IT and stays as a safety hatch for tests that want to validate the replay infrastructure
+ * without standing up QuickFIX. Production deployments always set {@code routing.backend=fix}
+ * so both beans load.
  */
 @Component
 @Profile(OmsProfiles.FIX_EGRESS)
@@ -71,14 +126,22 @@ public class OmsFixEgressService {
 
     private final OmsConfig config;
     private final OmsFixEgressCursorRepository cursorRepository;
+    private final FixNewOrderSingleBuilder newOrderSingleBuilder;
+    private final FixOutboundSessionSend fixOutboundSessionSend;
 
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicReference<Long> lastAppliedPosition = new AtomicReference<>(0L);
     private Thread replayThread;
 
-    public OmsFixEgressService(OmsConfig config, OmsFixEgressCursorRepository cursorRepository) {
+    public OmsFixEgressService(
+            OmsConfig config,
+            OmsFixEgressCursorRepository cursorRepository,
+            @Autowired(required = false) FixNewOrderSingleBuilder newOrderSingleBuilder,
+            @Autowired(required = false) FixOutboundSessionSend fixOutboundSessionSend) {
         this.config = config;
         this.cursorRepository = cursorRepository;
+        this.newOrderSingleBuilder = newOrderSingleBuilder;
+        this.fixOutboundSessionSend = fixOutboundSessionSend;
     }
 
     @PostConstruct
@@ -87,9 +150,12 @@ public class OmsFixEgressService {
                 .findLastAppliedPosition(EGRESS_ID, OmsClusterWireFormat.EVENTS_STREAM_ID)
                 .orElse(0L);
         lastAppliedPosition.set(resumePos);
+        boolean fixWired = newOrderSingleBuilder != null && fixOutboundSessionSend != null;
         log.info(
-                "oms-fix-egress starting (slice 3b-1 — replay infrastructure only, no NOS send yet);"
-                        + " resuming from log position {} (egressId={}, streamId={})",
+                "oms-fix-egress starting (slice 3b-2 — {}); resuming from log position {} (egressId={}, streamId={})",
+                fixWired
+                        ? "FIX send active: NewOrderSingle via FixOutboundSessionSend"
+                        : "cursor-only mode (no FIX beans on classpath; routing.backend != fix)",
                 resumePos,
                 EGRESS_ID,
                 OmsClusterWireFormat.EVENTS_STREAM_ID);
@@ -326,16 +392,15 @@ public class OmsFixEgressService {
     private record RecordingDescriptor(long recordingId, long startPosition, long stopPosition) {}
 
     /**
-     * Decodes one fragment and (slice 3b-1) advances the cursor.
-     * {@link io.aeron.logbuffer.Header#position()} is the cluster log position <em>after</em>
-     * this fragment.
+     * Decodes one fragment and applies it: slice 3b-2 builds + sends {@link NewOrderSingle},
+     * then advances the cursor. {@link io.aeron.logbuffer.Header#position()} is the cluster log
+     * position <em>after</em> this fragment.
      *
-     * <p>Slice 3b-2 will extend this handler with a {@link FixNewOrderSingleBuilder}-like step
-     * + {@link com.balh.oms.fix.FixOutboundSessionSend#send} call before the cursor advance.
-     * Crash semantics in slice 3b-1 are simple: if the JVM dies after the cursor SQL UPDATE
-     * but before {@link #lastAppliedPosition} updates, restart resumes from the persisted
-     * cursor and re-decodes the same fragment (no side effect to repeat in 3b-1; {@code
-     * advance} is idempotent on the monotonic guard).
+     * <p>If {@link #applyAdmittedEvent} returns without advancing (e.g. running flipped false
+     * during a session-not-ready park loop), {@link #lastAppliedPosition} is also not updated —
+     * the next iteration of the replay loop sees the new {@code running} state and exits, and
+     * restart redelivers this fragment from the persisted cursor (option 1 dedupe; see
+     * class-level Javadoc).
      */
     private final class EgressFragmentHandler implements FragmentHandler {
 
@@ -354,21 +419,66 @@ public class OmsFixEgressService {
             }
             OrderAdmittedEvent ev = OrderAdmittedEvent.decode(buffer, offset, length);
             long newPosition = header.position();
-            applyAdmittedEvent(ev, newPosition);
-            lastAppliedPosition.set(newPosition);
+            boolean advanced = applyAdmittedEvent(ev, newPosition);
+            if (advanced) {
+                lastAppliedPosition.set(newPosition);
+            }
         }
     }
 
     /**
      * Single-fragment apply for one {@link OrderAdmittedEvent}. Package-private so tests can
      * drive replay from a synthesised event without standing up Aeron when that is wasteful
-     * (live ITs in {@code OmsFixEgressIT} still drive the full path through the cluster).
+     * (live ITs in {@code OmsFixEgressBrokerIT} still drive the full path through the cluster +
+     * embedded acceptor).
      *
-     * <p>Slice 3b-1: cursor advance only. Slice 3b-2 builds the {@code NewOrderSingle},
-     * calls {@link com.balh.oms.fix.FixOutboundSessionSend#send}, and only advances the
-     * cursor on a successful send.
+     * <p><strong>Slice 3b-2 sequence:</strong> build {@link NewOrderSingle} from the event →
+     * {@link FixOutboundSessionSend#send send} → {@link OmsFixEgressCursorRepository#advance
+     * cursor advance}. The cursor advances <em>after</em> a successful send so a crash between
+     * send and cursor write replays the fragment (option 1: at-least-once at broker; broker
+     * rejects with {@code DupClOrdID}). See class-level Javadoc for the full dedupe semantics.
+     *
+     * <p>If FIX beans are not autowired (context-only ITs that set
+     * {@code oms.routing.backend=noop} so {@code FixNewOrderSingleBuilder} /
+     * {@code FixOutboundSessionSend} are absent), the method falls back to the slice-3b-1
+     * cursor-only behaviour. Production always wires the FIX path.
+     *
+     * <p>{@link SessionNotFound} (initiator mid-reconnect) → park
+     * {@link OmsConfig.Cluster.FixEgress#getSessionNotReadyParkNanos()} ns and retry. If
+     * {@link #running} flips false during the wait, return {@code false} so the caller does
+     * <em>not</em> advance {@link #lastAppliedPosition} — restart will redeliver the fragment
+     * from the persisted cursor.
+     *
+     * @return {@code true} if the cursor was advanced (event fully applied / send succeeded);
+     *     {@code false} if the apply was aborted (shutdown during session-not-ready wait).
      */
-    void applyAdmittedEvent(OrderAdmittedEvent ev, long newPosition) {
+    boolean applyAdmittedEvent(OrderAdmittedEvent ev, long newPosition) {
+        if (newOrderSingleBuilder != null && fixOutboundSessionSend != null) {
+            NewOrderSingle nos = newOrderSingleBuilder.build(ev);
+            long parkNanos = config.getCluster().getFixEgress().getSessionNotReadyParkNanos();
+            while (running.get()) {
+                if (!fixOutboundSessionSend.hasActiveSession()) {
+                    LockSupport.parkNanos(parkNanos);
+                    continue;
+                }
+                try {
+                    fixOutboundSessionSend.send(nos);
+                    break;
+                } catch (SessionNotFound e) {
+                    log.warn(
+                            "oms-fix-egress: SessionNotFound on Session.sendToTarget for orderId={}; retrying in {}ns.",
+                            ev.orderId(),
+                            parkNanos);
+                    LockSupport.parkNanos(parkNanos);
+                }
+            }
+            if (!running.get()) {
+                // Service shutting down before the FIX send succeeded — leave the cursor
+                // un-advanced so the next start replays this fragment.
+                return false;
+            }
+        }
         cursorRepository.advance(EGRESS_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, newPosition);
+        return true;
     }
 }

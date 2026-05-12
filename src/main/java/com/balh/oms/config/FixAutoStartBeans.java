@@ -20,6 +20,7 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Profile;
 import org.springframework.core.env.Environment;
 import org.springframework.scheduling.annotation.SchedulingConfigurer;
 import org.springframework.scheduling.config.ScheduledTaskRegistrar;
@@ -64,8 +65,20 @@ public class FixAutoStartBeans {
         return new FixInitiatorManager(omsConfig, application, jdbcMessageStoreDataSource);
     }
 
+    /**
+     * Legacy in-memory queue dispatcher: drains {@link FixOutboundOrderDequeue} and sends NOS via
+     * {@link FixOutboundSessionSend}. Excluded from {@link OmsProfiles#FIX_EGRESS} (Phase 3 slice
+     * 3b-2) — on that JVM the FIX wire side effect is owned by
+     * {@code OmsFixEgressService.applyAdmittedEvent} on the Aeron Archive replay path, so
+     * keeping the dispatcher around would either (a) idle-poll an empty queue every
+     * {@code oms.fix.outbound-poll-interval-ms} ticks, wasting cycles for no behavioural effect,
+     * or (b) accidentally double-send if some future code path enqueues into {@code
+     * fixOutboundPendingOrderQueue}. The legacy path stays alive for {@code oms-fix-worker}
+     * (deleted in slice 3g once {@code oms-fix-egress} is the production FIX-out JVM).
+     */
     @Bean
     @ConditionalOnProperty(name = "oms.fix.auto-start", havingValue = "true")
+    @Profile("!" + OmsProfiles.FIX_EGRESS)
     FixOutboundDispatchWorker fixOutboundDispatchWorker(
             RouteDispatcher routeDispatcher,
             FixOutboundOrderDequeue fixOutboundOrderDequeue,
@@ -97,9 +110,15 @@ public class FixAutoStartBeans {
      * {@code oms.fix.outbound-driver=scheduled}. When {@code dedicated}, this configurer is a no-op so we do not
      * register duplicate @{@link org.springframework.boot.autoconfigure.condition.ConditionalOnProperty} annotations
      * (not repeatable on the same element).
+     *
+     * <p>Excluded on {@link OmsProfiles#FIX_EGRESS} for the same reason
+     * {@link #fixOutboundDispatchWorker} is: the egress JVM does not run the in-memory queue
+     * path. Without this exclusion Spring would fail to wire the bean (the worker dependency
+     * is profile-excluded) and the context would crash at startup.
      */
     @Bean
     @ConditionalOnProperty(name = "oms.fix.auto-start", havingValue = "true")
+    @Profile("!" + OmsProfiles.FIX_EGRESS)
     SchedulingConfigurer fixOutboundPollScheduling(FixOutboundDispatchWorker worker, OmsConfig omsConfig) {
         return registrar -> {
             if (omsConfig.getFix().getOutboundDriver() != FixOutboundDriver.SCHEDULED) {

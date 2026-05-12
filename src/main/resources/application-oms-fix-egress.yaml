@@ -28,6 +28,22 @@ oms:
       enabled: false
     fix-egress:
       enabled: ${OMS_FIX_EGRESS_ENABLED:true}
+      # Aeron MediaDriver directory of the cluster member this JVM consumes from. For local
+      # dev / single-host deploys this is the same value as oms.cluster.client.aeron-directory
+      # in mixed roles. Empty string skips the replay loop with a warn log (used by Spring
+      # context-only ITs). Slice 3b-2 will tighten the topology validator to require this when
+      # the egress runs against a real cluster.
+      aeron-directory: ${OMS_FIX_EGRESS_AERON_DIR:}
+      archive-control-request-channel: ${OMS_FIX_EGRESS_ARCHIVE_CONTROL_REQUEST_CHANNEL:aeron:ipc?term-length=64k}
+      archive-control-response-channel: ${OMS_FIX_EGRESS_ARCHIVE_CONTROL_RESPONSE_CHANNEL:aeron:ipc?term-length=64k}
+      replay-channel: ${OMS_FIX_EGRESS_REPLAY_CHANNEL:aeron:ipc?term-length=64k}
+      # Distinct from oms.cluster.projector.replay-stream-id (4321) and the in-test projector
+      # singleton stream id (4322) — both consume the same EVENTS recording over independent
+      # replay subscriptions and must not collide on the replay channel's stream id.
+      replay-stream-id: ${OMS_FIX_EGRESS_REPLAY_STREAM_ID:4323}
+      poll-park-nanos: ${OMS_FIX_EGRESS_POLL_PARK_NANOS:1000000}
+      fragment-limit: ${OMS_FIX_EGRESS_FRAGMENT_LIMIT:64}
+      recording-lookup-park-ms: ${OMS_FIX_EGRESS_RECORDING_LOOKUP_PARK_MS:100}
   routing:
     backend: fix
   fix:

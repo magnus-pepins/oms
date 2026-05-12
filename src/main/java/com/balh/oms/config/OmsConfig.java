@@ -1705,16 +1705,87 @@ public class OmsConfig {
          * inbound {@code ExecutionReport} back to the cluster as an {@code ApplyExecutionReport}
          * command.
          *
-         * <p>Slice 3a (this revision) ships only the topology scaffold — {@link #isEnabled()}
-         * gates whether the skeleton bean activates. Slice 3b adds the replay-channel /
-         * archive-control fields needed to actually consume.
+         * <p>Slice 3a shipped only the topology scaffold ({@link #isEnabled()}). Slice 3b-1
+         * adds the replay-channel / archive-control fields needed to actually consume cluster
+         * events. {@link #replayStreamId} defaults to {@code 4323} so the egress JVM does not
+         * collide with the production projector's stream id (4321) or the in-test projector
+         * singleton's id (4322); the setter rejects equality with
+         * {@link com.balh.oms.cluster.OmsClusterWireFormat#EVENTS_STREAM_ID} for the same
+         * reason {@link Projector#setReplayStreamId(int)} does.
          */
         public static class FixEgress {
 
+            private static final long DEFAULT_POLL_PARK_NANOS = 1_000_000L;
+            private static final int DEFAULT_FRAGMENT_LIMIT = 64;
+            private static final long DEFAULT_RECORDING_LOOKUP_PARK_MS = 100L;
+            private static final int DEFAULT_REPLAY_STREAM_ID = 4323;
+
             private boolean enabled = false;
+            private String aeronDirectory = "";
+            private String archiveControlRequestChannel = "aeron:ipc?term-length=64k";
+            private String archiveControlResponseChannel = "aeron:ipc?term-length=64k";
+            private String replayChannel = "aeron:ipc?term-length=64k";
+            private int replayStreamId = DEFAULT_REPLAY_STREAM_ID;
+            private long pollParkNanos = DEFAULT_POLL_PARK_NANOS;
+            private int fragmentLimit = DEFAULT_FRAGMENT_LIMIT;
+            private long recordingLookupParkMs = DEFAULT_RECORDING_LOOKUP_PARK_MS;
 
             public boolean isEnabled() { return enabled; }
             public void setEnabled(boolean enabled) { this.enabled = enabled; }
+
+            public String getAeronDirectory() { return aeronDirectory; }
+            public void setAeronDirectory(String aeronDirectory) {
+                this.aeronDirectory = aeronDirectory == null ? "" : aeronDirectory.trim();
+            }
+
+            public String getArchiveControlRequestChannel() { return archiveControlRequestChannel; }
+            public void setArchiveControlRequestChannel(String archiveControlRequestChannel) {
+                this.archiveControlRequestChannel =
+                        archiveControlRequestChannel == null || archiveControlRequestChannel.isBlank()
+                                ? "aeron:ipc?term-length=64k"
+                                : archiveControlRequestChannel.trim();
+            }
+
+            public String getArchiveControlResponseChannel() { return archiveControlResponseChannel; }
+            public void setArchiveControlResponseChannel(String archiveControlResponseChannel) {
+                this.archiveControlResponseChannel =
+                        archiveControlResponseChannel == null || archiveControlResponseChannel.isBlank()
+                                ? "aeron:ipc?term-length=64k"
+                                : archiveControlResponseChannel.trim();
+            }
+
+            public String getReplayChannel() { return replayChannel; }
+            public void setReplayChannel(String replayChannel) {
+                this.replayChannel =
+                        replayChannel == null || replayChannel.isBlank()
+                                ? "aeron:ipc?term-length=64k"
+                                : replayChannel.trim();
+            }
+
+            public int getReplayStreamId() { return replayStreamId; }
+            public void setReplayStreamId(int replayStreamId) {
+                if (replayStreamId == com.balh.oms.cluster.OmsClusterWireFormat.EVENTS_STREAM_ID) {
+                    throw new IllegalArgumentException(
+                            "oms.cluster.fix-egress.replay-stream-id must differ from EVENTS_STREAM_ID="
+                                    + com.balh.oms.cluster.OmsClusterWireFormat.EVENTS_STREAM_ID);
+                }
+                this.replayStreamId = replayStreamId;
+            }
+
+            public long getPollParkNanos() { return pollParkNanos; }
+            public void setPollParkNanos(long pollParkNanos) {
+                this.pollParkNanos = Math.max(1_000L, pollParkNanos);
+            }
+
+            public int getFragmentLimit() { return fragmentLimit; }
+            public void setFragmentLimit(int fragmentLimit) {
+                this.fragmentLimit = Math.max(1, fragmentLimit);
+            }
+
+            public long getRecordingLookupParkMs() { return recordingLookupParkMs; }
+            public void setRecordingLookupParkMs(long recordingLookupParkMs) {
+                this.recordingLookupParkMs = Math.max(10L, recordingLookupParkMs);
+            }
         }
 
         /**

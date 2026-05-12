@@ -14,10 +14,12 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
 
+import java.time.Duration;
 import java.util.Map;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 
 /**
  * Phase 1 closeout integration test for the Aeron Cluster substrate plan
@@ -29,14 +31,18 @@ import static org.assertj.core.api.Assertions.assertThat;
  * cluster admission → Postgres path:
  *
  * <ul>
- *   <li>Fresh {@code POST /internal/v1/orders} commits via the cluster and writes the same
- *       {@code orders} / {@code control_outbox} / {@code domain_event_outbox} rows the legacy
- *       Chronicle path produced.</li>
+ *   <li>Fresh {@code POST /internal/v1/orders} commits via the cluster and (after the projector
+ *       daemon applies) writes the same {@code orders} / {@code control_outbox} /
+ *       {@code domain_event_outbox} rows the legacy Chronicle path produced.</li>
  *   <li>A duplicate post (same {@code accountId} + {@code clientIdempotencyKey}) is detected by
  *       the cluster, returns the original {@code orderId}, and does not create a second
- *       {@code orders} row (option (A): cluster gate is authoritative; Postgres write stays in
- *       the ingress transaction in Phase 1, projection split-out lands in Phase 2).</li>
+ *       {@code orders} row (option (A): cluster gate is authoritative).</li>
  * </ul>
+ *
+ * <p>Phase 2 slice 2c moves the {@code orders} INSERT out of the ingress transaction; the
+ * orders row materialises via the JVM-wide test projector daemon shortly after the HTTP
+ * response. {@code control_outbox} / {@code domain_event_outbox} continue to commit inside the
+ * ingress transaction in slice 2c (slice 2d/2e retire those rows).
  *
  * <p>Complement to {@link OmsClusterIngressClientIT} (cluster client in isolation) and
  * {@link com.balh.oms.ingress.OrderIngressServiceClusterGateTest} (Mockito unit test of the gate
@@ -44,6 +50,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * Cluster + Postgres end-to-end.
  */
 class OrderIngressClusterIntegrationTest extends AbstractPostgresIntegrationTest {
+
+    private static final Duration ORDERS_VISIBLE_TIMEOUT = Duration.ofSeconds(20);
+    private static final Duration ORDERS_VISIBLE_POLL = Duration.ofMillis(50);
 
     @LocalServerPort int port;
     @Autowired TestRestTemplate http;
@@ -59,19 +68,13 @@ class OrderIngressClusterIntegrationTest extends AbstractPostgresIntegrationTest
         assertThat(res.getBody()).isNotNull();
         UUID orderId = UUID.fromString((String) res.getBody().get("id"));
 
-        Long orderCount = jdbc.queryForObject(
-                "SELECT COUNT(*) FROM orders WHERE id = ? AND account_id = ?",
-                Long.class,
-                orderId,
-                accountId);
-        assertThat(orderCount).isEqualTo(1L);
-
+        // outbox / domain-fanout still commit inside the ingress transaction in slice 2c.
         Long outboxCount = jdbc.queryForObject(
                 "SELECT COUNT(*) FROM control_outbox WHERE order_id = ?",
                 Long.class,
                 orderId);
         assertThat(outboxCount)
-                .as("ingress transaction must still write control_outbox in Phase 1 (Postgres in same tx as cluster commit)")
+                .as("ingress transaction still writes control_outbox in slice 2c (slice 2e retires it)")
                 .isEqualTo(1L);
 
         Long domainOutboxCount = jdbc.queryForObject(
@@ -79,8 +82,21 @@ class OrderIngressClusterIntegrationTest extends AbstractPostgresIntegrationTest
                 Long.class,
                 orderId);
         assertThat(domainOutboxCount)
-                .as("ingress transaction must still write domain_event_outbox in Phase 1")
+                .as("ingress transaction still writes domain_event_outbox in slice 2c")
                 .isEqualTo(1L);
+
+        // Phase 2 slice 2c: the orders row arrives via the test projector daemon.
+        await()
+                .atMost(ORDERS_VISIBLE_TIMEOUT)
+                .pollInterval(ORDERS_VISIBLE_POLL)
+                .untilAsserted(() -> {
+                    Long orderCount = jdbc.queryForObject(
+                            "SELECT COUNT(*) FROM orders WHERE id = ? AND account_id = ?",
+                            Long.class,
+                            orderId,
+                            accountId);
+                    assertThat(orderCount).isEqualTo(1L);
+                });
     }
 
     @Test
@@ -99,14 +115,21 @@ class OrderIngressClusterIntegrationTest extends AbstractPostgresIntegrationTest
                 .as("cluster idempotency: replay must return the original orderId so callers see a single identity")
                 .isEqualTo(first.getBody().get("id"));
 
-        Long count = jdbc.queryForObject(
-                "SELECT COUNT(*) FROM orders WHERE account_id = ? AND client_idempotency_key = ?",
-                Long.class,
-                accountId,
-                "phase1-closeout-replay");
-        assertThat(count)
-                .as("Postgres must remain a single row even when the cluster replays the admission")
-                .isEqualTo(1L);
+        // Cluster idempotency keeps Postgres at one orders row even after projector apply. Wait
+        // for the projector to apply (so we don't pre-empt with a 0-row read) before asserting.
+        await()
+                .atMost(ORDERS_VISIBLE_TIMEOUT)
+                .pollInterval(ORDERS_VISIBLE_POLL)
+                .untilAsserted(() -> {
+                    Long count = jdbc.queryForObject(
+                            "SELECT COUNT(*) FROM orders WHERE account_id = ? AND client_idempotency_key = ?",
+                            Long.class,
+                            accountId,
+                            "phase1-closeout-replay");
+                    assertThat(count)
+                            .as("Postgres must remain a single row even when the cluster replays the admission")
+                            .isEqualTo(1L);
+                });
     }
 
     private ResponseEntity<Map<String, Object>> exchange(String body) {

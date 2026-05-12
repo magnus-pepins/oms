@@ -15,12 +15,23 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
 
+import java.time.Duration;
 import java.util.Map;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 
 class OrdersControllerIntegrationTest extends AbstractPostgresIntegrationTest {
+
+    /**
+     * Phase 2 slice 2c: HTTP returns 200/201 on cluster commit; the orders row + outbox / fanout
+     * side-tables materialise via the JVM-wide test projector daemon shortly after. 20s budget
+     * absorbs the projector connect cost on the first test in a JVM.
+     */
+    private static final Duration ORDERS_VISIBLE_TIMEOUT = Duration.ofSeconds(20);
+
+    private static final Duration ORDERS_VISIBLE_POLL = Duration.ofMillis(50);
 
     @LocalServerPort int port;
     @Autowired TestRestTemplate http;
@@ -63,9 +74,8 @@ class OrdersControllerIntegrationTest extends AbstractPostgresIntegrationTest {
         assertThat(res.getBody()).isNotNull();
         UUID orderId = UUID.fromString((String) res.getBody().get("id"));
 
-        var stored = orders.findById(orderId).orElseThrow();
-        assertThat(stored.accountId()).isEqualTo(accountId);
-
+        // outbox / domain-fanout rows are still written inside the ingress transaction (slice 2d/2e
+        // delete those paths). They commit before the controller returns.
         Long outboxCount = jdbc.queryForObject(
                 "SELECT COUNT(*) FROM control_outbox WHERE order_id = ?", Long.class, orderId);
         assertThat(outboxCount).isEqualTo(1L);
@@ -73,6 +83,16 @@ class OrdersControllerIntegrationTest extends AbstractPostgresIntegrationTest {
         Long domainOutboxCount = jdbc.queryForObject(
                 "SELECT COUNT(*) FROM domain_event_outbox WHERE order_id = ?", Long.class, orderId);
         assertThat(domainOutboxCount).isEqualTo(1L);
+
+        // Phase 2 slice 2c: the orders row arrives via the test projector daemon (the production
+        // ingress no longer writes it). HTTP 201 means cluster-committed; await the projection.
+        await()
+                .atMost(ORDERS_VISIBLE_TIMEOUT)
+                .pollInterval(ORDERS_VISIBLE_POLL)
+                .untilAsserted(() -> {
+                    var stored = orders.findById(orderId).orElseThrow();
+                    assertThat(stored.accountId()).isEqualTo(accountId);
+                });
     }
 
     @Test
@@ -85,10 +105,18 @@ class OrdersControllerIntegrationTest extends AbstractPostgresIntegrationTest {
         assertThat(second.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(second.getBody().get("id")).isEqualTo(first.getBody().get("id"));
 
-        Long count = jdbc.queryForObject(
-                "SELECT COUNT(*) FROM orders WHERE account_id = ? AND client_idempotency_key = 'key-1'",
-                Long.class, accountId);
-        assertThat(count).isEqualTo(1L);
+        // Cluster idempotency keeps Postgres at one orders row even after projector apply. Await
+        // the projector apply, then assert the row count is exactly one.
+        await()
+                .atMost(ORDERS_VISIBLE_TIMEOUT)
+                .pollInterval(ORDERS_VISIBLE_POLL)
+                .untilAsserted(() -> {
+                    Long count = jdbc.queryForObject(
+                            "SELECT COUNT(*) FROM orders WHERE account_id = ? AND client_idempotency_key = 'key-1'",
+                            Long.class,
+                            accountId);
+                    assertThat(count).isEqualTo(1L);
+                });
 
         UUID orderId = UUID.fromString((String) first.getBody().get("id"));
         Long duplicateRejectAudit = jdbc.queryForObject(
@@ -105,6 +133,8 @@ class OrdersControllerIntegrationTest extends AbstractPostgresIntegrationTest {
         assertThat(created.getStatusCode()).isEqualTo(HttpStatus.CREATED);
         UUID orderId = UUID.fromString((String) created.getBody().get("id"));
 
+        // GET reads from the orders table; the auth check rejects before the read so we don't need
+        // to await the projector here.
         ResponseEntity<String> res = http.getForEntity(
                 "http://localhost:" + port + "/internal/v1/orders/" + orderId,
                 String.class);
@@ -117,6 +147,10 @@ class OrdersControllerIntegrationTest extends AbstractPostgresIntegrationTest {
         ResponseEntity<Map<String, Object>> created = exchange(jsonRequest(accountId, "get-key-2"));
         assertThat(created.getStatusCode()).isEqualTo(HttpStatus.CREATED);
         UUID orderId = UUID.fromString((String) created.getBody().get("id"));
+
+        // Phase 2 slice 2c: orders row arrives via the test projector daemon. Wait for the row to
+        // be visible before issuing the GET, otherwise GET returns 404.
+        awaitOrderVisible(orderId);
 
         HttpHeaders headers = new HttpHeaders();
         headers.set("X-OMS-Internal-Key", "test-key");
@@ -139,6 +173,11 @@ class OrdersControllerIntegrationTest extends AbstractPostgresIntegrationTest {
         ResponseEntity<Map<String, Object>> created = exchange(jsonRequest(accountId, "get-key-settlement"));
         assertThat(created.getStatusCode()).isEqualTo(HttpStatus.CREATED);
         UUID orderId = UUID.fromString((String) created.getBody().get("id"));
+
+        // The executions row used to share an FK to orders(id); V25 dropped it in slice 2c, but we
+        // still want the orders row materialised before the GET so the controller can join with
+        // executions and produce the aggregated settlementStatus.
+        awaitOrderVisible(orderId);
 
         jdbc.update(
                 """
@@ -168,6 +207,18 @@ class OrdersControllerIntegrationTest extends AbstractPostgresIntegrationTest {
         assertThat(res.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(res.getBody()).isNotNull();
         assertThat(res.getBody().get("settlementStatus")).isEqualTo("settling");
+    }
+
+    /**
+     * Awaits the projector daemon to apply the orders row for {@code orderId}. Phase 2 slice 2c
+     * removed the synchronous orders write from {@link OrderIngressService}; row arrival now lags
+     * the HTTP response by one projector poll cycle.
+     */
+    private void awaitOrderVisible(UUID orderId) {
+        await()
+                .atMost(ORDERS_VISIBLE_TIMEOUT)
+                .pollInterval(ORDERS_VISIBLE_POLL)
+                .untilAsserted(() -> assertThat(orders.findById(orderId)).isPresent());
     }
 
     @Test

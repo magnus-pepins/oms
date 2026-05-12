@@ -5,7 +5,6 @@ import com.balh.oms.chronicle.PendingControlEvent;
 import com.balh.oms.cluster.AcceptOrderCommand;
 import com.balh.oms.cluster.AdmissionResult;
 import com.balh.oms.cluster.OmsClusterIngressClient;
-import com.balh.oms.config.ControlPostgresWritePath;
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.config.OmsProfiles;
 import com.balh.oms.domain.Order;
@@ -19,7 +18,6 @@ import com.balh.oms.persistence.LedgerInflightOutboxRepository;
 import com.balh.oms.observability.metrics.OmsPipelineMetrics;
 import com.balh.oms.observability.otel.IngressToFixNosLatencyRecorder;
 import com.balh.oms.persistence.OrdersRepository;
-import com.balh.oms.tailer.ControlTailer;
 import com.balh.oms.tailer.OrderControlAdmission;
 import com.balh.oms.domain.Side;
 import com.balh.oms.ledger.LedgerBalanceClient;
@@ -44,23 +42,32 @@ import java.util.UUID;
 import java.util.concurrent.TimeoutException;
 
 /**
- * Owns the single Postgres transaction that inserts an order and matching
- * {@code control_outbox} and {@code domain_event_outbox} rows, after
- * <em>mandatory</em> admission through Aeron Cluster.
+ * Drives mandatory admission through Aeron Cluster on every order accept, and (for now) records
+ * the residual outbox / fanout side-tables that downstream Phase 2 slices will retire.
  *
- * <p>Phase 1c slice B (Aeron Cluster substrate plan) made the cluster the
- * only admission path. {@link OmsClusterIngressClient} is a hard required
- * dependency: every accept call submits an {@link AcceptOrderCommand} and
- * blocks until the cluster emits {@code OrderAccepted} or
- * {@code OrderRejected}. Postgres rows are written only after the cluster
- * accepts the order. The {@code IngressControlChroniclePublisher}
- * after-commit hook that previously wrote to Chronicle is gone (slice C
- * deletes the publisher class itself).
+ * <p>Phase 1c slice B (Aeron Cluster substrate plan) made the cluster the only admission path.
+ * {@link OmsClusterIngressClient} is a hard required dependency: every accept call submits an
+ * {@link AcceptOrderCommand} and blocks until the cluster emits {@code OrderAccepted} or
+ * {@code OrderRejected}.
+ *
+ * <p>Phase 2 slice 2c (this revision) removes the {@code orders} INSERT from the ingress
+ * transaction. {@code orders} is now a downstream projection of the cluster log, written by the
+ * {@code oms-postgres-projector} JVM (see {@link com.balh.oms.projector.OmsPostgresProjector}
+ * and the V25 migration that drops the FK constraints back to {@code orders(id)}). HTTP 200/201
+ * means cluster-committed; the orders row appears in Postgres after the projector applies the
+ * cluster-emitted {@code OrderAdmittedEvent} (sub-millisecond in steady state). Tests that
+ * previously read the orders row immediately after the controller response upgrade to
+ * Awaitility, and the {@code INGRESS} control-Postgres-write-path branch is gone — slice 2d
+ * subsumes its work into the projector.
+ *
+ * <p>The {@code control_outbox}, {@code domain_event_outbox}, and (for BUY orders) the optional
+ * {@code ledger_inflight_outbox} writes still happen here in slice 2c; they are retired by
+ * later Phase 2 slices (2d/2e) once the projector covers their consumers.
  *
  * <p>This is a separate Spring bean (not a controller method) because Spring's
  * {@code @Transactional} relies on AOP proxies and self-invocation through
- * {@code this} would skip the proxy. Keeping this in its own bean is what
- * actually opens the transaction at the right boundary.
+ * {@code this} would skip the proxy. Keeping this in its own bean is what actually opens the
+ * transaction at the right boundary.
  */
 @Service
 @Profile(OmsProfiles.ORDER_ACCEPT_PROFILE)
@@ -121,19 +128,28 @@ public class OrderIngressService {
     }
 
     /**
-     * Result of an idempotent ingress call. {@link #created} tells the
-     * controller whether the row was inserted by this call ({@code true} —
-     * respond 201) or already existed ({@code false} — respond 200).
+     * Result of an idempotent ingress call. {@link #created} tells the controller whether the
+     * cluster admitted this submission as a fresh order ({@code true} — respond 201) or as an
+     * idempotent re-hit on a prior {@code (account_id, client_idempotency_key)} ({@code false} —
+     * respond 200). The {@link #order} carries the cluster's authoritative {@code orderId} —
+     * even on duplicates, the response echoes the original orderId so callers see a single
+     * identity.
+     *
+     * <p>Phase 2 slice 2c (oms-aeron-cluster-substrate plan): the orders row may not yet be
+     * visible in Postgres at this point. Tests that need the row materialised wait for the
+     * projector via Awaitility; production callers should treat the response as
+     * cluster-committed and read-after-write only after a small delay (or via the cluster's
+     * read APIs once they exist).
      */
     public record IngressResult(Order order, boolean created) {}
 
     /**
-     * Inserts the order and the outbox row in a single Postgres transaction,
-     * or — if another concurrent request beat us to the unique constraint —
-     * returns the pre-existing row.
+     * Drives the cluster admission and writes the Phase 2-slice-2c residual outbox / fanout rows.
      *
-     * <p>Commit happens when this method returns. Domain fanout delivery is
-     * asynchronous via {@link com.balh.oms.reconciler.DomainFanoutReconciler}.
+     * <p>The {@code orders} INSERT moved out of this method in slice 2c — the
+     * {@code oms-postgres-projector} JVM owns it now, applying the cluster-emitted
+     * {@code OrderAdmittedEvent} idempotently. Returning from this method means "cluster
+     * committed"; the Postgres orders row materialises shortly after via the projector.
      */
     @Transactional
     public IngressResult persistAccepted(CreateOrderRequest req) {
@@ -158,59 +174,24 @@ public class OrderIngressService {
         String accountIdHash = piiHash.hash(req.accountId());
         String ledgerBalanceId = normalizeLedgerBalanceId(req.ledgerBalanceId());
 
-        Order order = new Order(
-                id,
-                req.accountId(),
-                req.clientIdempotencyKey(),
-                shardId,
-                0,
-                OrderStatus.NEW,
-                null,
-                req.side(),
-                req.instrumentSymbol(),
-                req.quantity(),
-                req.limitPrice(),
-                req.timeInForce(),
-                now,
-                now,
-                null,
-                accountIdHash,
-                ledgerBalanceId,
-                BigDecimal.ZERO
-        );
+        Order order = buildOrder(id, req, shardId, accountIdHash, ledgerBalanceId, now);
 
         AdmissionResult ar = submitToClusterOrThrow(clusterIngressClient, order, accountIdHash, now);
         AdmissionResult.Accepted accepted = (AdmissionResult.Accepted) ar;
+        boolean created = !accepted.event().duplicate();
         if (accepted.event().duplicate() && !accepted.event().orderId().equals(id)) {
+            // Cluster idempotency: an earlier submission for this (accountId, idempotencyKey) won.
+            // Echo the original orderId in the response body so the caller sees a single identity.
             id = accepted.event().orderId();
-            order = new Order(
-                    id,
-                    req.accountId(),
-                    req.clientIdempotencyKey(),
-                    shardId,
-                    0,
-                    OrderStatus.NEW,
-                    null,
-                    req.side(),
-                    req.instrumentSymbol(),
-                    req.quantity(),
-                    req.limitPrice(),
-                    req.timeInForce(),
-                    now,
-                    now,
-                    null,
-                    accountIdHash,
-                    ledgerBalanceId,
-                    BigDecimal.ZERO);
+            order = buildOrder(id, req, shardId, accountIdHash, ledgerBalanceId, now);
         }
 
-        try {
-            orders.insert(order);
-        } catch (OrdersRepository.DuplicateOrderException e) {
-            Order existing = orders.findByIdempotency(req.accountId(), req.clientIdempotencyKey())
-                    .orElseThrow(() -> new IllegalStateException(
-                            "duplicate detected but no row visible: " + e.getMessage()));
-            return new IngressResult(existing, false);
+        if (!created) {
+            // Duplicate at the cluster: the orders row + outbox/fanout side-tables were already
+            // produced by the original submission. Return without re-writing them; the projector
+            // does NOT re-emit OrderAdmittedEvent on idempotent re-hits (see slice 2b-1), and
+            // re-inserting the side-tables would create spurious extra control / domain envelopes.
+            return new IngressResult(order, false);
         }
 
         maybePlaceBuyLedgerInflightHold(order);
@@ -232,16 +213,36 @@ public class OrderIngressService {
             log.error("Failed to serialise domain fanout envelope for orderId={}", id, e);
             throw new RuntimeException("domain event envelope serialisation failed", e);
         }
-        if (config.getControl().getPostgresWritePath() == ControlPostgresWritePath.INGRESS) {
-            ControlTailer.TailResult admission = orderControlAdmission.persistAdmission(controlEvent);
-            Order latest = orders.findById(id).orElse(order);
-            if (admission == ControlTailer.TailResult.APPLIED) {
-                ingressToFixNosLatencyRecorder.onOrderIngressCommitted(id);
-            }
-            return new IngressResult(latest, true);
-        }
         ingressToFixNosLatencyRecorder.onOrderIngressCommitted(id);
         return new IngressResult(order, true);
+    }
+
+    private Order buildOrder(
+            UUID id,
+            CreateOrderRequest req,
+            int shardId,
+            String accountIdHash,
+            String ledgerBalanceId,
+            Instant now) {
+        return new Order(
+                id,
+                req.accountId(),
+                req.clientIdempotencyKey(),
+                shardId,
+                0,
+                OrderStatus.NEW,
+                null,
+                req.side(),
+                req.instrumentSymbol(),
+                req.quantity(),
+                req.limitPrice(),
+                req.timeInForce(),
+                now,
+                now,
+                null,
+                accountIdHash,
+                ledgerBalanceId,
+                BigDecimal.ZERO);
     }
 
     private AdmissionResult submitToClusterOrThrow(

@@ -1,11 +1,22 @@
 package com.balh.oms;
 
+import com.balh.oms.cluster.OmsClusterWireFormat;
+import com.balh.oms.cluster.OrderAdmittedEvent;
+import com.balh.oms.persistence.OrdersRepository;
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
+import io.aeron.Aeron;
+import io.aeron.Subscription;
 import io.aeron.archive.Archive;
+import io.aeron.archive.client.AeronArchive;
 import io.aeron.cluster.ClusteredMediaDriver;
 import io.aeron.cluster.ConsensusModule;
 import io.aeron.cluster.service.ClusteredServiceContainer;
+import io.aeron.logbuffer.FragmentHandler;
+import org.agrona.CloseHelper;
 import org.agrona.IoUtil;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -17,6 +28,8 @@ import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.LockSupport;
 
 /**
  * Base class for integration tests that need a real Postgres instance and (when applicable) a
@@ -57,6 +70,18 @@ import java.util.concurrent.TimeUnit;
  * <p>Tests that need their own cluster (cluster-internal smoke tests, or this same class boot
  * coverage like {@code OmsClusterNodeBootstrapSmokeIT}) keep their own boot logic on different
  * ports — see individual classes.
+ *
+ * <h2>Postgres orders projector daemon (Phase 2 slice 2c)</h2>
+ *
+ * <p>Phase 2 slice 2c of the cluster substrate plan removes the {@code orders} INSERT from
+ * {@link com.balh.oms.ingress.OrderIngressService} — the orders row now arrives via a separate
+ * projector JVM ({@code oms-postgres-projector}). In tests we run a JVM-wide
+ * {@link TestPostgresProjectorSingleton} that subscribes to the test cluster's events
+ * recording and idempotently inserts orders rows into the test Postgres, so HTTP / cluster
+ * integration tests still see the row materialise after a brief Awaitility wait. The daemon
+ * uses a self-contained code path (no {@code aeron_projector_cursor} write) to avoid racing
+ * the Spring-managed projector that runs under
+ * {@link com.balh.oms.config.OmsProfiles#POSTGRES_PROJECTOR}.
  *
  * <p>To run the OMS app itself against compose Postgres, use {@code ./gradlew bootRun} with
  * {@code OMS_PG_URL} / {@code OMS_PG_USER} / {@code OMS_PG_PASSWORD}; see README.
@@ -113,12 +138,19 @@ public abstract class AbstractPostgresIntegrationTest {
      * still resolve these properties (so they're cheap), but the
      * {@code @ConditionalOnProperty} on {@code OmsClusterIngressClient} only loads the client
      * for order-accept contexts.
+     *
+     * <p>Phase 2 slice 2c also lazy-starts the {@link TestPostgresProjectorSingleton} alongside
+     * the cluster wiring so the orders row appears in Postgres even though the ingress no longer
+     * writes it. The daemon is a JVM-wide singleton and runs for the lifetime of the test JVM.
      */
     @DynamicPropertySource
     static void registerClusterClientProperties(DynamicPropertyRegistry registry) {
         registry.add("oms.cluster.client.enabled", () -> "true");
         registry.add("oms.cluster.client.aeron-directory", () -> testClusterAeronDirectory());
         registry.add("oms.cluster.client.ingress-endpoints", () -> testClusterIngressEndpoints());
+        // Eagerly start the projector daemon so the first test that depends on the orders row
+        // does not pay the projector connect / first-recording cost on its hot path.
+        testPostgresProjectorDaemon();
     }
 
     /**
@@ -132,6 +164,21 @@ public abstract class AbstractPostgresIntegrationTest {
     /** Ingress endpoints string for the JVM-wide {@link TestAeronClusterSingleton}. */
     public static String testClusterIngressEndpoints() {
         return TestAeronClusterSingleton.INGRESS_ENDPOINTS;
+    }
+
+    /**
+     * Lazily starts the JVM-wide {@link TestPostgresProjectorSingleton} (Phase 2 slice 2c). The
+     * daemon subscribes to the test cluster's events recording and idempotently writes orders
+     * rows so tests that expect read-after-write semantics on the orders table still observe the
+     * row (after a small Awaitility wait) even though
+     * {@link com.balh.oms.ingress.OrderIngressService} no longer writes it. Idempotent on
+     * {@code (account_id, client_idempotency_key)}; safe to start multiple times across a test
+     * suite (singleton).
+     *
+     * <p>Returns the singleton (not {@code null}) so callers can observe lifecycle if needed.
+     */
+    public static TestPostgresProjectorSingleton testPostgresProjectorDaemon() {
+        return TestPostgresProjectorSingleton.startedInstance();
     }
 
     /** JDBC URL for the shared integration Postgres (env-driven or Testcontainers-driven). */
@@ -341,6 +388,213 @@ public abstract class AbstractPostgresIntegrationTest {
 
         String aeronDirectory() {
             return paths.aeronDirectory();
+        }
+    }
+
+    /**
+     * JVM-wide singleton projector daemon for Phase 2 slice 2c integration tests. Subscribes to
+     * the test cluster's events recording (via {@link AeronArchive#replay}), decodes
+     * {@link OrderAdmittedEvent} fragments, and idempotently inserts orders rows via
+     * {@link OrdersRepository#insertFromAdmittedEvent} on a dedicated Hikari pool over the
+     * shared test Postgres.
+     *
+     * <p>Why this is a separate codepath from the production
+     * {@link com.balh.oms.projector.OmsPostgresProjector}:
+     *
+     * <ul>
+     *   <li>The production projector is {@code @Profile(POSTGRES_PROJECTOR)} and topology-validated
+     *       to be mutually exclusive with {@code ORDER_ACCEPT_PROFILE}. Order-accept contexts
+     *       therefore never load it, but they still need orders rows to materialise.</li>
+     *   <li>Multiple Spring contexts come and go during the test JVM lifetime; each one would
+     *       construct its own projector if we relied on a Spring bean, which would race on the
+     *       {@code aeron_projector_cursor} table.</li>
+     *   <li>This daemon does NOT touch {@code aeron_projector_cursor} — it always replays from
+     *       position 0. Tests truncate {@code orders} between cases (or assert per-id), and the
+     *       projector's idempotent {@code INSERT ... ON CONFLICT DO NOTHING} keeps re-replays
+     *       safe. The Spring-managed projector that runs under
+     *       {@link com.balh.oms.projector.OmsPostgresProjectorIT} uses a different projector
+     *       identity / cursor, so this daemon does not interfere with it.</li>
+     * </ul>
+     */
+    public static final class TestPostgresProjectorSingleton {
+
+        private static final long REPLAY_POLL_PARK_NANOS = 1_000_000L;
+        private static final int REPLAY_FRAGMENT_LIMIT = 64;
+        private static final long RECORDING_LOOKUP_PARK_MS = 50L;
+        /** Stream id reserved for the test-only replay subscription so it never collides with the
+         * production replay stream id (4321) used by {@code OmsPostgresProjector}. */
+        private static final int REPLAY_STREAM_ID = 4322;
+
+        private static volatile TestPostgresProjectorSingleton INSTANCE;
+        private static final Object LOCK = new Object();
+
+        private final HikariDataSource dataSource;
+        private final OrdersRepository ordersRepository;
+        private final Aeron aeron;
+        private final AeronArchive archive;
+        private final Subscription replay;
+        private final Thread replayThread;
+        private final AtomicBoolean running;
+
+        private TestPostgresProjectorSingleton(
+                HikariDataSource dataSource,
+                OrdersRepository ordersRepository,
+                Aeron aeron,
+                AeronArchive archive,
+                Subscription replay,
+                Thread replayThread,
+                AtomicBoolean running) {
+            this.dataSource = dataSource;
+            this.ordersRepository = ordersRepository;
+            this.aeron = aeron;
+            this.archive = archive;
+            this.replay = replay;
+            this.replayThread = replayThread;
+            this.running = running;
+        }
+
+        static TestPostgresProjectorSingleton startedInstance() {
+            TestPostgresProjectorSingleton local = INSTANCE;
+            if (local != null) {
+                return local;
+            }
+            synchronized (LOCK) {
+                if (INSTANCE != null) {
+                    return INSTANCE;
+                }
+                // Force the cluster to start first so the events recording exists by the time we
+                // poll listRecordingsForUri.
+                String aeronDir = testClusterAeronDirectory();
+                INSTANCE = launch(aeronDir);
+                Runtime.getRuntime().addShutdownHook(new Thread(
+                        TestPostgresProjectorSingleton::closeInstance, "oms-test-projector-shutdown"));
+                return INSTANCE;
+            }
+        }
+
+        private static TestPostgresProjectorSingleton launch(String aeronDir) {
+            HikariConfig hc = new HikariConfig();
+            hc.setJdbcUrl(integrationTestJdbcUrl());
+            hc.setUsername(integrationTestJdbcUser());
+            hc.setPassword(integrationTestJdbcPassword());
+            hc.setMaximumPoolSize(2);
+            hc.setMinimumIdle(1);
+            hc.setPoolName("oms-test-projector");
+            hc.setConnectionTimeout(Long.parseLong(HIKARI_CONNECTION_TIMEOUT_MS));
+            HikariDataSource ds = new HikariDataSource(hc);
+            OrdersRepository orders = new OrdersRepository(new NamedParameterJdbcTemplate(ds));
+
+            Aeron aeron = Aeron.connect(new Aeron.Context().aeronDirectoryName(aeronDir));
+            AeronArchive archive = AeronArchive.connect(new AeronArchive.Context()
+                    .aeron(aeron)
+                    .ownsAeronClient(false)
+                    .controlRequestChannel("aeron:ipc?term-length=64k")
+                    .controlResponseChannel("aeron:ipc?term-length=64k"));
+
+            long recordingId = waitForRecording(archive);
+            Subscription replay = archive.replay(
+                    recordingId,
+                    /* position = */ 0L,
+                    /* length = */ Long.MAX_VALUE,
+                    "aeron:ipc?term-length=64k",
+                    REPLAY_STREAM_ID);
+
+            AtomicBoolean running = new AtomicBoolean(true);
+            Thread thread = new Thread(
+                    () -> replayLoop(replay, orders, running), "oms-test-projector-daemon");
+            thread.setDaemon(true);
+            TestPostgresProjectorSingleton instance = new TestPostgresProjectorSingleton(
+                    ds, orders, aeron, archive, replay, thread, running);
+            thread.start();
+            return instance;
+        }
+
+        private static long waitForRecording(AeronArchive archive) {
+            long[] result = {-1L};
+            while (result[0] < 0) {
+                archive.listRecordingsForUri(
+                        /* fromRecordingId = */ 0L,
+                        /* recordCount = */ 1024,
+                        OmsClusterWireFormat.EVENTS_CHANNEL,
+                        OmsClusterWireFormat.EVENTS_STREAM_ID,
+                        (controlSessionId,
+                                correlationId,
+                                recordingId,
+                                startTimestamp,
+                                stopTimestamp,
+                                startPosition,
+                                stopPosition,
+                                initialTermId,
+                                segmentFileLength,
+                                termBufferLength,
+                                mtuLength,
+                                sessionId,
+                                streamId,
+                                strippedChannel,
+                                originalChannel,
+                                sourceIdentity) -> {
+                            if (streamId == OmsClusterWireFormat.EVENTS_STREAM_ID && recordingId > result[0]) {
+                                result[0] = recordingId;
+                            }
+                        });
+                if (result[0] >= 0) {
+                    return result[0];
+                }
+                try {
+                    Thread.sleep(RECORDING_LOOKUP_PARK_MS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException(
+                            "interrupted while waiting for events recording", e);
+                }
+            }
+            return result[0];
+        }
+
+        private static void replayLoop(
+                Subscription replay, OrdersRepository orders, AtomicBoolean running) {
+            FragmentHandler handler = (buffer, offset, length, header) -> {
+                int typeId = buffer.getInt(offset + OmsClusterWireFormat.HEADER_TYPE_ID_OFFSET);
+                if (typeId != OmsClusterWireFormat.TYPE_ID_ORDER_ADMITTED) {
+                    return;
+                }
+                OrderAdmittedEvent ev = OrderAdmittedEvent.decode(buffer, offset, length);
+                try {
+                    orders.insertFromAdmittedEvent(ev);
+                } catch (RuntimeException e) {
+                    // Swallow per-fragment errors so the daemon doesn't die on a single bad row.
+                    // Tests that care will see the missing row and time out; the JVM logs will show
+                    // the offending event.
+                    e.printStackTrace();
+                }
+            };
+            while (running.get()) {
+                int polled = replay.poll(handler, REPLAY_FRAGMENT_LIMIT);
+                if (polled == 0) {
+                    LockSupport.parkNanos(REPLAY_POLL_PARK_NANOS);
+                }
+            }
+        }
+
+        private static void closeInstance() {
+            TestPostgresProjectorSingleton local = INSTANCE;
+            if (local == null) {
+                return;
+            }
+            local.running.set(false);
+            try {
+                local.replayThread.join(2_000L);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            CloseHelper.quietClose(local.replay);
+            CloseHelper.quietClose(local.archive);
+            CloseHelper.quietClose(local.aeron);
+            try {
+                local.dataSource.close();
+            } catch (RuntimeException ignored) {
+                // best-effort during JVM shutdown
+            }
         }
     }
 }

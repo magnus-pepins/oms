@@ -23,7 +23,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.mockito.ArgumentCaptor;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.http.HttpStatus;
 
@@ -42,15 +41,16 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * Phase 1c slice B unit test: verifies {@link OrderIngressService} routes admission through the
- * (now mandatory) {@link OmsClusterIngressClient} and surfaces cluster failures as the right
- * {@link ClusterAdmissionException} HTTP status.
+ * Phase 1c slice B / Phase 2 slice 2c unit test: verifies {@link OrderIngressService} routes
+ * admission through the (now mandatory) {@link OmsClusterIngressClient}, surfaces cluster
+ * failures as the right {@link ClusterAdmissionException} HTTP status, and (since slice 2c) does
+ * NOT write an orders row inside the ingress transaction.
  *
- * <p>Plan: {@code system-documentation/plans/oms-aeron-cluster-substrate.md} §Phase 1c. The
- * "cluster absent" case from slice B's predecessor (Phase 1b) is gone: the cluster bean is now
- * a hard dependency injected directly. The full HTTP + Postgres + cluster integration test
- * lives in {@link com.balh.oms.cluster.OrderIngressClusterIntegrationTest}; this test exercises
- * the cluster-gate logic in-process for fast feedback without Docker.
+ * <p>Plan: {@code system-documentation/plans/oms-aeron-cluster-substrate.md}. Slice 2c removed
+ * the {@code orders} INSERT from {@code persistAcceptedBody}; the projector JVM now owns it.
+ * The full HTTP + Postgres + cluster integration test lives in
+ * {@link com.balh.oms.cluster.OrderIngressClusterIntegrationTest}; this test exercises the
+ * cluster-gate logic in-process for fast feedback without Docker.
  */
 class OrderIngressServiceClusterGateTest {
 
@@ -120,7 +120,7 @@ class OrderIngressServiceClusterGateTest {
     }
 
     @Test
-    void freshAccept_callsClusterAndProceedsToInsert() throws Exception {
+    void freshAccept_callsCluster_doesNotInsertOrders_writesOutboxAndDomainFanout() throws Exception {
         when(cluster.submitAcceptOrder(any(AcceptOrderCommand.class), any(Duration.class)))
                 .thenAnswer(invocation -> {
                     AcceptOrderCommand cmd = invocation.getArgument(0);
@@ -135,15 +135,18 @@ class OrderIngressServiceClusterGateTest {
 
         OrderIngressService.IngressResult result = service.persistAccepted(buyRequest());
 
-        assertThat(result.created()).isTrue();
-        ArgumentCaptor<Order> insertedOrder = ArgumentCaptor.forClass(Order.class);
-        verify(orders).insert(insertedOrder.capture());
+        assertThat(result.created())
+                .as("cluster reported duplicate=false → IngressResult.created=true (HTTP 201)")
+                .isTrue();
         verify(cluster).submitAcceptOrder(any(AcceptOrderCommand.class), any(Duration.class));
-        assertThat(insertedOrder.getValue().id()).isEqualTo(result.order().id());
+        verify(orders, never())
+                .insert(any(Order.class));
+        verify(controlOutbox)
+                .insert(eq(result.order().id()), any(Integer.class), any(), any());
     }
 
     @Test
-    void duplicateAcceptWithDifferentClusterOrderId_rebuildsOrderWithClusterId() throws Exception {
+    void duplicateAcceptWithDifferentClusterOrderId_returnsClusterOrderId_skipsSideTables() throws Exception {
         UUID clusterOriginalOrderId = UUID.fromString("00000000-0000-4000-8000-00000000aaaa");
 
         when(cluster.submitAcceptOrder(any(AcceptOrderCommand.class), any(Duration.class)))
@@ -158,17 +161,21 @@ class OrderIngressServiceClusterGateTest {
                                     /* acceptedAtNanos = */ 1L));
                 });
 
-        service.persistAccepted(buyRequest());
+        OrderIngressService.IngressResult result = service.persistAccepted(buyRequest());
 
-        ArgumentCaptor<Order> insertedOrder = ArgumentCaptor.forClass(Order.class);
-        verify(orders).insert(insertedOrder.capture());
-        assertThat(insertedOrder.getValue().id())
-                .as("when cluster says duplicate=true, ingress must use the cluster-returned orderId, not its tentative UUID")
+        assertThat(result.created())
+                .as("cluster reported duplicate=true → IngressResult.created=false (HTTP 200)")
+                .isFalse();
+        assertThat(result.order().id())
+                .as("response must echo the cluster's original orderId so callers see a single identity")
                 .isEqualTo(clusterOriginalOrderId);
+        verify(orders, never()).insert(any(Order.class));
+        verify(controlOutbox, never()).insert(any(), any(Integer.class), any(), any());
+        verify(domainEventOutbox, never()).insert(any(), any());
     }
 
     @Test
-    void clusterRejected_throws422AndDoesNotInsertPostgresRow() throws Exception {
+    void clusterRejected_throws422_doesNotTouchPostgres() throws Exception {
         when(cluster.submitAcceptOrder(any(AcceptOrderCommand.class), any(Duration.class)))
                 .thenAnswer(invocation -> {
                     AcceptOrderCommand cmd = invocation.getArgument(0);
@@ -187,10 +194,12 @@ class OrderIngressServiceClusterGateTest {
                     assertThat(e.getErrorCode()).isEqualTo("cluster_rejected");
                 });
         verify(orders, never()).insert(any());
+        verify(controlOutbox, never()).insert(any(), any(Integer.class), any(), any());
+        verify(domainEventOutbox, never()).insert(any(), any());
     }
 
     @Test
-    void clusterTimeout_throws503AndDoesNotInsertPostgresRow() throws Exception {
+    void clusterTimeout_throws503_doesNotTouchPostgres() throws Exception {
         when(cluster.submitAcceptOrder(any(AcceptOrderCommand.class), any(Duration.class)))
                 .thenThrow(new TimeoutException("cluster slow"));
 
@@ -200,10 +209,12 @@ class OrderIngressServiceClusterGateTest {
                     assertThat(e.getErrorCode()).isEqualTo("cluster_admission_timeout");
                 });
         verify(orders, never()).insert(any());
+        verify(controlOutbox, never()).insert(any(), any(Integer.class), any(), any());
+        verify(domainEventOutbox, never()).insert(any(), any());
     }
 
     @Test
-    void clusterNotConnected_throws503AndDoesNotInsertPostgresRow() throws Exception {
+    void clusterNotConnected_throws503_doesNotTouchPostgres() throws Exception {
         when(cluster.submitAcceptOrder(any(AcceptOrderCommand.class), any(Duration.class)))
                 .thenThrow(new IllegalStateException("not connected"));
 
@@ -213,6 +224,8 @@ class OrderIngressServiceClusterGateTest {
                     assertThat(e.getErrorCode()).isEqualTo("cluster_unavailable");
                 });
         verify(orders, never()).insert(any());
+        verify(controlOutbox, never()).insert(any(), any(Integer.class), any(), any());
+        verify(domainEventOutbox, never()).insert(any(), any());
     }
 
     private static CreateOrderRequest buyRequest() {

@@ -26,6 +26,16 @@ public class OmsExceptionHandler {
         return ResponseEntity.status(ex.getHttpStatus()).body(body);
     }
 
+    @ExceptionHandler(ClusterAdmissionException.class)
+    public ResponseEntity<ApiErrorResponse> handleClusterAdmission(ClusterAdmissionException ex) {
+        var body = new ApiErrorResponse(
+                RejectCode.INTERNAL_ERROR.name(),
+                ex.getErrorCode(),
+                List.of(new ApiErrorResponse.FieldViolation("clusterAdmission", ex.getMessage()))
+        );
+        return ResponseEntity.status(ex.getHttpStatus()).body(body);
+    }
+
     @ExceptionHandler(MethodArgumentNotValidException.class)
     public ResponseEntity<ApiErrorResponse> handleValidation(MethodArgumentNotValidException ex) {
         var violations = ex.getBindingResult().getFieldErrors().stream()

@@ -2,6 +2,9 @@ package com.balh.oms.ingress;
 
 import com.balh.oms.chronicle.ControlChroniclePayloadCodec;
 import com.balh.oms.chronicle.PendingControlEvent;
+import com.balh.oms.cluster.AcceptOrderCommand;
+import com.balh.oms.cluster.AdmissionResult;
+import com.balh.oms.cluster.OmsClusterIngressClient;
 import com.balh.oms.config.ControlPostgresWritePath;
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.config.OmsProfiles;
@@ -37,8 +40,10 @@ import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.math.BigDecimal;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.UUID;
+import java.util.concurrent.TimeoutException;
 
 /**
  * Owns the single Postgres transaction that inserts an order and matching
@@ -73,6 +78,7 @@ public class OrderIngressService {
     private final IngressToFixNosLatencyRecorder ingressToFixNosLatencyRecorder;
     private final ObjectProvider<IngressControlChroniclePublisher> ingressControlChroniclePublisher;
     private final OrderControlAdmission orderControlAdmission;
+    private final ObjectProvider<OmsClusterIngressClient> clusterIngressClient;
 
     public OrderIngressService(
             OrdersRepository orders,
@@ -89,7 +95,8 @@ public class OrderIngressService {
             MeterRegistry meterRegistry,
             IngressToFixNosLatencyRecorder ingressToFixNosLatencyRecorder,
             ObjectProvider<IngressControlChroniclePublisher> ingressControlChroniclePublisher,
-            OrderControlAdmission orderControlAdmission) {
+            OrderControlAdmission orderControlAdmission,
+            ObjectProvider<OmsClusterIngressClient> clusterIngressClient) {
         this.orders = orders;
         this.outbox = outbox;
         this.domainEventOutbox = domainEventOutbox;
@@ -105,6 +112,7 @@ public class OrderIngressService {
         this.ingressToFixNosLatencyRecorder = ingressToFixNosLatencyRecorder;
         this.ingressControlChroniclePublisher = ingressControlChroniclePublisher;
         this.orderControlAdmission = orderControlAdmission;
+        this.clusterIngressClient = clusterIngressClient;
     }
 
     /**
@@ -166,6 +174,35 @@ public class OrderIngressService {
                 BigDecimal.ZERO
         );
 
+        OmsClusterIngressClient cluster = clusterIngressClient.getIfAvailable();
+        boolean clusterGateActive = cluster != null;
+        if (clusterGateActive) {
+            AdmissionResult ar = submitToClusterOrThrow(cluster, order, accountIdHash, now);
+            AdmissionResult.Accepted accepted = (AdmissionResult.Accepted) ar;
+            if (accepted.event().duplicate() && !accepted.event().orderId().equals(id)) {
+                id = accepted.event().orderId();
+                order = new Order(
+                        id,
+                        req.accountId(),
+                        req.clientIdempotencyKey(),
+                        shardId,
+                        0,
+                        OrderStatus.NEW,
+                        null,
+                        req.side(),
+                        req.instrumentSymbol(),
+                        req.quantity(),
+                        req.limitPrice(),
+                        req.timeInForce(),
+                        now,
+                        now,
+                        null,
+                        accountIdHash,
+                        ledgerBalanceId,
+                        BigDecimal.ZERO);
+            }
+        }
+
         try {
             orders.insert(order);
         } catch (OrdersRepository.DuplicateOrderException e) {
@@ -189,7 +226,9 @@ public class OrderIngressService {
         String controlPayload = serializePayload(controlEvent);
         ControlOutboxRepository.InsertResult controlOutboxRow =
                 outbox.insert(id, order.version(), controlPayload, controlOutboxEnqueuedAt);
-        registerIngressChronicleAfterCommit(controlOutboxRow.id(), controlPayload, controlOutboxRow.enqueuedAt());
+        if (!clusterGateActive) {
+            registerIngressChronicleAfterCommit(controlOutboxRow.id(), controlPayload, controlOutboxRow.enqueuedAt());
+        }
         try {
             domainEventOutbox.insert(id, domainEventEnvelopeCodec.orderAccepted(order));
         } catch (JsonProcessingException e) {
@@ -206,6 +245,104 @@ public class OrderIngressService {
         }
         ingressToFixNosLatencyRecorder.onOrderIngressCommitted(id);
         return new IngressResult(order, true);
+    }
+
+    private AdmissionResult submitToClusterOrThrow(
+            OmsClusterIngressClient cluster, Order order, String accountIdHash, Instant now) {
+        AcceptOrderCommand cmd = buildAcceptOrderCommand(cluster, order, accountIdHash, now);
+        Duration timeout = Duration.ofMillis(config.getCluster().getClient().getSubmitTimeoutMs());
+        AdmissionResult result;
+        try {
+            result = cluster.submitAcceptOrder(cmd, timeout);
+        } catch (TimeoutException e) {
+            throw new ClusterAdmissionException(
+                    HttpStatus.SERVICE_UNAVAILABLE,
+                    "cluster_admission_timeout",
+                    "OMS cluster did not respond within " + timeout.toMillis() + "ms",
+                    e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new ClusterAdmissionException(
+                    HttpStatus.SERVICE_UNAVAILABLE,
+                    "cluster_admission_interrupted",
+                    "OMS cluster admission was interrupted",
+                    e);
+        } catch (IllegalStateException e) {
+            throw new ClusterAdmissionException(
+                    HttpStatus.SERVICE_UNAVAILABLE,
+                    "cluster_unavailable",
+                    "OMS cluster client is not connected",
+                    e);
+        }
+        if (result instanceof AdmissionResult.Rejected r) {
+            throw new ClusterAdmissionException(
+                    HttpStatus.UNPROCESSABLE_ENTITY,
+                    "cluster_rejected",
+                    "OMS cluster rejected order: " + r.event().reason());
+        }
+        return result;
+    }
+
+    private AcceptOrderCommand buildAcceptOrderCommand(
+            OmsClusterIngressClient cluster, Order order, String accountIdHash, Instant now) {
+        long quantityScaled;
+        try {
+            quantityScaled = order.quantity().movePointRight(9).longValueExact();
+        } catch (ArithmeticException e) {
+            throw new ClusterAdmissionException(
+                    HttpStatus.BAD_REQUEST,
+                    "quantity_unrepresentable",
+                    "quantity " + order.quantity()
+                            + " cannot be represented at AcceptOrderCommand quantity scale (1e9)",
+                    e);
+        }
+        long limitPriceScaled = 0L;
+        if (order.limitPrice() != null) {
+            try {
+                limitPriceScaled = order.limitPrice().movePointRight(6).longValueExact();
+            } catch (ArithmeticException e) {
+                throw new ClusterAdmissionException(
+                        HttpStatus.BAD_REQUEST,
+                        "limit_price_unrepresentable",
+                        "limitPrice " + order.limitPrice()
+                                + " cannot be represented at AcceptOrderCommand price scale (1e6)",
+                        e);
+            }
+        }
+        byte sideByte = order.side() == Side.BUY ? AcceptOrderCommand.SIDE_BUY : AcceptOrderCommand.SIDE_SELL;
+        byte tifByte = tifByteFromString(order.timeInForce());
+        long correlationId = cluster.nextCorrelationId();
+        return new AcceptOrderCommand(
+                correlationId,
+                order.id(),
+                Math.multiplyExact(now.getEpochSecond(), 1_000_000_000L) + now.getNano(),
+                quantityScaled,
+                limitPriceScaled,
+                order.shardId(),
+                sideByte,
+                tifByte,
+                order.accountId().toString(),
+                order.clientIdempotencyKey(),
+                accountIdHash,
+                order.instrumentSymbol(),
+                order.ledgerBalanceId());
+    }
+
+    private static byte tifByteFromString(String tif) {
+        if (tif == null) {
+            throw new ClusterAdmissionException(
+                    HttpStatus.BAD_REQUEST, "tif_required", "timeInForce is required for cluster admission");
+        }
+        return switch (tif.trim().toUpperCase(java.util.Locale.ROOT)) {
+            case "DAY" -> AcceptOrderCommand.TIF_DAY;
+            case "IOC" -> AcceptOrderCommand.TIF_IOC;
+            case "FOK" -> AcceptOrderCommand.TIF_FOK;
+            case "GTC" -> AcceptOrderCommand.TIF_GTC;
+            default -> throw new ClusterAdmissionException(
+                    HttpStatus.BAD_REQUEST,
+                    "tif_unsupported",
+                    "unsupported timeInForce '" + tif + "'; expected DAY/IOC/FOK/GTC");
+        };
     }
 
     private void maybeVerifyLedgerBalanceBinding(CreateOrderRequest req) {

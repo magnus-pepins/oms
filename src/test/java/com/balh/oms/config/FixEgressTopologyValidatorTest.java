@@ -9,12 +9,14 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class FixEgressTopologyValidatorTest {
 
     @Test
-    void fixEgressProfile_grpcOff_clusterClientOff_ok() {
+    void fixEgressProfile_grpcOff_clusterClientOn_ok() {
+        // Slice 3d invariant: cluster.client.enabled MUST be true on oms-fix-egress so the inbound
+        // FixInboundClusterSink can offer ApplyExecutionReportCommand back to the cluster.
         MockEnvironment env = new MockEnvironment();
         env.setActiveProfiles(OmsProfiles.FIX_EGRESS);
         OmsConfig cfg = new OmsConfig();
         cfg.getGrpc().setEnabled(false);
-        cfg.getCluster().getClient().setEnabled(false);
+        cfg.getCluster().getClient().setEnabled(true);
         assertThatCode(() -> FixEgressTopologyValidator.validateFixEgressTopology(env, cfg))
                 .doesNotThrowAnyException();
     }
@@ -25,22 +27,26 @@ class FixEgressTopologyValidatorTest {
         env.setActiveProfiles(OmsProfiles.FIX_EGRESS);
         OmsConfig cfg = new OmsConfig();
         cfg.getGrpc().setEnabled(true);
-        cfg.getCluster().getClient().setEnabled(false);
+        cfg.getCluster().getClient().setEnabled(true);
         assertThatThrownBy(() -> FixEgressTopologyValidator.validateFixEgressTopology(env, cfg))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("oms.grpc.enabled=false");
     }
 
     @Test
-    void fixEgressProfile_clusterClientEnabled_throws() {
+    void fixEgressProfile_clusterClientDisabled_throws() {
+        // Slice 3d: validator now REQUIRES cluster.client.enabled=true on oms-fix-egress (was
+        // rejected in slices 3a/3b). The flip mirrors the behaviour change in the role: egress now
+        // both reads from the events recording AND writes back via OmsClusterIngressClient on
+        // inbound venue ER.
         MockEnvironment env = new MockEnvironment();
         env.setActiveProfiles(OmsProfiles.FIX_EGRESS);
         OmsConfig cfg = new OmsConfig();
         cfg.getGrpc().setEnabled(false);
-        cfg.getCluster().getClient().setEnabled(true);
+        cfg.getCluster().getClient().setEnabled(false);
         assertThatThrownBy(() -> FixEgressTopologyValidator.validateFixEgressTopology(env, cfg))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("oms.cluster.client.enabled=false");
+                .hasMessageContaining("oms.cluster.client.enabled=true");
     }
 
     @Test

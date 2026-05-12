@@ -6,10 +6,10 @@
 # order-accept HTTP/gRPC (ORDER_ACCEPT_PROFILE excludes oms-fix-egress) and is mutex with every
 # other role profile (TopologyWorkerProfiles + FixEgressTopologyValidator).
 #
-# Slice 3b-2 (current): replay loop + Session.sendToTarget(NewOrderSingle). Cursor advance is
-# post-send (option 1 dedupe: at-least-once at broker; broker rejects on DupClOrdID — see
-# OmsFixEgressService class-level Javadoc for the alternatives). Slice 3d adds inbound ER →
-# ApplyExecutionReportCommand (turns the cluster client back on at that point).
+# Slice 3d (current): outbound NOS via Aeron Archive replay (slice 3b-2) PLUS inbound
+# ExecutionReport / OrderCancelReject translated to ApplyExecutionReportCommand and offered back
+# via OmsClusterIngressClient. The cluster client is now REQUIRED on this JVM
+# (FixEgressTopologyValidator rejects cluster.client.enabled=false on the egress profile).
 #
 # Example: SPRING_PROFILES_ACTIVE=oms-fix-egress
 #
@@ -23,10 +23,18 @@ oms:
     enabled: false
   cluster:
     client:
-      # Slice 3a/3b: FIX-egress reads from the events recording, not via the cluster client.
-      # Slice 3d will flip this to true so the JVM can offer ApplyExecutionReportCommand back
-      # to the cluster on inbound ExecutionReport.
-      enabled: false
+      # Slice 3d: required on this JVM. Inbound FIX ExecutionReport / OrderCancelReject is
+      # translated to ApplyExecutionReportCommand and offered to the cluster via
+      # OmsClusterIngressClient. FixEgressTopologyValidator fails fast if this is false.
+      enabled: ${OMS_FIX_EGRESS_CLUSTER_CLIENT_ENABLED:true}
+      # The cluster client connects to the same media-driver as the egress's Archive replay.
+      # Defaulting to OMS_FIX_EGRESS_AERON_DIR lets the operator point both at the cluster
+      # member's media-driver with one env var; can be overridden when the egress reads from a
+      # local replay-host driver but writes to the cluster's main driver.
+      aeron-directory: ${OMS_FIX_EGRESS_CLUSTER_CLIENT_AERON_DIR:${OMS_FIX_EGRESS_AERON_DIR:}}
+      ingress-endpoints: ${OMS_FIX_EGRESS_CLUSTER_CLIENT_INGRESS_ENDPOINTS:0=localhost:20110}
+      ingress-channel: ${OMS_FIX_EGRESS_CLUSTER_CLIENT_INGRESS_CHANNEL:aeron:udp?endpoint=localhost:0}
+      egress-channel: ${OMS_FIX_EGRESS_CLUSTER_CLIENT_EGRESS_CHANNEL:aeron:udp?endpoint=localhost:0}
     fix-egress:
       enabled: ${OMS_FIX_EGRESS_ENABLED:true}
       # Aeron MediaDriver directory of the cluster member this JVM consumes from. For local

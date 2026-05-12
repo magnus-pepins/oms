@@ -419,6 +419,122 @@ class OmsAdmissionClusteredServiceTest {
     }
 
     @Test
+    void applyExecutionReport_duplicateSenderSeq_isWireLevelDedupe() {
+        // Slice 3d wire-level dedupe: a broker resend of the same MsgSeqNum after a session-level
+        // gap MUST NOT re-fill the order, even if it carries a fresh ExecID. We verify by sending
+        // two commands with the same (senderCompId, msgSeqNum) but different venueExecRef and
+        // different lastQty values; only the first apply takes effect on the order state.
+        UUID orderId = UUID.fromString("00000000-0000-4000-8000-000000000165");
+        deliverCommand(sampleAccept(1L, "acct", "idem", orderId), ANY_TIMESTAMP_NS);
+
+        ApplyExecutionReportCommand first = sampleTradeWithSenderSeq(
+                orderId, /* lastQtyScaled = */ 4_000_000_000L, "EXEC-FIRST", "BROKER_X", 42);
+        ApplyExecutionReportCommand resend = sampleTradeWithSenderSeq(
+                orderId, /* lastQtyScaled = */ 9_000_000_000L, "EXEC-RESEND", "BROKER_X", 42);
+
+        deliverCommand(first, ANY_TIMESTAMP_NS + 1);
+        int eventsAfterFirst = capturedAdmittedEvents.size();
+
+        deliverCommand(resend, ANY_TIMESTAMP_NS + 2);
+
+        assertThat(capturedAdmittedEvents)
+                .as("wire-level dedupe drops the resend before any state mutation; no second event")
+                .hasSize(eventsAfterFirst);
+        OmsAdmissionClusteredService.AdmittedOrder o = service.lookupByOrderId(orderId);
+        assertThat(o.cumQtyScaled())
+                .as("only the first apply contributed to cumQty (4e9), the resend was dropped")
+                .isEqualTo(4_000_000_000L);
+        assertThat(o.version()).isEqualTo(1);
+        assertThat(service.hasAppliedSenderSeq("BROKER_X", 42)).isTrue();
+    }
+
+    @Test
+    void applyExecutionReport_distinctSenderOrSeq_areAppliedIndependently() {
+        // Wire dedupe is keyed on the (senderCompId, msgSeqNum) pair: distinct seq from same
+        // sender, OR same seq from a different sender, both pass through.
+        UUID orderId = UUID.fromString("00000000-0000-4000-8000-000000000166");
+        deliverCommand(sampleAccept(1L, "acct", "idem", orderId), ANY_TIMESTAMP_NS);
+
+        deliverCommand(
+                sampleTradeWithSenderSeq(orderId, 1_000_000_000L, "EXEC-A", "BROKER_X", 1),
+                ANY_TIMESTAMP_NS + 1);
+        deliverCommand(
+                sampleTradeWithSenderSeq(orderId, 2_000_000_000L, "EXEC-B", "BROKER_X", 2),
+                ANY_TIMESTAMP_NS + 2);
+        deliverCommand(
+                sampleTradeWithSenderSeq(orderId, 3_000_000_000L, "EXEC-C", "BROKER_Y", 1),
+                ANY_TIMESTAMP_NS + 3);
+
+        OmsAdmissionClusteredService.AdmittedOrder o = service.lookupByOrderId(orderId);
+        assertThat(o.cumQtyScaled())
+                .as("all three fills counted (no dedupe collision): 1e9 + 2e9 + 3e9")
+                .isEqualTo(6_000_000_000L);
+        assertThat(o.version()).isEqualTo(3);
+        assertThat(service.hasAppliedSenderSeq("BROKER_X", 1)).isTrue();
+        assertThat(service.hasAppliedSenderSeq("BROKER_X", 2)).isTrue();
+        assertThat(service.hasAppliedSenderSeq("BROKER_Y", 1)).isTrue();
+        assertThat(service.hasAppliedSenderSeq("BROKER_Y", 2)).isFalse();
+    }
+
+    @Test
+    void applyExecutionReport_emptySenderCompId_optsOutOfWireDedupe() {
+        // The slice 3c codec tests and any cluster-internal callers pass senderCompId="";
+        // wire-level dedupe MUST NOT engage in that case (the (orderId, venueExecRef) FIX-level
+        // guard is sufficient for those callers). Two trades with different ExecIDs but both
+        // carrying empty senderCompId apply normally.
+        UUID orderId = UUID.fromString("00000000-0000-4000-8000-000000000167");
+        deliverCommand(sampleAccept(1L, "acct", "idem", orderId), ANY_TIMESTAMP_NS);
+
+        deliverCommand(
+                sampleTrade(orderId, 1_000_000_000L, 100_000_000L, "EXEC-X-1"),
+                ANY_TIMESTAMP_NS + 1);
+        deliverCommand(
+                sampleTrade(orderId, 1_000_000_000L, 100_000_000L, "EXEC-X-2"),
+                ANY_TIMESTAMP_NS + 2);
+
+        OmsAdmissionClusteredService.AdmittedOrder o = service.lookupByOrderId(orderId);
+        assertThat(o.cumQtyScaled()).isEqualTo(2_000_000_000L);
+        assertThat(o.version()).isEqualTo(2);
+        // The empty-sender index is never written to.
+        assertThat(service.hasAppliedSenderSeq("", 0)).isFalse();
+    }
+
+    @Test
+    void snapshot_includesSenderSeqIndex_resendAfterRestore_isStillDedupedOnWire() {
+        UUID orderId = UUID.fromString("00000000-0000-4000-8000-000000000168");
+        deliverCommand(sampleAccept(1L, "acct", "idem", orderId), ANY_TIMESTAMP_NS);
+        deliverCommand(
+                sampleTradeWithSenderSeq(orderId, 4_000_000_000L, "EXEC-WIRE-1", "BROKER_W", 7),
+                ANY_TIMESTAMP_NS + 1);
+
+        byte[] snapshotBytes = takeSnapshotBytes(service);
+        OmsAdmissionClusteredService restored = newServiceFromSnapshot(snapshotBytes);
+
+        assertThat(restored.hasAppliedSenderSeq("BROKER_W", 7))
+                .as("wire-dedupe set survives snapshot/restore (slice 3d v3 schema)")
+                .isTrue();
+
+        // Re-deliver the exact (sender, seq) with a fresh ExecID — the (orderId, venueExecRef)
+        // guard would have allowed the second apply, but the (sender, seq) guard catches it.
+        ExclusivePublication restoredEventsPub =
+                (ExclusivePublication) lastAddedExclusivePublication(restored);
+        org.mockito.Mockito.reset(restoredEventsPub);
+        when(restoredEventsPub.offer(any(DirectBuffer.class), anyInt(), anyInt())).thenReturn(1L);
+        deliverCommandTo(
+                restored,
+                sampleTradeWithSenderSeq(orderId, 4_000_000_000L, "EXEC-FRESH-EXECID", "BROKER_W", 7),
+                ANY_TIMESTAMP_NS + 100);
+        org.mockito.Mockito.verify(restoredEventsPub, org.mockito.Mockito.never())
+                .offer(any(DirectBuffer.class), anyInt(), anyInt());
+
+        OmsAdmissionClusteredService.AdmittedOrder o = restored.lookupByOrderId(orderId);
+        assertThat(o.cumQtyScaled())
+                .as("re-delivered ER did not bump cumQty after restore — wire dedupe held")
+                .isEqualTo(4_000_000_000L);
+        assertThat(o.version()).isEqualTo(1);
+    }
+
+    @Test
     void snapshot_includesExecutionRefIndex_andPostFillOrderState() {
         UUID orderId = UUID.fromString("00000000-0000-4000-8000-000000000170");
         deliverCommand(sampleAccept(1L, "acct", "idem", orderId), ANY_TIMESTAMP_NS);
@@ -492,6 +608,32 @@ class OmsAdmissionClusteredServiceTest {
                 "VENUE",
                 venueExecRef,
                 /* senderCompId = */ "",
+                "{}");
+    }
+
+    /**
+     * Slice 3d helper: trade command with the wire-level dedupe key
+     * {@code (senderCompId, msgSeqNum)} populated. Tests that exercise wire dedupe build their
+     * commands through this; tests that opt out (slice 3c-style) keep using {@link #sampleTrade}.
+     */
+    private static ApplyExecutionReportCommand sampleTradeWithSenderSeq(
+            UUID orderId,
+            long lastQtyScaled,
+            String venueExecRef,
+            String senderCompId,
+            int msgSeqNum) {
+        return new ApplyExecutionReportCommand(
+                0L,
+                orderId,
+                lastQtyScaled,
+                /* lastPxScaled = */ 100_000_000L,
+                1L,
+                msgSeqNum,
+                ApplyExecutionReportCommand.EXEC_TYPE_TRADE,
+                (byte) 0,
+                "VENUE",
+                venueExecRef,
+                senderCompId,
                 "{}");
     }
 

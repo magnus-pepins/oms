@@ -14,7 +14,14 @@ import quickfix.UnsupportedMessageType;
 import quickfix.field.MsgType;
 
 /**
- * QuickFIX/J {@link Application} adapter: logon registry + inbound app messages → {@link FixInboundHandler}.
+ * QuickFIX/J {@link Application} adapter: logon registry + inbound app messages →
+ * {@link FixInboundExecutionReportSink}.
+ *
+ * <p>Slice 3d of the Aeron Cluster substrate plan splits the inbound applier path: the
+ * concrete {@link FixInboundExecutionReportSink} bean wired here is either the legacy
+ * {@link FixInboundHandler} (every FIX-routing JVM except {@code oms-fix-egress}) or
+ * {@code FixInboundClusterSink} (egress only). The dispatch logic in {@link #fromApp} is
+ * unchanged.
  */
 @Component
 @ConditionalOnProperty(name = "oms.routing.backend", havingValue = "fix")
@@ -23,15 +30,15 @@ public class OmsFixApplication implements Application {
     private static final Logger log = LoggerFactory.getLogger(OmsFixApplication.class);
 
     private final FixSessionRegistry fixSessionRegistry;
-    private final FixInboundHandler fixInboundHandler;
+    private final FixInboundExecutionReportSink fixInboundSink;
     private final FixMassCancelOnDisconnectService massCancelOnDisconnectService;
 
     public OmsFixApplication(
             FixSessionRegistry fixSessionRegistry,
-            FixInboundHandler fixInboundHandler,
+            FixInboundExecutionReportSink fixInboundSink,
             FixMassCancelOnDisconnectService massCancelOnDisconnectService) {
         this.fixSessionRegistry = fixSessionRegistry;
-        this.fixInboundHandler = fixInboundHandler;
+        this.fixInboundSink = fixInboundSink;
         this.massCancelOnDisconnectService = massCancelOnDisconnectService;
     }
 
@@ -74,9 +81,9 @@ public class OmsFixApplication implements Application {
         String msgType = message.getHeader().getString(MsgType.FIELD);
         try {
             if (MsgType.EXECUTION_REPORT.equals(msgType)) {
-                fixInboundHandler.handleExecutionReport(message);
+                fixInboundSink.handleExecutionReport(message);
             } else if (MsgType.ORDER_CANCEL_REJECT.equals(msgType)) {
-                fixInboundHandler.handleOrderCancelReject(message);
+                fixInboundSink.handleOrderCancelReject(message);
             } else {
                 log.warn("Unsupported FIX app MsgType={} — {}", msgType, message);
                 throw new UnsupportedMessageType();

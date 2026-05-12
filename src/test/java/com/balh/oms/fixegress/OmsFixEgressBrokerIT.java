@@ -105,7 +105,11 @@ class OmsFixEgressBrokerIT extends AbstractPostgresIntegrationTest {
 
         // Order-accept transports off (egress JVM does not run them).
         registry.add("oms.grpc.enabled", () -> "false");
-        registry.add("oms.cluster.client.enabled", () -> "false");
+        // Slice 3d: oms-fix-egress requires a cluster client (FixInboundClusterSink offers
+        // ApplyExecutionReportCommand on inbound venue ER). The parent
+        // AbstractPostgresIntegrationTest wires cluster.client.{aeron-directory,ingress-endpoints}
+        // to the JVM-wide TestAeronClusterSingleton, so flipping enabled=true here picks those up.
+        registry.add("oms.cluster.client.enabled", () -> "true");
 
         // FIX initiator on, pointed at the embedded acceptor on a per-context loopback port.
         registry.add("oms.routing.backend", () -> "fix");

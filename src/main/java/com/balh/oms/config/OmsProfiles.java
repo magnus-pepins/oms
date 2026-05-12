@@ -36,6 +36,17 @@ public final class OmsProfiles {
     public static final String ORDER_ACCEPT_PROFILE =
             "!oms-control-worker & !oms-fix-worker & !oms-postgres-projector & !oms-fix-egress";
 
+    /**
+     * Spring {@code @Profile} expression: JVMs that submit commands through {@code OmsClusterIngressClient}.
+     * Superset of {@link #ORDER_ACCEPT_PROFILE}: ingress JVMs offer {@code AcceptOrderCommand} on the HTTP /
+     * gRPC accept paths, and slice 3d of the Aeron substrate plan adds {@value #FIX_EGRESS} which offers
+     * {@code ApplyExecutionReportCommand} on inbound FIX execution reports. Excludes pure cluster-internal
+     * roles ({@value #CONTROL_WORKER}, {@value #FIX_WORKER}, {@value #POSTGRES_PROJECTOR}) that read state
+     * from the cluster events recording but never offer commands back.
+     */
+    public static final String CLUSTER_CLIENT_PROFILE =
+            "!oms-control-worker & !oms-fix-worker & !oms-postgres-projector";
+
     // ------------------------------------------------------------------------
     // ADR 0001 / topology-aeron-cluster — new role profiles.
     //

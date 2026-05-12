@@ -19,9 +19,15 @@ import org.springframework.stereotype.Component;
  * context.
  *
  * <p>Unlike the projector validator, this role <strong>does</strong> own QuickFIX: {@code oms.routing.backend=fix}
- * and {@code oms.fix.auto-start=true} are both expected. We instead reject {@code oms.grpc.enabled=true} (no order
- * ingress on this JVM) and {@code oms.cluster.client.enabled=true} (egress reads from Archive, not from cluster
- * client; mixing the two opens a second Aeron control channel for no reason).
+ * and {@code oms.fix.auto-start=true} are both expected. We reject {@code oms.grpc.enabled=true} (no order
+ * ingress on this JVM).
+ *
+ * <p><strong>Slice 3d:</strong> {@code oms.cluster.client.enabled=true} is now <em>required</em>: the egress
+ * JVM offers {@link com.balh.oms.cluster.ApplyExecutionReportCommand} back to the cluster on inbound FIX
+ * {@code ExecutionReport} / {@code OrderCancelReject}. The earlier slice (3a/3b) rejected the property to
+ * mark the role's read-only intent on the events recording; that constraint is gone now that the role also
+ * writes back. Misconfigured deployments (cluster-client off) would silently swallow inbound venue traffic,
+ * so we fail fast at startup.
  *
  * <p>Excluded from the {@code test} profile so Spring boot context tests can probe configuration without booting a
  * real cluster connection. Production deployments always carry the real validator.
@@ -54,13 +60,14 @@ public class FixEgressTopologyValidator {
                             + OmsProfiles.FIX_EGRESS
                             + " requires oms.grpc.enabled=false (no OrderIngress on this JVM; gRPC server wiring would fail).");
         }
-        if (omsConfig.getCluster().getClient().isEnabled()) {
+        if (!omsConfig.getCluster().getClient().isEnabled()) {
             throw new IllegalStateException(
                     "Spring profile "
                             + OmsProfiles.FIX_EGRESS
-                            + " requires oms.cluster.client.enabled=false (FIX-egress reads the cluster events recording"
-                            + " via Aeron Archive replay; it does not need an OmsClusterIngressClient until slice 3d adds"
-                            + " ApplyExecutionReportCommand).");
+                            + " requires oms.cluster.client.enabled=true (slice 3d: inbound ExecutionReport /"
+                            + " OrderCancelReject is translated to ApplyExecutionReportCommand and offered to the"
+                            + " cluster via OmsClusterIngressClient; without it the inbound venue traffic would be"
+                            + " silently dropped).");
         }
     }
 }

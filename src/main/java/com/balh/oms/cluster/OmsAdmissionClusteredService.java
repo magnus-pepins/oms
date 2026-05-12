@@ -79,11 +79,17 @@ public class OmsAdmissionClusteredService implements ClusteredService {
      * the cluster's deterministic state machine owns the order lifecycle; trailing
      * {@code (orderId, venueExecRef)} list captures the
      * {@link ApplyExecutionReportCommand} idempotency set so a snapshot recovery never re-applies a
-     * previously-seen execution report. Per ADR 0001 § Discipline (no backwards compat in dev), v1
-     * snapshots are rejected — production is rebuilt from the cluster log on restart, no v1 prod
-     * snapshot exists today.
+     * previously-seen execution report.
+     *
+     * <p>v3 (slice 3d): adds a trailing {@code (senderCompId, msgSeqNum)} dedupe index so a broker
+     * resend of the same FIX {@code MsgSeqNum} after a session gap does not re-apply an ER. The
+     * earlier {@code (orderId, venueExecRef)} guard catches identical {@code ExecID}s; this guard
+     * catches the broker quirk where a resend recycles {@code MsgSeqNum} but reissues a fresh
+     * {@code ExecID}. Per ADR 0001 § Discipline (no backwards compat in dev), v1 / v2 snapshots
+     * are rejected — production is rebuilt from the cluster log on restart, no older prod snapshot
+     * exists today.
      */
-    static final int SNAPSHOT_SCHEMA_VERSION = 2;
+    static final int SNAPSHOT_SCHEMA_VERSION = 3;
 
     /** Initial buffer capacity for command processing. Grown on demand. */
     private static final int INITIAL_BUFFER_CAPACITY = 1024;
@@ -107,6 +113,31 @@ public class OmsAdmissionClusteredService implements ClusteredService {
      * byte-for-byte.
      */
     private final Map<UUID, Set<String>> executionRefIndex = new HashMap<>(INITIAL_INDEX_CAPACITY);
+
+    /**
+     * Per-{@code senderCompId} set of {@code msgSeqNum}s the cluster has already applied an
+     * {@link ApplyExecutionReportCommand} for. This is the FIX wire-level dedupe guard: a broker
+     * may resend a FIX {@code ExecutionReport} with the <em>same</em> {@code MsgSeqNum} after a
+     * session-level reconnect (e.g. session-level retransmit, garbled link followed by resend
+     * request); the {@code (orderId, venueExecRef)} guard catches identical {@code ExecID}s, but
+     * if the broker reissues a fresh {@code ExecID} on the resend, this index is the only thing
+     * keeping a duplicate ER out.
+     *
+     * <p>Slice 3c reserved {@code senderCompId} / {@code msgSeqNum} on the wire of
+     * {@link ApplyExecutionReportCommand}; slice 3d turns the guard on. Empty
+     * {@code senderCompId} (e.g. cluster-internal tests, slice 3c codec tests) opts out — wire
+     * dedupe is FIX-specific, and we do not want to penalise non-FIX callers that legitimately
+     * always pass {@code msgSeqNum=0}.
+     *
+     * <p><strong>Memory:</strong> the set grows monotonically per session. A FIX session that
+     * runs for years could in theory accumulate millions of entries; in practice broker sessions
+     * roll over daily / weekly with a {@code ResetSeqNumFlag=Y} that comes through as a new
+     * {@code senderCompId} epoch (ops convention), so a {@code clear} on a future session-reset
+     * command will compact the index. Slice 3d does not introduce that command; the index is left
+     * unbounded for now and revisited if any FIX session genuinely keeps the same
+     * {@code (senderCompId, msgSeqNum)} space across more than ~1M ERs.
+     */
+    private final Map<String, Set<Integer>> senderSeqIndex = new HashMap<>(INITIAL_INDEX_CAPACITY);
 
     private final ExpandableArrayBuffer egressBuffer = new ExpandableArrayBuffer(INITIAL_BUFFER_CAPACITY);
 
@@ -236,6 +267,32 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                 p += Integer.BYTES + bytes.length;
             }
         }
+        // senderSeqIndex (v3): int senderCount, then per sender { string senderCompId, int seqCount, int[] seqs }.
+        // Empty senders are skipped, same shape as the executionRefIndex above.
+        int senderCountWithSeqs = 0;
+        for (Set<Integer> seqs : senderSeqIndex.values()) {
+            if (seqs != null && !seqs.isEmpty()) {
+                senderCountWithSeqs++;
+            }
+        }
+        buffer.putInt(p, senderCountWithSeqs);
+        p += Integer.BYTES;
+        for (Map.Entry<String, Set<Integer>> e : senderSeqIndex.entrySet()) {
+            Set<Integer> seqs = e.getValue();
+            if (seqs == null || seqs.isEmpty()) {
+                continue;
+            }
+            byte[] senderBytes = e.getKey().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            buffer.putInt(p, senderBytes.length);
+            buffer.putBytes(p + Integer.BYTES, senderBytes);
+            p += Integer.BYTES + senderBytes.length;
+            buffer.putInt(p, seqs.size());
+            p += Integer.BYTES;
+            for (Integer seq : seqs) {
+                buffer.putInt(p, seq);
+                p += Integer.BYTES;
+            }
+        }
         long pos;
         while ((pos = snapshotPublication.offer(buffer, 0, p)) < 0L) {
             // BACK_PRESSURED / NOT_CONNECTED / ADMIN_ACTION — retry.
@@ -341,6 +398,20 @@ public class OmsAdmissionClusteredService implements ClusteredService {
             long clusterTimestampNs, DirectBuffer buffer, int offset, int length) {
         ApplyExecutionReportCommand cmd = ApplyExecutionReportCommand.decode(buffer, offset, length);
 
+        // Wire-level (senderCompId, msgSeqNum) dedupe (slice 3d). Empty senderCompId opts out —
+        // see {@link #senderSeqIndex}. We check this BEFORE looking up the order so a wire-replay
+        // is dropped at the cheapest possible point and unknown-order behaviour is reserved for
+        // genuine misroutes (the alternative — order-lookup-then-wire-dedupe — would cause a
+        // resend after the order is already terminal to take the "isTerminal" branch instead of
+        // the "wire dedupe" branch, hiding the broker quirk from operators).
+        Set<Integer> seenSeqs = null;
+        if (!cmd.senderCompId().isEmpty()) {
+            seenSeqs = senderSeqIndex.get(cmd.senderCompId());
+            if (seenSeqs != null && seenSeqs.contains(cmd.msgSeqNum())) {
+                return;
+            }
+        }
+
         AdmittedOrder order = orderIndex.get(cmd.orderId());
         if (order == null) {
             // Unknown order — silently ignored. See class-doc on apply-path discipline.
@@ -415,6 +486,17 @@ public class OmsAdmissionClusteredService implements ClusteredService {
             executionRefIndex.put(cmd.orderId(), seen);
         }
         seen.add(cmd.venueExecRef());
+
+        // Wire-level dedupe entry — only when the FIX caller supplied a senderCompId. Cluster-
+        // internal callers (slice 3c codec tests, future cluster-driven ERs) keep senderCompId
+        // empty and opt out of the wire dedupe.
+        if (!cmd.senderCompId().isEmpty()) {
+            if (seenSeqs == null) {
+                seenSeqs = new HashSet<>(4);
+                senderSeqIndex.put(cmd.senderCompId(), seenSeqs);
+            }
+            seenSeqs.add(cmd.msgSeqNum());
+        }
 
         emitExecutionApplied(cmd, mutated, clusterTimestampNs);
     }
@@ -516,6 +598,20 @@ public class OmsAdmissionClusteredService implements ClusteredService {
         return refs != null && refs.contains(venueExecRef);
     }
 
+    /**
+     * Visible for tests. Returns whether the cluster has already accepted an
+     * {@link ApplyExecutionReportCommand} with the given {@code (senderCompId, msgSeqNum)} pair —
+     * mirrors the wire-level dedupe guard inside {@link #applyExecutionReport}. Returns
+     * {@code false} for empty {@code senderCompId} (wire-dedupe opt-out).
+     */
+    public boolean hasAppliedSenderSeq(String senderCompId, int msgSeqNum) {
+        if (senderCompId == null || senderCompId.isEmpty()) {
+            return false;
+        }
+        Set<Integer> seqs = senderSeqIndex.get(senderCompId);
+        return seqs != null && seqs.contains(msgSeqNum);
+    }
+
     private final class SnapshotLoader implements io.aeron.logbuffer.FragmentHandler {
         @Override
         public void onFragment(DirectBuffer buffer, int offset, int length, Header header) {
@@ -556,6 +652,24 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                     p += Integer.BYTES + refLen;
                 }
                 executionRefIndex.put(new UUID(msb, lsb), refs);
+            }
+            // senderSeqIndex (v3).
+            int senderCountWithSeqs = buffer.getInt(p);
+            p += Integer.BYTES;
+            for (int i = 0; i < senderCountWithSeqs; i++) {
+                int senderLen = buffer.getInt(p);
+                byte[] senderBytes = new byte[senderLen];
+                buffer.getBytes(p + Integer.BYTES, senderBytes);
+                String sender = new String(senderBytes, java.nio.charset.StandardCharsets.UTF_8);
+                p += Integer.BYTES + senderLen;
+                int seqCount = buffer.getInt(p);
+                p += Integer.BYTES;
+                Set<Integer> seqs = new HashSet<>(seqCount);
+                for (int j = 0; j < seqCount; j++) {
+                    seqs.add(buffer.getInt(p));
+                    p += Integer.BYTES;
+                }
+                senderSeqIndex.put(sender, seqs);
             }
         }
     }

@@ -64,8 +64,19 @@ import java.util.concurrent.locks.ReentrantLock;
  * itself never observes wall time or random ids — that is what makes replay
  * deterministic across leader / follower / cold start.
  */
+/**
+ * <h2>Profile gating</h2>
+ *
+ * <p>Slice 3d of the Aeron Cluster substrate plan extended the consumer set: the
+ * {@code oms-fix-egress} JVM also offers commands now ({@link ApplyExecutionReportCommand} on
+ * inbound venue ER). The {@code @Profile} therefore pins to
+ * {@link OmsProfiles#CLUSTER_CLIENT_PROFILE} (ingress JVMs <em>and</em> {@code oms-fix-egress}),
+ * and {@code @ConditionalOnProperty(oms.cluster.client.enabled=true)} provides the per-deployment
+ * opt-in. Worker / projector profiles never load this bean even if their config flips the
+ * property on, because they fall outside the profile expression.
+ */
 @Component
-@Profile(OmsProfiles.ORDER_ACCEPT_PROFILE)
+@Profile(OmsProfiles.CLUSTER_CLIENT_PROFILE)
 @ConditionalOnProperty(prefix = "oms.cluster.client", name = "enabled", havingValue = "true")
 public class OmsClusterIngressClient {
 
@@ -261,6 +272,65 @@ public class OmsClusterIngressClient {
                     client = null;
                 }
             }
+        } finally {
+            clientLock.unlock();
+        }
+    }
+
+    /**
+     * Submits an {@link ApplyExecutionReportCommand} to the cluster as a fire-and-forget offer:
+     * the call returns once Aeron has accepted the command into the log (deterministic order
+     * preserved across all consumers — projector, future analytics, leader handover replay), but
+     * does <em>not</em> wait for an {@link ExecutionAppliedEvent} reply. The cluster service emits
+     * that event on the side publication recorded by Aeron Archive; consumers (projector, future
+     * downstream analytics) read it from the recording, not as session egress, so a per-call wait
+     * here would only mean blocking on a poll loop that produces nothing for this thread.
+     *
+     * <p>Used by {@code FixInboundClusterSink} on the {@code oms-fix-egress} JVM (slice 3d): the
+     * inbound FIX {@code ExecutionReport} / {@code OrderCancelReject} hot path translates to this
+     * command and offers it without holding a session-bound waiter. {@code (orderId, venueExecRef)}
+     * dedupe still happens inside the cluster service ({@link OmsAdmissionClusteredService}); the
+     * caller does not need to know whether this was a duplicate.
+     *
+     * <h3>Back-pressure handling</h3>
+     *
+     * <p>Same shape as {@link #submitAcceptOrder}: the {@link AeronCluster#offer offer} can return
+     * negative on {@code BACK_PRESSURED} / {@code NOT_CONNECTED} / {@code ADMIN_ACTION}, and we
+     * park {@link OmsConfig.Cluster.Client#getOfferBackpressureParkNanos()} ns and retry until the
+     * deadline. On positive return we leave; we do not poll egress for this command.
+     *
+     * @throws IllegalStateException if not connected (see {@link #connect()}).
+     * @throws TimeoutException if back-pressure persists past {@code timeout}.
+     * @throws InterruptedException if the calling thread is interrupted while parked.
+     */
+    public void submitApplyExecutionReport(ApplyExecutionReportCommand cmd, Duration timeout)
+            throws TimeoutException, InterruptedException {
+        Objects.requireNonNull(cmd, "cmd");
+        Objects.requireNonNull(timeout, "timeout");
+
+        ExpandableArrayBuffer buffer = new ExpandableArrayBuffer(OmsClusterWireFormat.MAX_COMMAND_BYTES);
+        int written = cmd.encode(buffer, 0);
+
+        long deadlineNanos = System.nanoTime() + timeout.toNanos();
+
+        clientLock.lockInterruptibly();
+        try {
+            AeronCluster active = client;
+            if (active == null) {
+                throw new IllegalStateException("OMS cluster client is not connected");
+            }
+            long offerResult;
+            do {
+                offerResult = active.offer(buffer, 0, written);
+                if (offerResult < 0L) {
+                    if (System.nanoTime() > deadlineNanos) {
+                        throw new TimeoutException(
+                                "cluster offer back-pressure timeout for ApplyExecutionReportCommand orderId="
+                                        + cmd.orderId() + " venueExecRef=" + cmd.venueExecRef());
+                    }
+                    parkOrThrow(config.getOfferBackpressureParkNanos());
+                }
+            } while (offerResult < 0L);
         } finally {
             clientLock.unlock();
         }

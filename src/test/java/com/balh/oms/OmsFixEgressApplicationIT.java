@@ -17,13 +17,16 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * Phase 3 slice 3a: {@value OmsProfiles#FIX_EGRESS} JVM boots without order-accept beans, without
- * {@link OmsClusterIngressClient} (slice 3a/3b — turns back on at slice 3d for inbound ER), and
+ * Phase 3 slice 3a/3d: {@value OmsProfiles#FIX_EGRESS} JVM boots without order-accept beans and
  * without {@link OmsPostgresProjector} (mutually exclusive role profiles), but exposes the
  * {@link OmsFixEgressService} skeleton bean.
  *
- * <p>Slice 3b will extend this IT to cover the actual Aeron Archive replay path; today it only
- * validates that the new profile produces a healthy Spring context with the expected bean topology.
+ * <p><strong>Slice 3d:</strong> {@link OmsClusterIngressClient} now <em>does</em> load on this
+ * JVM — the egress translates inbound venue ER into {@link com.balh.oms.cluster.ApplyExecutionReportCommand}
+ * and offers it back to the cluster. {@link com.balh.oms.config.FixEgressTopologyValidator} fails
+ * fast if {@code oms.cluster.client.enabled=false} on this profile in production. The validator
+ * itself is excluded from the {@code test} profile so this IT can probe bean topology without
+ * booting a real cluster connection.
  */
 @ActiveProfiles({"test", OmsProfiles.FIX_EGRESS})
 class OmsFixEgressApplicationIT extends AbstractPostgresIntegrationTest {
@@ -31,15 +34,16 @@ class OmsFixEgressApplicationIT extends AbstractPostgresIntegrationTest {
     @DynamicPropertySource
     static void fixEgressProperties(DynamicPropertyRegistry registry) {
         // Slice 3a: skeleton bean is gated on this property; flip it on for the IT so the bean
-        // loads. Slice 3b will replace this with full Aeron config (mirrors
+        // loads. Slice 3b replaced this with full Aeron config (mirrors
         // application-oms-postgres-projector.yaml's slice 2b additions).
         registry.add("oms.cluster.fix-egress.enabled", () -> "true");
         // FIX-egress JVM does not run order-ingress; gRPC must be off.
         registry.add("oms.grpc.enabled", () -> "false");
-        // Slice 3a/3b: cluster client is off (egress reads from Archive, not the cluster client).
-        // Slice 3d will flip this back on for ApplyExecutionReportCommand.
-        registry.add("oms.cluster.client.enabled", () -> "false");
-        // FIX-egress owns QuickFIX but slice 3a does not boot it (no broker connection in the IT).
+        // Slice 3d: cluster client is now required on oms-fix-egress (inbound ER -> cluster).
+        // AbstractPostgresIntegrationTest already sets enabled=true and points it at the test
+        // cluster; we re-state it here so the contract is explicit at the role-test level.
+        registry.add("oms.cluster.client.enabled", () -> "true");
+        // FIX-egress owns QuickFIX but this IT does not boot it (no broker connection here).
         registry.add("oms.fix.auto-start", () -> "false");
         registry.add("oms.routing.backend", () -> "noop");
     }
@@ -48,12 +52,14 @@ class OmsFixEgressApplicationIT extends AbstractPostgresIntegrationTest {
 
     @Autowired OmsFixEgressService fixEgressService;
 
+    @Autowired OmsClusterIngressClient clusterIngressClient;
+
     @Test
-    void contextLoads_withFixEgressBeanAndWithoutOrderIngressOrProjector() {
+    void contextLoads_withFixEgressBeanAndClusterClient_butWithoutOrderIngressOrProjector() {
         assertThat(fixEgressService).isNotNull();
+        // Slice 3d: cluster client is part of the egress topology now.
+        assertThat(clusterIngressClient).isNotNull();
         assertThatThrownBy(() -> applicationContext.getBean(OrderIngressService.class))
-                .isInstanceOf(NoSuchBeanDefinitionException.class);
-        assertThatThrownBy(() -> applicationContext.getBean(OmsClusterIngressClient.class))
                 .isInstanceOf(NoSuchBeanDefinitionException.class);
         assertThatThrownBy(() -> applicationContext.getBean(OmsPostgresProjector.class))
                 .isInstanceOf(NoSuchBeanDefinitionException.class);

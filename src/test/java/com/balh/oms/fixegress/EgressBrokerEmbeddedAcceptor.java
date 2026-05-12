@@ -38,12 +38,27 @@ public final class EgressBrokerEmbeddedAcceptor implements SmartLifecycle {
     private final int port;
     private final Path fileStorePath;
     private final Application application;
+    private final String senderCompId;
+    private final String targetCompId;
     private volatile SocketAcceptor acceptor;
 
     public EgressBrokerEmbeddedAcceptor(int port, Path fileStorePath, Application application) {
+        this(port, fileStorePath, application, "ACCEPTOR", "INITIATOR");
+    }
+
+    /**
+     * Slice 3d overload: round-trip IT runs in the same JVM as the slice-3b-2 IT; QuickFIX/J's
+     * session registry is JVM-global and rejects two sessions with the same {@code SessionID},
+     * so the round-trip IT picks distinct CompIDs ({@code ACCEPTOR_RT} / {@code INITIATOR_RT}) and
+     * the acceptor's session settings must match.
+     */
+    public EgressBrokerEmbeddedAcceptor(
+            int port, Path fileStorePath, Application application, String senderCompId, String targetCompId) {
         this.port = port;
         this.fileStorePath = fileStorePath;
         this.application = application;
+        this.senderCompId = senderCompId;
+        this.targetCompId = targetCompId;
     }
 
     @Override
@@ -58,7 +73,7 @@ public final class EgressBrokerEmbeddedAcceptor implements SmartLifecycle {
         }
         try {
             Files.createDirectories(fileStorePath);
-            SessionSettings settings = acceptorSettings(port, fileStorePath);
+            SessionSettings settings = acceptorSettings(port, fileStorePath, senderCompId, targetCompId);
             MessageStoreFactory storeFactory = new FileStoreFactory(settings);
             LogFactory logFactory = new ScreenLogFactory(settings);
             acceptor = new SocketAcceptor(application, storeFactory, settings, logFactory, new DefaultMessageFactory());
@@ -91,7 +106,8 @@ public final class EgressBrokerEmbeddedAcceptor implements SmartLifecycle {
         return running.get();
     }
 
-    private static SessionSettings acceptorSettings(int port, Path fileStorePath) throws ConfigError {
+    private static SessionSettings acceptorSettings(
+            int port, Path fileStorePath, String senderCompId, String targetCompId) throws ConfigError {
         SessionSettings s = new SessionSettings();
         s.setString("ConnectionType", "acceptor");
         s.setString("StartTime", "00:00:00");
@@ -103,11 +119,11 @@ public final class EgressBrokerEmbeddedAcceptor implements SmartLifecycle {
         s.setString("SocketAcceptPort", String.valueOf(port));
         SessionID sid = new SessionID(
                 new BeginString("FIX.4.4"),
-                new SenderCompID("ACCEPTOR"),
-                new TargetCompID("INITIATOR"));
+                new SenderCompID(senderCompId),
+                new TargetCompID(targetCompId));
         s.setString(sid, "BeginString", "FIX.4.4");
-        s.setString(sid, "SenderCompID", "ACCEPTOR");
-        s.setString(sid, "TargetCompID", "INITIATOR");
+        s.setString(sid, "SenderCompID", senderCompId);
+        s.setString(sid, "TargetCompID", targetCompId);
         return s;
     }
 }

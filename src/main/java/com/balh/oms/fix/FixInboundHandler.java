@@ -1,23 +1,30 @@
 package com.balh.oms.fix;
 
 import com.balh.oms.config.OmsConfig;
+import com.balh.oms.config.OmsProfiles;
 import com.balh.oms.domain.RejectCode;
 import com.balh.oms.returnpath.ExecutionReportApplier;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.context.annotation.Profile;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import quickfix.FieldNotFound;
 import quickfix.Message;
 
 /**
- * Applies inbound venue traffic on a managed transaction boundary (slice 4).
+ * Legacy applier path: applies inbound venue traffic on a managed transaction boundary by
+ * routing through {@link ExecutionReportApplier} (Postgres-side state machine). Loaded on every
+ * FIX-routing JVM <em>except</em> {@value OmsProfiles#FIX_EGRESS}: slice 3d's
+ * {@code FixInboundClusterSink} replaces this path on the egress JVM (cluster service becomes the
+ * source of truth, the Postgres applier becomes the projector at slice 3e).
  */
 @Service
 @ConditionalOnProperty(name = "oms.routing.backend", havingValue = "fix")
-public class FixInboundHandler {
+@Profile("!" + OmsProfiles.FIX_EGRESS)
+public class FixInboundHandler implements FixInboundExecutionReportSink {
 
     private static final Logger log = LoggerFactory.getLogger(FixInboundHandler.class);
 

@@ -230,22 +230,370 @@ class OmsAdmissionClusteredServiceTest {
 
         byte[] snapshotBytes = takeSnapshotBytes(service);
 
-        OmsAdmissionClusteredService restored = new OmsAdmissionClusteredService();
-        Cluster mockCluster2 = mock(Cluster.class);
-        when(mockCluster2.role()).thenReturn(Cluster.Role.FOLLOWER);
-        Aeron aeronMock2 = mock(Aeron.class);
-        when(aeronMock2.addExclusivePublication(
-                        OmsClusterWireFormat.EVENTS_CHANNEL, OmsClusterWireFormat.EVENTS_STREAM_ID))
-                .thenReturn(mock(ExclusivePublication.class));
-        when(mockCluster2.aeron()).thenReturn(aeronMock2);
-        Image snapshotImage = mockSnapshotImage(snapshotBytes);
-        restored.onStart(mockCluster2, snapshotImage);
+        OmsAdmissionClusteredService restored = newServiceFromSnapshot(snapshotBytes);
 
         assertThat(restored.admittedOrderCount()).isEqualTo(2);
         assertThat(restored.lookupByIdempotency("acctA", "idem-A")).isNotNull();
         assertThat(restored.lookupByIdempotency("acctB", "idem-B")).isNotNull();
         assertThat(restored.lookupByOrderId(orderA)).isNotNull();
         assertThat(restored.lookupByOrderId(orderB)).isNotNull();
+    }
+
+    // ------------------------------------------------------------------------
+    // Slice 3c: ApplyExecutionReportCommand state machine
+    // ------------------------------------------------------------------------
+
+    @Test
+    void admittedOrder_startsAtVersion0_workingStatus_zeroCumQty() {
+        UUID orderId = UUID.fromString("00000000-0000-4000-8000-000000000100");
+        deliverCommand(sampleAccept(1L, "acct", "idem", orderId), ANY_TIMESTAMP_NS);
+
+        OmsAdmissionClusteredService.AdmittedOrder o = service.lookupByOrderId(orderId);
+        assertThat(o.version()).isZero();
+        assertThat(o.statusCode()).isEqualTo(OmsAdmissionClusteredService.STATUS_WORKING);
+        assertThat(o.cumQtyScaled()).isZero();
+    }
+
+    @Test
+    void applyTrade_partialFill_emitsExecutionAppliedEvent_andUpdatesState() {
+        UUID orderId = UUID.fromString("00000000-0000-4000-8000-000000000110");
+        deliverCommand(sampleAccept(1L, "acct", "idem", orderId), ANY_TIMESTAMP_NS);
+        // Discard the OrderAdmitted event so we can assert on ExecutionApplied alone.
+        capturedAdmittedEvents.clear();
+
+        ApplyExecutionReportCommand cmd = sampleTrade(
+                orderId,
+                /* lastQtyScaled = */ 4_000_000_000L,
+                /* lastPxScaled = */ 100_000_000L,
+                "EXEC-PARTIAL-1");
+        deliverCommand(cmd, ANY_TIMESTAMP_NS + 1);
+
+        assertThat(capturedAdmittedEvents).hasSize(1);
+        ExecutionAppliedEvent ev = ExecutionAppliedEvent.decode(
+                new UnsafeBuffer(capturedAdmittedEvents.get(0)), 0, capturedAdmittedEvents.get(0).length);
+        assertThat(ev.orderId()).isEqualTo(orderId);
+        assertThat(ev.execTypeCode()).isEqualTo(ApplyExecutionReportCommand.EXEC_TYPE_TRADE);
+        assertThat(ev.newStatusCode()).isEqualTo(OmsAdmissionClusteredService.STATUS_PARTIALLY_FILLED);
+        assertThat(ev.newCumQtyScaled()).isEqualTo(4_000_000_000L);
+        assertThat(ev.newVersion()).isEqualTo(1);
+        assertThat(ev.lastQtyScaled()).isEqualTo(4_000_000_000L);
+        assertThat(ev.lastPxScaled()).isEqualTo(100_000_000L);
+        assertThat(ev.venueExecRef()).isEqualTo("EXEC-PARTIAL-1");
+        assertThat(ev.accountId()).isEqualTo("acct");
+        assertThat(ev.appliedAtNanos()).isEqualTo(ANY_TIMESTAMP_NS + 1);
+
+        OmsAdmissionClusteredService.AdmittedOrder o = service.lookupByOrderId(orderId);
+        assertThat(o.statusCode()).isEqualTo(OmsAdmissionClusteredService.STATUS_PARTIALLY_FILLED);
+        assertThat(o.cumQtyScaled()).isEqualTo(4_000_000_000L);
+        assertThat(o.version()).isEqualTo(1);
+    }
+
+    @Test
+    void applyTrade_fullFillFromPartial_transitionsToFilled() {
+        UUID orderId = UUID.fromString("00000000-0000-4000-8000-000000000111");
+        deliverCommand(sampleAccept(1L, "acct", "idem", orderId), ANY_TIMESTAMP_NS);
+        deliverCommand(
+                sampleTrade(orderId, /* lastQtyScaled = */ 4_000_000_000L, 100_000_000L, "EXEC-1"),
+                ANY_TIMESTAMP_NS + 1);
+        deliverCommand(
+                sampleTrade(orderId, /* lastQtyScaled = */ 6_000_000_000L, 100_000_000L, "EXEC-2"),
+                ANY_TIMESTAMP_NS + 2);
+
+        OmsAdmissionClusteredService.AdmittedOrder o = service.lookupByOrderId(orderId);
+        assertThat(o.statusCode()).isEqualTo(OmsAdmissionClusteredService.STATUS_FILLED);
+        assertThat(o.cumQtyScaled()).isEqualTo(10_000_000_000L);
+        assertThat(o.version()).isEqualTo(2);
+        // Three events total: one OrderAdmitted, two ExecutionApplied.
+        assertThat(capturedAdmittedEvents).hasSize(3);
+    }
+
+    @Test
+    void applyTrade_overFill_isSilentlyDropped() {
+        UUID orderId = UUID.fromString("00000000-0000-4000-8000-000000000112");
+        deliverCommand(sampleAccept(1L, "acct", "idem", orderId), ANY_TIMESTAMP_NS);
+        capturedAdmittedEvents.clear();
+
+        // Order quantity is 10_000_000_000 (sampleAccept default); a 12B fill exceeds the order qty
+        // and must not mutate state or emit an event.
+        deliverCommand(
+                sampleTrade(orderId, /* lastQtyScaled = */ 12_000_000_000L, 100_000_000L, "EXEC-OVER"),
+                ANY_TIMESTAMP_NS + 1);
+
+        assertThat(capturedAdmittedEvents).isEmpty();
+        OmsAdmissionClusteredService.AdmittedOrder o = service.lookupByOrderId(orderId);
+        assertThat(o.statusCode()).isEqualTo(OmsAdmissionClusteredService.STATUS_WORKING);
+        assertThat(o.version()).isZero();
+        assertThat(o.cumQtyScaled()).isZero();
+    }
+
+    @Test
+    void applyCancel_workingOrder_transitionsToCancelled() {
+        UUID orderId = UUID.fromString("00000000-0000-4000-8000-000000000120");
+        deliverCommand(sampleAccept(1L, "acct", "idem", orderId), ANY_TIMESTAMP_NS);
+        capturedAdmittedEvents.clear();
+
+        deliverCommand(sampleCancel(orderId, "EXEC-CXL-1"), ANY_TIMESTAMP_NS + 1);
+
+        assertThat(capturedAdmittedEvents).hasSize(1);
+        ExecutionAppliedEvent ev = ExecutionAppliedEvent.decode(
+                new UnsafeBuffer(capturedAdmittedEvents.get(0)), 0, capturedAdmittedEvents.get(0).length);
+        assertThat(ev.execTypeCode()).isEqualTo(ApplyExecutionReportCommand.EXEC_TYPE_CANCEL);
+        assertThat(ev.newStatusCode()).isEqualTo(OmsAdmissionClusteredService.STATUS_CANCELLED);
+        assertThat(ev.newCumQtyScaled()).isZero();
+        assertThat(ev.newVersion()).isEqualTo(1);
+    }
+
+    @Test
+    void applyVenueReject_workingOrder_transitionsToRejected_withRejectCode() {
+        UUID orderId = UUID.fromString("00000000-0000-4000-8000-000000000130");
+        deliverCommand(sampleAccept(1L, "acct", "idem", orderId), ANY_TIMESTAMP_NS);
+        capturedAdmittedEvents.clear();
+
+        deliverCommand(
+                new ApplyExecutionReportCommand(
+                        2L, orderId, 0L, 0L, ANY_TIMESTAMP_NS,
+                        /* msgSeqNum = */ 0,
+                        ApplyExecutionReportCommand.EXEC_TYPE_VENUE_REJECT,
+                        /* rejectCodeOrZero = */ (byte) 17,
+                        "VENUE", "EXEC-RJX-1", "", "{}"),
+                ANY_TIMESTAMP_NS + 1);
+
+        assertThat(capturedAdmittedEvents).hasSize(1);
+        ExecutionAppliedEvent ev = ExecutionAppliedEvent.decode(
+                new UnsafeBuffer(capturedAdmittedEvents.get(0)), 0, capturedAdmittedEvents.get(0).length);
+        assertThat(ev.execTypeCode()).isEqualTo(ApplyExecutionReportCommand.EXEC_TYPE_VENUE_REJECT);
+        assertThat(ev.newStatusCode()).isEqualTo(OmsAdmissionClusteredService.STATUS_REJECTED);
+        assertThat(ev.rejectCodeOrZero()).isEqualTo((byte) 17);
+    }
+
+    @Test
+    void applyExecutionReport_duplicateVenueExecRef_isIdempotent() {
+        UUID orderId = UUID.fromString("00000000-0000-4000-8000-000000000140");
+        deliverCommand(sampleAccept(1L, "acct", "idem", orderId), ANY_TIMESTAMP_NS);
+        capturedAdmittedEvents.clear();
+
+        ApplyExecutionReportCommand first = sampleTrade(orderId, 4_000_000_000L, 100_000_000L, "EXEC-DUP");
+        deliverCommand(first, ANY_TIMESTAMP_NS + 1);
+        assertThat(capturedAdmittedEvents).hasSize(1);
+
+        // Same (orderId, venueExecRef) — must be a no-op (no event, no version bump, no cum-qty
+        // double-application).
+        deliverCommand(first, ANY_TIMESTAMP_NS + 2);
+        assertThat(capturedAdmittedEvents).hasSize(1);
+
+        OmsAdmissionClusteredService.AdmittedOrder o = service.lookupByOrderId(orderId);
+        assertThat(o.cumQtyScaled()).isEqualTo(4_000_000_000L);
+        assertThat(o.version()).isEqualTo(1);
+        assertThat(service.hasAppliedExecutionRef(orderId, "EXEC-DUP")).isTrue();
+    }
+
+    @Test
+    void applyExecutionReport_terminalOrder_isSilentlyIgnored() {
+        UUID orderId = UUID.fromString("00000000-0000-4000-8000-000000000150");
+        deliverCommand(sampleAccept(1L, "acct", "idem", orderId), ANY_TIMESTAMP_NS);
+        deliverCommand(sampleCancel(orderId, "EXEC-CXL-FIRST"), ANY_TIMESTAMP_NS + 1);
+        capturedAdmittedEvents.clear();
+
+        // Order is already CANCELLED — late venue trade ER must be a no-op and not flap state back
+        // to a live status.
+        deliverCommand(
+                sampleTrade(orderId, 1_000_000_000L, 100_000_000L, "EXEC-LATE-TRADE"),
+                ANY_TIMESTAMP_NS + 2);
+
+        assertThat(capturedAdmittedEvents).isEmpty();
+        OmsAdmissionClusteredService.AdmittedOrder o = service.lookupByOrderId(orderId);
+        assertThat(o.statusCode()).isEqualTo(OmsAdmissionClusteredService.STATUS_CANCELLED);
+        assertThat(o.version()).isEqualTo(1);
+    }
+
+    @Test
+    void applyExecutionReport_unknownOrder_isSilentlyIgnored() {
+        UUID unknownOrderId = UUID.fromString("00000000-0000-4000-8000-000000000160");
+
+        deliverCommand(
+                sampleTrade(unknownOrderId, 1_000_000_000L, 100_000_000L, "EXEC-UNKNOWN"),
+                ANY_TIMESTAMP_NS);
+
+        assertThat(capturedAdmittedEvents).isEmpty();
+        assertThat(service.lookupByOrderId(unknownOrderId)).isNull();
+    }
+
+    @Test
+    void snapshot_includesExecutionRefIndex_andPostFillOrderState() {
+        UUID orderId = UUID.fromString("00000000-0000-4000-8000-000000000170");
+        deliverCommand(sampleAccept(1L, "acct", "idem", orderId), ANY_TIMESTAMP_NS);
+        deliverCommand(sampleTrade(orderId, 4_000_000_000L, 100_000_000L, "EXEC-S-1"), ANY_TIMESTAMP_NS + 1);
+        deliverCommand(sampleTrade(orderId, 3_000_000_000L, 100_000_000L, "EXEC-S-2"), ANY_TIMESTAMP_NS + 2);
+
+        byte[] snapshotBytes = takeSnapshotBytes(service);
+        OmsAdmissionClusteredService restored = newServiceFromSnapshot(snapshotBytes);
+
+        // Order state survived the snapshot byte-for-byte.
+        OmsAdmissionClusteredService.AdmittedOrder o = restored.lookupByOrderId(orderId);
+        assertThat(o.statusCode()).isEqualTo(OmsAdmissionClusteredService.STATUS_PARTIALLY_FILLED);
+        assertThat(o.cumQtyScaled()).isEqualTo(7_000_000_000L);
+        assertThat(o.version()).isEqualTo(2);
+
+        // Execution-ref dedupe set survived: re-delivering EXEC-S-1 / EXEC-S-2 against the
+        // restored service must be a no-op. Drive the re-delivery through onSessionMessage on the
+        // restored instance and assert no new events emitted.
+        ExclusivePublication restoredEventsPub =
+                (ExclusivePublication) lastAddedExclusivePublication(restored);
+        org.mockito.Mockito.reset(restoredEventsPub);
+        when(restoredEventsPub.offer(any(DirectBuffer.class), anyInt(), anyInt())).thenReturn(1L);
+        deliverCommandTo(restored, sampleTrade(orderId, 4_000_000_000L, 100_000_000L, "EXEC-S-1"),
+                ANY_TIMESTAMP_NS + 100);
+        deliverCommandTo(restored, sampleTrade(orderId, 3_000_000_000L, 100_000_000L, "EXEC-S-2"),
+                ANY_TIMESTAMP_NS + 101);
+        org.mockito.Mockito.verify(restoredEventsPub, org.mockito.Mockito.never())
+                .offer(any(DirectBuffer.class), anyInt(), anyInt());
+
+        // And confirm the helper is consistent with hasAppliedExecutionRef.
+        assertThat(restored.hasAppliedExecutionRef(orderId, "EXEC-S-1")).isTrue();
+        assertThat(restored.hasAppliedExecutionRef(orderId, "EXEC-S-2")).isTrue();
+        assertThat(restored.hasAppliedExecutionRef(orderId, "NEVER-SEEN")).isFalse();
+    }
+
+    @Test
+    void replay_reproducesIdenticalEventsStream_byteForByte() {
+        // Determinism guard: a replay over the same command sequence must produce the same bytes
+        // on the events publication. This protects against any non-deterministic field (timestamp,
+        // version, ordering) sneaking into ExecutionAppliedEvent or OrderAdmittedEvent.
+        UUID orderId = UUID.fromString("00000000-0000-4000-8000-000000000180");
+        deliverCommand(sampleAccept(1L, "acct", "idem", orderId), ANY_TIMESTAMP_NS);
+        deliverCommand(sampleTrade(orderId, 4_000_000_000L, 100_000_000L, "EXEC-R-1"), ANY_TIMESTAMP_NS + 1);
+        deliverCommand(sampleCancel(orderId, "EXEC-R-CXL"), ANY_TIMESTAMP_NS + 2);
+        java.util.List<byte[]> firstRunEvents = new java.util.ArrayList<>(capturedAdmittedEvents);
+
+        ReplayHarness replay = new ReplayHarness();
+        replay.deliverCommand(sampleAccept(1L, "acct", "idem", orderId), ANY_TIMESTAMP_NS);
+        replay.deliverCommand(sampleTrade(orderId, 4_000_000_000L, 100_000_000L, "EXEC-R-1"), ANY_TIMESTAMP_NS + 1);
+        replay.deliverCommand(sampleCancel(orderId, "EXEC-R-CXL"), ANY_TIMESTAMP_NS + 2);
+
+        assertThat(replay.captured).hasSameSizeAs(firstRunEvents);
+        for (int i = 0; i < firstRunEvents.size(); i++) {
+            assertThat(replay.captured.get(i))
+                    .as("event %d byte-equal across runs", i)
+                    .isEqualTo(firstRunEvents.get(i));
+        }
+    }
+
+    private static ApplyExecutionReportCommand sampleTrade(
+            UUID orderId, long lastQtyScaled, long lastPxScaled, String venueExecRef) {
+        return new ApplyExecutionReportCommand(
+                /* correlationId = */ 0L,
+                orderId,
+                lastQtyScaled,
+                lastPxScaled,
+                /* venueTsNanos = */ 1L,
+                /* msgSeqNum = */ 0,
+                ApplyExecutionReportCommand.EXEC_TYPE_TRADE,
+                /* rejectCodeOrZero = */ (byte) 0,
+                "VENUE",
+                venueExecRef,
+                /* senderCompId = */ "",
+                "{}");
+    }
+
+    private static ApplyExecutionReportCommand sampleCancel(UUID orderId, String venueExecRef) {
+        return new ApplyExecutionReportCommand(
+                0L, orderId, 0L, 0L, 1L, 0,
+                ApplyExecutionReportCommand.EXEC_TYPE_CANCEL,
+                (byte) 0, "VENUE", venueExecRef, "", "{}");
+    }
+
+    /** Build a fresh service primed from {@code snapshotBytes}. Uses a stub events publication. */
+    private static OmsAdmissionClusteredService newServiceFromSnapshot(byte[] snapshotBytes) {
+        OmsAdmissionClusteredService restored = new OmsAdmissionClusteredService();
+        Cluster mockCluster = mock(Cluster.class);
+        when(mockCluster.role()).thenReturn(Cluster.Role.FOLLOWER);
+        Aeron aeronMock = mock(Aeron.class);
+        ExclusivePublication eventsPub = mock(ExclusivePublication.class);
+        when(eventsPub.offer(any(DirectBuffer.class), anyInt(), anyInt())).thenReturn(1L);
+        when(aeronMock.addExclusivePublication(
+                        OmsClusterWireFormat.EVENTS_CHANNEL, OmsClusterWireFormat.EVENTS_STREAM_ID))
+                .thenReturn(eventsPub);
+        when(mockCluster.aeron()).thenReturn(aeronMock);
+        Image snapshotImage = mockSnapshotImage(snapshotBytes);
+        restored.onStart(mockCluster, snapshotImage);
+        return restored;
+    }
+
+    /** Reflectively pull the events publication mock the restored service captured at onStart. */
+    private static ExclusivePublication lastAddedExclusivePublication(OmsAdmissionClusteredService svc) {
+        try {
+            java.lang.reflect.Field f = OmsAdmissionClusteredService.class.getDeclaredField("eventsPublication");
+            f.setAccessible(true);
+            return (ExclusivePublication) f.get(svc);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    /** Encode + deliver any command via {@code onSessionMessage} on an arbitrary service instance. */
+    private void deliverCommandTo(
+            OmsAdmissionClusteredService svc, AcceptOrderCommand cmd, long clusterTimestampNs) {
+        ExpandableArrayBuffer buffer = new ExpandableArrayBuffer(COMMAND_BUFFER_BYTES);
+        int written = cmd.encode(buffer, 0);
+        svc.onSessionMessage(session, clusterTimestampNs, buffer, 0, written, /* header = */ null);
+    }
+
+    private void deliverCommandTo(
+            OmsAdmissionClusteredService svc, ApplyExecutionReportCommand cmd, long clusterTimestampNs) {
+        ExpandableArrayBuffer buffer = new ExpandableArrayBuffer(COMMAND_BUFFER_BYTES);
+        int written = cmd.encode(buffer, 0);
+        svc.onSessionMessage(session, clusterTimestampNs, buffer, 0, written, /* header = */ null);
+    }
+
+    private void deliverCommand(ApplyExecutionReportCommand cmd, long clusterTimestampNs) {
+        ExpandableArrayBuffer buffer = new ExpandableArrayBuffer(COMMAND_BUFFER_BYTES);
+        int written = cmd.encode(buffer, 0);
+        service.onSessionMessage(session, clusterTimestampNs, buffer, 0, written, /* header = */ null);
+    }
+
+    /**
+     * A second standalone service instance for replay-equivalence assertions. Built fresh so it has
+     * no leftover state from {@link #service}. Captures every events-publication offer into
+     * {@link #captured} for byte-equal comparison.
+     */
+    private final class ReplayHarness {
+        final java.util.List<byte[]> captured = new java.util.ArrayList<>();
+        private final OmsAdmissionClusteredService svc = new OmsAdmissionClusteredService();
+        private final ClientSession sessionMock = mock(ClientSession.class);
+
+        ReplayHarness() {
+            when(sessionMock.offer(any(DirectBuffer.class), anyInt(), anyInt())).thenReturn(1L);
+            ExclusivePublication eventsPub = mock(ExclusivePublication.class);
+            when(eventsPub.offer(any(DirectBuffer.class), anyInt(), anyInt())).thenAnswer(inv -> {
+                DirectBuffer buf = inv.getArgument(0);
+                int off = inv.getArgument(1);
+                int len = inv.getArgument(2);
+                byte[] copy = new byte[len];
+                buf.getBytes(off, copy);
+                captured.add(copy);
+                return 1L;
+            });
+            Aeron aeronMock = mock(Aeron.class);
+            when(aeronMock.addExclusivePublication(
+                            OmsClusterWireFormat.EVENTS_CHANNEL, OmsClusterWireFormat.EVENTS_STREAM_ID))
+                    .thenReturn(eventsPub);
+            Cluster clusterMock = mock(Cluster.class);
+            when(clusterMock.role()).thenReturn(Cluster.Role.LEADER);
+            when(clusterMock.aeron()).thenReturn(aeronMock);
+            svc.onStart(clusterMock, /* snapshotImage = */ null);
+        }
+
+        void deliverCommand(AcceptOrderCommand cmd, long clusterTimestampNs) {
+            ExpandableArrayBuffer buffer = new ExpandableArrayBuffer(COMMAND_BUFFER_BYTES);
+            int written = cmd.encode(buffer, 0);
+            svc.onSessionMessage(sessionMock, clusterTimestampNs, buffer, 0, written, /* header = */ null);
+        }
+
+        void deliverCommand(ApplyExecutionReportCommand cmd, long clusterTimestampNs) {
+            ExpandableArrayBuffer buffer = new ExpandableArrayBuffer(COMMAND_BUFFER_BYTES);
+            int written = cmd.encode(buffer, 0);
+            svc.onSessionMessage(sessionMock, clusterTimestampNs, buffer, 0, written, /* header = */ null);
+        }
     }
 
     // ------------------------------------------------------------------------

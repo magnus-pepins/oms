@@ -60,6 +60,13 @@ public final class OmsClusterWireFormat {
     /** {@link AcceptOrderCommand}. */
     public static final int TYPE_ID_ACCEPT_ORDER = 1;
 
+    /**
+     * {@link ApplyExecutionReportCommand}. Phase 3 of
+     * {@code system-documentation/plans/oms-aeron-cluster-substrate.md}: the cluster service is the
+     * source of truth for execution-report state transitions (fill / partial / cancel / venue reject).
+     */
+    public static final int TYPE_ID_APPLY_EXECUTION_REPORT = 2;
+
     // ---- Event type IDs (1000..1999) ----
 
     /** {@link OrderAcceptedEvent}. */
@@ -70,6 +77,14 @@ public final class OmsClusterWireFormat {
 
     /** {@link OrderAdmittedEvent}. Phase 2 projection event. */
     public static final int TYPE_ID_ORDER_ADMITTED = 1002;
+
+    /**
+     * {@link ExecutionAppliedEvent}. Phase 3 projection event emitted to the side publication after the
+     * cluster's deterministic state machine applies an {@link ApplyExecutionReportCommand}. Slice 3e folds
+     * {@code ExecutionReportApplier}'s Postgres effects (executions / orders / control_decisions) into the
+     * projector by consuming this event.
+     */
+    public static final int TYPE_ID_EXECUTION_APPLIED = 1003;
 
     // ---- Cluster→projector event stream (Phase 2) ----
 

@@ -16,7 +16,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -68,8 +70,20 @@ public class OmsAdmissionClusteredService implements ClusteredService {
     /** Magic number identifying an OMS admission snapshot fragment ("OMSA" in ASCII). */
     static final int SNAPSHOT_MAGIC = 0x4F4D5341;
 
-    /** Snapshot schema version. Bumped only on incompatible state changes. */
-    static final int SNAPSHOT_SCHEMA_VERSION = 1;
+    /**
+     * Snapshot schema version. Bumped only on incompatible state changes.
+     *
+     * <p>v1 (slice 2): orderIndex + idempotencyIndex, no per-order status / cumQty / executionRefs.
+     *
+     * <p>v2 (slice 3c): {@link AdmittedOrder} gains {@code statusCode} and {@code cumQtyScaled} so
+     * the cluster's deterministic state machine owns the order lifecycle; trailing
+     * {@code (orderId, venueExecRef)} list captures the
+     * {@link ApplyExecutionReportCommand} idempotency set so a snapshot recovery never re-applies a
+     * previously-seen execution report. Per ADR 0001 § Discipline (no backwards compat in dev), v1
+     * snapshots are rejected — production is rebuilt from the cluster log on restart, no v1 prod
+     * snapshot exists today.
+     */
+    static final int SNAPSHOT_SCHEMA_VERSION = 2;
 
     /** Initial buffer capacity for command processing. Grown on demand. */
     private static final int INITIAL_BUFFER_CAPACITY = 1024;
@@ -80,6 +94,19 @@ public class OmsAdmissionClusteredService implements ClusteredService {
     private final Map<IdempotencyKey, AdmittedOrder> idempotencyIndex =
             new HashMap<>(INITIAL_INDEX_CAPACITY);
     private final Map<UUID, AdmittedOrder> orderIndex = new HashMap<>(INITIAL_INDEX_CAPACITY);
+
+    /**
+     * Per-order set of {@code venueExecRef}s the cluster has already applied an
+     * {@link ApplyExecutionReportCommand} for. Provides cluster-level
+     * {@code (orderId, venueExecRef)} idempotency so a duplicate ER from QuickFIX (e.g. broker
+     * resend) does not double-emit {@link ExecutionAppliedEvent}.
+     *
+     * <p>The set lives <em>only</em> in the state machine — Postgres no longer dedupes ERs in
+     * {@code ExecutionReportApplier} as of slice 3e. Snapshot encode/decode round-trips this index
+     * along with {@link #orderIndex}; a leader-handover or replay reconstructs the same set
+     * byte-for-byte.
+     */
+    private final Map<UUID, Set<String>> executionRefIndex = new HashMap<>(INITIAL_INDEX_CAPACITY);
 
     private final ExpandableArrayBuffer egressBuffer = new ExpandableArrayBuffer(INITIAL_BUFFER_CAPACITY);
 
@@ -153,6 +180,8 @@ public class OmsAdmissionClusteredService implements ClusteredService {
         switch (typeId) {
             case OmsClusterWireFormat.TYPE_ID_ACCEPT_ORDER ->
                     applyAcceptOrder(session, timestamp, buffer, offset, length);
+            case OmsClusterWireFormat.TYPE_ID_APPLY_EXECUTION_REPORT ->
+                    applyExecutionReport(timestamp, buffer, offset, length);
             default -> {
                 // Unknown command — silently ignored. A real reject would require an event;
                 // adding an UnknownCommandRejected event is a Phase 2 concern.
@@ -177,6 +206,35 @@ public class OmsAdmissionClusteredService implements ClusteredService {
         p += Integer.BYTES;
         for (AdmittedOrder o : orderIndex.values()) {
             p = o.encode(buffer, p);
+        }
+        // executionRefIndex: int orderCount, then per order { msb, lsb, int refCount, string[] refs }.
+        // Empty entries are skipped (an order with no applied ERs has nothing to dedupe), so the
+        // count is over orders-with-at-least-one-ref.
+        int orderCountWithRefs = 0;
+        for (Set<String> refs : executionRefIndex.values()) {
+            if (refs != null && !refs.isEmpty()) {
+                orderCountWithRefs++;
+            }
+        }
+        buffer.putInt(p, orderCountWithRefs);
+        p += Integer.BYTES;
+        for (Map.Entry<UUID, Set<String>> e : executionRefIndex.entrySet()) {
+            Set<String> refs = e.getValue();
+            if (refs == null || refs.isEmpty()) {
+                continue;
+            }
+            buffer.putLong(p, e.getKey().getMostSignificantBits());
+            p += Long.BYTES;
+            buffer.putLong(p, e.getKey().getLeastSignificantBits());
+            p += Long.BYTES;
+            buffer.putInt(p, refs.size());
+            p += Integer.BYTES;
+            for (String ref : refs) {
+                byte[] bytes = ref.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                buffer.putInt(p, bytes.length);
+                buffer.putBytes(p + Integer.BYTES, bytes);
+                p += Integer.BYTES + bytes.length;
+            }
         }
         long pos;
         while ((pos = snapshotPublication.offer(buffer, 0, p)) < 0L) {
@@ -241,12 +299,154 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                 cmd.timeInForceCode(),
                 cmd.ledgerBalanceIdOrNull(),
                 /* version = */ 0,
-                clusterTimestampNs);
+                clusterTimestampNs,
+                /* statusCode = */ STATUS_WORKING,
+                /* cumQtyScaled = */ 0L);
         idempotencyIndex.put(key, admitted);
         orderIndex.put(admitted.orderId(), admitted);
 
         emitAdmitted(cmd, clusterTimestampNs, admitted.version());
         emitAccepted(session, cmd.correlationId(), admitted, clusterTimestampNs, false);
+    }
+
+    /**
+     * Apply path for venue execution reports (slice 3c). Determines the post-apply order state from
+     * {@code cmd.execTypeCode}, mutates {@link #orderIndex} / {@link #idempotencyIndex} /
+     * {@link #executionRefIndex} in place, and emits one {@link ExecutionAppliedEvent} on the side
+     * publication. No external I/O; no logging at INFO+ on the hot path.
+     *
+     * <p><strong>Determinism:</strong> the cluster timestamp is supplied by the cluster, not read
+     * from the wall clock. Branch decisions look only at {@code cmd} and the in-memory state — both
+     * of which are reconstructed identically on every member and on replay.
+     *
+     * <p><strong>Idempotency:</strong> if {@code (orderId, venueExecRef)} is already in
+     * {@link #executionRefIndex}, the apply is a no-op (no event emission, no state mutation, no
+     * version bump). Re-delivery of the same ER over the cluster log therefore advances the log
+     * position without producing a second projection-side row, which is what makes "duplicate ERs
+     * from broker resends are silently absorbed" a cluster-side guarantee rather than a projector
+     * concern.
+     *
+     * <p><strong>Unknown order:</strong> arriving with an {@code orderId} the cluster has never
+     * admitted is silently ignored today. The legacy {@code ExecutionReportApplier} returned
+     * {@code UNKNOWN_ORDER} as a status code; we will fold a deterministic
+     * {@code OrderRejectedEvent} for unknown-order ERs into a follow-up slice if operations finds it
+     * useful to surface them as projection rows. Slice 3c keeps the apply path side-effect-free for
+     * unknown orders so a misrouted ER cannot wedge the projector.
+     *
+     * <p><strong>Invalid state:</strong> arriving for an already-terminal order
+     * ({@code FILLED / CANCELLED / REJECTED}) is also a silent no-op. Same reasoning: we do not
+     * want a late venue retry to flap a terminal order back to a live state.
+     */
+    private void applyExecutionReport(
+            long clusterTimestampNs, DirectBuffer buffer, int offset, int length) {
+        ApplyExecutionReportCommand cmd = ApplyExecutionReportCommand.decode(buffer, offset, length);
+
+        AdmittedOrder order = orderIndex.get(cmd.orderId());
+        if (order == null) {
+            // Unknown order — silently ignored. See class-doc on apply-path discipline.
+            return;
+        }
+        if (isTerminal(order.statusCode())) {
+            // Already-terminal order — no-op. Late venue retries cannot flap a terminal order back
+            // to a live status; the projector's {@code orders} CAS would reject anyway, but the
+            // cluster has the same rule so the dedup set stays in sync with reality.
+            return;
+        }
+
+        Set<String> seen = executionRefIndex.get(cmd.orderId());
+        if (seen != null && seen.contains(cmd.venueExecRef())) {
+            // Cluster-level (orderId, venueExecRef) dedupe. The first apply already emitted the
+            // event; the projector wrote the executions row from the recording. No second emission
+            // means no second projector row.
+            return;
+        }
+
+        long newCumQty = order.cumQtyScaled();
+        byte newStatus = order.statusCode();
+        switch (cmd.execTypeCode()) {
+            case ApplyExecutionReportCommand.EXEC_TYPE_TRADE -> {
+                if (cmd.lastQtyScaled() <= 0L) {
+                    // Trade ER with no quantity is malformed; ignore. Legacy applier never accepted
+                    // a zero-quantity fill either; we mirror that here without a state mutation.
+                    return;
+                }
+                long candidateCum = order.cumQtyScaled() + cmd.lastQtyScaled();
+                if (candidateCum > order.quantityScaled()) {
+                    // Fill overflow. {@code ExecutionReportApplier} threw IllegalStateException here
+                    // and rolled back the TX; in the cluster we cannot throw without halting the
+                    // state machine, so we silently drop the malformed fill and keep the prior
+                    // state. Operations alerting on missing fills surfaces this; recovery is a
+                    // venue-side ops concern, not a cluster correctness concern.
+                    return;
+                }
+                newCumQty = candidateCum;
+                newStatus = (newCumQty >= order.quantityScaled()) ? STATUS_FILLED : STATUS_PARTIALLY_FILLED;
+            }
+            case ApplyExecutionReportCommand.EXEC_TYPE_CANCEL -> newStatus = STATUS_CANCELLED;
+            case ApplyExecutionReportCommand.EXEC_TYPE_VENUE_REJECT -> newStatus = STATUS_REJECTED;
+            default -> {
+                // Unknown execTypeCode — silently dropped, same shape as unknown command typeIds in
+                // {@link #onSessionMessage}.
+                return;
+            }
+        }
+
+        int newVersion = order.version() + 1;
+        AdmittedOrder mutated = new AdmittedOrder(
+                order.orderId(),
+                order.accountId(),
+                order.clientIdempotencyKey(),
+                order.accountIdHash(),
+                order.instrumentSymbol(),
+                order.side(),
+                order.quantityScaled(),
+                order.limitPriceScaledOrZero(),
+                order.timeInForceCode(),
+                order.ledgerBalanceIdOrNull(),
+                newVersion,
+                order.acceptedAtNanos(),
+                newStatus,
+                newCumQty);
+        orderIndex.put(mutated.orderId(), mutated);
+        idempotencyIndex.put(
+                new IdempotencyKey(mutated.accountId(), mutated.clientIdempotencyKey()), mutated);
+        if (seen == null) {
+            seen = new HashSet<>(4);
+            executionRefIndex.put(cmd.orderId(), seen);
+        }
+        seen.add(cmd.venueExecRef());
+
+        emitExecutionApplied(cmd, mutated, clusterTimestampNs);
+    }
+
+    private void emitExecutionApplied(
+            ApplyExecutionReportCommand cmd, AdmittedOrder mutated, long appliedAtNanos) {
+        if (eventsPublication == null) {
+            return;
+        }
+        ExecutionAppliedEvent ev = new ExecutionAppliedEvent(
+                mutated.orderId(),
+                mutated.cumQtyScaled(),
+                cmd.lastQtyScaled(),
+                cmd.lastPxScaled(),
+                cmd.venueTsNanos(),
+                appliedAtNanos,
+                mutated.version(),
+                cmd.execTypeCode(),
+                mutated.statusCode(),
+                cmd.rejectCodeOrZero(),
+                mutated.accountId(),
+                cmd.venueId(),
+                cmd.venueExecRef(),
+                cmd.rawEnvelopeJson());
+        int len = ev.encode(eventsBuffer, 0);
+        long pos;
+        while ((pos = eventsPublication.offer(eventsBuffer, 0, len)) < 0L) {
+            if (pos == io.aeron.Publication.CLOSED || pos == io.aeron.Publication.MAX_POSITION_EXCEEDED) {
+                throw new IllegalStateException("eventsPublication offer closed; pos=" + pos);
+            }
+            Thread.yield();
+        }
     }
 
     private void emitAdmitted(AcceptOrderCommand cmd, long acceptedAtNanos, int version) {
@@ -306,6 +506,16 @@ public class OmsAdmissionClusteredService implements ClusteredService {
         return orderIndex.size();
     }
 
+    /**
+     * Visible for tests. Returns whether the cluster has already applied an
+     * {@link ApplyExecutionReportCommand} for {@code (orderId, venueExecRef)}; mirrors the dedupe
+     * guard inside {@link #applyExecutionReport}. Returns {@code false} for unknown orders.
+     */
+    public boolean hasAppliedExecutionRef(UUID orderId, String venueExecRef) {
+        Set<String> refs = executionRefIndex.get(orderId);
+        return refs != null && refs.contains(venueExecRef);
+    }
+
     private final class SnapshotLoader implements io.aeron.logbuffer.FragmentHandler {
         @Override
         public void onFragment(DirectBuffer buffer, int offset, int length, Header header) {
@@ -328,11 +538,58 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                 idempotencyIndex.put(new IdempotencyKey(o.accountId(), o.clientIdempotencyKey()), o);
                 orderIndex.put(o.orderId(), o);
             }
+            int orderCountWithRefs = buffer.getInt(p);
+            p += Integer.BYTES;
+            for (int i = 0; i < orderCountWithRefs; i++) {
+                long msb = buffer.getLong(p);
+                p += Long.BYTES;
+                long lsb = buffer.getLong(p);
+                p += Long.BYTES;
+                int refCount = buffer.getInt(p);
+                p += Integer.BYTES;
+                Set<String> refs = new HashSet<>(refCount);
+                for (int j = 0; j < refCount; j++) {
+                    int refLen = buffer.getInt(p);
+                    byte[] bytes = new byte[refLen];
+                    buffer.getBytes(p + Integer.BYTES, bytes);
+                    refs.add(new String(bytes, java.nio.charset.StandardCharsets.UTF_8));
+                    p += Integer.BYTES + refLen;
+                }
+                executionRefIndex.put(new UUID(msb, lsb), refs);
+            }
         }
     }
 
     /** Composite key for the idempotency index. Records auto-generate equals/hashCode. */
     record IdempotencyKey(String accountId, String clientIdempotencyKey) {}
+
+    // ---- Order status wire codes (slice 3c) ------------------------------------------------------
+    // Kept in sync with {@code com.balh.oms.domain.OrderStatus} ordinal values so the projector can
+    // round-trip {@link ExecutionAppliedEvent#newStatusCode()} into {@code OrderStatus} via
+    // {@code OrderStatus.values()[newStatusCode]}. Adding a new status to the enum requires bumping
+    // the snapshot schema version and reviewing every call site that compares against these
+    // constants.
+
+    /** Equivalent to {@code OrderStatus.WORKING.ordinal()}. */
+    static final byte STATUS_WORKING = 2;
+
+    /** Equivalent to {@code OrderStatus.PARTIALLY_FILLED.ordinal()}. */
+    static final byte STATUS_PARTIALLY_FILLED = 3;
+
+    /** Equivalent to {@code OrderStatus.FILLED.ordinal()}. */
+    static final byte STATUS_FILLED = 4;
+
+    /** Equivalent to {@code OrderStatus.CANCELLED.ordinal()}. */
+    static final byte STATUS_CANCELLED = 5;
+
+    /** Equivalent to {@code OrderStatus.REJECTED.ordinal()}. */
+    static final byte STATUS_REJECTED = 6;
+
+    private static boolean isTerminal(byte statusCode) {
+        return statusCode == STATUS_FILLED
+                || statusCode == STATUS_CANCELLED
+                || statusCode == STATUS_REJECTED;
+    }
 
     /**
      * Snapshot of an admitted order held in the state machine.
@@ -353,7 +610,9 @@ public class OmsAdmissionClusteredService implements ClusteredService {
             byte timeInForceCode,
             String ledgerBalanceIdOrNull,
             int version,
-            long acceptedAtNanos) {
+            long acceptedAtNanos,
+            byte statusCode,
+            long cumQtyScaled) {
 
         int encode(MutableDirectBuffer buffer, int offset) {
             int p = offset;
@@ -369,10 +628,12 @@ public class OmsAdmissionClusteredService implements ClusteredService {
             p += Long.BYTES;
             buffer.putLong(p, limitPriceScaledOrZero);
             p += Long.BYTES;
+            buffer.putLong(p, cumQtyScaled);
+            p += Long.BYTES;
             buffer.putByte(p++, side);
             buffer.putByte(p++, timeInForceCode);
+            buffer.putByte(p++, statusCode);
             buffer.putByte(p++, (byte) (ledgerBalanceIdOrNull == null ? 0 : 1));
-            buffer.putByte(p++, (byte) 0);
             p = writeString(buffer, p, accountId);
             p = writeString(buffer, p, clientIdempotencyKey);
             p = writeString(buffer, p, accountIdHash);
@@ -397,10 +658,12 @@ public class OmsAdmissionClusteredService implements ClusteredService {
             p += Long.BYTES;
             long limitPriceScaledOrZero = buffer.getLong(p);
             p += Long.BYTES;
+            long cumQtyScaled = buffer.getLong(p);
+            p += Long.BYTES;
             byte side = buffer.getByte(p++);
             byte timeInForceCode = buffer.getByte(p++);
+            byte statusCode = buffer.getByte(p++);
             byte hasLedgerBalanceId = buffer.getByte(p++);
-            p++;
             String accountId = readString(buffer, p);
             p += stringByteLen(accountId);
             String clientIdempotencyKey = readString(buffer, p);
@@ -425,13 +688,18 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                     timeInForceCode,
                     ledgerBalanceId,
                     version,
-                    acceptedAtNanos);
+                    acceptedAtNanos,
+                    statusCode,
+                    cumQtyScaled);
         }
 
         int encodedLength() {
             int p = 0;
-            p += Long.BYTES * 5;
+            // 6 longs (msb, lsb, acceptedAtNanos, quantityScaled, limitPriceScaledOrZero, cumQtyScaled).
+            p += Long.BYTES * 6;
+            // 1 int (version).
             p += Integer.BYTES;
+            // 4 bytes (side, tif, statusCode, hasLedgerBalanceId).
             p += 4;
             p += stringByteLen(accountId);
             p += stringByteLen(clientIdempotencyKey);

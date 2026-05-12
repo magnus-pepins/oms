@@ -1720,6 +1720,14 @@ public class OmsConfig {
             private static final long DEFAULT_OFFER_BACKPRESSURE_PARK_NANOS = 100_000L;
             /** Park between egress poll passes when waiting for our correlation id. */
             private static final long DEFAULT_EGRESS_POLL_PARK_NANOS = 100_000L;
+            /**
+             * Default heartbeat interval. Aeron Cluster {@code ConsensusModule} default
+             * {@code sessionTimeoutNs} is 5s; we keep the session warm well below that to
+             * survive idle periods between {@code submitAcceptOrder} calls (e.g. a quiet
+             * trading night, a stalled producer, or a Spring context that loaded the bean
+             * but hasn't sent a command yet).
+             */
+            private static final long DEFAULT_HEARTBEAT_INTERVAL_MS = 1_000L;
 
             private boolean enabled = false;
             private String aeronDirectory = "";
@@ -1731,6 +1739,7 @@ public class OmsConfig {
             private long connectTimeoutMs = DEFAULT_CONNECT_TIMEOUT_MS;
             private long offerBackpressureParkNanos = DEFAULT_OFFER_BACKPRESSURE_PARK_NANOS;
             private long egressPollParkNanos = DEFAULT_EGRESS_POLL_PARK_NANOS;
+            private long heartbeatIntervalMs = DEFAULT_HEARTBEAT_INTERVAL_MS;
 
             public boolean isEnabled() { return enabled; }
             public void setEnabled(boolean enabled) { this.enabled = enabled; }
@@ -1787,6 +1796,11 @@ public class OmsConfig {
             public long getEgressPollParkNanos() { return egressPollParkNanos; }
             public void setEgressPollParkNanos(long egressPollParkNanos) {
                 this.egressPollParkNanos = Math.max(1_000L, egressPollParkNanos);
+            }
+
+            public long getHeartbeatIntervalMs() { return heartbeatIntervalMs; }
+            public void setHeartbeatIntervalMs(long heartbeatIntervalMs) {
+                this.heartbeatIntervalMs = Math.max(50L, heartbeatIntervalMs);
             }
         }
     }

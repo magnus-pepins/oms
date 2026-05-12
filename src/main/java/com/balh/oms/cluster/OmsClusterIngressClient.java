@@ -1,6 +1,7 @@
 package com.balh.oms.cluster;
 
 import com.balh.oms.config.OmsConfig;
+import com.balh.oms.config.OmsProfiles;
 import io.aeron.cluster.client.AeronCluster;
 import io.aeron.cluster.client.EgressListener;
 import io.aeron.cluster.codecs.EventCode;
@@ -14,6 +15,7 @@ import org.agrona.ExpandableArrayBuffer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.context.annotation.Profile;
 import org.springframework.stereotype.Component;
 
 import java.time.Duration;
@@ -24,27 +26,35 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Spring-managed Aeron Cluster client used by the HTTP / gRPC ingress JVM to
  * submit admission commands to the OMS cluster and await the deterministic
  * response.
  *
- * <p>This is the Phase 1a artifact of the Aeron Cluster substrate plan
+ * <p>Phase 1a artifact of the Aeron Cluster substrate plan
  * ({@code system-documentation/plans/oms-aeron-cluster-substrate.md} and
- * {@code oms/docs/adr/0001-aeron-cluster-substrate.md}). Only the cluster
- * client connection and synchronous {@code submitAcceptOrder} are wired here;
- * Phase 1b replaces the Chronicle path inside {@link com.balh.oms.ingress.OrderIngressService}
- * by calling this bean.
+ * {@code oms/docs/adr/0001-aeron-cluster-substrate.md}). Phase 1b wires it into
+ * {@link com.balh.oms.ingress.OrderIngressService}; Phase 1c added the
+ * background {@linkplain #heartbeatLoop() heartbeat thread} so cluster sessions
+ * survive idle periods between submits (Aeron's default
+ * {@code ConsensusModule.sessionTimeoutNs} is 5s — without keep-alives a quiet
+ * accept channel for &gt;5s would yank the session and the next submit would
+ * fail with {@code cluster_unavailable}).
  *
- * <h2>Threading model (Phase 1a)</h2>
+ * <h2>Threading model</h2>
  *
- * Aeron's {@link AeronCluster} is thread-confined: {@code offer} and {@code pollEgress}
- * must not be called concurrently. We satisfy this by serializing every
- * client-touching method on a single intrinsic lock. At expected OMS volumes
- * (low thousands of orders / second) the per-call latency is dominated by Raft
- * commit and projector lag, not by lock contention; Phase 4 introduces a
- * dedicated agent thread with a queue if a benchmark shows the lock matters.
+ * Aeron's {@link AeronCluster} is thread-confined: {@code offer},
+ * {@code pollEgress}, and {@code sendKeepAlive} must not be called concurrently.
+ * Two threads touch the client: the calling thread inside
+ * {@link #submitAcceptOrder(AcceptOrderCommand, Duration)} and the daemon
+ * heartbeat thread. They serialize on {@link #clientLock} (a
+ * {@link ReentrantLock}). The heartbeat thread uses
+ * {@link ReentrantLock#tryLock(long, TimeUnit) tryLock} so it does not stall
+ * when a slow submit holds the lock — that submit's own
+ * {@code pollEgress}/{@code sendKeepAlive} loop keeps the session alive
+ * during its critical section.
  *
  * <h2>Determinism (per ADR 0001 §Discipline)</h2>
  *
@@ -55,6 +65,7 @@ import java.util.concurrent.locks.LockSupport;
  * deterministic across leader / follower / cold start.
  */
 @Component
+@Profile(OmsProfiles.ORDER_ACCEPT_PROFILE)
 @ConditionalOnProperty(prefix = "oms.cluster.client", name = "enabled", havingValue = "true")
 public class OmsClusterIngressClient {
 
@@ -79,6 +90,16 @@ public class OmsClusterIngressClient {
         }
     };
 
+    /**
+     * Max time the heartbeat thread spends trying to acquire {@link #clientLock} per pass before
+     * skipping that tick. Bounded so that a slow submit can't choke the heartbeat indefinitely; the
+     * submit's own {@code pollEgress} keeps the session alive while it holds the lock.
+     */
+    private static final long HEARTBEAT_LOCK_TRY_NANOS = 1_000_000L;
+
+    /** {@link Thread#join(long)} budget when stopping the heartbeat thread on close. */
+    private static final long HEARTBEAT_JOIN_MS = 2_000L;
+
     private final OmsConfig.Cluster.Client config;
     private final AtomicLong correlationIds = new AtomicLong(1);
 
@@ -89,7 +110,7 @@ public class OmsClusterIngressClient {
      */
     private final Map<Long, AdmissionResult> received = new HashMap<>();
 
-    private final Object clientLock = new Object();
+    private final ReentrantLock clientLock = new ReentrantLock();
 
     private final EgressListener egressListener = new EgressListener() {
         @Override
@@ -140,6 +161,8 @@ public class OmsClusterIngressClient {
     };
 
     private volatile AeronCluster client;
+    private volatile Thread heartbeatThread;
+    private volatile boolean closing;
 
     public OmsClusterIngressClient(OmsConfig config) {
         this.config = Objects.requireNonNull(config, "config").getCluster().getClient();
@@ -163,11 +186,14 @@ public class OmsClusterIngressClient {
      * Connects to the cluster using {@link AeronCluster#connect(AeronCluster.Context)}.
      * Retries (Aeron's own internal retry inside {@code connect}) within
      * {@link OmsConfig.Cluster.Client#getConnectTimeoutMs()}. Idempotent — a
-     * second call after a successful connect is a no-op.
+     * second call after a successful connect is a no-op. Starts the
+     * {@linkplain #heartbeatLoop() heartbeat thread} on the first successful
+     * connect.
      */
     @PostConstruct
     public void connect() {
-        synchronized (clientLock) {
+        clientLock.lock();
+        try {
             if (client != null) {
                 return;
             }
@@ -194,6 +220,7 @@ public class OmsClusterIngressClient {
                             "OMS cluster client connected: aeronDir={} ingressEndpoints={}",
                             aeronDirectory,
                             config.getIngressEndpoints());
+                    startHeartbeatLocked();
                     return;
                 } catch (RuntimeException e) {
                     lastFailure = e;
@@ -204,13 +231,27 @@ public class OmsClusterIngressClient {
                     "OMS cluster client failed to connect within "
                             + config.getConnectTimeoutMs() + "ms",
                     lastFailure);
+        } finally {
+            clientLock.unlock();
         }
     }
 
     /** Closes the underlying {@link AeronCluster}. Idempotent. */
     @PreDestroy
     public void close() {
-        synchronized (clientLock) {
+        closing = true;
+        Thread t = heartbeatThread;
+        heartbeatThread = null;
+        if (t != null) {
+            t.interrupt();
+            try {
+                t.join(HEARTBEAT_JOIN_MS);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        clientLock.lock();
+        try {
             if (client != null) {
                 try {
                     client.close();
@@ -220,6 +261,8 @@ public class OmsClusterIngressClient {
                     client = null;
                 }
             }
+        } finally {
+            clientLock.unlock();
         }
     }
 
@@ -243,7 +286,8 @@ public class OmsClusterIngressClient {
 
         long deadlineNanos = System.nanoTime() + timeout.toNanos();
 
-        synchronized (clientLock) {
+        clientLock.lockInterruptibly();
+        try {
             AeronCluster active = client;
             if (active == null) {
                 throw new IllegalStateException("OMS cluster client is not connected");
@@ -277,6 +321,58 @@ public class OmsClusterIngressClient {
                 }
                 parkOrThrow(config.getEgressPollParkNanos());
             }
+        } finally {
+            clientLock.unlock();
+        }
+    }
+
+    /** Caller must hold {@link #clientLock}. */
+    private void startHeartbeatLocked() {
+        if (heartbeatThread != null) {
+            return;
+        }
+        closing = false;
+        Thread t = new Thread(this::heartbeatLoop, "oms-cluster-client-heartbeat");
+        t.setDaemon(true);
+        heartbeatThread = t;
+        t.start();
+    }
+
+    /**
+     * Daemon loop: every {@link OmsConfig.Cluster.Client#getHeartbeatIntervalMs()} we try to
+     * grab {@link #clientLock} (without blocking submits) and call
+     * {@link AeronCluster#sendKeepAlive()} + {@link AeronCluster#pollEgress()}. If a submit holds
+     * the lock, we skip — that submit is doing its own polling so the session stays warm.
+     */
+    private void heartbeatLoop() {
+        long parkNanos = TimeUnit.MILLISECONDS.toNanos(config.getHeartbeatIntervalMs());
+        while (!closing) {
+            try {
+                if (clientLock.tryLock(HEARTBEAT_LOCK_TRY_NANOS, TimeUnit.NANOSECONDS)) {
+                    try {
+                        AeronCluster active = client;
+                        if (active != null) {
+                            try {
+                                active.sendKeepAlive();
+                                active.pollEgress();
+                            } catch (RuntimeException e) {
+                                log.warn("OMS cluster client heartbeat call failed", e);
+                            }
+                        }
+                    } finally {
+                        clientLock.unlock();
+                    }
+                }
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                return;
+            } catch (RuntimeException e) {
+                log.warn("OMS cluster client heartbeat loop error", e);
+            }
+            if (Thread.interrupted()) {
+                return;
+            }
+            LockSupport.parkNanos(parkNanos);
         }
     }
 

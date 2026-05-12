@@ -79,6 +79,18 @@ public final class OmsClusterNodeBootstrap {
     /** Default media-driver subdirectory under {@link #DEFAULT_AERON_DIR_BASE}. */
     private static final String DEFAULT_AERON_MEDIA_DRIVER_DIR_NAME = "media-driver";
 
+    /**
+     * Default {@code maxConcurrentSessions} for the cluster node. Aeron's stock default is 10
+     * (see {@code ConsensusModule.Configuration.MAX_CONCURRENT_SESSIONS_DEFAULT}), which is too
+     * tight for OMS where every ingress replica plus every operator tool holds a long-lived
+     * session: one cluster will easily see hundreds. Single tunable per node since cluster nodes
+     * don't share Spring config; override via {@link #ENV_MAX_CONCURRENT_SESSIONS} in k8s.
+     */
+    private static final int DEFAULT_MAX_CONCURRENT_SESSIONS = 1024;
+
+    /** Env var: override {@link #DEFAULT_MAX_CONCURRENT_SESSIONS}. */
+    private static final String ENV_MAX_CONCURRENT_SESSIONS = "OMS_AERON_CLUSTER_MAX_SESSIONS";
+
     /** Env var: comma-separated cluster member tuple (Aeron's {@code clusterMembers} format). */
     private static final String ENV_CLUSTER_MEMBERS = "OMS_AERON_CLUSTER_MEMBERS";
 
@@ -187,10 +199,38 @@ public final class OmsClusterNodeBootstrap {
                 .clusterDir(new File(paths.clusterDir()))
                 .ingressChannel("aeron:udp?term-length=64k")
                 .replicationChannel("aeron:udp?endpoint=localhost:0")
+                .maxConcurrentSessions(parseMaxConcurrentSessions())
                 .archiveContext(new AeronArchive.Context()
                         .aeronDirectoryName(paths.aeronDirectory())
                         .controlRequestChannel("aeron:ipc?term-length=64k")
                         .controlResponseChannel("aeron:ipc?term-length=64k"));
+    }
+
+    static int parseMaxConcurrentSessions() {
+        String raw = System.getenv(ENV_MAX_CONCURRENT_SESSIONS);
+        if (raw == null || raw.isBlank()) {
+            return DEFAULT_MAX_CONCURRENT_SESSIONS;
+        }
+        try {
+            int parsed = Integer.parseInt(raw.trim());
+            if (parsed < 1) {
+                throw new IllegalArgumentException(
+                        String.format(
+                                Locale.ROOT,
+                                "Invalid %s='%s'; expected a positive integer",
+                                ENV_MAX_CONCURRENT_SESSIONS,
+                                raw));
+            }
+            return parsed;
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException(
+                    String.format(
+                            Locale.ROOT,
+                            "Invalid %s='%s'; expected a positive integer",
+                            ENV_MAX_CONCURRENT_SESSIONS,
+                            raw),
+                    e);
+        }
     }
 
     public static ClusteredServiceContainer.Context buildServiceContainerContext(ClusterNodePaths paths) {

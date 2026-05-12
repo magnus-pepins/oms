@@ -59,6 +59,7 @@ class OmsClusterNodeBootstrapSmokeIT {
 
     private ClusteredMediaDriver clusteredMediaDriver;
     private ClusteredServiceContainer container;
+    private OmsClusterNodeBootstrap.EventsRecordingHandle eventsRecording;
 
     @AfterEach
     void tearDown() {
@@ -67,6 +68,13 @@ class OmsClusterNodeBootstrapSmokeIT {
                 container.close();
             }
         } finally {
+            if (eventsRecording != null) {
+                try {
+                    eventsRecording.close();
+                } catch (RuntimeException ignored) {
+                    // best-effort
+                }
+            }
             if (clusteredMediaDriver != null) {
                 clusteredMediaDriver.close();
             }
@@ -85,6 +93,7 @@ class OmsClusterNodeBootstrapSmokeIT {
                         paths,
                         /* memberId = */ 0,
                         "0,localhost:20110,localhost:20220,localhost:20330,localhost:20440,localhost:8010"));
+        eventsRecording = OmsClusterNodeBootstrap.startEventsRecording(paths);
         container = ClusteredServiceContainer.launch(OmsClusterNodeBootstrap.buildServiceContainerContext(paths));
 
         AtomicReference<OrderAcceptedEvent> received = new AtomicReference<>();

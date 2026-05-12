@@ -1,5 +1,6 @@
 package com.balh.oms.cluster;
 
+import io.aeron.CommonContext;
 import io.aeron.ExclusivePublication;
 import io.aeron.Image;
 import io.aeron.cluster.codecs.CloseReason;
@@ -7,6 +8,7 @@ import io.aeron.cluster.service.ClientSession;
 import io.aeron.cluster.service.Cluster;
 import io.aeron.cluster.service.ClusteredService;
 import io.aeron.logbuffer.Header;
+import org.agrona.CloseHelper;
 import org.agrona.DirectBuffer;
 import org.agrona.ExpandableArrayBuffer;
 import org.agrona.MutableDirectBuffer;
@@ -81,7 +83,30 @@ public class OmsAdmissionClusteredService implements ClusteredService {
 
     private final ExpandableArrayBuffer egressBuffer = new ExpandableArrayBuffer(INITIAL_BUFFER_CAPACITY);
 
+    /**
+     * Buffer for {@link OrderAdmittedEvent} payloads written to {@link #eventsPublication}. Held separately
+     * from {@link #egressBuffer} because the projection event is larger than the per-session
+     * {@link OrderAcceptedEvent} and growing the egress buffer to the same size would waste memory on every
+     * cluster session offer.
+     */
+    private final ExpandableArrayBuffer eventsBuffer = new ExpandableArrayBuffer(INITIAL_BUFFER_CAPACITY);
+
     private Cluster cluster;
+
+    /**
+     * Side publication carrying {@link OrderAdmittedEvent}s for the Postgres projector (Phase 2).
+     *
+     * <p>Created on {@link #onStart(Cluster, Image)} via {@code cluster.aeron().addExclusivePublication}.
+     * The corresponding Aeron Archive recording is started by the cluster bootstrap
+     * ({@code OmsClusterNodeBootstrap.startEventsRecording}) <em>before</em> the cluster comes up, so the
+     * Archive sees the publication as it appears and records every event from position 0 — which means
+     * the projector's cursor advances along the same byte stream the Archive recorded.
+     *
+     * <p>Lifecycle: opened on {@code onStart}, closed on {@code onTerminate}. Replay (after a snapshot
+     * load) does <em>not</em> re-emit prior events on this publication — the recording already holds
+     * them; the projector reads from the recording, not from the live publication.
+     */
+    private ExclusivePublication eventsPublication;
 
     @Override
     public void onStart(Cluster cluster, Image snapshotImage) {
@@ -89,10 +114,17 @@ public class OmsAdmissionClusteredService implements ClusteredService {
         if (snapshotImage != null) {
             loadSnapshot(snapshotImage);
         }
+        // Determinism note: addExclusivePublication is a deterministic side effect — same cluster
+        // configuration produces the same publication on every member / replay. The publication is the
+        // bridge to the Archive recording, which is the durable projection signal.
+        this.eventsPublication = cluster.aeron().addExclusivePublication(
+                OmsClusterWireFormat.EVENTS_CHANNEL, OmsClusterWireFormat.EVENTS_STREAM_ID);
         log.info(
-                "OmsAdmissionClusteredService started; orders={}, role={}",
+                "OmsAdmissionClusteredService started; orders={}, role={}, eventsPub={}/{}",
                 orderIndex.size(),
-                cluster.role());
+                cluster.role(),
+                OmsClusterWireFormat.EVENTS_CHANNEL,
+                OmsClusterWireFormat.EVENTS_STREAM_ID);
     }
 
     @Override
@@ -176,6 +208,8 @@ public class OmsAdmissionClusteredService implements ClusteredService {
     @Override
     public void onTerminate(Cluster cluster) {
         log.info("OmsAdmissionClusteredService terminating; orders={}", orderIndex.size());
+        CloseHelper.quietClose(eventsPublication);
+        eventsPublication = null;
     }
 
     // ------------------------------------------------------------------------
@@ -189,6 +223,8 @@ public class OmsAdmissionClusteredService implements ClusteredService {
         IdempotencyKey key = new IdempotencyKey(cmd.accountId(), cmd.clientIdempotencyKey());
         AdmittedOrder existing = idempotencyIndex.get(key);
         if (existing != null) {
+            // Idempotent re-hit. The projector already saw the first emission; do not re-emit on the side
+            // publication. Per-session egress still tells the originating client {duplicate=true}.
             emitAccepted(session, cmd.correlationId(), existing, clusterTimestampNs, true);
             return;
         }
@@ -209,7 +245,27 @@ public class OmsAdmissionClusteredService implements ClusteredService {
         idempotencyIndex.put(key, admitted);
         orderIndex.put(admitted.orderId(), admitted);
 
+        emitAdmitted(cmd, clusterTimestampNs, admitted.version());
         emitAccepted(session, cmd.correlationId(), admitted, clusterTimestampNs, false);
+    }
+
+    private void emitAdmitted(AcceptOrderCommand cmd, long acceptedAtNanos, int version) {
+        if (eventsPublication == null) {
+            // Defensive: cluster is shutting down. Not expected on the apply path; the consensus module
+            // halts message delivery before onTerminate, but we guard so a late frame does not NPE.
+            return;
+        }
+        OrderAdmittedEvent ev = OrderAdmittedEvent.fromAdmittedCommand(cmd, acceptedAtNanos, version);
+        int len = ev.encode(eventsBuffer, 0);
+        long pos;
+        while ((pos = eventsPublication.offer(eventsBuffer, 0, len)) < 0L) {
+            // BACK_PRESSURED / NOT_CONNECTED is normal during steady-state and during projector reconnect.
+            // The Archive subscribes to this publication on the cluster member and is always present.
+            if (pos == io.aeron.Publication.CLOSED || pos == io.aeron.Publication.MAX_POSITION_EXCEEDED) {
+                throw new IllegalStateException("eventsPublication offer closed; pos=" + pos);
+            }
+            Thread.yield();
+        }
     }
 
     private void emitAccepted(

@@ -37,6 +37,7 @@ class OmsClusterIngressClientIT {
 
     private ClusteredMediaDriver clusteredMediaDriver;
     private ClusteredServiceContainer container;
+    private OmsClusterNodeBootstrap.EventsRecordingHandle eventsRecording;
     private OmsClusterIngressClient ingressClient;
 
     @AfterEach
@@ -51,6 +52,13 @@ class OmsClusterIngressClientIT {
                     container.close();
                 }
             } finally {
+                if (eventsRecording != null) {
+                    try {
+                        eventsRecording.close();
+                    } catch (RuntimeException ignored) {
+                        // best-effort
+                    }
+                }
                 if (clusteredMediaDriver != null) {
                     clusteredMediaDriver.close();
                 }
@@ -71,6 +79,7 @@ class OmsClusterIngressClientIT {
                         paths,
                         /* memberId = */ 0,
                         "0,localhost:20110,localhost:20220,localhost:20330,localhost:20440,localhost:8010"));
+        eventsRecording = OmsClusterNodeBootstrap.startEventsRecording(paths);
         container = ClusteredServiceContainer.launch(OmsClusterNodeBootstrap.buildServiceContainerContext(paths));
 
         OmsConfig omsConfig = new OmsConfig();

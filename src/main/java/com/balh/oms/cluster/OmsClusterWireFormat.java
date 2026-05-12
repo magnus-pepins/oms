@@ -67,4 +67,30 @@ public final class OmsClusterWireFormat {
 
     /** {@link OrderRejectedEvent}. */
     public static final int TYPE_ID_ORDER_REJECTED = 1001;
+
+    /** {@link OrderAdmittedEvent}. Phase 2 projection event. */
+    public static final int TYPE_ID_ORDER_ADMITTED = 1002;
+
+    // ---- Cluster→projector event stream (Phase 2) ----
+
+    /**
+     * Aeron channel for the projection event stream emitted by
+     * {@link OmsAdmissionClusteredService}. IPC is correct for in-process tests and for production where the
+     * Aeron Archive on the cluster node records the publication locally; remote projectors consume the stream
+     * via {@code AeronArchive} replay over the cluster's archive control channel, not by subscribing to this
+     * channel directly.
+     *
+     * <p>Phase 5 may add a UDP variant for live multicast fan-out to co-located stateless consumers, but that
+     * does not change the recorded-channel contract; the recording is always the source of truth for
+     * projector cursor.
+     */
+    public static final String EVENTS_CHANNEL = "aeron:ipc?term-length=64k";
+
+    /**
+     * Aeron stream id for the projection event stream. Chosen well outside the range Aeron Cluster uses for
+     * its internal streams (cluster log, snapshot, ingress, egress are 100..199 by default in
+     * {@code AeronCluster.Configuration}). Not configurable by env — projector and cluster both compile
+     * against this constant.
+     */
+    public static final int EVENTS_STREAM_ID = 2000;
 }

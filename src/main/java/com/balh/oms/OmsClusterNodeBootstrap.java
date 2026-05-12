@@ -1,14 +1,18 @@
 package com.balh.oms;
 
 import com.balh.oms.cluster.OmsAdmissionClusteredService;
+import com.balh.oms.cluster.OmsClusterWireFormat;
+import io.aeron.Aeron;
 import io.aeron.archive.Archive;
 import io.aeron.archive.ArchiveThreadingMode;
 import io.aeron.archive.client.AeronArchive;
+import io.aeron.archive.codecs.SourceLocation;
 import io.aeron.cluster.ClusteredMediaDriver;
 import io.aeron.cluster.ConsensusModule;
 import io.aeron.cluster.service.ClusteredServiceContainer;
 import io.aeron.driver.MediaDriver;
 import io.aeron.driver.ThreadingMode;
+import org.agrona.CloseHelper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -144,6 +148,12 @@ public final class OmsClusterNodeBootstrap {
                 buildArchiveContext(paths),
                 buildConsensusModuleContext(paths, memberId, clusterMembers));
 
+        // Register Archive recording for the projector event stream BEFORE launching the service container.
+        // The cluster service's onStart will then create the publication on EVENTS_CHANNEL/EVENTS_STREAM_ID
+        // and the already-started recording captures it from byte 0 — which is what makes the projector's
+        // cursor a stable monotonic position into a continuous recording.
+        EventsRecordingHandle eventsRecording = startEventsRecording(paths);
+
         ClusteredServiceContainer container = ClusteredServiceContainer.launch(
                 buildServiceContainerContext(paths));
 
@@ -154,6 +164,7 @@ public final class OmsClusterNodeBootstrap {
             } catch (Exception e) {
                 log.warn("error closing cluster service container", e);
             }
+            CloseHelper.quietClose(eventsRecording);
             try {
                 clusteredMediaDriver.close();
             } catch (Exception e) {
@@ -167,6 +178,73 @@ public final class OmsClusterNodeBootstrap {
             shutdownLatch.await();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+        }
+    }
+
+    /**
+     * Starts the Aeron Archive recording for the projector event stream
+     * ({@link OmsClusterWireFormat#EVENTS_CHANNEL} / {@link OmsClusterWireFormat#EVENTS_STREAM_ID}).
+     *
+     * <p>Opens its own short-lived {@link Aeron} client and {@link AeronArchive} session against the cluster
+     * member's local Archive, calls {@code startRecording(channel, streamId, LOCAL)}, then keeps the
+     * AeronArchive session open for the lifetime of the JVM (closed via the returned handle on shutdown).
+     * The Archive treats {@code startRecording} as an interest registration: the recording engages as soon
+     * as the cluster service's {@code onStart} adds the matching {@code ExclusivePublication}.
+     *
+     * <p>The Aeron client used here is independent of the one inside the cluster's
+     * {@code ClusteredServiceContainer}. They share the same MediaDriver via the Aeron directory; opening a
+     * second client adds a single subscriber session, which is well within
+     * {@link #DEFAULT_MAX_CONCURRENT_SESSIONS}.
+     */
+    public static EventsRecordingHandle startEventsRecording(ClusterNodePaths paths) {
+        Aeron aeron = Aeron.connect(new Aeron.Context().aeronDirectoryName(paths.aeronDirectory()));
+        AeronArchive.Context archiveCtx = new AeronArchive.Context()
+                .aeron(aeron)
+                .ownsAeronClient(false)
+                .controlRequestChannel("aeron:ipc?term-length=64k")
+                .controlResponseChannel("aeron:ipc?term-length=64k");
+        AeronArchive archive = AeronArchive.connect(archiveCtx);
+        long subscriptionId = archive.startRecording(
+                OmsClusterWireFormat.EVENTS_CHANNEL,
+                OmsClusterWireFormat.EVENTS_STREAM_ID,
+                SourceLocation.LOCAL);
+        log.info(
+                "Registered events recording subscriptionId={} on {}/{}",
+                subscriptionId,
+                OmsClusterWireFormat.EVENTS_CHANNEL,
+                OmsClusterWireFormat.EVENTS_STREAM_ID);
+        return new EventsRecordingHandle(archive, aeron, subscriptionId);
+    }
+
+    /**
+     * Closeable handle owning the Aeron + AeronArchive clients used to register the events recording.
+     * Calling {@link #close()} stops the recording subscription and closes both clients.
+     */
+    public static final class EventsRecordingHandle implements AutoCloseable {
+
+        private final AeronArchive archive;
+        private final Aeron aeron;
+        private final long subscriptionId;
+
+        EventsRecordingHandle(AeronArchive archive, Aeron aeron, long subscriptionId) {
+            this.archive = archive;
+            this.aeron = aeron;
+            this.subscriptionId = subscriptionId;
+        }
+
+        public long subscriptionId() {
+            return subscriptionId;
+        }
+
+        @Override
+        public void close() {
+            try {
+                archive.stopRecording(subscriptionId);
+            } catch (Exception ignored) {
+                // best-effort during shutdown; the JVM exit closes the Aeron client either way.
+            }
+            CloseHelper.quietClose(archive);
+            CloseHelper.quietClose(aeron);
         }
     }
 

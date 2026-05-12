@@ -244,14 +244,17 @@ public abstract class AbstractPostgresIntegrationTest {
         private final OmsClusterNodeBootstrap.ClusterNodePaths paths;
         private final ClusteredMediaDriver clusteredMediaDriver;
         private final ClusteredServiceContainer container;
+        private final OmsClusterNodeBootstrap.EventsRecordingHandle eventsRecording;
 
         private TestAeronClusterSingleton(
                 OmsClusterNodeBootstrap.ClusterNodePaths paths,
                 ClusteredMediaDriver clusteredMediaDriver,
-                ClusteredServiceContainer container) {
+                ClusteredServiceContainer container,
+                OmsClusterNodeBootstrap.EventsRecordingHandle eventsRecording) {
             this.paths = paths;
             this.clusteredMediaDriver = clusteredMediaDriver;
             this.container = container;
+            this.eventsRecording = eventsRecording;
         }
 
         static TestAeronClusterSingleton startedInstance() {
@@ -304,10 +307,14 @@ public abstract class AbstractPostgresIntegrationTest {
                     OmsClusterNodeBootstrap.buildMediaDriverContext(paths),
                     archiveContext,
                     consensusContext);
+            // Phase 2 slice 2b-1: register events recording before the service container brings the
+            // publication up. See OmsClusterNodeBootstrap.startEventsRecording for rationale.
+            OmsClusterNodeBootstrap.EventsRecordingHandle eventsRecording =
+                    OmsClusterNodeBootstrap.startEventsRecording(paths);
             ClusteredServiceContainer container =
                     ClusteredServiceContainer.launch(OmsClusterNodeBootstrap.buildServiceContainerContext(paths));
 
-            return new TestAeronClusterSingleton(paths, driver, container);
+            return new TestAeronClusterSingleton(paths, driver, container, eventsRecording);
         }
 
         private static void closeInstance() {
@@ -317,6 +324,11 @@ public abstract class AbstractPostgresIntegrationTest {
             }
             try {
                 local.container.close();
+            } catch (RuntimeException ignored) {
+                // best-effort during JVM shutdown
+            }
+            try {
+                local.eventsRecording.close();
             } catch (RuntimeException ignored) {
                 // best-effort during JVM shutdown
             }

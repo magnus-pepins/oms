@@ -1,5 +1,6 @@
 package com.balh.oms.cluster;
 
+import io.aeron.Aeron;
 import io.aeron.ExclusivePublication;
 import io.aeron.Image;
 import io.aeron.cluster.service.ClientSession;
@@ -57,7 +58,9 @@ class OmsAdmissionClusteredServiceTest {
     private OmsAdmissionClusteredService service;
     private ClientSession session;
     private List<byte[]> capturedEgress;
+    private List<byte[]> capturedAdmittedEvents;
     private Cluster clusterMock;
+    private ExclusivePublication eventsPublicationMock;
 
     @BeforeEach
     void setUp() {
@@ -68,8 +71,19 @@ class OmsAdmissionClusteredServiceTest {
         when(session.offer(any(DirectBuffer.class), anyInt(), anyInt()))
                 .thenAnswer(this::captureEgress);
 
+        capturedAdmittedEvents = new ArrayList<>();
+        eventsPublicationMock = mock(ExclusivePublication.class);
+        when(eventsPublicationMock.offer(any(DirectBuffer.class), anyInt(), anyInt()))
+                .thenAnswer(this::captureAdmitted);
+
+        Aeron aeronMock = mock(Aeron.class);
+        when(aeronMock.addExclusivePublication(
+                        OmsClusterWireFormat.EVENTS_CHANNEL, OmsClusterWireFormat.EVENTS_STREAM_ID))
+                .thenReturn(eventsPublicationMock);
+
         clusterMock = mock(Cluster.class);
         when(clusterMock.role()).thenReturn(Cluster.Role.LEADER);
+        when(clusterMock.aeron()).thenReturn(aeronMock);
         service.onStart(clusterMock, /* snapshotImage = */ null);
     }
 
@@ -80,6 +94,16 @@ class OmsAdmissionClusteredServiceTest {
         byte[] copy = new byte[len];
         buf.getBytes(off, copy);
         capturedEgress.add(copy);
+        return 1L;
+    }
+
+    private long captureAdmitted(InvocationOnMock inv) {
+        DirectBuffer buf = inv.getArgument(0);
+        int off = inv.getArgument(1);
+        int len = inv.getArgument(2);
+        byte[] copy = new byte[len];
+        buf.getBytes(off, copy);
+        capturedAdmittedEvents.add(copy);
         return 1L;
     }
 
@@ -144,6 +168,50 @@ class OmsAdmissionClusteredServiceTest {
     }
 
     @Test
+    void freshAccept_emitsOrderAdmittedEvent_toEventsPublication() {
+        AcceptOrderCommand cmd = sampleAccept(
+                /* correlationId = */ 1L,
+                "acct-A",
+                "idem-1",
+                UUID.fromString("00000000-0000-4000-8000-000000000040"));
+
+        deliverCommand(cmd, ANY_TIMESTAMP_NS);
+
+        assertThat(capturedAdmittedEvents).hasSize(1);
+        OrderAdmittedEvent admitted = OrderAdmittedEvent.decode(
+                new UnsafeBuffer(capturedAdmittedEvents.get(0)),
+                0,
+                capturedAdmittedEvents.get(0).length);
+        assertThat(admitted.orderId()).isEqualTo(cmd.orderId());
+        assertThat(admitted.accountId()).isEqualTo(cmd.accountId());
+        assertThat(admitted.clientIdempotencyKey()).isEqualTo(cmd.clientIdempotencyKey());
+        assertThat(admitted.accountIdHash()).isEqualTo(cmd.accountIdHash());
+        assertThat(admitted.instrumentSymbol()).isEqualTo(cmd.instrumentSymbol());
+        assertThat(admitted.quantityScaled()).isEqualTo(cmd.quantityScaled());
+        assertThat(admitted.limitPriceScaledOrZero()).isEqualTo(cmd.limitPriceScaledOrZero());
+        assertThat(admitted.shardId()).isEqualTo(cmd.shardId());
+        assertThat(admitted.side()).isEqualTo(cmd.side());
+        assertThat(admitted.timeInForceCode()).isEqualTo(cmd.timeInForceCode());
+        assertThat(admitted.acceptedAtNanos()).isEqualTo(ANY_TIMESTAMP_NS);
+        assertThat(admitted.version()).isZero();
+    }
+
+    @Test
+    void idempotentReHit_doesNotReEmitAdmittedEvent() {
+        UUID firstOrderId = UUID.fromString("00000000-0000-4000-8000-000000000050");
+        UUID secondOrderId = UUID.fromString("00000000-0000-4000-8000-000000000051");
+
+        deliverCommand(sampleAccept(1L, "acct", "idem", firstOrderId), ANY_TIMESTAMP_NS);
+        assertThat(capturedAdmittedEvents).hasSize(1);
+
+        deliverCommand(sampleAccept(2L, "acct", "idem", secondOrderId), ANY_TIMESTAMP_NS + 1);
+        // Per-session egress emitted twice (the duplicate path tells the second caller); the side
+        // publication only saw the first emission — the projector relies on this to avoid duplicate rows.
+        assertThat(capturedEgress).hasSize(2);
+        assertThat(capturedAdmittedEvents).hasSize(1);
+    }
+
+    @Test
     void onSessionMessage_malformedPayload_isIgnoredSilently() {
         ExpandableArrayBuffer buffer = new ExpandableArrayBuffer(OmsClusterWireFormat.HEADER_LENGTH);
         // Length below header is a malformed command and must be a no-op (not an exception).
@@ -165,6 +233,11 @@ class OmsAdmissionClusteredServiceTest {
         OmsAdmissionClusteredService restored = new OmsAdmissionClusteredService();
         Cluster mockCluster2 = mock(Cluster.class);
         when(mockCluster2.role()).thenReturn(Cluster.Role.FOLLOWER);
+        Aeron aeronMock2 = mock(Aeron.class);
+        when(aeronMock2.addExclusivePublication(
+                        OmsClusterWireFormat.EVENTS_CHANNEL, OmsClusterWireFormat.EVENTS_STREAM_ID))
+                .thenReturn(mock(ExclusivePublication.class));
+        when(mockCluster2.aeron()).thenReturn(aeronMock2);
         Image snapshotImage = mockSnapshotImage(snapshotBytes);
         restored.onStart(mockCluster2, snapshotImage);
 

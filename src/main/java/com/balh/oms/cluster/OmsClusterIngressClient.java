@@ -24,10 +24,14 @@ import org.springframework.context.annotation.Profile;
 import org.springframework.stereotype.Component;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.EnumMap;
-import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
@@ -42,25 +46,45 @@ import java.util.concurrent.locks.ReentrantLock;
  * <p>Phase 1a artifact of the Aeron Cluster substrate plan
  * ({@code system-documentation/plans/oms-aeron-cluster-substrate.md} and
  * {@code oms/docs/adr/0001-aeron-cluster-substrate.md}). Phase 1b wires it into
- * {@link com.balh.oms.ingress.OrderIngressService}; Phase 1c added the
- * background {@linkplain #heartbeatLoop() heartbeat thread} so cluster sessions
- * survive idle periods between submits (Aeron's default
- * {@code ConsensusModule.sessionTimeoutNs} is 5s — without keep-alives a quiet
- * accept channel for &gt;5s would yank the session and the next submit would
- * fail with {@code cluster_unavailable}).
+ * {@link com.balh.oms.ingress.OrderIngressService}; Phase 1c added a background
+ * thread so cluster sessions survive idle periods between submits (Aeron's
+ * default {@code ConsensusModule.sessionTimeoutNs} is 5s — without keep-alives
+ * a quiet accept channel for &gt;5s would yank the session and the next submit
+ * would fail with {@code cluster_unavailable}). Slice 4n folded that heartbeat
+ * into the {@linkplain #egressPollerLoop() egress poller thread} so it also
+ * demuxes cluster replies for in-flight submits.
  *
  * <h2>Threading model</h2>
  *
  * Aeron's {@link AeronCluster} is thread-confined: {@code offer},
  * {@code pollEgress}, and {@code sendKeepAlive} must not be called concurrently.
- * Two threads touch the client: the calling thread inside
- * {@link #submitAcceptOrder(AcceptOrderCommand, Duration)} and the daemon
- * heartbeat thread. They serialize on {@link #clientLock} (a
- * {@link ReentrantLock}). The heartbeat thread uses
- * {@link ReentrantLock#tryLock(long, TimeUnit) tryLock} so it does not stall
- * when a slow submit holds the lock — that submit's own
- * {@code pollEgress}/{@code sendKeepAlive} loop keeps the session alive
- * during its critical section.
+ * Phase 4 slice 4n pipelined the client so a single ingress-replica JVM is no
+ * longer capped at one cluster commit at a time:
+ *
+ * <ul>
+ *   <li>Calling threads (HTTP request threads inside
+ *       {@link #submitAcceptOrder(AcceptOrderCommand, Duration)}) acquire
+ *       {@link #clientLock} only long enough to call {@link AeronCluster#offer offer}.
+ *       On success they release the lock and park on a
+ *       {@link CompletableFuture} registered in {@link #pending} keyed by
+ *       correlation id. On back-pressure they release the lock, park outside
+ *       the lock, and retry — slow back-pressure no longer blocks every other
+ *       in-flight submit.</li>
+ *   <li>A dedicated daemon thread, {@linkplain #egressPollerLoop()}, holds the
+ *       lock briefly each pass to call {@link AeronCluster#pollEgress pollEgress}
+ *       (and, every {@link OmsConfig.Cluster.Client#getHeartbeatIntervalMs()}
+ *       ms, {@link AeronCluster#sendKeepAlive sendKeepAlive}). Egress events
+ *       arrive via {@link #egressListener} and complete the matching future in
+ *       {@link #pending} directly — no more correlation-id-keyed map drained
+ *       under the submit's own lock hold.</li>
+ * </ul>
+ *
+ * Lock holds are bounded to single-digit microseconds in steady state, so per-JVM
+ * commit throughput is limited by Aeron's {@code offer} rate, not by cluster RTT.
+ *
+ * <p>{@link #submitApplyExecutionReport(ApplyExecutionReportCommand, Duration)}
+ * remains a single-flight offer (no egress reply expected); slice 4n did not
+ * change its shape.
  *
  * <h2>Determinism (per ADR 0001 §Discipline)</h2>
  *
@@ -108,24 +132,33 @@ public class OmsClusterIngressClient {
     };
 
     /**
-     * Max time the heartbeat thread spends trying to acquire {@link #clientLock} per pass before
-     * skipping that tick. Bounded so that a slow submit can't choke the heartbeat indefinitely; the
-     * submit's own {@code pollEgress} keeps the session alive while it holds the lock.
+     * Max time the egress poller thread spends trying to acquire {@link #clientLock} per pass
+     * before skipping that tick. Bounded so a back-pressured submit can't choke the poller
+     * indefinitely. Slice 4n: lock holds are now &lt;~10µs in steady state because no thread
+     * waits for an egress reply under the lock anymore, so this value is effectively only a
+     * safety upper bound.
      */
-    private static final long HEARTBEAT_LOCK_TRY_NANOS = 1_000_000L;
+    private static final long POLLER_LOCK_TRY_NANOS = 1_000_000L;
 
-    /** {@link Thread#join(long)} budget when stopping the heartbeat thread on close. */
-    private static final long HEARTBEAT_JOIN_MS = 2_000L;
+    /** {@link Thread#join(long)} budget when stopping the egress poller thread on close. */
+    private static final long POLLER_JOIN_MS = 2_000L;
 
     private final OmsConfig.Cluster.Client config;
     private final AtomicLong correlationIds = new AtomicLong(1);
 
     /**
-     * Egress events received but not yet drained by the submitting thread.
-     * Keyed by correlation id. Mutations and reads happen only while
-     * {@link #clientLock} is held, so a plain {@link HashMap} is safe.
+     * In-flight {@link #submitAcceptOrder} calls awaiting their cluster reply, keyed by the
+     * caller's correlation id. The submit thread {@link Map#put puts} an entry and parks on the
+     * future; the egress poller thread (via {@link #egressListener}) {@link Map#remove removes}
+     * the entry and {@link CompletableFuture#complete completes} it.
+     *
+     * <p>Slice 4n: replaces the previous correlation-id-keyed {@code received} map drained under
+     * the submit's own lock hold. With this map a submit thread no longer holds
+     * {@link #clientLock} while waiting for the cluster's egress round-trip, so per-JVM commit
+     * throughput is no longer capped at {@code 1 / cluster_rtt}.
      */
-    private final Map<Long, AdmissionResult> received = new HashMap<>();
+    private final ConcurrentHashMap<Long, CompletableFuture<AdmissionResult>> pending =
+            new ConcurrentHashMap<>();
 
     private final ReentrantLock clientLock = new ReentrantLock();
 
@@ -143,19 +176,26 @@ public class OmsClusterIngressClient {
                 return;
             }
             int typeId = buffer.getInt(offset + OmsClusterWireFormat.HEADER_TYPE_ID_OFFSET);
+            long correlationId;
+            AdmissionResult result;
             try {
                 if (typeId == OmsClusterWireFormat.TYPE_ID_ORDER_ACCEPTED) {
                     OrderAcceptedEvent ev = OrderAcceptedEvent.decode(buffer, offset);
-                    received.put(ev.correlationId(), new AdmissionResult.Accepted(ev));
+                    correlationId = ev.correlationId();
+                    result = new AdmissionResult.Accepted(ev);
                 } else if (typeId == OmsClusterWireFormat.TYPE_ID_ORDER_REJECTED) {
                     OrderRejectedEvent ev = OrderRejectedEvent.decode(buffer, offset);
-                    received.put(ev.correlationId(), new AdmissionResult.Rejected(ev));
+                    correlationId = ev.correlationId();
+                    result = new AdmissionResult.Rejected(ev);
                 } else {
                     log.warn("cluster egress: unknown typeId={} length={}", typeId, length);
+                    return;
                 }
             } catch (RuntimeException e) {
                 log.warn("cluster egress: failed to decode typeId={} length={}", typeId, length, e);
+                return;
             }
+            completeWaiter(correlationId, result);
         }
 
         @Override
@@ -177,8 +217,31 @@ public class OmsClusterIngressClient {
         }
     };
 
+    /**
+     * Slice 4n: complete the awaiting submit's future. Called from {@link #egressListener}
+     * (under {@link #clientLock} held by the egress poller) and from unit tests that exercise
+     * the demux path without spinning up a real cluster. {@link CompletableFuture#complete} is
+     * non-blocking (just unparks the waiter); we hold the lock here only because the call site
+     * inside {@code pollEgress} happens to hold it. A {@code null} entry means the caller
+     * already gave up — drop the reply.
+     */
+    void completeWaiter(long correlationId, AdmissionResult result) {
+        CompletableFuture<AdmissionResult> waiter = pending.remove(correlationId);
+        if (waiter != null) {
+            waiter.complete(result);
+        } else {
+            log.debug("cluster egress: orphan reply for correlationId={} (caller gave up)",
+                    correlationId);
+        }
+    }
+
+    /** Visible for testing — number of in-flight submits awaiting an egress reply. */
+    int pendingCountForTest() {
+        return pending.size();
+    }
+
     private volatile AeronCluster client;
-    private volatile Thread heartbeatThread;
+    private volatile Thread egressPollerThread;
     private volatile boolean closing;
 
     // ---- Phase 4 slice 4c: commit-round-trip timer ----
@@ -280,7 +343,7 @@ public class OmsClusterIngressClient {
      * Retries (Aeron's own internal retry inside {@code connect}) within
      * {@link OmsConfig.Cluster.Client#getConnectTimeoutMs()}. Idempotent — a
      * second call after a successful connect is a no-op. Starts the
-     * {@linkplain #heartbeatLoop() heartbeat thread} on the first successful
+     * {@linkplain #egressPollerLoop() egress poller thread} on the first successful
      * connect.
      */
     @PostConstruct
@@ -313,7 +376,7 @@ public class OmsClusterIngressClient {
                             "OMS cluster client connected: aeronDir={} ingressEndpoints={}",
                             aeronDirectory,
                             config.getIngressEndpoints());
-                    startHeartbeatLocked();
+                    startEgressPollerLocked();
                     return;
                 } catch (RuntimeException e) {
                     lastFailure = e;
@@ -333,12 +396,12 @@ public class OmsClusterIngressClient {
     @PreDestroy
     public void close() {
         closing = true;
-        Thread t = heartbeatThread;
-        heartbeatThread = null;
+        Thread t = egressPollerThread;
+        egressPollerThread = null;
         if (t != null) {
             t.interrupt();
             try {
-                t.join(HEARTBEAT_JOIN_MS);
+                t.join(POLLER_JOIN_MS);
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
             }
@@ -356,6 +419,18 @@ public class OmsClusterIngressClient {
             }
         } finally {
             clientLock.unlock();
+        }
+        // Slice 4n: wake any submitters parked on futures that will now never get a reply.
+        // ConcurrentHashMap.values() iterates a weakly consistent snapshot; we drain by removing
+        // each key as we go so a late onMessage() racing against close() can't double-complete.
+        IllegalStateException reason = new IllegalStateException(
+                "OMS cluster client closed before egress reply arrived");
+        List<Long> draining = new ArrayList<>(pending.keySet());
+        for (Long correlationId : draining) {
+            CompletableFuture<AdmissionResult> waiter = pending.remove(correlationId);
+            if (waiter != null) {
+                waiter.completeExceptionally(reason);
+            }
         }
     }
 
@@ -427,14 +502,19 @@ public class OmsClusterIngressClient {
     }
 
     /**
-     * Submits an {@link AcceptOrderCommand} to the cluster and blocks the
-     * caller until the matching {@link OrderAcceptedEvent} or
-     * {@link OrderRejectedEvent} egress arrives.
+     * Submits an {@link AcceptOrderCommand} to the cluster and blocks the caller until the
+     * matching {@link OrderAcceptedEvent} or {@link OrderRejectedEvent} egress arrives.
+     *
+     * <p>Slice 4n: pipelined. The submit thread takes {@link #clientLock} only long enough to
+     * call {@link AeronCluster#offer offer}, then parks on a {@link CompletableFuture}
+     * registered in {@link #pending}; the dedicated egress poller thread completes that future
+     * when {@link AeronCluster#pollEgress pollEgress} delivers the matching reply. Back-pressure
+     * retries also happen with the lock released, so a slow offer doesn't block other in-flight
+     * submits on this JVM.
      *
      * @throws IllegalStateException if not connected (see {@link #connect()}).
      * @throws TimeoutException if no matching egress arrives within {@code timeout}.
-     * @throws InterruptedException if the calling thread is interrupted while
-     *         parked between poll passes.
+     * @throws InterruptedException if the calling thread is interrupted while parked.
      */
     public AdmissionResult submitAcceptOrder(AcceptOrderCommand cmd, Duration timeout)
             throws TimeoutException, InterruptedException {
@@ -445,88 +525,163 @@ public class OmsClusterIngressClient {
         int written = cmd.encode(buffer, 0);
 
         long deadlineNanos = System.nanoTime() + timeout.toNanos();
+        long correlationId = cmd.correlationId();
+
+        // Register the waiter BEFORE the offer so a sub-microsecond cluster reply that lands
+        // before submit returns from `offer` finds the future to complete (otherwise onMessage
+        // would log "orphan reply" and the submit would later time out for nothing).
+        CompletableFuture<AdmissionResult> waiter = new CompletableFuture<>();
+        if (pending.putIfAbsent(correlationId, waiter) != null) {
+            // Correlation ids come from a per-client AtomicLong; collisions only happen if a
+            // caller passes a hand-rolled command. Fail fast — the egress demux assumes uniqueness.
+            throw new IllegalStateException(
+                    "duplicate in-flight cluster correlationId=" + correlationId);
+        }
 
         Timer.Sample sample = Timer.start(meterRegistry);
         Outcome outcome = Outcome.ERROR;
         try {
-            clientLock.lockInterruptibly();
             try {
-                AeronCluster active = client;
-                if (active == null) {
-                    throw new IllegalStateException("OMS cluster client is not connected");
+                offerWithBackpressure(buffer, written, deadlineNanos, correlationId);
+            } catch (RuntimeException | InterruptedException | TimeoutException e) {
+                pending.remove(correlationId, waiter);
+                if (e instanceof TimeoutException) {
+                    outcome = Outcome.TIMEOUT;
                 }
+                throw e;
+            }
 
-                long offerResult;
-                do {
-                    offerResult = active.offer(buffer, 0, written);
-                    if (offerResult < 0L) {
-                        if (System.nanoTime() > deadlineNanos) {
-                            outcome = Outcome.TIMEOUT;
-                            throw new TimeoutException(
-                                    "cluster offer back-pressure timeout for correlationId=" + cmd.correlationId());
-                        }
-                        parkOrThrow(config.getOfferBackpressureParkNanos());
-                    }
-                } while (offerResult < 0L);
-
-                while (true) {
-                    AdmissionResult result = received.remove(cmd.correlationId());
-                    if (result != null) {
-                        outcome = Outcome.COMMIT;
-                        return result;
-                    }
-                    active.pollEgress();
-                    result = received.remove(cmd.correlationId());
-                    if (result != null) {
-                        outcome = Outcome.COMMIT;
-                        return result;
-                    }
-                    if (System.nanoTime() > deadlineNanos) {
-                        outcome = Outcome.TIMEOUT;
-                        throw new TimeoutException(
-                                "cluster egress wait timeout for correlationId=" + cmd.correlationId());
-                    }
-                    parkOrThrow(config.getEgressPollParkNanos());
+            long remainingNanos = deadlineNanos - System.nanoTime();
+            if (remainingNanos <= 0L) {
+                // Offer used the whole budget on back-pressure retries; salvage if the egress
+                // poller already raced us to completion before checking the deadline.
+                AdmissionResult salvaged = drainCompletedFuture(correlationId, waiter);
+                if (salvaged != null) {
+                    outcome = Outcome.COMMIT;
+                    return salvaged;
                 }
-            } finally {
-                clientLock.unlock();
+                outcome = Outcome.TIMEOUT;
+                throw new TimeoutException(
+                        "cluster egress wait timeout for correlationId=" + correlationId);
+            }
+            try {
+                AdmissionResult result = waiter.get(remainingNanos, TimeUnit.NANOSECONDS);
+                outcome = Outcome.COMMIT;
+                return result;
+            } catch (java.util.concurrent.TimeoutException e) {
+                AdmissionResult salvaged = drainCompletedFuture(correlationId, waiter);
+                if (salvaged != null) {
+                    outcome = Outcome.COMMIT;
+                    return salvaged;
+                }
+                outcome = Outcome.TIMEOUT;
+                throw new TimeoutException(
+                        "cluster egress wait timeout for correlationId=" + correlationId);
+            } catch (ExecutionException e) {
+                pending.remove(correlationId, waiter);
+                Throwable cause = e.getCause();
+                if (cause instanceof RuntimeException re) {
+                    throw re;
+                }
+                throw new RuntimeException(
+                        "cluster egress unexpected failure for correlationId=" + correlationId,
+                        cause);
             }
         } finally {
             sample.stop(acceptOrderTimers.get(outcome));
         }
     }
 
+    /**
+     * Slice 4n: take {@link #clientLock} only for the offer call; on back-pressure release the
+     * lock, park, and retry. This keeps lock-hold to single-digit microseconds in steady state
+     * so other in-flight submits and the egress poller make progress.
+     */
+    private void offerWithBackpressure(
+            ExpandableArrayBuffer buffer, int written, long deadlineNanos, long correlationId)
+            throws TimeoutException, InterruptedException {
+        while (true) {
+            clientLock.lockInterruptibly();
+            long offerResult;
+            try {
+                AeronCluster active = client;
+                if (active == null) {
+                    throw new IllegalStateException("OMS cluster client is not connected");
+                }
+                offerResult = active.offer(buffer, 0, written);
+            } finally {
+                clientLock.unlock();
+            }
+            if (offerResult >= 0L) {
+                return;
+            }
+            if (System.nanoTime() > deadlineNanos) {
+                throw new TimeoutException(
+                        "cluster offer back-pressure timeout for correlationId=" + correlationId);
+            }
+            parkOrThrow(config.getOfferBackpressureParkNanos());
+        }
+    }
+
+    /**
+     * Race-resolution: when the submit hits its deadline, the egress poller may have completed
+     * the future a few nanos earlier. {@code remove(key, value)} succeeds only if the entry is
+     * still there — if the poller already removed it, we know the future is complete, so we
+     * read it without blocking and return the salvaged value. Returns {@code null} if the
+     * future is genuinely incomplete (real timeout).
+     */
+    private AdmissionResult drainCompletedFuture(
+            long correlationId, CompletableFuture<AdmissionResult> waiter) {
+        if (pending.remove(correlationId, waiter)) {
+            return null;
+        }
+        if (waiter.isDone() && !waiter.isCompletedExceptionally()) {
+            return waiter.getNow(null);
+        }
+        return null;
+    }
+
     /** Caller must hold {@link #clientLock}. */
-    private void startHeartbeatLocked() {
-        if (heartbeatThread != null) {
+    private void startEgressPollerLocked() {
+        if (egressPollerThread != null) {
             return;
         }
         closing = false;
-        Thread t = new Thread(this::heartbeatLoop, "oms-cluster-client-heartbeat");
+        Thread t = new Thread(this::egressPollerLoop, "oms-cluster-client-egress-poller");
         t.setDaemon(true);
-        heartbeatThread = t;
+        egressPollerThread = t;
         t.start();
     }
 
     /**
-     * Daemon loop: every {@link OmsConfig.Cluster.Client#getHeartbeatIntervalMs()} we try to
-     * grab {@link #clientLock} (without blocking submits) and call
-     * {@link AeronCluster#sendKeepAlive()} + {@link AeronCluster#pollEgress()}. If a submit holds
-     * the lock, we skip — that submit is doing its own polling so the session stays warm.
+     * Slice 4n daemon loop: every {@link OmsConfig.Cluster.Client#getEgressPollParkNanos()} ns we
+     * acquire {@link #clientLock} briefly and call {@link AeronCluster#pollEgress()} so cluster
+     * replies for in-flight submits ({@link #pending}) get demuxed and complete their futures
+     * with bounded latency. {@link AeronCluster#sendKeepAlive()} is called inside the same lock
+     * acquisition every {@link OmsConfig.Cluster.Client#getHeartbeatIntervalMs()} ms so the
+     * cluster session survives idle periods. {@link ReentrantLock#tryLock(long, TimeUnit) tryLock}
+     * keeps us non-blocking against bursty offer contention; on contention we skip a tick and
+     * retry on the next park.
      */
-    private void heartbeatLoop() {
-        long parkNanos = TimeUnit.MILLISECONDS.toNanos(config.getHeartbeatIntervalMs());
+    private void egressPollerLoop() {
+        long parkNanos = config.getEgressPollParkNanos();
+        long heartbeatIntervalNanos = TimeUnit.MILLISECONDS.toNanos(config.getHeartbeatIntervalMs());
+        long nextHeartbeatDeadlineNanos = System.nanoTime() + heartbeatIntervalNanos;
         while (!closing) {
             try {
-                if (clientLock.tryLock(HEARTBEAT_LOCK_TRY_NANOS, TimeUnit.NANOSECONDS)) {
+                if (clientLock.tryLock(POLLER_LOCK_TRY_NANOS, TimeUnit.NANOSECONDS)) {
                     try {
                         AeronCluster active = client;
                         if (active != null) {
                             try {
-                                active.sendKeepAlive();
                                 active.pollEgress();
+                                if (System.nanoTime() >= nextHeartbeatDeadlineNanos) {
+                                    active.sendKeepAlive();
+                                    nextHeartbeatDeadlineNanos =
+                                            System.nanoTime() + heartbeatIntervalNanos;
+                                }
                             } catch (RuntimeException e) {
-                                log.warn("OMS cluster client heartbeat call failed", e);
+                                log.warn("OMS cluster client egress poll/keep-alive failed", e);
                             }
                         }
                     } finally {
@@ -537,7 +692,7 @@ public class OmsClusterIngressClient {
                 Thread.currentThread().interrupt();
                 return;
             } catch (RuntimeException e) {
-                log.warn("OMS cluster client heartbeat loop error", e);
+                log.warn("OMS cluster client egress poller loop error", e);
             }
             if (Thread.interrupted()) {
                 return;

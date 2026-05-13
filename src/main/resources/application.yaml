@@ -48,11 +48,12 @@ oms:
     port: ${OMS_GRPC_PORT:9099}
   otel:
     # When true, starts an OpenTelemetry SdkMeterProvider + Prometheus scrape listener (default port 9464).
-    # Micrometer /actuator/prometheus remains available. Use for histogram_quantile(p50/p95) on ingress→FIX NOS.
+    # Micrometer /actuator/prometheus remains available. Slice 4i removed the orphan
+    # IngressToFixNosLatencyRecorder; per-JVM end-to-end latency now lives across
+    # oms.cluster.client.commit_round_trip (slice 4c, ingress-replica) +
+    # oms.fix_egress.lag_seconds (slice 4d, oms-fix-egress) — see oms/docs/cluster-slo.md.
     metrics-enabled: ${OMS_OTEL_METRICS_ENABLED:false}
     prometheus-port: ${OMS_OTEL_PROMETHEUS_PORT:9464}
-    ingress-to-nos-sample-ttl-ms: ${OMS_OTEL_INGRESS_TO_NOS_SAMPLE_TTL_MS:1800000}
-    ingress-to-nos-evict-interval-ms: ${OMS_OTEL_INGRESS_TO_NOS_EVICT_INTERVAL_MS:60000}
   shard:
     id: ${OMS_SHARD_ID:0}
     count: ${OMS_SHARD_COUNT:1}

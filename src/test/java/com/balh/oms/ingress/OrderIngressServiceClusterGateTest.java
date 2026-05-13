@@ -12,7 +12,6 @@ import com.balh.oms.events.DomainEventEnvelopeCodec;
 import com.balh.oms.ledger.LedgerBalanceClient;
 import com.balh.oms.ledger.LedgerInflightReservationClient;
 import com.balh.oms.observability.PiiHash;
-import com.balh.oms.observability.otel.IngressToFixNosLatencyRecorder;
 import com.balh.oms.persistence.DomainEventOutboxRepository;
 import com.balh.oms.persistence.LedgerInflightOutboxRepository;
 import com.balh.oms.persistence.OrdersRepository;
@@ -57,7 +56,6 @@ class OrderIngressServiceClusterGateTest {
     private ObjectMapper objectMapper;
     private PiiHash piiHash;
     private LedgerInflightOutboxRepository ledgerInflightOutbox;
-    private IngressToFixNosLatencyRecorder ingressToFixNosLatencyRecorder;
     private OrderControlAdmission orderControlAdmission;
     private OmsClusterIngressClient cluster;
 
@@ -73,7 +71,6 @@ class OrderIngressServiceClusterGateTest {
         objectMapper = mock(ObjectMapper.class);
         piiHash = mock(PiiHash.class);
         ledgerInflightOutbox = mock(LedgerInflightOutboxRepository.class);
-        ingressToFixNosLatencyRecorder = mock(IngressToFixNosLatencyRecorder.class);
         orderControlAdmission = mock(OrderControlAdmission.class);
         cluster = mock(OmsClusterIngressClient.class);
 
@@ -102,7 +99,6 @@ class OrderIngressServiceClusterGateTest {
                 ledgerBalance,
                 ledgerInflightOutbox,
                 new SimpleMeterRegistry(),
-                ingressToFixNosLatencyRecorder,
                 orderControlAdmission,
                 cluster);
     }

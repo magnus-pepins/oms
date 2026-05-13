@@ -6,8 +6,6 @@ import com.balh.oms.domain.Order;
 import com.balh.oms.domain.OrderStatus;
 import com.balh.oms.domain.RejectCode;
 import com.balh.oms.events.DomainEventEnvelopeCodec;
-import com.balh.oms.observability.otel.IngressToFixNosLatencyLimits;
-import com.balh.oms.observability.otel.IngressToFixNosLatencyRecorder;
 import com.balh.oms.persistence.ControlDecisionsRepository;
 import com.balh.oms.persistence.DomainEventOutboxRepository;
 import com.balh.oms.persistence.OrdersRepository;
@@ -65,7 +63,6 @@ public class OrderControlAdmission {
     private final DomainEventOutboxRepository domainEventOutbox;
     private final DomainEventEnvelopeCodec envelopeCodec;
     private final MeterRegistry meterRegistry;
-    private final IngressToFixNosLatencyRecorder ingressToFixNosLatencyRecorder;
 
     public OrderControlAdmission(
             OrdersRepository orders,
@@ -76,8 +73,7 @@ public class OrderControlAdmission {
             ControlDecisionsRepository controlDecisions,
             DomainEventOutboxRepository domainEventOutbox,
             DomainEventEnvelopeCodec envelopeCodec,
-            MeterRegistry meterRegistry,
-            IngressToFixNosLatencyRecorder ingressToFixNosLatencyRecorder) {
+            MeterRegistry meterRegistry) {
         this.orders = orders;
         this.stale = stale;
         this.config = config;
@@ -87,7 +83,6 @@ public class OrderControlAdmission {
         this.domainEventOutbox = domainEventOutbox;
         this.envelopeCodec = envelopeCodec;
         this.meterRegistry = meterRegistry;
-        this.ingressToFixNosLatencyRecorder = ingressToFixNosLatencyRecorder;
     }
 
     /**
@@ -229,7 +224,6 @@ public class OrderControlAdmission {
     }
 
     private void publishRejected(PendingControlEvent event, RejectCode reason) {
-        ingressToFixNosLatencyRecorder.discard(event.orderId(), IngressToFixNosLatencyLimits.REASON_CONTROL_REJECT);
         int newSeq = event.orderVersion() + 1;
         try {
             domainEventOutbox.insert(event.orderId(), envelopeCodec.orderRejected(event, reason, newSeq));

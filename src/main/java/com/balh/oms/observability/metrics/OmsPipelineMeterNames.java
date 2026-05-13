@@ -1,8 +1,16 @@
 package com.balh.oms.observability.metrics;
 
 /**
- * Micrometer {@link io.micrometer.core.instrument.Timer} names for slice-1 order pipeline stages.
+ * Micrometer {@link io.micrometer.core.instrument.Timer} names for the order pipeline.
  * Prometheus export maps dots to underscores and appends {@code _seconds_*} for timers.
+ *
+ * <p>Phase 4 slice 4i housekeeping: the {@code oms.pipeline.control.apply},
+ * {@code oms.pipeline.fix.outbound_nos}, and {@code oms.pipeline.ingress_to_fix_nos} constants
+ * lived here as a Phase-1 monolith breakdown. Their producers were deleted across slices 3b-2,
+ * 3f, and 3g; the constants had no callers (verified at slice 4i landing) so they were removed
+ * along with the orphan {@code IngressToFixNosLatencyRecorder}. Per-JVM substitutes:
+ * {@code oms.cluster.client.commit_round_trip} (slice 4c, ingress-replica),
+ * {@code oms.fix_egress.lag_seconds} (slice 4d, fix-egress JVM).
  */
 public final class OmsPipelineMeterNames {
 
@@ -15,23 +23,4 @@ public final class OmsPipelineMeterNames {
      * Tag {@code outcome}: {@code created}, {@code duplicate}, {@code error}.
      */
     public static final String INGRESS_ACCEPT = "oms.pipeline.ingress.accept";
-
-    /**
-     * {@link com.balh.oms.tailer.OrderControlAdmission#persistAdmission} transaction (risk, buying power, CAS,
-     * domain outbox), driven by the {@code OmsPostgresProjector} on cluster {@code OrderAdmittedEvent} replay.
-     * Tag {@code result}: {@link com.balh.oms.tailer.OrderControlAdmission.AdmissionResult} name or {@code exception}.
-     */
-    public static final String CONTROL_APPLY = "oms.pipeline.control.apply";
-
-    /**
-     * FIX egress: build NOS + {@code Session.sendToTarget} after the cluster admits the order (egress JVM only).
-     * Tag {@code outcome}: {@code success}, {@code failure}.
-     */
-    public static final String FIX_OUTBOUND_NOS = "oms.pipeline.fix.outbound_nos";
-
-    /**
-     * End-to-end wall time from committed NEW order to successful NOS send (same window as OTel
-     * {@code oms.fix.ingress_to_nos}); Micrometer form for {@code /actuator/prometheus} without enabling OTel.
-     */
-    public static final String PIPELINE_INGRESS_TO_FIX_NOS = "oms.pipeline.ingress_to_fix_nos";
 }

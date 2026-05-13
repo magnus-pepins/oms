@@ -1413,8 +1413,6 @@ public class OmsConfig {
     public static class Otel {
         private boolean metricsEnabled = false;
         private int prometheusPort = 9464;
-        private long ingressToNosSampleTtlMs = 1_800_000L;
-        private long ingressToNosEvictIntervalMs = 60_000L;
 
         public boolean isMetricsEnabled() {
             return metricsEnabled;
@@ -1430,22 +1428,6 @@ public class OmsConfig {
 
         public void setPrometheusPort(int prometheusPort) {
             this.prometheusPort = Math.min(65_535, Math.max(1, prometheusPort));
-        }
-
-        public long getIngressToNosSampleTtlMs() {
-            return ingressToNosSampleTtlMs;
-        }
-
-        public void setIngressToNosSampleTtlMs(long ingressToNosSampleTtlMs) {
-            this.ingressToNosSampleTtlMs = Math.max(60_000L, ingressToNosSampleTtlMs);
-        }
-
-        public long getIngressToNosEvictIntervalMs() {
-            return ingressToNosEvictIntervalMs;
-        }
-
-        public void setIngressToNosEvictIntervalMs(long ingressToNosEvictIntervalMs) {
-            this.ingressToNosEvictIntervalMs = Math.max(5_000L, ingressToNosEvictIntervalMs);
         }
     }
 

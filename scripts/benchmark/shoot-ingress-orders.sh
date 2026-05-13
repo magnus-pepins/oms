@@ -1,79 +1,92 @@
 #!/usr/bin/env bash
-# Fire many POST /internal/v1/orders against a running OMS (synthetic load + latency).
+# Fire many POST /internal/v1/orders against a running multi-JVM OMS topology
+# (cluster-node + ingress-replica + projector + optional fix-egress).
 #
-# Prereqs: curl, jq, python3; OMS up with internal API key; unique idempotency key per iteration.
+# REWRITTEN in slice 4i for the post-Phase-3 multi-JVM topology. The previous monolith
+# version is gone — see oms/docs/runbooks/local-multi-jvm-bench.md for bring-up.
 #
-# Typical local stack (3 terminals):
-#   1) ./gradlew fixLoopbackAcceptor
-#   2) OMS bootRun with OMS_ROUTING_BACKEND=fix OMS_FIX_AUTO_START=true (and matching FIX comp ids / port)
-#   3) ./scripts/benchmark/shoot-ingress-orders.sh
+# What you get:
+# - HTTP `time_total` p50/p95/p99 from the curl loop (ingress-replica HTTP commit window).
+# - Per-role Prometheus deltas: ingress-replica timers (`oms.pipeline.ingress.accept` slice 1,
+#   `oms.cluster.client.commit_round_trip` slice 4c) + projector / fix-egress lag gauges
+#   (slice 4d) + cluster-node snapshot freshness (slice 4h).
+# - A derived end-of-run "ingress→NOS upper bound" = commit_round_trip_p99 + fix_egress_lag_seconds.
+#   NOT a per-order histogram (the slice-3b-2 cross-JVM cut deleted that single-process sample).
+#   For HdrHistogram-grade cluster-path tail latency use `./gradlew clusterBench` (slice 4e).
 #
-# Env:
-#   OMS_INTERNAL_API_KEY (required — must match running OMS, same as OMS_INTERNAL_API_KEY on bootRun)
-#   OMS_URL              default http://127.0.0.1:8088  (used for default actuator URL)
-#   SHOOT_COUNT          default 50
-#   SHOOT_SLEEP_MS       default 0   (sleep between POSTs)
-#   SHOOT_INSTRUMENT     default AAPL
-#   SHOOT_QTY            default 1
-#   SHOOT_LIMIT          default 150
-#   SHOOT_PRINT_EACH     default 0   (set to 1 to print each request's HTTP time on stderr)
+# Prereqs (Pop! server / Linux dev box; macOS works for HTTP-only side):
+#   curl, jq, python3
 #
-# Full-flow (THIS BATCH only):
-#   SHOOT_OTEL_METRICS_URL — e.g. http://127.0.0.1:9464/metrics with OMS_OTEL_METRICS_ENABLED=true.
-#   The script saves OTel scrape before POSTs and after the wait; printed mean/pXX are **deltas**, not lifetime.
+# Required env:
+#   OMS_INTERNAL_API_KEY   must match the running ingress-replica's oms.http.internal-api-key.
 #
-#   SHOOT_PROMETHEUS_URL — default ${OMS_URL}/actuator/prometheus for Micrometer oms.pipeline.* breakdown
-#   (where time went: ingress vs outbox→Chronicle vs control.apply vs FIX).
+# Optional env (defaults are localhost):
+#   OMS_URL                          http://127.0.0.1:8088              ingress-replica HTTP
+#   OMS_INGRESS_REPLICA_PROM_URL     http://127.0.0.1:8087/actuator/prometheus
+#   OMS_POSTGRES_PROJECTOR_PROM_URL  http://127.0.0.1:8090/actuator/prometheus
+#   OMS_FIX_EGRESS_PROM_URL          http://127.0.0.1:8091/actuator/prometheus
+#   OMS_CLUSTER_NODE_METRICS_URL     http://127.0.0.1:8089/metrics
 #
-#   SHOOT_OTEL_WAIT_MAX_SEC      default 120
-#   SHOOT_OTEL_POLL_INTERVAL_SEC default 1
-#   SHOOT_OTEL_SHOW_RAW          default 0 — dump raw OTel histogram lines
+# Tuning:
+#   SHOOT_COUNT          50     number of orders to send
+#   SHOOT_SLEEP_MS       0      sleep between POSTs (ms)
+#   SHOOT_INSTRUMENT     AAPL
+#   SHOOT_QTY            1
+#   SHOOT_LIMIT          150
+#   SHOOT_PRINT_EACH     0      set 1 to print per-request HTTP time on stderr
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PARSE_PY="$SCRIPT_DIR/parse_otel_ingress_to_nos_histogram.py"
-DELTA_PROM_PY="$SCRIPT_DIR/summarize_micrometer_pipeline_deltas.py"
+DELTA_PROM_PY="$SCRIPT_DIR/summarize_cluster_pipeline_deltas.py"
 
 random_uuid() {
   python3 -c "import uuid; print(uuid.uuid4())"
 }
 
+# --- env defaults (config-and-limits: no bare numerics in the body) ---
 OMS_URL="${OMS_URL:-http://127.0.0.1:8088}"
-PROM_URL="${SHOOT_PROMETHEUS_URL:-${OMS_URL%/}/actuator/prometheus}"
-KEY="${OMS_INTERNAL_API_KEY:?set OMS_INTERNAL_API_KEY (must match the running OMS process — same value as bootRun / OMS_INTERNAL_API_KEY)}"
+INGRESS_PROM_URL="${OMS_INGRESS_REPLICA_PROM_URL:-http://127.0.0.1:8087/actuator/prometheus}"
+PROJECTOR_PROM_URL="${OMS_POSTGRES_PROJECTOR_PROM_URL:-http://127.0.0.1:8090/actuator/prometheus}"
+FIX_EGRESS_PROM_URL="${OMS_FIX_EGRESS_PROM_URL:-http://127.0.0.1:8091/actuator/prometheus}"
+CLUSTER_NODE_METRICS_URL="${OMS_CLUSTER_NODE_METRICS_URL:-http://127.0.0.1:8089/metrics}"
+
+KEY="${OMS_INTERNAL_API_KEY:?set OMS_INTERNAL_API_KEY (must match the running ingress-replica)}"
 if [[ "$KEY" == *"…"* || "$KEY" == "replace-me-internal-key" ]]; then
   echo "Refusing to run: OMS_INTERNAL_API_KEY looks like a documentation placeholder." >&2
-  echo "Set a real secret and use the identical value when starting OMS (oms.http.internal-api-key)." >&2
+  echo "Set a real secret and use the identical value when starting the ingress-replica" >&2
+  echo "(oms.http.internal-api-key)." >&2
   exit 1
 fi
+
 COUNT="${SHOOT_COUNT:-50}"
 SLEEP_MS="${SHOOT_SLEEP_MS:-0}"
 SYM="${SHOOT_INSTRUMENT:-AAPL}"
 QTY="${SHOOT_QTY:-1}"
 LIM="${SHOOT_LIMIT:-150}"
-OTEL_WAIT_MAX_SEC="${SHOOT_OTEL_WAIT_MAX_SEC:-120}"
-OTEL_POLL_SEC="${SHOOT_OTEL_POLL_INTERVAL_SEC:-1}"
 
 TIMES_FILE="$(mktemp)"
 SCRATCH="$(mktemp -d)"
 trap 'rm -rf "$SCRATCH" "$TIMES_FILE"' EXIT
 
-curl -fsS "$PROM_URL" -o "$SCRATCH/prom_before.txt" 2>/dev/null || true
+scrape() {
+  local url="$1"
+  local out="$2"
+  if [[ -z "$url" ]]; then
+    return 0
+  fi
+  curl -fsS "$url" -o "$out" 2>/dev/null || true
+}
 
-hinted_401=false
+# --- baseline scrapes (ingress-replica is the only one we need pre AND post for
+# histogram deltas; projector / fix-egress / cluster-node we read at the end so the
+# gauge values reflect end-of-run state, which is what the SLO doc describes) ---
+scrape "$INGRESS_PROM_URL" "$SCRATCH/ingress_before.txt"
+
 ok=0
 created=0
 fail=0
-
-BASELINE_OTEL="NA"
-if [[ -n "${SHOOT_OTEL_METRICS_URL:-}" ]]; then
-  if curl -fsS "${SHOOT_OTEL_METRICS_URL}" -o "$SCRATCH/otel_before.txt" 2>/dev/null; then
-    BASELINE_OTEL="$(python3 "$PARSE_PY" count <"$SCRATCH/otel_before.txt")"
-  else
-    rm -f "$SCRATCH/otel_before.txt"
-  fi
-fi
+hinted_401=false
 
 for i in $(seq 1 "$COUNT"); do
   CLIENT_KEY="bench-shoot-$(date +%s)-$i-$RANDOM"
@@ -105,9 +118,8 @@ for i in $(seq 1 "$COUNT"); do
     echo "FAIL i=$i http=$code" >&2
     if [[ "$code" == "401" && "$hinted_401" == "false" ]]; then
       hinted_401=true
-      echo "  401: header X-OMS-Internal-Key must exactly match OMS_INTERNAL_API_KEY on the running OMS." >&2
-      echo "  If OMS was started without OMS_INTERNAL_API_KEY, oms.http.internal-api-key is empty and every request is rejected." >&2
-      echo "  Restart OMS with the same export you use here, e.g. export OMS_INTERNAL_API_KEY='your-secret'" >&2
+      echo "  401: header X-OMS-Internal-Key must exactly match OMS_INTERNAL_API_KEY on the running ingress-replica." >&2
+      echo "  Restart with the same export you use here, e.g. export OMS_INTERNAL_API_KEY='your-secret'" >&2
     fi
     head -c 500 /tmp/oms-shoot-last.json >&2 || true
     echo >&2
@@ -117,90 +129,28 @@ for i in $(seq 1 "$COUNT"); do
   fi
 done
 
-echo "done: ok=$ok (http 201+200)  created=$created (http 201 only; OTel full-flow counts these)  fail=$fail"
+echo "done: ok=$ok (http 201+200)  created=$created (http 201)  fail=$fail"
 
-# --- FULL FLOW OTel: THIS BATCH (delta before vs after scrape), ms ---
-if [[ -n "${SHOOT_OTEL_METRICS_URL:-}" ]]; then
-  echo ""
-  echo "======================================================================"
-  echo "FULL FLOW (this batch) — DB commit (201) → FIX NOS  |  OTel, ms, Δ scrapes"
-  echo "======================================================================"
-  if [[ "$created" -eq 0 ]]; then
-    echo "  No HTTP 201 in this run — OTel histogram only starts on new orders."
-  elif [[ ! -f "$SCRATCH/otel_before.txt" ]]; then
-    echo "  No baseline OTel scrape (curl failed at script start)."
-  else
-    if [[ "$BASELINE_OTEL" == "NA" ]]; then
-      echo "  Note: baseline scrape had no ingress_to_nos histogram yet (cold OTel / first scrape) — using baseline count 0."
-      BASELINE_OTEL=0
-    fi
-    target=$((BASELINE_OTEL + created))
-    poll_start=$SECONDS
-    poll_deadline=$((SECONDS + OTEL_WAIT_MAX_SEC))
-    last_metrics=""
-    curl_rc=1
-    last_cur="NA"
-    while (( SECONDS < poll_deadline )); do
-      set +e
-      last_metrics="$(curl -fsS "${SHOOT_OTEL_METRICS_URL}" 2>&1)"
-      curl_rc=$?
-      set -e
-      if [[ "$curl_rc" -eq 0 && -n "$last_metrics" ]]; then
-        last_cur="$(echo "$last_metrics" | python3 "$PARSE_PY" count)"
-        if [[ "$last_cur" != "NA" ]] && [[ "$last_cur" -ge "$target" ]]; then
-          printf '%s\n' "$last_metrics" >"$SCRATCH/otel_after.txt"
-          break
-        fi
-      fi
-      sleep "$OTEL_POLL_SEC"
-    done
-    waited=$((SECONDS - poll_start))
-    if [[ ! -f "$SCRATCH/otel_after.txt" ]]; then
-      printf '%s\n' "${last_metrics:-}" >"$SCRATCH/otel_after.txt" || true
-    fi
-    if [[ "$curl_rc" -ne 0 ]]; then
-      echo "  scrape failed (curl exit $curl_rc) — last message:" >&2
-      while IFS= read -r line || [[ -n "$line" ]]; do echo "    $line" >&2; done <<< "${last_metrics:-}"
-      echo "  Fix: OMS_OTEL_METRICS_ENABLED=true and SHOOT_OTEL_METRICS_URL (default :9464/metrics)." >&2
-    elif [[ ! -s "$SCRATCH/otel_after.txt" ]]; then
-      echo "  (empty OTel scrape after run)" >&2
-    else
-      if [[ "${last_cur:-NA}" == "NA" ]]; then
-        last_cur=0
-      fi
-      if [[ "$last_cur" -lt "$target" ]]; then
-        echo "  TIMEOUT after ${waited}s: global _count is ${last_cur}, need >= ${target} (baseline ${BASELINE_OTEL} + ${created})."
-        echo "  Using last scrape for delta anyway (partial batch):"
-      else
-        echo "  Histogram global count reached ${target} (waited ${waited}s)."
-      fi
-      echo ""
-      python3 "$PARSE_PY" delta-summary "$SCRATCH/otel_before.txt" "$SCRATCH/otel_after.txt" | while IFS= read -r line; do echo "  $line"; done
-      echo ""
-      echo "  count_this_run = new observations between first and last scrape (should match created=${created})."
-      if [[ "${SHOOT_OTEL_SHOW_RAW:-0}" == "1" ]]; then
-        echo ""
-        echo "  --- raw OTel lines (ingress_to_nos) from last scrape ---"
-        grep -E 'ingress_to_nos' "$SCRATCH/otel_after.txt" || true
-      fi
-    fi
-  fi
-else
-  echo ""
-  echo "======================================================================"
-  echo "FULL FLOW OTel — skipped (set SHOOT_OTEL_METRICS_URL + OMS_OTEL_METRICS_ENABLED=true)"
-  echo "======================================================================"
-  echo "  Example: export SHOOT_OTEL_METRICS_URL='http://127.0.0.1:9464/metrics'"
-fi
+# --- end-of-run scrapes ---
+scrape "$INGRESS_PROM_URL"        "$SCRATCH/ingress_after.txt"
+scrape "$PROJECTOR_PROM_URL"      "$SCRATCH/projector_after.txt"
+scrape "$FIX_EGRESS_PROM_URL"     "$SCRATCH/fix_egress_after.txt"
+scrape "$CLUSTER_NODE_METRICS_URL" "$SCRATCH/cluster_node_after.txt"
 
-# --- Micrometer pipeline (THIS BATCH): where time went ---
-curl -fsS "$PROM_URL" -o "$SCRATCH/prom_after.txt" 2>/dev/null || true
-python3 "$DELTA_PROM_PY" "$SCRATCH/prom_before.txt" "$SCRATCH/prom_after.txt" || true
+echo ""
+python3 "$DELTA_PROM_PY" \
+  --ingress-before "$SCRATCH/ingress_before.txt" \
+  --ingress-after "$SCRATCH/ingress_after.txt" \
+  --projector-after "$SCRATCH/projector_after.txt" \
+  --fix-egress-after "$SCRATCH/fix_egress_after.txt" \
+  --cluster-node-after "$SCRATCH/cluster_node_after.txt" \
+  --created "$created" \
+  || true
 
 # --- HTTP only (curl); seconds ---
 if [[ "$ok" -gt 0 ]]; then
   echo ""
-  echo "HTTP only — curl time_total until response ends (seconds; NOT full flow to FIX):"
+  echo "HTTP only — curl time_total to ingress-replica (seconds; client-observed, includes JSON marshalling):"
   python3 - "$TIMES_FILE" <<'PY'
 import sys
 from pathlib import Path

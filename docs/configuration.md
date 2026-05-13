@@ -259,16 +259,15 @@ These metrics are always registered when the corresponding code paths run; they 
 | `oms.marketdata.nbbo.fetch` | `Timer` (`tag` **`source=http`**) | HTTP NBBO fetch inside **`resolveNbbo`** when **`OMS_MARKETDATA_HTTP_NBBO_IN_MARKET_CONTEXT_ENABLED`** and **`OMS_MARKETDATA_HTTP_ENABLED`** are **`true`**. | **`OMS_MARKETDATA_HTTP_BASE_URL`**, timeouts, **`OMS_MARKETDATA_HTTP_NBBO_PATH`**. |
 | `oms.ledger.settlement.outbox.post` | `Timer` | Per-row **`LedgerSettlementPostingClient.postSettlementOutbox`** plus **`markPosted`** when **`OMS_LEDGER_SETTLEMENT_OUTBOX_RECONCILER_ENABLED`** is **`true`** (success path only; failures increment **`oms_ledger_settlement_outbox_failed_total`**). | **`OMS_LEDGER_SETTLEMENT_OUTBOX_RECONCILER_*`**, **`OMS_LEDGER_SETTLEMENT_OUTBOX_ENABLED`**. |
 
-### Slice-1 order pipeline (Micrometer `Timer`s)
+### Ingress accept (Micrometer `Timer`)
 
 Histograms use **`publishPercentileHistogram()`** with expected bounds **`1 ms`–`120 s`** (see `OmsPipelineLatencyBounds`). On Prometheus these appear as **`oms_pipeline_*_seconds_bucket`** (name dots become underscores).
 
 | Meter name | Tags | What it measures |
 |------------|------|------------------|
 | `oms.pipeline.ingress.accept` | **`outcome`**: `created`, `duplicate`, `error` | **`OrderIngressService.persistAccepted`** Postgres transaction until commit (**`domain_event_outbox`** + optional **`ledger_inflight_outbox`**); the **`orders`** INSERT moved to the projector in slice 2c and **`control_outbox`** was deleted in slice 3f. |
-| `oms.pipeline.control.apply` | **`result`**: **`OrderControlAdmission.AdmissionResult`** name or `exception` | **`OrderControlAdmission.persistAdmission`** transaction (stale guard, risk, buying power, CAS, domain outbox), driven by the projector on cluster `OrderAdmittedEvent` replay. |
-| `oms.pipeline.fix.outbound_nos` | **`outcome`**: `success`, `failure` | `oms-fix-egress`: build **`NewOrderSingle`** + **`Session.sendToTarget`** on cluster event replay. |
-| `oms.pipeline.ingress_to_fix_nos` | — | **End-to-end** wall time from committed NEW order (same start as OTel **`oms.fix.ingress_to_nos`**) to successful NOS send. Recorded on **`/actuator/prometheus`** whenever **`oms.routing.backend=fix`**, **without** requiring **`OMS_OTEL_METRICS_ENABLED`**. |
+
+The Phase-1 monolith breakdown timers (**`oms.pipeline.control.apply`**, **`oms.pipeline.fix.outbound_nos`**, **`oms.pipeline.ingress_to_fix_nos`**) and the **`oms.fix.ingress_to_nos`** OTel histogram were removed in slice 4i — their producers were deleted across slices 3b-2 / 3f / 3g and the cross-JVM stop-the-clock hook never reached oms-fix-egress in the multi-JVM topology. Per-role substitutes: **`oms.cluster.client.commit_round_trip`** (slice 4c, ingress-replica), **`oms.fix_egress.lag_seconds`** + **`oms.projector.lag_seconds`** (slice 4d). See [`cluster-slo.md`](cluster-slo.md) for the full set and [`runbooks/local-multi-jvm-bench.md`](runbooks/local-multi-jvm-bench.md) for the multi-JVM benchmark recipe.
 
 **Clock skew:** there is no `oms_clock_offset_ms` gauge in OMS yet; compare venue **`SendingTime`** / ER timestamps to server clock in logs or derive offset in your metrics stack if you need best-ex wall-clock budgets.
 
@@ -280,27 +279,6 @@ When **`OMS_OTEL_METRICS_ENABLED=true`**, OMS starts an OpenTelemetry **`SdkMete
 |-----|---------|---------|
 | `OMS_OTEL_METRICS_ENABLED` | `false` | When **`true`**, bind OTel Prometheus scrape listener. |
 | `OMS_OTEL_PROMETHEUS_PORT` | `9464` | TCP port for **`/metrics`** (OTel-native histograms). |
-| `OMS_OTEL_INGRESS_TO_NOS_SAMPLE_TTL_MS` | `1800000` | Drop unmatched ingress timing samples after this wall time (no histogram; increments discard counter with **`reason=ttl_evict`**). Minimum **`60000`**. |
-| `OMS_OTEL_INGRESS_TO_NOS_EVICT_INTERVAL_MS` | `60000` | **`@Scheduled`** interval for TTL eviction of stale samples. Minimum **`5000`**. |
-
-### Histogram: HTTP accept → FIX `NewOrderSingle` (happy path)
-
-**Instrument:** `oms.fix.ingress_to_nos` (unit **`ms`**). Recorded only when **`oms.routing.backend=fix`**, after a **new** order row commits on internal **`POST /internal/v1/orders`**, until **`Session.sendToTarget`** succeeds for that order’s NOS. The same duration is also recorded as the Micrometer timer **`oms.pipeline.ingress_to_fix_nos`** on **`/actuator/prometheus`** (no OTel env required).
-
-Prometheus scrape text uses underscores (exporter-dependent suffixes such as **`_milliseconds_bucket`** may appear). Discover on your build with:
-
-```bash
-curl -sS http://127.0.0.1:9464/metrics | grep -E 'ingress_to_nos'
-```
-
-**Example PromQL (classic histogram)** — replace **`METRIC_BUCKET`** with the scrape line ending in **`_bucket`** for this instrument (name is exporter-version-specific; it **contains** `ingress_to_nos`):
-
-```promql
-histogram_quantile(0.50, sum(rate(METRIC_BUCKET[5m])) by (le))
-histogram_quantile(0.95, sum(rate(METRIC_BUCKET[5m])) by (le))
-```
-
-**Smoke script:** [`../scripts/benchmark/ingress-to-fix-nos-smoke.sh`](../scripts/benchmark/ingress-to-fix-nos-smoke.sh) — posts one order and greps the OTel scrape (requires FIX path + logon + key env).
 
 ## PII
 

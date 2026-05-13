@@ -13,7 +13,6 @@ import com.balh.oms.events.DomainEventEnvelopeCodec;
 import com.balh.oms.persistence.DomainEventOutboxRepository;
 import com.balh.oms.persistence.LedgerInflightOutboxRepository;
 import com.balh.oms.observability.metrics.OmsPipelineMetrics;
-import com.balh.oms.observability.otel.IngressToFixNosLatencyRecorder;
 import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.tailer.OrderControlAdmission;
 import com.balh.oms.domain.Side;
@@ -88,7 +87,6 @@ public class OrderIngressService {
     private final ObjectProvider<LedgerBalanceClient> ledgerBalanceClient;
     private final LedgerInflightOutboxRepository ledgerInflightOutbox;
     private final MeterRegistry meterRegistry;
-    private final IngressToFixNosLatencyRecorder ingressToFixNosLatencyRecorder;
     private final OrderControlAdmission orderControlAdmission;
     private final OmsClusterIngressClient clusterIngressClient;
 
@@ -103,7 +101,6 @@ public class OrderIngressService {
             ObjectProvider<LedgerBalanceClient> ledgerBalanceClient,
             LedgerInflightOutboxRepository ledgerInflightOutbox,
             MeterRegistry meterRegistry,
-            IngressToFixNosLatencyRecorder ingressToFixNosLatencyRecorder,
             OrderControlAdmission orderControlAdmission,
             OmsClusterIngressClient clusterIngressClient) {
         this.orders = orders;
@@ -116,7 +113,6 @@ public class OrderIngressService {
         this.ledgerBalanceClient = ledgerBalanceClient;
         this.ledgerInflightOutbox = ledgerInflightOutbox;
         this.meterRegistry = meterRegistry;
-        this.ingressToFixNosLatencyRecorder = ingressToFixNosLatencyRecorder;
         this.orderControlAdmission = orderControlAdmission;
         this.clusterIngressClient = clusterIngressClient;
     }
@@ -196,7 +192,6 @@ public class OrderIngressService {
             log.error("Failed to serialise domain fanout envelope for orderId={}", id, e);
             throw new RuntimeException("domain event envelope serialisation failed", e);
         }
-        ingressToFixNosLatencyRecorder.onOrderIngressCommitted(id);
         return new IngressResult(order, true);
     }
 

@@ -867,13 +867,13 @@ public class OmsAdmissionClusteredService implements ClusteredService {
             byte statusCode = buffer.getByte(p++);
             byte hasLedgerBalanceId = buffer.getByte(p++);
             String accountId = readString(buffer, p);
-            p += stringByteLen(accountId);
+            p += stringByteLenAt(buffer, p);
             String clientIdempotencyKey = readString(buffer, p);
-            p += stringByteLen(clientIdempotencyKey);
+            p += stringByteLenAt(buffer, p);
             String accountIdHash = readString(buffer, p);
-            p += stringByteLen(accountIdHash);
+            p += stringByteLenAt(buffer, p);
             String instrumentSymbol = readString(buffer, p);
-            p += stringByteLen(instrumentSymbol);
+            p += stringByteLenAt(buffer, p);
             String ledgerBalanceId = null;
             if (hasLedgerBalanceId == 1) {
                 ledgerBalanceId = readString(buffer, p);
@@ -927,8 +927,27 @@ public class OmsAdmissionClusteredService implements ClusteredService {
             return new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
         }
 
+        /**
+         * UTF-8 byte length of {@code s} on the wire (4-byte length prefix + UTF-8 payload).
+         * <strong>Allocates</strong> a {@code byte[]} via {@link String#getBytes(java.nio.charset.Charset)};
+         * used at snapshot encode time where there is no buffer yet to read from. Decode-time cursor
+         * advance uses the allocation-free {@link #stringByteLenAt} (slice 4f). Snapshot load
+         * still calls {@link #encodedLength()} on each {@code AdmittedOrder} (line ~721), which
+         * itself calls this — that is a known follow-up: replace it with a cursor-tracking
+         * decode helper to make snapshot LOAD allocation-free as well. Snapshot loads are rare
+         * (JVM startup) so the per-replay cost is small relative to the per-command hot path.
+         */
         private static int stringByteLen(String s) {
             return Integer.BYTES + s.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+        }
+
+        /**
+         * Number of bytes a string field occupies on the wire, read directly from the 4-byte
+         * length prefix. Allocation-free; mirrors
+         * {@code AcceptOrderCommand#stringByteLenAt}.
+         */
+        private static int stringByteLenAt(DirectBuffer buffer, int offset) {
+            return Integer.BYTES + buffer.getInt(offset);
         }
     }
 }

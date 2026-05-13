@@ -167,13 +167,13 @@ public record AcceptOrderCommand(
         p++;
 
         String accountId = readString(buffer, p);
-        p += stringByteLen(accountId);
+        p += stringByteLenAt(buffer, p);
         String clientIdempotencyKey = readString(buffer, p);
-        p += stringByteLen(clientIdempotencyKey);
+        p += stringByteLenAt(buffer, p);
         String accountIdHash = readString(buffer, p);
-        p += stringByteLen(accountIdHash);
+        p += stringByteLenAt(buffer, p);
         String instrumentSymbol = readString(buffer, p);
-        p += stringByteLen(instrumentSymbol);
+        p += stringByteLenAt(buffer, p);
         String ledgerBalanceId = null;
         if (hasLedgerBalanceId == 1) {
             ledgerBalanceId = readString(buffer, p);
@@ -219,7 +219,20 @@ public record AcceptOrderCommand(
         return new String(bytes, StandardCharsets.UTF_8);
     }
 
-    private static int stringByteLen(String s) {
-        return Integer.BYTES + s.getBytes(StandardCharsets.UTF_8).length;
+    /**
+     * Number of bytes a string field occupies on the wire, read directly from the 4-byte length
+     * prefix in {@code buffer} at {@code offset}. Used by {@link #decode} to advance the read
+     * cursor between string fields without re-encoding the just-decoded {@link String} back to
+     * UTF-8 bytes.
+     *
+     * <p>Phase 4 slice 4f of {@code system-documentation/plans/oms-aeron-cluster-substrate.md}:
+     * eliminates 4× redundant {@code byte[]} allocations per {@link AcceptOrderCommand} decode
+     * (one per string field, ~176 B/op on production-shaped commands) by keeping the cursor
+     * advance allocation-free. The byte length is identical to what the encoder wrote — see
+     * {@link #writeString} where {@code buffer.putInt(offset, bytes.length)} is the same value
+     * we read back here.
+     */
+    private static int stringByteLenAt(DirectBuffer buffer, int offset) {
+        return Integer.BYTES + buffer.getInt(offset);
     }
 }

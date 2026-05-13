@@ -5,6 +5,10 @@ plugins {
     id("com.google.protobuf") version "0.9.4"
     id("org.springframework.boot") version "3.3.4"
     id("io.spring.dependency-management") version "1.1.6"
+    // Phase 4 slice 4f: JMH benchmarks for cluster wire-format hot paths.
+    // me.champeau.jmh discovers @Benchmark classes under src/jmh, generates the JMH harness, and
+    // exposes a `jmh` Gradle task. Profilers (e.g. `gc`, `stack`) wire via `jmh.profilers`.
+    id("me.champeau.jmh") version "0.7.2"
 }
 
 group = "com.balh"
@@ -191,6 +195,41 @@ tasks.withType<Test> {
 
 tasks.named<org.springframework.boot.gradle.tasks.run.BootRun>("bootRun") {
     jvmArgs(lowLatencyJvmModuleOpens)
+}
+
+/**
+ * Phase 4 slice 4f: JMH config. Benchmarks live under {@code src/jmh/java}. Defaults are tight
+ * enough for a single-laptop-second iteration cycle (3 forks, 3+5 warmup/measurement iterations,
+ * 1 s each) while still being statistically meaningful. Override per-run via `-PjmhInclude` or
+ * env. The {@code -prof gc} profiler is the workhorse for slice 4f's allocation audit; engage it
+ * with `./gradlew jmh -Pjmh.profilers=gc` (passed through via the {@code profilers} property).
+ */
+jmh {
+    warmupIterations.set(3)
+    iterations.set(5)
+    fork.set(3)
+    timeOnIteration.set("1s")
+    warmup.set("1s")
+    benchmarkMode.set(listOf("avgt"))
+    timeUnit.set("ns")
+    jvmArgs.set(lowLatencyJvmModuleOpens)
+    val profilersProp = project.findProperty("jmh.profilers")?.toString()
+    if (!profilersProp.isNullOrBlank()) {
+        profilers.set(profilersProp.split(",").map { it.trim() }.filter { it.isNotEmpty() })
+    }
+    val includeProp = project.findProperty("jmhInclude")?.toString()
+    if (!includeProp.isNullOrBlank()) {
+        includes.set(listOf(includeProp))
+    }
+    resultFormat.set("JSON")
+    resultsFile.set(layout.buildDirectory.file("reports/jmh/results.json"))
+    humanOutputFile.set(layout.buildDirectory.file("reports/jmh/human.txt"))
+}
+
+// JMH plugin builds a fat-jar including test classes, which in this project exceeds the 65535
+// entry limit of standard ZIP — enable zip64 so packaging succeeds.
+tasks.named<Jar>("jmhJar") {
+    isZip64 = true
 }
 
 tasks.named<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJar") {

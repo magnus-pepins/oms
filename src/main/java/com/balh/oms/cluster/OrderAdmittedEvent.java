@@ -174,13 +174,13 @@ public record OrderAdmittedEvent(
         p++;
 
         String accountId = readString(buffer, p);
-        p += stringByteLen(accountId);
+        p += stringByteLenAt(buffer, p);
         String clientIdempotencyKey = readString(buffer, p);
-        p += stringByteLen(clientIdempotencyKey);
+        p += stringByteLenAt(buffer, p);
         String accountIdHash = readString(buffer, p);
-        p += stringByteLen(accountIdHash);
+        p += stringByteLenAt(buffer, p);
         String instrumentSymbol = readString(buffer, p);
-        p += stringByteLen(instrumentSymbol);
+        p += stringByteLenAt(buffer, p);
         String ledgerBalanceId = null;
         if (hasLedgerBalanceId == 1) {
             ledgerBalanceId = readString(buffer, p);
@@ -227,7 +227,12 @@ public record OrderAdmittedEvent(
         return new String(bytes, StandardCharsets.UTF_8);
     }
 
-    private static int stringByteLen(String s) {
-        return Integer.BYTES + s.getBytes(StandardCharsets.UTF_8).length;
+    /**
+     * Number of bytes a string field occupies on the wire, read directly from the 4-byte length
+     * prefix in {@code buffer} at {@code offset}. See {@code AcceptOrderCommand#stringByteLenAt}
+     * for the slice-4f rationale (eliminates redundant {@code byte[]} allocations on decode).
+     */
+    private static int stringByteLenAt(DirectBuffer buffer, int offset) {
+        return Integer.BYTES + buffer.getInt(offset);
     }
 }

@@ -153,11 +153,11 @@ public record ExecutionAppliedEvent(
         p++; // reserved
 
         String accountId = readString(buffer, p);
-        p += stringByteLen(accountId);
+        p += stringByteLenAt(buffer, p);
         String venueId = readString(buffer, p);
-        p += stringByteLen(venueId);
+        p += stringByteLenAt(buffer, p);
         String venueExecRef = readString(buffer, p);
-        p += stringByteLen(venueExecRef);
+        p += stringByteLenAt(buffer, p);
         String rawEnvelopeJson = readString(buffer, p);
 
         return new ExecutionAppliedEvent(
@@ -201,7 +201,12 @@ public record ExecutionAppliedEvent(
         return new String(bytes, StandardCharsets.UTF_8);
     }
 
-    private static int stringByteLen(String s) {
-        return Integer.BYTES + s.getBytes(StandardCharsets.UTF_8).length;
+    /**
+     * Number of bytes a string field occupies on the wire, read directly from the 4-byte length
+     * prefix in {@code buffer} at {@code offset}. See {@code AcceptOrderCommand#stringByteLenAt}
+     * for the slice-4f rationale (eliminates redundant {@code byte[]} allocations on decode).
+     */
+    private static int stringByteLenAt(DirectBuffer buffer, int offset) {
+        return Integer.BYTES + buffer.getInt(offset);
     }
 }

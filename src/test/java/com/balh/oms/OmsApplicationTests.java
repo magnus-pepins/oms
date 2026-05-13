@@ -17,15 +17,15 @@ class OmsApplicationTests extends AbstractPostgresIntegrationTest {
 
     @Test
     void contextLoads() {
-        // Asserts that Spring Boot wiring is healthy: Flyway runs, beans are
-        // resolvable, the no-op publisher and chronicle journal are present.
+        // Asserts that Spring Boot wiring is healthy: Flyway runs, the cluster
+        // bootstrap loads, the projector + ingress beans wire up.
     }
 
     @Test
     void actuatorInfo_includesOmsTopology() throws Exception {
         mockMvc.perform(get("/actuator/info"))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$['oms-topology']['control.postgres-write-path']").exists())
+                .andExpect(jsonPath("$['oms-topology']['routing.backend']").exists())
                 .andExpect(jsonPath("$['oms-topology']['spring.active-profiles']").value("test"));
     }
 }

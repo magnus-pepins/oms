@@ -193,6 +193,12 @@ oms:
     heart-bt-int: ${OMS_FIX_HEART_BT_INT:30}
     venue-id-for-executions: ${OMS_FIX_VENUE_ID_FOR_EXECUTIONS:FIX}
     use-data-dictionary: ${OMS_FIX_USE_DATA_DICTIONARY:false}
+    # Slice 4l: QuickFIX/J FileStore sync mode. Y = fsync per outbound message (QuickFIX/J default,
+    # protocol-loss-free crash recovery via on-disk stream). N = rely on FIX MsgSeqNum + broker resend
+    # on logon (still loss-free at the protocol level, removes per-NOS fsync). Slice 4l measured this
+    # is NOT the egress bottleneck on Pop! (~20 us/event); we keep Y default and expose the knob for
+    # operators on slower storage. See OmsConfig.Fix.fileStoreSync javadoc.
+    file-store-sync: ${OMS_FIX_FILE_STORE_SYNC:Y}
     # JSON object: OMS instrument_symbol (case-insensitive key) → broker Symbol on NOS; empty env → {} in Java.
     symbol-map-json: ${OMS_FIX_SYMBOL_MAP_JSON:}
     route-key: ${OMS_FIX_ROUTE_KEY:default}

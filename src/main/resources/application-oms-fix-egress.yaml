@@ -56,6 +56,14 @@ oms:
       # Same shape as oms.fix.outbound-dedicated-not-ready-park-nanos on the legacy worker; named
       # separately so the egress can be tuned independently.
       session-not-ready-park-nanos: ${OMS_FIX_EGRESS_SESSION_NOT_READY_PARK_NANOS:50000000}
+      # Slice 4l: number of OrderAdmittedEvent fragments applied between Postgres UPSERTs to
+      # oms_fix_egress_cursor. Default 1 = per-event advance (slice 3b-2 contract; 1-fragment
+      # at-least-once-at-broker redelivery window). N>1 batches the cursor advance, trading a
+      # wider DupClOrdID redelivery burst on crash (up to N-1 NOS resent) for ~27x egress
+      # throughput on Pop! benchmarks. Recommended production setting: 25-50 once operators are
+      # comfortable with the wider broker-side dedupe burst on crash. See OmsConfig.Cluster.FixEgress
+      # javadoc and docs/runbooks/local-multi-jvm-bench.md "Slice 4l evidence" section.
+      cursor-flush-every: ${OMS_FIX_EGRESS_CURSOR_FLUSH_EVERY:1}
   routing:
     backend: fix
   fix:

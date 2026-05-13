@@ -340,28 +340,245 @@ flat-ceiling shape is consistent with serial-event processing on each consumer (
 UPSERT per admitted order on the projector; one FIX `Session.sendToTarget` + FileStore fsync +
 `oms_fix_egress_cursor` UPDATE per admit on the egress).
 
-### Slice 4 throughput decision
+### Slice 4 throughput decision (superseded by Slice 4l — see below)
 
-With 4j + 4k evidence in hand, the **explicit decision** is to NOT pursue batched cursor
-advance or in-memory FIX message store now. Rationale:
+With 4j + 4k evidence the original decision was to NOT pursue batched cursor advance or
+in-memory FIX message store. That decision is **retracted** by Slice 4l: when we re-bench
+with a sustained burst (60 k orders, ingress paced at >3 krps) we found the FIX-egress
+consumer holds a flat ~700 ev/s ceiling for the full burst, and the projector sustains a
+similarly low ceiling. That is no longer "well below realistic SLO" — it is a real ceiling
+on what the substrate can lift. The 4k burst at 1 k orders simply finished before the
+ceiling mattered.
 
-- At the production-shaped workloads we actually serve (Trading Desk single-digit rps,
-  customer-frontend dozens of orders/sec), per-event admit-to-NOS p99 is ~4 ms — far below any
-  realistic SLO (`cluster-slo.md` warns at 5 s, criticals at 30 s).
-- Bursts of 1 k orders at 2 700 rps from the burst tool are not a real workload. They exist
-  to find the consumer ceiling, not to set the SLO target.
-- Batched cursor advance widens the at-least-once window from 1 to N orders. Equivalent to
-  FIX `PossDupFlag` / `DupClOrdID` only if the broker actually dedups on `DupClOrdID`. We do
-  not have that broker analysis yet, so doing it now would land strictness regressions for a
-  latency improvement we do not need.
-- An in-memory FIX message store with Aeron-backed durability would replace the FileStore's
-  resend-history role; the blast radius for FIX session-layer recovery (broker
-  `Resend Request`, `Logon` with `MsgSeqNum`) is large and a complete design has not been done.
+The instrumentation (slice 4j histograms + slice 4k burst tool) was sufficient to reopen
+the decision once we ran a longer burst. Slice 4l does so explicitly.
 
-The instrumentation (slice 4j histograms + slice 4k burst tool) is sufficient to reopen this
-decision when an actual customer workload demands it. The bench harness itself is the
-artefact; the dashboards already render the new histograms automatically (Micrometer +
-percentile-histogram-enabled timers).
+## Slice 4l evidence (Pop! May 2026)
+
+### Setup
+
+- Same host, same JVMs, same Postgres as 4j/4k.
+- Ingress paced via `burst-ingress-orders.sh` with `OMS_BURST_TOTAL=60000`, concurrency 200.
+- All five OMS JVMs (`cluster-node`, `ingress-replica`, `oms-postgres-projector`,
+  `oms-fix-egress`, `fixLoopbackAcceptor`) run with constrained Hikari pools
+  (`OMS_PG_POOL_MAX_SIZE=3`, `OMS_PG_POOL_MIN_IDLE=1`) so the shared ledger Supavisor
+  session pool does not exhaust during the run. This does not affect throughput because
+  HTTP-accept and cluster-commit only need a single connection per request and the
+  projector / fix-egress are single-threaded consumers.
+
+### Hypotheses tested (pre-registered)
+
+| ID  | Hypothesis | Falsifier |
+|-----|------------|-----------|
+| H1  | QuickFIX `FileStoreSync=Y` (per-NOS fsync) is the dominant per-event egress cost | If H1 is true, flipping to `N` lifts the egress ceiling materially |
+| H2  | The `oms_fix_egress_cursor` UPSERT (one Postgres tx per fragment) is the dominant per-event cost | If H2 is true, batching the UPSERT (every N fragments) lifts the egress ceiling materially |
+
+### Result
+
+**H1 rejected**: `FileStoreSync=N` alone moved sustained drain from ~694 ev/s to ~686 ev/s
+(within noise; ext4 + NVMe + tmpfs-style cache means a per-message fsync is ~20 µs out of a
+~1.4 ms/event budget — too small to see).
+
+**H2 confirmed and the dominant lever**: with `cursor-flush-every=50` (single Postgres
+UPSERT per 50 fragments) the egress consumer drained the 60 k-event backlog in **3.19 s**,
+i.e. **~18 800 ev/s sustained** with peaks above 25 000 ev/s. That is a **~27× lift** over
+the H1+H2-off baseline.
+
+What that says about the architecture:
+
+- The original "items 1+2 (fsync + cursor UPSERT) account for the bulk of per-event cost"
+  framing was correct in *direction* but wrong in *split*: the cursor UPSERT was effectively
+  the entire per-event cost; the fsync is rounding error.
+- The egress is no longer the bottleneck. The new ceiling is the ingress pipeline (HTTP
+  accept + cluster commit + synchronous buying-power hold), which sustained ~3 700 orders/s
+  for the duration of the burst on this same single-host rig.
+
+### Decision
+
+`cursor-flush-every` ships as a configurable knob with default `1` (per-event UPSERT — the
+slice 3b-2 contract is preserved bit-for-bit). The recommended **production** setting is
+`25–50`. The trade-off is a wider at-least-once-at-broker redelivery window: on a crash the
+egress redelivers up to `cursor-flush-every - 1` `OrderAdmittedEvent` fragments, which
+become duplicate `NewOrderSingle` at the broker. The broker rejects them via the
+`DupClOrdID` field on the `NewOrderSingle` (option 1 in the FIX 4.4 dedupe model — already
+the contract for the existing 1-fragment redelivery window). The window widens; the
+correctness model does not change.
+
+`oms.fix.file-store-sync` ships as a configurable knob with default `Y` (QuickFIX/J's
+documented default; protocol-loss-free crash recovery via the on-disk message stream
+alone). H1 evidence says we don't need to flip it on Pop! storage; operators on slower
+storage may want `N` (recovery falls back to FIX `MsgSeqNum` + broker resend on `Logon`,
+which is also protocol-loss-free).
+
+Both knobs are surfaced via env vars on the `oms-fix-egress` profile:
+
+```yaml
+oms:
+  cluster:
+    fix-egress:
+      cursor-flush-every: ${OMS_FIX_EGRESS_CURSOR_FLUSH_EVERY:1}     # production: 25-50
+  fix:
+    file-store-sync: ${OMS_FIX_FILE_STORE_SYNC:Y}                    # leave Y unless storage-bound
+```
+
+### Slice 4l → next: pushing well beyond ~3 700 orders/s
+
+The egress ceiling moved from ~700 ev/s to ~18 800 ev/s. The **system** ceiling is now
+~3 700 orders/s and lives on the ingress side. The substrate is designed to scale
+horizontally on both axes the user named ("N ingress acceptors" and "N control / buying-
+power checks") — the next slices simply turn that property into measured throughput. See
+the `## Scaling roadmap (slice 4l → 5)` section below for the prioritised plan.
+
+## Scaling roadmap (slice 4l → 5)
+
+This is the prioritised path from the current ~3 700 orders/s ingress ceiling to "way
+beyond". Numbers are rough, single-host estimates from the slice 4l rig — multi-host
+production with the ledger's real load capacity will multiply most of them. Each item lists
+the hypothesised lift, the cost / risk, and where to look in the code.
+
+### Where the budget actually goes (post-H2)
+
+```
+client → HTTP POST /orders → ingress-replica (Tomcat)
+            │
+            ├─ pre-trade reservation (synchronous Postgres → ledger Supavisor)   ← ~1.5 ms
+            ├─ domain_event_outbox INSERT + tx commit                            ← ~1.5 ms
+            ├─ OmsClusterIngressClient.commit() (Aeron Cluster ingress)          ← ~0.3 ms
+            └─ HTTP 201
+                                │
+                                ▼
+cluster-node                    │  Raft replicate + apply (single-leader, deterministic)
+  OmsAdmissionClusteredService  │  ~0.05 ms / cmd at single-node, sub-ms at 3-node
+  emits OrderAdmittedEvent ─────┘
+                                │
+                ┌───────────────┴───────────────┐
+                ▼                               ▼
+   oms-postgres-projector             oms-fix-egress
+     orders/positions UPSERT            FIX NOS send + cursor UPSERT
+     + control admission                ~18 800 ev/s with H2
+     ~3 000 ev/s today                  bottleneck moved upstream
+```
+
+The ingress critical section currently does **two** Postgres round-trips per order on the
+ledger Supavisor: the buying-power hold and the OMS outbox commit. Cluster commit is
+sub-ms; egress and projector apply asynchronously off the cluster events recording.
+
+### Tier 1 — N ingress acceptors (zero new architecture, immediate lift)
+
+The ingress-replica JVM is **already** stateless. Every Tomcat thread submits to the same
+Aeron Cluster via `OmsClusterIngressClient.commit()`, the cluster owns ordering, the
+projector and egress are blind to which acceptor produced an event. Standing up N
+ingress-replica processes (or N pods in k8s) is a config-only change.
+
+- **Lift**: linear in N until the next bottleneck (cluster ingress or ledger pool).
+  Single-host fairness experiment on Pop!: 1 ingress = 3 700 rps; 2 ingress = ~6–7 krps
+  expected (CPU is plentiful at 48 cores; we just need separate HTTP ports and separate
+  cluster-client ingress channels).
+- **Cost / risk**: none, beyond the Supavisor session pool which is the next item.
+- **Where**: `application-oms-ingress-replica.yaml`. Each replica needs a unique
+  `OMS_INGRESS_REPLICA_HTTP_PORT`, unique `OMS_CLUSTER_CLIENT_INGRESS_CHANNEL` UDP endpoint,
+  and a unique `OMS_CLUSTER_CLIENT_AERON_DIR` (or shared via IPC if co-resident on the
+  cluster-node host).
+- **Slice**: 4m (proposed) — bench script that stands up 2× and 4× ingress-replicas, drives
+  `burst-ingress-orders.sh` against a round-robin LB (or the burst tool's `OMS_BURST_TARGETS`
+  if extended), and confirms linear scaling up to the ledger pool ceiling.
+
+### Tier 2 — Move buying-power hold off the ingress critical path
+
+Today the buying-power / pre-trade reservation is a synchronous JDBC call to the ledger
+inside the ingress acceptor's HTTP request thread. That is the biggest single chunk of the
+~3 ms ingress-accept p50. Two options, in order of preference:
+
+1. **Pipeline / batch the holds**. Multiple in-flight orders share a single ledger
+   transaction window (group commit on the OMS side). Concretely: replace the
+   "1 HTTP request → 1 hold tx" mapping with a small in-process queue + group-coalesce
+   worker that flushes every ≤1 ms or every 32 orders. Each order's HTTP response waits on
+   its own hold result; the *batch* commits to ledger as one tx. Ledger throughput per
+   commit is roughly fixed-cost, so this is a 4–10× lift on the hold tier alone.
+   - Lift: ingress p50 drops from ~3 ms to ~0.5–1 ms; ingress ceiling moves from ~3.7 krps
+     to ~10–20 krps before cluster ingress becomes the next bottleneck.
+   - Risk: low — semantics are preserved (hold is still synchronous from the client's POV).
+2. **Cache balances locally with optimistic reservation**. Ingress holds against an
+   in-process balance projection (Redis-backed or built off the ledger event stream),
+   submits the order to the cluster, and reconciles asynchronously. Mismatches reject the
+   order out-of-band (cancel + reverse hold). Only worth doing if (1) doesn't reach
+   target, because it changes the consistency model. The ledger already publishes the
+   stream we'd consume.
+
+- **Where**: `OrderAcceptService` / `LedgerHoldClient` (or whatever the slice 3 ledger
+  client is named in `customer-frontend/`-style usage). The batching boundary fits
+  cleanly between the request-scoped hold and the JDBC tx.
+- **Slice**: 4n (proposed).
+
+### Tier 3 — N control / buying-power workers (already supported by the substrate)
+
+The post-admission control evaluation (`OrderControlAdmission`, the projector-tier risk +
+buying-power check) **runs inside the projector JVM today**, on the projector's serial
+apply thread. That is fine when you have 1 projector and the projector keeps up — but the
+projector's drain rate (~3 k ev/s) is already lower than the egress's 18.8 k ev/s. We can:
+
+1. **Run N projector JVMs**, each consuming the same `OmsClusterWireFormat.EVENTS_STREAM_ID`
+   recording with **disjoint key shards** (e.g. `account_id mod N`). The cluster's
+   ordered-per-key guarantee already holds within a shard; the projector consumer side
+   just needs a shard predicate. Cursor advances become per-shard (`oms_projector_cursor`
+   already keys on `(stream_id, projector_id)`; we'd add `shard_id` to the grain).
+   - Lift: linear in N up to the ledger's commit ceiling for control checks.
+2. **Split the control check off the projector JVM** entirely. The projector keeps its
+   "orders / executions UPSERT" job; a separate `oms-control` JVM(s) subscribes to the
+   same events recording, runs the risk + buying-power evaluation, and emits a
+   `ControlAdmissionDecision` event back via the cluster ingress. The egress waits for
+   that decision before NOS. This is the cleanest "N control workers" shape; it costs one
+   extra Aeron ingress hop per order.
+
+- **Where**: `OmsPostgresProjector`, `OrderControlAdmission`, projector cursor schema.
+- **Slice**: 4o (proposed). Tier 3 is bigger than tiers 1 + 2 combined; do tiers 1 + 2
+  first and re-measure.
+
+### Tier 4 — Apply H2 to the projector
+
+Same idea as the egress H2 unlock. The projector currently does a Postgres UPSERT per
+admitted event for `orders` + cursor advance + (where applicable) positions. Each is one
+round-trip on the same Supavisor pool. Group-commit the cursor advance the same way
+egress does (config knob, default 1, recommended 25–50), and consider batching the
+`orders` / `positions` UPSERTs via a single multi-row statement per batch.
+
+- **Lift**: projector drain rate from ~3 k ev/s to "egress-grade" 15–20 k ev/s.
+- **Risk**: same redelivery shape as egress H2; the projector is idempotent on
+  `(account_id, client_order_id)` so duplicates are silently absorbed.
+- **Where**: `OmsPostgresProjector.applyAdmittedEvent` and friends; mirror the
+  `OmsConfig.Cluster.Projector.cursorFlushEvery` shape we just shipped on FixEgress.
+- **Slice**: 4p (proposed).
+
+### Tier 5 — Cluster-side and FIX-side parallelism (Phase 5 territory)
+
+Beyond ~50–100 krps single-cluster the leader's deterministic apply thread becomes the
+bottleneck. Two complementary moves:
+
+1. **Multiple cluster groups, sharded by `account_id`**. Each group is a fully independent
+   Raft cluster with its own leader, ingress channel, and events recording. Routing lives
+   in the ingress-replica (consistent hash on `account_id`). The ledger is already
+   account-keyed so the holds carry across cleanly.
+2. **Multiple FIX sessions to the broker**. `FixOutboundSessionSend` fans out by
+   `(account_id, route_key)` today; standing up N initiator sessions parallelises the
+   `Session.sendToTarget` path past the single-session ceiling. Brokers typically
+   throttle per-session, not per-firm, so this is mostly a broker-contract negotiation.
+
+- **Slice**: Phase 5 (Cloud / k8s).
+
+### Recommended order of execution
+
+| Slice | What | Expected ingress ceiling on Pop! |
+|-------|------|-----------------------------------|
+| 4l (done) | H2 batched egress cursor (default 1, prod 25–50) | ~3 700 orders/s (egress no longer the limit) |
+| 4m | 2–4 ingress-replicas, same cluster | ~8–15 krps |
+| 4n | Batched buying-power holds | ~15–30 krps |
+| 4o | Disjoint-shard projectors (or split control JVMs) | ~30 krps + (control no longer the limit) |
+| 4p | H2 batched projector cursor / UPSERTs | projector drain ≈ egress drain |
+| Phase 5 | Sharded cluster groups + multi-session FIX | "trade-08 QuickFIX-grade" 50 k+ NOS/s |
+
+The throughput delta for a 1980s-style trading-floor target (10 k NOS/s sustained) is
+already inside Tier 2. Tiers 3–5 are about not having to think about the ceiling again,
+not about reaching the immediate target.
 
 ## Caveats
 

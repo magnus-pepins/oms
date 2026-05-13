@@ -577,6 +577,18 @@ public class OmsConfig {
         private String venueIdForExecutions = "FIX";
         private boolean useDataDictionary = false;
         /**
+         * Slice 4l: QuickFIX/J FileStore sync mode for {@link quickfix.FileStoreFactory}. Default
+         * {@code Y} matches QuickFIX/J's documented default (fsync-per-message persistence on the
+         * sender's outbound store, giving crash-recovery via the on-disk message stream alone).
+         * {@code N} relies on FIX MsgSeqNum + broker resend on logon for crash recovery (still
+         * loss-free at the protocol level) and removes the per-NOS fsync from the hot path. Slice
+         * 4l hypothesis H1 measured this on Pop! and found the per-message fsync is NOT the
+         * dominant per-event cost at Pop! storage speeds (\u224820 \u00b5s vs \u22481.4 ms/event total before
+         * H2); see {@code docs/runbooks/local-multi-jvm-bench.md} \u201cSlice 4l evidence\u201d. We keep
+         * the safe default and expose the knob for operators on slower storage.
+         */
+        private String fileStoreSync = "Y";
+        /**
          * JSON object: OMS {@code instrument_symbol} (any case) → broker {@code Symbol} on outbound {@code NewOrderSingle}
          * (e.g. {@code {"AAPL":"AAPL.NMS"}}). {@code {}} or empty = identity mapping.
          */
@@ -658,6 +670,26 @@ public class OmsConfig {
         }
         public boolean isUseDataDictionary() { return useDataDictionary; }
         public void setUseDataDictionary(boolean useDataDictionary) { this.useDataDictionary = useDataDictionary; }
+
+        public String getFileStoreSync() { return fileStoreSync; }
+        public void setFileStoreSync(String fileStoreSync) {
+            if (fileStoreSync == null) {
+                this.fileStoreSync = "Y";
+                return;
+            }
+            String trimmed = fileStoreSync.trim();
+            if (trimmed.isEmpty()) {
+                this.fileStoreSync = "Y";
+                return;
+            }
+            // QuickFIX/J accepts only Y/N here. Reject anything else with a clear error rather than
+            // silently coercing, since this is the on-disk durability flag.
+            if (!"Y".equalsIgnoreCase(trimmed) && !"N".equalsIgnoreCase(trimmed)) {
+                throw new IllegalArgumentException(
+                        "oms.fix.file-store-sync must be 'Y' or 'N' (got '" + fileStoreSync + "')");
+            }
+            this.fileStoreSync = trimmed.toUpperCase(java.util.Locale.ROOT);
+        }
 
         public String getSymbolMapJson() {
             return symbolMapJson;
@@ -1479,6 +1511,22 @@ public class OmsConfig {
              * worker; named separately so the egress JVM can be tuned independently.
              */
             private static final long DEFAULT_SESSION_NOT_READY_PARK_NANOS = 50_000_000L;
+            /**
+             * Slice 4l: number of {@code OrderAdmittedEvent} fragments applied between Postgres
+             * UPSERTs to {@code oms_fix_egress_cursor}. Default {@code 1} preserves slice 3b-2's
+             * per-event advance contract: a crash redelivers exactly the in-flight fragment, the
+             * broker rejects with {@code DupClOrdID}, and the at-least-once-at-broker guarantee
+             * holds with the smallest possible redelivery window. Values {@code N>1} widen the
+             * redelivery window to up to {@code N-1} fragments per crash but trade per-event
+             * Postgres round-trips for a single batched advance every {@code N} fragments, which
+             * benchmarks (slice 4l on Pop!) showed lifts the egress drain ceiling by ~27\u00d7
+             * (\u2248694/s \u2192 \u224818,800/s) because the Postgres UPSERT, not QuickFIX fsync, is the
+             * dominant per-event cost. Recommended production setting: 25\u201350 once operators are
+             * comfortable with the wider broker-side dedupe burst on crash. See
+             * {@code docs/runbooks/local-multi-jvm-bench.md} \u201cSlice 4l evidence\u201d for the
+             * benchmark trace and the broker-side {@code DupClOrdID} contract review.
+             */
+            private static final int DEFAULT_CURSOR_FLUSH_EVERY = 1;
 
             private boolean enabled = false;
             private String aeronDirectory = "";
@@ -1490,6 +1538,7 @@ public class OmsConfig {
             private int fragmentLimit = DEFAULT_FRAGMENT_LIMIT;
             private long recordingLookupParkMs = DEFAULT_RECORDING_LOOKUP_PARK_MS;
             private long sessionNotReadyParkNanos = DEFAULT_SESSION_NOT_READY_PARK_NANOS;
+            private int cursorFlushEvery = DEFAULT_CURSOR_FLUSH_EVERY;
 
             public boolean isEnabled() { return enabled; }
             public void setEnabled(boolean enabled) { this.enabled = enabled; }
@@ -1551,6 +1600,11 @@ public class OmsConfig {
             public long getSessionNotReadyParkNanos() { return sessionNotReadyParkNanos; }
             public void setSessionNotReadyParkNanos(long sessionNotReadyParkNanos) {
                 this.sessionNotReadyParkNanos = Math.max(1_000L, sessionNotReadyParkNanos);
+            }
+
+            public int getCursorFlushEvery() { return cursorFlushEvery; }
+            public void setCursorFlushEvery(int cursorFlushEvery) {
+                this.cursorFlushEvery = Math.max(1, cursorFlushEvery);
             }
         }
 

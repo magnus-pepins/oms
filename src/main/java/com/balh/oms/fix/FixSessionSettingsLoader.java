@@ -39,6 +39,11 @@ final class FixSessionSettingsLoader {
         s.setString("HeartBtInt", String.valueOf(fix.getHeartBtInt()));
         s.setString("ReconnectInterval", "5");
         s.setString("FileStorePath", fileStorePath.toString());
+        // Slice 4l: per-message fsync (QuickFIX FileStoreSync=Y) is QuickFIX/J's documented default
+        // and gives crash-recovery via the on-disk message stream alone. Operators may flip to N
+        // on slower storage; FIX MsgSeqNum + broker resend on logon still gives a protocol-loss-free
+        // recovery path. See OmsConfig.Fix.fileStoreSync javadoc.
+        s.setString("FileStoreSync", fix.getFileStoreSync());
         s.setString("UseDataDictionary", fix.isUseDataDictionary() ? "Y" : "N");
         s.setString("SocketConnectHost", fix.getSocketConnectHost());
         s.setString("SocketConnectPort", String.valueOf(fix.getSocketConnectPort()));

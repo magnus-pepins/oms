@@ -2,7 +2,11 @@ package com.balh.oms.fixegress;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
 import com.balh.oms.cluster.AcceptOrderCommand;
@@ -161,6 +165,63 @@ class OmsFixEgressServiceTest {
         assertThat(meterRegistry.find(OmsPipelineMeterNames.CLUSTER_ADMIT_TO_FIX_NOS).timer())
                 .as("cursor-only mode emits no NOS — admit-to-fix-nos Timer must stay unregistered")
                 .isNull();
+    }
+
+    @Test
+    void applyAdmittedEvent_batchedCursorFlushEvery3_persistsOnceEvery3rdFragment() throws Exception {
+        // Slice 4l H2: with cursorFlushEvery=3 the Postgres UPSERT to oms_fix_egress_cursor must
+        // run on fragments 3, 6, 9 (and any final flush on shutdown), not on fragments 1/2/4/5/7/8.
+        // We carry the latest fragment position across the gap so the durable cursor never
+        // points behind a fragment that has already shipped to the broker.
+        OmsFixEgressService batched = new OmsFixEgressService(
+                config, cursorRepository, meterRegistry,
+                Clock.fixed(Instant.ofEpochMilli(NOW_MS), ZoneOffset.UTC),
+                builder, send);
+        setCursorFlushEvery(batched, 3);
+        flipRunning(batched, true);
+
+        when(builder.build(any(OrderAdmittedEvent.class))).thenReturn(new NewOrderSingle());
+        when(send.hasActiveSession()).thenReturn(true);
+
+        long pos1 = 1024L;
+        long pos2 = 2048L;
+        long pos3 = 3072L;
+        long pos4 = 4096L;
+        long pos5 = 5120L;
+        long pos6 = 6144L;
+
+        for (long pos : new long[] {pos1, pos2}) {
+            assertThat(batched.applyAdmittedEvent(sampleAdmitted(AcceptOrderCommand.SIDE_BUY, AcceptOrderCommand.TIF_DAY), pos)).isTrue();
+        }
+        verifyNoInteractions(cursorRepository);
+
+        assertThat(batched.applyAdmittedEvent(sampleAdmitted(AcceptOrderCommand.SIDE_BUY, AcceptOrderCommand.TIF_DAY), pos3)).isTrue();
+        verify(cursorRepository, times(1))
+                .advance(OmsFixEgressService.EGRESS_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, pos3);
+
+        for (long pos : new long[] {pos4, pos5}) {
+            assertThat(batched.applyAdmittedEvent(sampleAdmitted(AcceptOrderCommand.SIDE_BUY, AcceptOrderCommand.TIF_DAY), pos)).isTrue();
+        }
+        verify(cursorRepository, never())
+                .advance(OmsFixEgressService.EGRESS_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, pos4);
+        verify(cursorRepository, never())
+                .advance(OmsFixEgressService.EGRESS_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, pos5);
+
+        assertThat(batched.applyAdmittedEvent(sampleAdmitted(AcceptOrderCommand.SIDE_BUY, AcceptOrderCommand.TIF_DAY), pos6)).isTrue();
+        verify(cursorRepository, times(1))
+                .advance(OmsFixEgressService.EGRESS_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, pos6);
+
+        verifyNoMoreInteractions(cursorRepository);
+    }
+
+    private static void setCursorFlushEvery(OmsFixEgressService svc, int value) {
+        try {
+            Field f = OmsFixEgressService.class.getDeclaredField("cursorFlushEvery");
+            f.setAccessible(true);
+            f.setInt(svc, value);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("failed to set cursorFlushEvery for test", e);
+        }
     }
 
     private static OrderAdmittedEvent sampleAdmitted(byte side, byte tif) {

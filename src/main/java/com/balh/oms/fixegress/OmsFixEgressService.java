@@ -138,6 +138,23 @@ public class OmsFixEgressService {
     private final AtomicReference<Long> lastAppliedPosition = new AtomicReference<>(0L);
     private Thread replayThread;
 
+    /**
+     * Slice 4l H2 (batched cursor advance). Cached at {@link #init} from
+     * {@link OmsConfig.Cluster.FixEgress#getCursorFlushEvery()}. Default {@code 1} preserves the
+     * per-event advance shape from slice 3b-2; {@code N>1} batches the Postgres UPSERT to
+     * {@code oms_fix_egress_cursor} and widens the at-least-once-at-broker redelivery window to
+     * up to {@code N-1} NOS per crash (the broker rejects duplicates via {@code DupClOrdID}).
+     * Cached locally so the hot path does not chase through {@code OmsConfig} on every fragment.
+     */
+    private int cursorFlushEvery = 1;
+
+    // Slice 4l H2 batched-flush bookkeeping. Single-writer (replay thread) for the increment;
+    // the shutdown final flush also runs on the replay thread (in replayLoop's finally block),
+    // so plain ints/longs are safe. lastAppliedPosition stays atomic because lastAppliedPosition()
+    // is read from other threads (tests, JMX/actuator if added later).
+    private int eventsSinceCursorFlush;
+    private long pendingCursorPosition;
+
     @Autowired
     public OmsFixEgressService(
             OmsConfig config,
@@ -175,15 +192,22 @@ public class OmsFixEgressService {
                 .findLastAppliedPosition(EGRESS_ID, OmsClusterWireFormat.EVENTS_STREAM_ID)
                 .orElse(0L);
         lastAppliedPosition.set(resumePos);
+        pendingCursorPosition = resumePos;
+        eventsSinceCursorFlush = 0;
+        // Slice 4l H2: cache cursor-flush-every from OmsConfig so the hot replay path doesn't
+        // chase the config object on every fragment. Min-clamped to 1 by the setter; we still
+        // belt-and-braces clamp here to fail closed on pathological injection.
+        cursorFlushEvery = Math.max(1, config.getCluster().getFixEgress().getCursorFlushEvery());
         boolean fixWired = newOrderSingleBuilder != null && fixOutboundSessionSend != null;
         log.info(
-                "oms-fix-egress starting (slice 3b-2 — {}); resuming from log position {} (egressId={}, streamId={})",
+                "oms-fix-egress starting (slice 3b-2 — {}); resuming from log position {} (egressId={}, streamId={}); cursorFlushEvery={}",
                 fixWired
                         ? "FIX send active: NewOrderSingle via FixOutboundSessionSend"
                         : "cursor-only mode (no FIX beans on classpath; routing.backend != fix)",
                 resumePos,
                 EGRESS_ID,
-                OmsClusterWireFormat.EVENTS_STREAM_ID);
+                OmsClusterWireFormat.EVENTS_STREAM_ID,
+                cursorFlushEvery);
         running.set(true);
         replayThread = new Thread(this::replayLoop, "oms-fix-egress-replay");
         replayThread.setDaemon(true);
@@ -265,10 +289,40 @@ public class OmsFixEgressService {
         } catch (RuntimeException e) {
             log.error("oms-fix-egress replay loop terminating", e);
         } finally {
+            // Slice 4l H2: flush any pending batched cursor advance before tearing down. The
+            // replay thread is the only writer of eventsSinceCursorFlush / pendingCursorPosition,
+            // so reading them here (still on the replay thread) is race-free. With
+            // cursorFlushEvery=1 (default) this is always a no-op.
+            flushPendingCursorAdvance("replay loop shutdown");
             CloseHelper.quietClose(replay);
             CloseHelper.quietClose(archive);
             CloseHelper.quietClose(aeron);
             log.info("oms-fix-egress replay loop stopped");
+        }
+    }
+
+    /**
+     * Slice 4l H2 helper. Persists the latest in-memory cursor position when at least one
+     * fragment has been applied since the last flush. Idempotent: with no pending fragments
+     * (or {@code cursorFlushEvery=1} so every fragment already flushes inline) this is a
+     * no-op. Failures are logged but not rethrown — on restart, replay redelivers the
+     * batch's worth of fragments and the broker rejects duplicate NOS via {@code DupClOrdID}
+     * (option 1 dedupe).
+     */
+    private void flushPendingCursorAdvance(String reason) {
+        if (eventsSinceCursorFlush <= 0) {
+            return;
+        }
+        long pos = pendingCursorPosition;
+        eventsSinceCursorFlush = 0;
+        try {
+            cursorRepository.advance(EGRESS_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, pos);
+        } catch (RuntimeException e) {
+            log.warn(
+                    "oms-fix-egress: pending cursor flush failed at {} (reason={}); restart will replay fragments and broker will dedupe via DupClOrdID",
+                    pos,
+                    reason,
+                    e);
         }
     }
 
@@ -513,7 +567,15 @@ public class OmsFixEgressService {
             OmsPipelineMetrics.recordClusterAdmitToFixNos(
                     meterRegistry, EGRESS_ID, ev.side(), ev.timeInForceCode(), latencyMs);
         }
-        cursorRepository.advance(EGRESS_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, newPosition);
+        // Slice 4l H2: gate the Postgres UPSERT on the configured batch size. Default 1
+        // preserves slice 3b-2 per-event semantics; >1 widens the at-least-once-at-broker
+        // redelivery window to up to (cursorFlushEvery-1) NOS per crash.
+        pendingCursorPosition = newPosition;
+        eventsSinceCursorFlush++;
+        if (eventsSinceCursorFlush >= cursorFlushEvery) {
+            cursorRepository.advance(EGRESS_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, newPosition);
+            eventsSinceCursorFlush = 0;
+        }
         return true;
     }
 }

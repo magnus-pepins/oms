@@ -468,20 +468,21 @@ sub-ms; egress and projector apply asynchronously off the cluster events recordi
 The ingress-replica JVM is **already** stateless. Every Tomcat thread submits to the same
 Aeron Cluster via `OmsClusterIngressClient.commit()`, the cluster owns ordering, the
 projector and egress are blind to which acceptor produced an event. Standing up N
-ingress-replica processes (or N pods in k8s) is a config-only change.
+ingress-replica processes (or N pods in k8s) is a config-only change. Slice 4m landed the
+operator-side knobs needed to actually run this on Pop!: see the dedicated
+`## Slice 4m setup` section below.
 
 - **Lift**: linear in N until the next bottleneck (cluster ingress or ledger pool).
   Single-host fairness experiment on Pop!: 1 ingress = 3 700 rps; 2 ingress = ~6–7 krps
-  expected (CPU is plentiful at 48 cores; we just need separate HTTP ports and separate
-  cluster-client ingress channels).
+  expected (CPU is plentiful at 48 cores; we just need separate HTTP ports — the
+  cluster-client UDP endpoint is already ephemeral by default).
 - **Cost / risk**: none, beyond the Supavisor session pool which is the next item.
 - **Where**: `application-oms-ingress-replica.yaml`. Each replica needs a unique
-  `OMS_INGRESS_REPLICA_HTTP_PORT`, unique `OMS_CLUSTER_CLIENT_INGRESS_CHANNEL` UDP endpoint,
-  and a unique `OMS_CLUSTER_CLIENT_AERON_DIR` (or shared via IPC if co-resident on the
-  cluster-node host).
-- **Slice**: 4m (proposed) — bench script that stands up 2× and 4× ingress-replicas, drives
-  `burst-ingress-orders.sh` against a round-robin LB (or the burst tool's `OMS_BURST_TARGETS`
-  if extended), and confirms linear scaling up to the ledger pool ceiling.
+  `OMS_HTTP_PORT` and a unique `OMS_INGRESS_REPLICA_MANAGEMENT_SERVER_PORT`. The
+  cluster-client `ingress-channel` / `egress-channel` defaults are
+  `aeron:udp?endpoint=localhost:0` (port 0 = ephemeral) so two replicas sharing one Aeron
+  media driver each get distinct ports automatically — only override the channel env vars
+  when binding to a specific interface or pinning a port for a firewall rule.
 
 ### Tier 2 — Move buying-power hold off the ingress critical path
 
@@ -579,6 +580,138 @@ bottleneck. Two complementary moves:
 The throughput delta for a 1980s-style trading-floor target (10 k NOS/s sustained) is
 already inside Tier 2. Tiers 3–5 are about not having to think about the ceiling again,
 not about reaching the immediate target.
+
+## Slice 4m setup — running 2× ingress-replicas on Pop!
+
+Slice 4m exposes the operator contract for tier 1: stand up a second ingress-replica JVM
+sharing the cluster-node's Aeron media driver and Postgres, then drive the burst tool with
+two targets via `OMS_BURST_URLS`.
+
+### What the slice ships
+
+- `application-oms-ingress-replica.yaml`: `OMS_CLUSTER_CLIENT_INGRESS_CHANNEL` and
+  `OMS_CLUSTER_CLIENT_EGRESS_CHANNEL` are now first-class env vars (defaults remain
+  `aeron:udp?endpoint=localhost:0`, i.e. ephemeral UDP port). No code change is required to
+  run N replicas on the same host because port 0 binds a fresh ephemeral port per JVM; the
+  envs let you pin specific ports for firewall / multi-host setups when needed.
+- `IngressBurstMain` / `scripts/benchmark/burst-ingress-orders.sh`:
+  `OMS_BURST_URLS=<csv of full URLs>` round-robins requests across the listed targets
+  (request `i` → `urls[i % urls.size()]`). The end-of-run summary prints
+  `per-target submitted` so you can confirm both replicas actually saw their share. The
+  single-URL `OMS_URL` / `OMS_BURST_URL` path keeps working unchanged.
+
+### Topology
+
+```
+                     (this is the existing single-host bench, with 1 extra ingress-replica)
+
+  burst-ingress-orders.sh ─┬─► ingress-replica-1   HTTP 8088   actuator 8087
+                           │       │
+                           │       ▼
+                           │   OmsClusterIngressClient (ephemeral UDP)
+                           │       │
+                           │       ▼
+                           │   ┌──────────────────────────────────────┐
+                           │   │ cluster-node + ClusteredMediaDriver  │   actuator 8089
+                           │   │ (one shared Aeron dir on disk)       │
+                           │   └──────────────────────────────────────┘
+                           │       │              │
+                           │       ▼              ▼
+                           │   projector       fix-egress
+                           │   actuator 8090   actuator 8091
+                           │       │              │
+                           └─► ingress-replica-2   HTTP 8095   actuator 8086
+                                   │ (same OmsClusterIngressClient → same media driver)
+                                   ▼
+                              (cluster-node above)
+```
+
+Both ingress-replicas connect to the cluster-node's Aeron media driver as Aeron clients.
+Each `AeronCluster` session is a separate logical client of the cluster regardless of the
+shared media driver; the cluster's Raft replication handles ordering across both. Each
+replica also has its own Hikari pool against the OMS Postgres for `domain_event_outbox`
+inserts.
+
+### Per-replica env contract
+
+Replica 1 (the one you already run today):
+
+```bash
+export OMS_HTTP_PORT=8088
+export OMS_INGRESS_REPLICA_MANAGEMENT_SERVER_PORT=8087
+export OMS_CLUSTER_CLIENT_AERON_DIRECTORY=$HOME/oms/build/aeron-cluster/media-driver
+# OMS_CLUSTER_CLIENT_INGRESS_CHANNEL / _EGRESS_CHANNEL: leave at defaults (ephemeral UDP)
+export OMS_PG_POOL_MAX_SIZE=3
+export OMS_PG_POOL_MIN_IDLE=1
+```
+
+Replica 2 (new — distinct HTTP / management ports, same Aeron dir, same Postgres):
+
+```bash
+export OMS_HTTP_PORT=8095
+export OMS_INGRESS_REPLICA_MANAGEMENT_SERVER_PORT=8086
+export OMS_CLUSTER_CLIENT_AERON_DIRECTORY=$HOME/oms/build/aeron-cluster/media-driver
+# Defaults again — port 0 ephemeral binds a fresh UDP port for replica 2's cluster client
+export OMS_PG_POOL_MAX_SIZE=3
+export OMS_PG_POOL_MIN_IDLE=1
+```
+
+The Supavisor session-pool budget on Pop! is the limiter: with 5 OMS JVMs already running
+at `OMS_PG_POOL_MAX_SIZE=3` (= 15 reserved sessions), one more ingress-replica adds 3
+more, putting us close to the slow path you hit during slice 4l. If startup fails with
+`MaxClientsInSessionMode`, restart `ledger-supabase-pooler` to drop stale sessions and
+re-launch.
+
+### Driving the burst across both replicas
+
+```bash
+export OMS_INTERNAL_API_KEY='<same key you set on both replicas>'
+export OMS_BURST_TOTAL=60000
+export OMS_BURST_CONCURRENCY=200
+export OMS_BURST_URLS='http://127.0.0.1:8088/internal/v1/orders,http://127.0.0.1:8095/internal/v1/orders'
+./scripts/benchmark/burst-ingress-orders.sh
+```
+
+The script's stdout will start with:
+
+```
+Burst targets (OMS_BURST_URLS, round-robin):
+  http://127.0.0.1:8088/internal/v1/orders
+  http://127.0.0.1:8095/internal/v1/orders
+```
+
+…and end with the burst summary, including:
+
+```
+per-target submitted (round-robin):
+  http://127.0.0.1:8088/internal/v1/orders = 30000
+  http://127.0.0.1:8095/internal/v1/orders = 30000
+```
+
+### How to read the result
+
+The post-run Prometheus delta script only scrapes **one** `OMS_INGRESS_REPLICA_PROM_URL`
+(replica 1, port 8087 by default). That is intentional — operators who want a true
+aggregate across replicas can either:
+
+1. Look at the **burst tool's own end-of-run summary** (`elapsed`, `rps`, `success`,
+   per-target submitted, HdrHistogram p50/p99 of HTTP RTT). This is aggregate-correct
+   without summing across replicas because it sits client-side.
+2. Look at the **cluster-side per-event histograms**:
+   `oms.pipeline.cluster_admit_to_projector` (projector JVM) and
+   `oms.pipeline.cluster_admit_to_fix_nos` (fix-egress JVM). Both are unsharded — there's
+   one projector and one fix-egress consuming the cluster's events recording — so their
+   p50/p99 represent the system-level admit-to-apply latency across whichever replica
+   the order entered through.
+
+The lift you're looking for is in (1): if burst rps with 2 replicas is materially higher
+than burst rps with 1 replica at the same concurrency, tier 1 worked. If it plateaus, the
+next bottleneck is either the Supavisor pool (look for `Connection is not available` in
+the OMS logs) or cluster-node ingress (look for backlog growth on
+`oms.cluster.client.commit_round_trip_seconds` p99 in either replica's actuator scrape —
+add `OMS_INGRESS_REPLICA_PROM_URL_2` and a second pre/post scrape to the wrapper if you
+want to compare them; not implemented yet because we expect tier 2 — batched holds — to
+be the next bottleneck once tier 1 lifts the ceiling).
 
 ## Caveats
 

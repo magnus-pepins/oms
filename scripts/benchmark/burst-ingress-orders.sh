@@ -21,6 +21,12 @@
 #
 # Optional env (defaults; mirrors shoot-ingress-orders.sh + IngressBurstMain):
 #   OMS_URL                          http://127.0.0.1:8088              ingress-replica HTTP
+#   OMS_BURST_URLS                   (unset)                            slice 4m: comma-separated
+#                                    full target URLs (e.g.
+#                                    http://127.0.0.1:8088/internal/v1/orders,http://127.0.0.1:8095/internal/v1/orders)
+#                                    when set, IngressBurstMain round-robins requests across the
+#                                    listed targets — used to drive N ingress-replicas without an
+#                                    external load balancer. Overrides OMS_URL / OMS_BURST_URL.
 #   OMS_INGRESS_REPLICA_PROM_URL     http://127.0.0.1:8087/actuator/prometheus
 #   OMS_POSTGRES_PROJECTOR_PROM_URL  http://127.0.0.1:8090/actuator/prometheus
 #   OMS_FIX_EGRESS_PROM_URL          http://127.0.0.1:8091/actuator/prometheus
@@ -77,10 +83,22 @@ scrape "$FIX_EGRESS_PROM_URL" "$SCRATCH/fix_egress_before.txt"
 # --- run the burst (Gradle bootRunBurst -> IngressBurstMain) ---
 # Gradle args are the burst tool's env vars; we forward OMS_URL into OMS_BURST_URL by suffix.
 BURST_URL="${OMS_BURST_URL:-${OMS_URL%/}/internal/v1/orders}"
+# Slice 4m: when OMS_BURST_URLS is set, forward it untouched and the burst tool round-robins
+# across the list. OMS_BURST_URL stays valid as a single-target fallback.
+BURST_URLS="${OMS_BURST_URLS:-}"
+
+if [[ -n "$BURST_URLS" ]]; then
+  echo "Burst targets (OMS_BURST_URLS, round-robin):"
+  echo "  $BURST_URLS" | tr ',' '\n' | sed 's/^[[:space:]]*/  /'
+else
+  echo "Burst target (single OMS_BURST_URL):"
+  echo "  $BURST_URL"
+fi
 
 (
   cd "$OMS_REPO_DIR"
   OMS_BURST_URL="$BURST_URL" \
+  OMS_BURST_URLS="$BURST_URLS" \
   OMS_INTERNAL_API_KEY="$KEY" \
     ./gradlew --console=plain --no-daemon -q bootRunBurst
 )

@@ -17,6 +17,14 @@ oms:
       # ingress-replica is on a separate host from the cluster member it talks to (Phase 5 / k8s).
       aeron-directory: ${OMS_CLUSTER_CLIENT_AERON_DIRECTORY:${OMS_AERON_MEDIA_DRIVER_DIR:${OMS_AERON_DIR_BASE:build/aeron-cluster}/media-driver}}
       ingress-endpoints: ${OMS_CLUSTER_CLIENT_INGRESS_ENDPOINTS:0=localhost:20110}
+      # Slice 4m: ingress / egress channel default to UDP with port 0 (ephemeral). When N
+      # ingress-replicas share one host (and one Aeron media driver), each replica's cluster
+      # client gets a distinct ephemeral UDP port automatically — no operator-side port
+      # bookkeeping is required. Override these env vars only when binding to a specific
+      # interface (multi-host k8s) or pinning a port for a firewall rule. Mirrors the same
+      # knobs already exposed on oms-fix-egress.
+      ingress-channel: ${OMS_CLUSTER_CLIENT_INGRESS_CHANNEL:aeron:udp?endpoint=localhost:0}
+      egress-channel: ${OMS_CLUSTER_CLIENT_EGRESS_CHANNEL:aeron:udp?endpoint=localhost:0}
 
 management:
   server:

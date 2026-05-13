@@ -9,6 +9,9 @@ import java.net.http.HttpResponse;
 import java.net.http.HttpResponse.BodyHandlers;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -47,6 +50,11 @@ import java.util.concurrent.locks.LockSupport;
  * <pre>
  *   OMS_INTERNAL_API_KEY=...     required; must match the running ingress-replica's secret
  *   OMS_BURST_URL                http://127.0.0.1:8088/internal/v1/orders
+ *   OMS_BURST_URLS               comma-separated list, overrides OMS_BURST_URL when set; the
+ *                                burst tool round-robins requests across the URLs. Use this to
+ *                                drive N ingress-replicas without standing up an external load
+ *                                balancer (slice 4m). Example:
+ *                                {@code http://127.0.0.1:8088/internal/v1/orders,http://127.0.0.1:8095/internal/v1/orders}
  *   OMS_BURST_TOTAL              1000   total requests sent (steady-state phase)
  *   OMS_BURST_CONCURRENCY        50     max in-flight requests
  *   OMS_BURST_RPS_CAP            0      optional RPS cap (0 = unlimited / concurrency-bound)
@@ -73,6 +81,12 @@ public final class IngressBurstMain {
 
     public static final String ENV_API_KEY = "OMS_INTERNAL_API_KEY";
     public static final String ENV_URL = "OMS_BURST_URL";
+    /**
+     * Slice 4m: comma-separated list of burst targets. When set, requests are distributed
+     * round-robin across the URLs (request {@code i} goes to {@code urls[i % urls.size()]}).
+     * Empty / unset falls back to the single {@link #ENV_URL} target.
+     */
+    public static final String ENV_URLS = "OMS_BURST_URLS";
     public static final String ENV_TOTAL = "OMS_BURST_TOTAL";
     public static final String ENV_CONCURRENCY = "OMS_BURST_CONCURRENCY";
     public static final String ENV_RPS_CAP = "OMS_BURST_RPS_CAP";
@@ -145,6 +159,14 @@ public final class IngressBurstMain {
         AtomicLong duplicates = new AtomicLong();
         AtomicLong failures = new AtomicLong();
         ConcurrentHashMap<Integer, AtomicLong> statusCounts = new ConcurrentHashMap<>();
+        // Slice 4m: per-target submitted-request count. Submitted (not 2xx) so an operator can
+        // see at the end of a run that the round-robin actually reached every replica even if
+        // a subset returned errors. Sized to urls.size() so one entry per target — no overhead
+        // when only one URL is configured.
+        ConcurrentHashMap<String, AtomicLong> perTargetSubmitted = new ConcurrentHashMap<>();
+        for (String u : cfg.urls) {
+            perTargetSubmitted.put(u, new AtomicLong());
+        }
 
         Semaphore concurrencyGate = new Semaphore(cfg.concurrency);
         long opIntervalNanos = cfg.rpsCap > 0 ? TimeUnit.SECONDS.toNanos(1) / cfg.rpsCap : 0L;
@@ -166,7 +188,11 @@ public final class IngressBurstMain {
             final boolean isWarmup = requestIndex < cfg.warmup;
             UUID accountId = accountIds[requestIndex % accountIds.length];
             String body = buildBody(accountId, requestIndex, cfg);
-            HttpRequest request = HttpRequest.newBuilder(URI.create(cfg.url))
+            // Slice 4m: round-robin across the configured targets. With one URL this is a fixed
+            // index; with N URLs the burst tool spreads load uniformly without an external LB.
+            String targetUrl = cfg.urls.get(requestIndex % cfg.urls.size());
+            perTargetSubmitted.get(targetUrl).incrementAndGet();
+            HttpRequest request = HttpRequest.newBuilder(URI.create(targetUrl))
                     .timeout(Duration.ofSeconds(cfg.requestTimeoutSeconds))
                     .header("Content-Type", "application/json")
                     .header("X-OMS-Internal-Key", cfg.apiKey)
@@ -225,6 +251,7 @@ public final class IngressBurstMain {
                 duplicates.get(),
                 failures.get(),
                 statusCounts,
+                perTargetSubmitted,
                 elapsedNanos);
     }
 
@@ -267,7 +294,13 @@ public final class IngressBurstMain {
     public static final class Config {
 
         public final String apiKey;
-        public final String url;
+        /**
+         * Slice 4m: ordered, immutable list of burst target URLs. Always at least one entry.
+         * Requests are distributed round-robin: request {@code i} goes to
+         * {@code urls.get(i % urls.size())}. Single-URL operators set one entry; multi-replica
+         * operators set N entries via {@link #ENV_URLS}.
+         */
+        public final List<String> urls;
         public final int total;
         public final int concurrency;
         public final int rpsCap;
@@ -290,8 +323,41 @@ public final class IngressBurstMain {
                 String limitPrice,
                 int requestTimeoutSeconds,
                 int warmup) {
+            this(apiKey,
+                    Collections.singletonList(requireUrl(url)),
+                    total,
+                    concurrency,
+                    rpsCap,
+                    accountPoolSize,
+                    instrument,
+                    quantity,
+                    limitPrice,
+                    requestTimeoutSeconds,
+                    warmup);
+        }
+
+        public Config(
+                String apiKey,
+                List<String> urls,
+                int total,
+                int concurrency,
+                int rpsCap,
+                int accountPoolSize,
+                String instrument,
+                String quantity,
+                String limitPrice,
+                int requestTimeoutSeconds,
+                int warmup) {
             if (apiKey == null || apiKey.isBlank()) {
                 throw new IllegalArgumentException("apiKey must be set (env " + ENV_API_KEY + ")");
+            }
+            if (urls == null || urls.isEmpty()) {
+                throw new IllegalArgumentException(
+                        "urls must contain at least one entry (env " + ENV_URL + " or " + ENV_URLS + ")");
+            }
+            List<String> sanitised = new ArrayList<>(urls.size());
+            for (String u : urls) {
+                sanitised.add(requireUrl(u));
             }
             if (total <= 0) {
                 throw new IllegalArgumentException("total must be > 0");
@@ -309,7 +375,7 @@ public final class IngressBurstMain {
                 throw new IllegalArgumentException("warmup must be in [0, total]");
             }
             this.apiKey = apiKey;
-            this.url = url;
+            this.urls = Collections.unmodifiableList(sanitised);
             this.total = total;
             this.concurrency = concurrency;
             this.rpsCap = rpsCap;
@@ -323,9 +389,10 @@ public final class IngressBurstMain {
 
         public static Config fromEnv() {
             String apiKey = requireEnv(ENV_API_KEY);
+            List<String> urls = parseUrls(System.getenv(ENV_URLS), envOrDefault(ENV_URL, DEFAULT_URL));
             return new Config(
                     apiKey,
-                    envOrDefault(ENV_URL, DEFAULT_URL),
+                    urls,
                     parseInt(ENV_TOTAL, DEFAULT_TOTAL),
                     parseInt(ENV_CONCURRENCY, DEFAULT_CONCURRENCY),
                     parseInt(ENV_RPS_CAP, DEFAULT_RPS_CAP),
@@ -339,7 +406,7 @@ public final class IngressBurstMain {
 
         @Override
         public String toString() {
-            return "Config{url=" + url
+            return "Config{urls=" + urls
                     + ", total=" + total
                     + ", concurrency=" + concurrency
                     + ", rpsCap=" + rpsCap
@@ -348,6 +415,37 @@ public final class IngressBurstMain {
                     + ", warmup=" + warmup
                     + "}";
         }
+    }
+
+    /**
+     * Parse {@link #ENV_URLS} (comma-separated, any whitespace around entries is trimmed). When
+     * blank, returns a single-element list with {@code fallback}. Empty entries inside the list
+     * (e.g. {@code "a,,b"}) are dropped silently rather than failing — operators copy-paste
+     * comma-separated lists from runbooks and a stray trailing comma should not block a run.
+     */
+    static List<String> parseUrls(String raw, String fallback) {
+        if (raw == null || raw.isBlank()) {
+            return Collections.singletonList(fallback);
+        }
+        String[] parts = raw.split(",");
+        List<String> urls = new ArrayList<>(parts.length);
+        for (String p : parts) {
+            String trimmed = p.trim();
+            if (!trimmed.isEmpty()) {
+                urls.add(trimmed);
+            }
+        }
+        if (urls.isEmpty()) {
+            return Collections.singletonList(fallback);
+        }
+        return urls;
+    }
+
+    private static String requireUrl(String url) {
+        if (url == null || url.isBlank()) {
+            throw new IllegalArgumentException("url must not be blank");
+        }
+        return url.trim();
     }
 
     /** Result struct — immutable post-construction; histograms are owned. */
@@ -361,6 +459,12 @@ public final class IngressBurstMain {
         public final long duplicateCount;
         public final long failureCount;
         public final ConcurrentHashMap<Integer, AtomicLong> statusCounts;
+        /**
+         * Slice 4m: per-target submitted-request count. Always populated (one entry per
+         * {@link Config#urls} entry) so multi-replica runs print "we did reach every replica"
+         * without operators needing to grep ingress-replica access logs.
+         */
+        public final ConcurrentHashMap<String, AtomicLong> perTargetSubmitted;
         public final long elapsedNanos;
 
         public BurstResult(
@@ -372,6 +476,7 @@ public final class IngressBurstMain {
                 long duplicateCount,
                 long failureCount,
                 ConcurrentHashMap<Integer, AtomicLong> statusCounts,
+                ConcurrentHashMap<String, AtomicLong> perTargetSubmitted,
                 long elapsedNanos) {
             this.config = config;
             this.steadyHistogram = steadyHistogram;
@@ -381,6 +486,7 @@ public final class IngressBurstMain {
             this.duplicateCount = duplicateCount;
             this.failureCount = failureCount;
             this.statusCounts = statusCounts;
+            this.perTargetSubmitted = perTargetSubmitted;
             this.elapsedNanos = elapsedNanos;
         }
 
@@ -401,6 +507,15 @@ public final class IngressBurstMain {
                                     : String.valueOf(e.getKey());
                             out.printf("  %s = %d%n", label, e.getValue().get());
                         });
+            }
+            // Slice 4m: print only when we actually have multiple targets — single-URL runs do
+            // not need a one-line "100% to localhost" breakdown that would clutter every shoot.
+            if (config.urls.size() > 1) {
+                out.println("per-target submitted (round-robin):");
+                for (String u : config.urls) {
+                    long count = perTargetSubmitted.getOrDefault(u, new AtomicLong()).get();
+                    out.printf("  %s = %d%n", u, count);
+                }
             }
             if (steadyHistogram.getTotalCount() == 0) {
                 out.println("(no successful samples — histogram empty)");

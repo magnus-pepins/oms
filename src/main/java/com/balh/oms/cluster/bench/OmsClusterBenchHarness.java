@@ -105,6 +105,12 @@ public final class OmsClusterBenchHarness {
     public static final String ENV_TIMEOUT_MS = "OMS_BENCH_TIMEOUT_MS";
     public static final String ENV_REPORT_DIR = "OMS_BENCH_REPORT_DIR";
     public static final String ENV_AERON_DIR_BASE = "OMS_BENCH_AERON_DIR_BASE";
+    /**
+     * Slice 4g — GC label echoed into {@code summary.md} so a stack of bench reports is
+     * self-describing. Set by the {@code clusterBench} Gradle task when {@code -PgcMode} is
+     * specified; not consumed by harness logic, only by report formatting.
+     */
+    public static final String ENV_GC_LABEL = "OMS_BENCH_GC_LABEL";
 
     public static final int DEFAULT_DURATION_S = 30;
     public static final int DEFAULT_THROUGHPUT_OPS_PER_S = 1_000;
@@ -363,6 +369,18 @@ public final class OmsClusterBenchHarness {
             out.println("| `" + ENV_DURATION_S + "` | " + config.durationSeconds + " s |");
             out.println("| `" + ENV_THROUGHPUT_OPS_PER_S + "` | " + config.throughputOpsPerSec + " ops/s |");
             out.println("| `" + ENV_TIMEOUT_MS + "` | " + config.timeoutMs + " ms |");
+            // Phase 4 slice 4g: GC label is set by the `clusterBench` Gradle task when
+            // `-PgcMode=g1|zgc|shenandoah` is passed (see build.gradle.kts). Plumbed through env so
+            // GC-comparison summaries are self-describing without grepping JVM args. Java vendor /
+            // version are JVM-side facts the comparison report cares about — write them too.
+            String gcLabel = System.getenv(ENV_GC_LABEL);
+            if (gcLabel != null && !gcLabel.isBlank()) {
+                out.println("| `" + ENV_GC_LABEL + "` | " + gcLabel + " |");
+            }
+            out.println("| `java.vm.name` | " + System.getProperty("java.vm.name") + " |");
+            out.println("| `java.vm.vendor` | " + System.getProperty("java.vm.vendor") + " |");
+            out.println("| `java.version` | " + System.getProperty("java.version") + " |");
+            out.println("| `os.arch` | " + System.getProperty("os.arch") + " |");
             out.println();
             out.println("## Outcomes (steady-state phase only)");
             out.println();

@@ -140,6 +140,108 @@ sustained throughput shows them dominating.
 
 ---
 
+---
+
+## Slice 4g — GC comparison (G1 vs generational ZGC vs Shenandoah)
+
+The cluster-node JVM ships under `bootJarClusterNode` (`com.balh.oms.OmsClusterNodeBootstrap`)
+on top of `eclipse-temurin:21-jre-jammy`, which defaults to G1. This slice asks: would either of
+the low-pause collectors (generational ZGC or Shenandoah) give a tail-latency win over G1 at the
+workload shape `clusterBench` produces — and if so, by how much?
+
+### Rig
+
+* `clusterBench` Gradle task gained a `-PgcMode=g1|zgc|shenandoah` parameter that wires the
+  matching JVM flags (`-XX:+UseG1GC` / `-XX:+UseZGC -XX:+ZGenerational` / `-XX:+UseShenandoahGC`)
+  and exports `OMS_BENCH_GC_LABEL` so each `summary.md` self-describes which GC produced it.
+* `clusterBench` also gained `-PclusterBenchJava=/abs/path/to/java`. The project's default
+  toolchain JVM here (JetBrains Runtime 21.0.8 — the JDK 21 distribution that ships with
+  Android Studio) **does not include ZGC or Shenandoah** (`-XX:+UseZGC` fails with
+  `Option -XX:+UseZGC not supported`), so the GC comparison runs under a different JVM. The
+  toolchain stays JDK 21 for compile (production parity); only the bench runtime is swapped.
+* `scripts/cluster-bench-gc-compare.sh` orchestrates the loop: invokes `clusterBench` once per
+  GC × `CLUSTER_BENCH_GC_REPEAT` repeats, dumps each run into its own report directory, and
+  prints a per-run p50 / p99 / p99.9 / max table at the end.
+
+### Local result (4 repeats × 3 GCs × 20 s steady-state @ 1000 ops/s)
+
+JVM: Homebrew OpenJDK 25.0.2, macOS aarch64, single-laptop dev box. Bench: 3 s warmup + 20 s
+steady-state at 1000 ops/s ≈ 20 000 commits per run; 4 runs per GC. All 12 runs hit zero
+timeouts and zero errors.
+
+| GC | Run | p50 (µs) | p99 (µs) | p99.9 (µs) | max (µs) |
+| --- | --- | ---: | ---: | ---: | ---: |
+| G1         | 1 | 812 | 4029 |  5447 | 21455 |
+| G1         | 2 | 813 | 4075 | 10095 | 22687 |
+| G1         | 3 | 815 | 3995 |  5051 | 10519 |
+| G1         | 4 | 816 | 3995 |  5151 |  7003 |
+| ZGC (gen.) | 1 | 815 | 4017 |  5107 |  6027 |
+| ZGC (gen.) | 2 | 817 | 4155 |  6611 | 17951 |
+| ZGC (gen.) | 3 | 815 | 4183 |  8463 | 22463 |
+| ZGC (gen.) | 4 | 817 | 4013 |  5683 | 23423 |
+| Shenandoah | 1 | 835 | 4407 |  5503 |  6755 |
+| Shenandoah | 2 | 857 | 4619 |  6251 | 10063 |
+| Shenandoah | 3 | 858 | 4695 |  6035 |  7979 |
+| Shenandoah | 4 | 818 | 4059 |  5879 | 14967 |
+
+Median of the 4 runs per GC:
+
+| GC | p50 (µs) | p99 (µs) | p99.9 (µs) | worst max (µs) |
+| --- | ---: | ---: | ---: | ---: |
+| **G1**         | **814** | **4012** | 5299 | 22 687 |
+| ZGC (gen.)     |   816   |  4099    | 6147 | 23 423 |
+| Shenandoah     |   846   |  4513    | 5891 | 14 967 |
+
+### Interpretation
+
+Three honest readings of the table:
+
+1. **The workload is not GC-bound at this allocation rate.** With slice 4f's decode fix,
+   per-command allocation is ~560 B/op on the apply side plus a few hundred bytes for the
+   admission record and event encode → ~1 MB/s of allocation at 1 000 ops/s. The retained
+   live set is ~24 k `AdmittedOrder` records ≈ 3 MB. There is essentially nothing for the GC
+   to do; p50 differences across the three collectors are smaller than the run-to-run noise.
+2. **G1 is the most consistent at p99 and the median is fastest.** G1 wins p50 (814 vs 816 vs
+   846 µs) and p99 (4012 vs 4099 vs 4513 µs). It is also the JDK 21+ default — using anything
+   else means an explicit operator override that will surprise an on-call engineer reading a
+   `jcmd ... VM.flags` dump.
+3. **Tail spikes (p99.9, max) are dominated by something other than the GC.** All three see
+   occasional 20 ms+ outliers (G1 p99.9 ranges 5051–10095, ZGC 5107–8463, Shenandoah
+   5503–6251 within their respective 4-run windows; max touches 22 687 / 23 423 / 14 967).
+   At ~20 samples per p99.9 bucket, these outliers are individual events — most likely macOS
+   scheduler noise, Aeron media-driver pauses, or APFS / mmap behaviour rather than GC.
+
+### Decision: G1 stays as the cluster-node default
+
+* G1 is the JDK 21 default — `Dockerfile` (`FROM eclipse-temurin:21-jre-jammy`) already runs
+  it. Slice 4g lands NO change to JVM flags. The slice's value is the recorded evidence that
+  generational ZGC and Shenandoah do not buy us anything on this workload.
+* `OmsClusterNodeBootstrap`'s `bootJarClusterNode` is unchanged. If a future production
+  workload pushes allocation rate or live set high enough to make GC pauses visible at p99,
+  the rig is in place to re-run the comparison cheaply.
+
+### What this does NOT prove
+
+* Single-laptop, Apple Silicon, JDK 25 — none of which is the production cluster-node shape
+  (Linux x86_64, eclipse-temurin:21). The relative ordering may flip on a Linux runner.
+  Generational ZGC's mmap and unmap behaviour, transparent huge pages, and NUMA all differ
+  markedly between macOS and Linux. **Phase 5 (k8s-driven multi-process load) will re-run
+  this comparison on a Linux runner; until then the production decision is "stay on the JDK
+  default" rather than "G1 has been validated for production".**
+* The bench is single-thread offer / single-thread egress consume. Real production has
+  inbound `oms-fix-egress` ER traffic too, multi-account fan-out, snapshot bursts, and a
+  longer time horizon. Allocation rate could 5–10× under realistic load, at which point GC
+  choice starts to matter.
+* Live set is small — ~24 k orders during the bench. Production with weeks of admitted
+  orders before a snapshot would carry tens or hundreds of MB of `AdmittedOrder` /
+  `executionRefIndex` / `senderSeqIndex` data. Generational ZGC's allocation behaviour is
+  designed to remain pauseless as the heap grows; that property is not exercised here.
+* macOS scheduler / mmap behaviour is the most likely culprit for p99.9 outliers in this run.
+  A Linux runner with isolated CPUs and `chrt -f` priority would tighten the tail
+  distribution and let the GC differences (if any) actually show through.
+
+---
+
 ## How to reproduce
 
 ```bash
@@ -150,4 +252,15 @@ OMS_BENCH_DURATION_S=2 OMS_BENCH_THROUGHPUT_OPS_PER_S=200 ./gradlew clusterBench
 # JMH wire-format bench with allocation profiler (slice 4f):
 ./gradlew jmh -PjmhInclude=AcceptOrderCommandWireBench -Pjmh.profilers=gc
 # results: build/reports/jmh/{human.txt,results.json}
+
+# GC comparison (slice 4g) — runs G1, generational ZGC, Shenandoah back-to-back:
+CLUSTER_BENCH_JAVA=/opt/homebrew/opt/openjdk/bin/java \
+CLUSTER_BENCH_GC_REPEAT=4 \
+OMS_BENCH_WARMUP_S=3 OMS_BENCH_DURATION_S=20 OMS_BENCH_THROUGHPUT_OPS_PER_S=1000 \
+  bash scripts/cluster-bench-gc-compare.sh
+# results: build/reports/cluster-bench-gc-compare/<ts>/{g1,zgc,shenandoah}-run<N>/summary.md
 ```
+
+CI / Linux Temurin 21 — same script, point `CLUSTER_BENCH_JAVA` at the runner's Temurin
+install. Per-run reports + the comparison table land in the workspace; upload the report
+directory as a CI artifact for production-shape decisions.

@@ -394,10 +394,44 @@ tasks.register<JavaExec>("clusterBench") {
     description =
         "Run the OMS cluster bench harness (HdrHistogram of commit-round-trip)." +
                 " Env: OMS_BENCH_DURATION_S, OMS_BENCH_THROUGHPUT_OPS_PER_S, OMS_BENCH_WARMUP_S," +
-                " OMS_BENCH_TIMEOUT_MS, OMS_BENCH_REPORT_DIR, OMS_BENCH_AERON_DIR_BASE."
+                " OMS_BENCH_TIMEOUT_MS, OMS_BENCH_REPORT_DIR, OMS_BENCH_AERON_DIR_BASE." +
+                " GC selection (slice 4g): -PgcMode=g1|zgc|shenandoah." +
+                " Override the JVM (e.g. for a Temurin 21 runner that ships ZGC + Shenandoah):" +
+                " -PclusterBenchJava=/absolute/path/to/java."
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("com.balh.oms.cluster.bench.OmsClusterBenchHarness")
     jvmArgs(lowLatencyJvmModuleOpens)
+
+    // Slice 4g — GC selection. Default is "default": let the JVM pick (which is G1 on JDK 21+).
+    // Each named GC sets ONLY the toggles needed to switch collector; bench-relevant tuning
+    // (heap size, NUMA, AlwaysPreTouch) is intentionally NOT set here so the comparison
+    // measures the GC's out-of-the-box behaviour rather than an operator-tuned configuration.
+    // The first slice 4g pass is "is one of these obviously bad on the cluster apply path"
+    // — tuning passes can follow once we have a baseline.
+    val gcMode = (project.findProperty("gcMode") as String?)?.lowercase() ?: "default"
+    when (gcMode) {
+        "default" -> { /* no-op — JVM default (G1 on JDK 21+) */ }
+        "g1" -> jvmArgs("-XX:+UseG1GC")
+        "zgc" -> jvmArgs("-XX:+UseZGC", "-XX:+ZGenerational")
+        "shenandoah" -> jvmArgs("-XX:+UseShenandoahGC")
+        else -> throw GradleException(
+            "Unknown gcMode='$gcMode'. Expected one of: default, g1, zgc, shenandoah.")
+    }
+
+    // Bench reports default to build/reports/cluster-bench/<ts>; under -PgcMode let the harness
+    // see the GC label so summaries are self-describing without having to grep the JVM args.
+    if (gcMode != "default") {
+        environment("OMS_BENCH_GC_LABEL", gcMode)
+    }
+
+    // Allow swapping the JVM (without changing the project toolchain) — useful when the
+    // toolchain JDK doesn't ship ZGC / Shenandoah (e.g. JetBrains Runtime). Only applied when
+    // the property is set; CI / Linux runners can pass `-PclusterBenchJava=$JAVA_HOME/bin/java`
+    // pointing at a Temurin 21 install that ships all three collectors.
+    val clusterBenchJava = project.findProperty("clusterBenchJava") as String?
+    if (!clusterBenchJava.isNullOrBlank()) {
+        executable(clusterBenchJava)
+    }
 }
 
 /**

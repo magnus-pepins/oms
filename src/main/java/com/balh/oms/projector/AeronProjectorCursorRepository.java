@@ -5,6 +5,8 @@ import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.stereotype.Repository;
 
+import java.sql.Timestamp;
+import java.time.Instant;
 import java.util.Optional;
 import java.util.OptionalLong;
 
@@ -22,6 +24,14 @@ public class AeronProjectorCursorRepository {
 
     private static final String SELECT_POSITION_SQL = """
             SELECT last_applied_position
+              FROM aeron_projector_cursor
+             WHERE projector_id = :projector_id
+               AND stream_id = :stream_id
+            """;
+
+    /** Slice 4d: source for the {@code oms.projector.lag_seconds} gauge. */
+    private static final String SELECT_LAST_APPLIED_AT_SQL = """
+            SELECT last_applied_at
               FROM aeron_projector_cursor
              WHERE projector_id = :projector_id
                AND stream_id = :stream_id
@@ -79,6 +89,26 @@ public class AeronProjectorCursorRepository {
                 .addValue("stream_id", streamId)
                 .addValue("last_applied_position", newPosition);
         return jdbc.update(UPSERT_SQL, params) == 1;
+    }
+
+    /**
+     * @return wall-clock {@code last_applied_at} of the projector cursor (set server-side via
+     *     {@code NOW()} on every {@link #advance}), or empty if the projector has never applied.
+     *     The time is the Postgres server's clock, not the projector JVM's — close enough for the
+     *     {@code oms.projector.lag_seconds} gauge (slice 4d) since lag-budget alerts work on
+     *     order-of-seconds granularity and any per-host clock skew is dwarfed by the lag we care
+     *     about.
+     */
+    public Optional<Instant> findLastAppliedAt(String projectorId, int streamId) {
+        var params = new MapSqlParameterSource()
+                .addValue("projector_id", projectorId)
+                .addValue("stream_id", streamId);
+        try {
+            Timestamp ts = jdbc.queryForObject(SELECT_LAST_APPLIED_AT_SQL, params, Timestamp.class);
+            return ts == null ? Optional.empty() : Optional.of(ts.toInstant());
+        } catch (EmptyResultDataAccessException e) {
+            return Optional.empty();
+        }
     }
 
     /**

@@ -6,6 +6,9 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.jdbc.core.JdbcTemplate;
 
+import java.time.Duration;
+import java.time.Instant;
+import java.util.Optional;
 import java.util.OptionalLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -94,5 +97,38 @@ class OmsFixEgressCursorRepositoryIntegrationTest extends AbstractPostgresIntegr
                 .hasValue(50L);
 
         jdbc.update("DELETE FROM oms_fix_egress_cursor WHERE egress_id = ?", EGRESS_ID + "-other");
+    }
+
+    @Test
+    void findLastAppliedAt_emptyBeforeFirstAdvance_thenTracksAdvance() {
+        assertThat(cursorRepository.findLastAppliedAt(EGRESS_ID, STREAM_ID)).isEmpty();
+
+        Instant before = Instant.now();
+        cursorRepository.advance(EGRESS_ID, STREAM_ID, 100L);
+        Instant after = Instant.now();
+
+        Optional<Instant> ts = cursorRepository.findLastAppliedAt(EGRESS_ID, STREAM_ID);
+        assertThat(ts).isPresent();
+        assertThat(ts.get()).isBetween(before.minus(Duration.ofSeconds(2)), after.plus(Duration.ofSeconds(2)));
+    }
+
+    @Test
+    void findLastAppliedAt_advancesOnUpsert_butNotOnNoopOlderWrite() throws InterruptedException {
+        cursorRepository.advance(EGRESS_ID, STREAM_ID, 200L);
+        Optional<Instant> firstTs = cursorRepository.findLastAppliedAt(EGRESS_ID, STREAM_ID);
+        assertThat(firstTs).isPresent();
+
+        Thread.sleep(50);
+
+        cursorRepository.advance(EGRESS_ID, STREAM_ID, 100L);
+        Optional<Instant> staleTs = cursorRepository.findLastAppliedAt(EGRESS_ID, STREAM_ID);
+        assertThat(staleTs).contains(firstTs.get());
+
+        Thread.sleep(50);
+
+        cursorRepository.advance(EGRESS_ID, STREAM_ID, 300L);
+        Optional<Instant> bumpedTs = cursorRepository.findLastAppliedAt(EGRESS_ID, STREAM_ID);
+        assertThat(bumpedTs).isPresent();
+        assertThat(bumpedTs.get()).isAfter(firstTs.get());
     }
 }

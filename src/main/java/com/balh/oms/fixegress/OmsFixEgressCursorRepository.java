@@ -5,6 +5,8 @@ import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.stereotype.Repository;
 
+import java.sql.Timestamp;
+import java.time.Instant;
 import java.util.Optional;
 import java.util.OptionalLong;
 
@@ -31,6 +33,14 @@ public class OmsFixEgressCursorRepository {
 
     private static final String SELECT_POSITION_SQL = """
             SELECT last_applied_position
+              FROM oms_fix_egress_cursor
+             WHERE egress_id = :egress_id
+               AND stream_id = :stream_id
+            """;
+
+    /** Slice 4d: source for the {@code oms.fix_egress.lag_seconds} gauge. */
+    private static final String SELECT_LAST_APPLIED_AT_SQL = """
+            SELECT last_applied_at
               FROM oms_fix_egress_cursor
              WHERE egress_id = :egress_id
                AND stream_id = :stream_id
@@ -85,6 +95,24 @@ public class OmsFixEgressCursorRepository {
                 .addValue("stream_id", streamId)
                 .addValue("last_applied_position", newPosition);
         return jdbc.update(UPSERT_SQL, params) == 1;
+    }
+
+    /**
+     * @return wall-clock {@code last_applied_at} of the egress cursor (set server-side via
+     *     {@code NOW()} on every {@link #advance}), or empty if the egress JVM has never sent
+     *     a NOS for this {@code (egressId, streamId)}. Drives the {@code oms.fix_egress.lag_seconds}
+     *     gauge (slice 4d).
+     */
+    public Optional<Instant> findLastAppliedAt(String egressId, int streamId) {
+        var params = new MapSqlParameterSource()
+                .addValue("egress_id", egressId)
+                .addValue("stream_id", streamId);
+        try {
+            Timestamp ts = jdbc.queryForObject(SELECT_LAST_APPLIED_AT_SQL, params, Timestamp.class);
+            return ts == null ? Optional.empty() : Optional.of(ts.toInstant());
+        } catch (EmptyResultDataAccessException e) {
+            return Optional.empty();
+        }
     }
 
     public Optional<Long> findLastAppliedPositionBoxed(String egressId, int streamId) {

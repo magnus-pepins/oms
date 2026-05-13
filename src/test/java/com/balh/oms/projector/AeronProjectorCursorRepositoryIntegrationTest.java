@@ -6,6 +6,9 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.jdbc.core.JdbcTemplate;
 
+import java.time.Duration;
+import java.time.Instant;
+import java.util.Optional;
 import java.util.OptionalLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -67,5 +70,38 @@ class AeronProjectorCursorRepositoryIntegrationTest extends AbstractPostgresInte
 
         assertThat(cursorRepository.findLastAppliedPosition(PROJECTOR_ID, STREAM_ID)).hasValue(100L);
         assertThat(cursorRepository.findLastAppliedPosition(PROJECTOR_ID, STREAM_ID + 1)).hasValue(50L);
+    }
+
+    @Test
+    void findLastAppliedAt_emptyBeforeFirstAdvance_thenTracksAdvance() {
+        assertThat(cursorRepository.findLastAppliedAt(PROJECTOR_ID, STREAM_ID)).isEmpty();
+
+        Instant before = Instant.now();
+        cursorRepository.advance(PROJECTOR_ID, STREAM_ID, 100L);
+        Instant after = Instant.now();
+
+        Optional<Instant> ts = cursorRepository.findLastAppliedAt(PROJECTOR_ID, STREAM_ID);
+        assertThat(ts).isPresent();
+        assertThat(ts.get()).isBetween(before.minus(Duration.ofSeconds(2)), after.plus(Duration.ofSeconds(2)));
+    }
+
+    @Test
+    void findLastAppliedAt_advancesOnUpsert_butNotOnNoopOlderWrite() throws InterruptedException {
+        cursorRepository.advance(PROJECTOR_ID, STREAM_ID, 200L);
+        Optional<Instant> firstTs = cursorRepository.findLastAppliedAt(PROJECTOR_ID, STREAM_ID);
+        assertThat(firstTs).isPresent();
+
+        Thread.sleep(50);
+
+        cursorRepository.advance(PROJECTOR_ID, STREAM_ID, 100L);
+        Optional<Instant> staleTs = cursorRepository.findLastAppliedAt(PROJECTOR_ID, STREAM_ID);
+        assertThat(staleTs).contains(firstTs.get());
+
+        Thread.sleep(50);
+
+        cursorRepository.advance(PROJECTOR_ID, STREAM_ID, 300L);
+        Optional<Instant> bumpedTs = cursorRepository.findLastAppliedAt(PROJECTOR_ID, STREAM_ID);
+        assertThat(bumpedTs).isPresent();
+        assertThat(bumpedTs.get()).isAfter(firstTs.get());
     }
 }

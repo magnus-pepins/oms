@@ -4,20 +4,24 @@
 
 Order Management System for the Balh financial platform ecosystem.
 
-This is the slice-1 bootstrap. It is a runnable Spring Boot 3 application
-backed by Postgres + Flyway, with the Postgres-first / Chronicle-after
-control-plane pattern wired end-to-end (outbox reconciler → Chronicle append →
-tail reader → `ControlTailer` CAS updates). Optional **`oms.control.postgres-write-path=ingress`**
-(`OMS_CONTROL_POSTGRES_WRITE_PATH`): CAS + `OrderWorking` / `OrderRejected` run in **`OrderIngressService`**;
-Chronicle tail only enqueues outbound routing (see `plans/oms-ingress-control-fix-topology.md` P1).
+A runnable Spring Boot 3 application backed by Postgres + Flyway. Phase 3 of the
+[Aeron Cluster substrate plan](../system-documentation/plans/oms-aeron-cluster-substrate.md)
+is the source of truth for OMS topology: order admission and execution-report
+state run inside `OmsAdmissionClusteredService` on the cluster nodes, the
+`oms-postgres-projector` JVM consumes the cluster events recording and writes
+projection rows (`orders`, `executions`, `control_decisions`,
+`domain_event_outbox`, market context, positions), and the `oms-fix-egress`
+JVM owns QuickFIX `SocketInitiator` for outbound NOS and inbound execution
+reports.
 
-**P3 prep — `oms-control-worker` profile:** `./gradlew bootRunControlWorker` (or `./scripts/oms-control-worker.sh`), or **`./gradlew bootJarControlWorker`** → `build/libs/oms-*-SNAPSHOT-control-worker.jar` (`Start-Class` **`OmsControlWorkerBootstrap`**), or set `SPRING_PROFILES_ACTIVE` to include `oms-control-worker` on the monolith JAR. That profile **forces `reconciler`** Chronicle append (`application-oms-control-worker.yaml`) so `OutboxReconciler` drains peers’ `control_outbox`. **Actuator** binds **`management.server.port`** (default **8089**, override **`OMS_CONTROL_WORKER_MANAGEMENT_SERVER_PORT`**) so health/prometheus do not share **`OMS_HTTP_PORT`**. Monolith **default** is **`ingress-after-commit`**. Incompatible: **`ingress-after-commit`** on control-worker (validator); **`oms.routing.backend=fix` + `oms.fix.auto-start=true`** on control-worker — use **`oms-fix-worker`** for QuickFIX (validator). Runbook: [`docs/runbooks/oms-control-worker.md`](docs/runbooks/oms-control-worker.md).
+**Role JVMs (one Spring profile per role; `TopologyWorkerProfiles` enforces mutual exclusion):**
 
-**P4 prep — `oms-fix-worker` profile:** `./gradlew bootRunFixWorker` (or `./scripts/oms-fix-worker.sh`), or **`./gradlew bootJarFixWorker`** → `build/libs/oms-*-SNAPSHOT-fix-worker.jar` (`Start-Class` **`OmsFixWorkerBootstrap`**). Same no–order-accept ingress as control-worker, but **`application-oms-fix-worker.yaml`** sets **`oms.routing.backend=fix`**, **`oms.fix.auto-start=true`**, and **`oms.control.postgres-write-path=ingress`** (FIX-out JVM has no `OrderIngressService`; admission runs on ingress replicas — enforced by **`FixWorkerTopologyValidator`**). Single initiator per route; do not run two replicas with the same FIX session store. Actuator default **`8090`** (`OMS_FIX_WORKER_MANAGEMENT_SERVER_PORT`). Runbook: [`docs/runbooks/oms-fix-worker.md`](docs/runbooks/oms-fix-worker.md). See `plans/oms-ingress-control-fix-topology.md` in system-documentation.
+- **`oms-cluster-node`** — `./gradlew bootRunClusterNode` / `bootJarClusterNode`. Runs MediaDriver + Archive + ConsensusModule + ClusteredServiceContainer hosting `OmsAdmissionClusteredService`. StatefulSet, ≥3 replicas per shard.
+- **`oms-postgres-projector`** — `./gradlew bootRunPostgresProjector` / `bootJarPostgresProjector`. Subscribes to the cluster events recording via Aeron Archive replay and projects to Postgres. Idempotent on replay.
+- **`oms-fix-egress`** — `./gradlew bootRunFixEgress` / `bootJarFixEgress`. Singleton FIX initiator per route; reads the events recording for outbound NOS and offers `ApplyExecutionReportCommand` back to the cluster on inbound venue ER. Runbook: [`docs/runbooks/oms-fix-egress.md`](docs/runbooks/oms-fix-egress.md) (TODO).
+- **`oms-ingress-replica`** — `./gradlew bootRunIngressReplica` / `bootJarIngressReplica`. Horizontal HTTP/gRPC ingress; submits `AcceptOrderCommand` through `OmsClusterIngressClient`. Runbook: [`docs/runbooks/oms-ingress-replica.md`](docs/runbooks/oms-ingress-replica.md).
 
-**P5 prep — `oms-ingress-replica` profile:** horizontal **ingress** only — same new-order HTTP/gRPC as the monolith; **`application-oms-ingress-replica.yaml`** sets **`oms.control.postgres-write-path=ingress`**, **`oms.chronicle.control-tail-enabled=false`** (append only; workers tail). **`./gradlew bootRunIngressReplica`** (or `./scripts/oms-ingress-replica.sh`), or **`./gradlew bootJarIngressReplica`** → `build/libs/oms-*-SNAPSHOT-ingress-replica.jar` (`Start-Class` **`OmsIngressReplicaBootstrap`**). Mutually exclusive with **`oms-control-worker`** / **`oms-fix-worker`** on the same JVM (`TopologyWorkerProfiles`, **`IngressReplicaTopologyValidator`**). Actuator default **`8087`** (`OMS_INGRESS_REPLICA_MANAGEMENT_SERVER_PORT`). Runbook: [`docs/runbooks/oms-ingress-replica.md`](docs/runbooks/oms-ingress-replica.md).
-
-**CI:** GitHub Actions runs `./gradlew clean test` against a **job-level Postgres service** (see `services:` in `.github/workflows/ci.yml` and env `OMS_CI_JDBC_*` in `AbstractPostgresIntegrationTest`), then **`./gradlew bootJar bootJarControlWorker bootJarFixWorker bootJarIngressReplica`** on pushes and PRs to `main` / `master`, and can be triggered manually (`workflow_dispatch`). Testcontainers is still used on CI for other images (e.g. NATS). Failed runs upload an **`oms-test-reports`** artifact (JUnit XML + HTML under `build/`). If the job log is not visible, download that artifact or run `./gradlew clean test --no-daemon --no-build-cache` locally (**Docker required** for Testcontainers Postgres and NATS-backed ITs).
+**CI:** GitHub Actions runs `./gradlew clean test` against a **job-level Postgres service** (see `services:` in `.github/workflows/ci.yml` and env `OMS_CI_JDBC_*` in `AbstractPostgresIntegrationTest`), then **`./gradlew bootJar bootJarIngressReplica bootJarClusterNode bootJarPostgresProjector bootJarFixEgress`** on pushes and PRs to `main` / `master`, and can be triggered manually (`workflow_dispatch`). Testcontainers is still used on CI for other images (e.g. NATS). Failed runs upload an **`oms-test-reports`** artifact (JUnit XML + HTML under `build/`). If the job log is not visible, download that artifact or run `./gradlew clean test --no-daemon --no-build-cache` locally (**Docker required** for Testcontainers Postgres and NATS-backed ITs).
 
 The product / architecture decisions that shaped this code live in the
 [system-documentation](../system-documentation) workspace — primarily
@@ -25,14 +29,16 @@ The product / architecture decisions that shaped this code live in the
 and the milestone plan it links to. **Phase 1 exit (UAT soak, §16 #3, prod session store):** fill
 [plans/oms-phase1-exit-actions.md](../system-documentation/plans/oms-phase1-exit-actions.md).
 
-## What is in slice 1
+## Slice 1 — order ingress + admission
 
 - `POST /internal/v1/orders` and `GET /internal/v1/orders/{id}` (HTTP, internal
-  API key auth; **not registered** when Spring profile **`oms-control-worker`** or **`oms-fix-worker`** is active — **registered** on **`oms-ingress-replica`**).
+  API key auth; **not registered** on `oms-postgres-projector` or `oms-fix-egress` — **registered** on the monolith JVM and on `oms-ingress-replica`).
 - Idempotent inserts on `(account_id, client_idempotency_key)`.
 - `domain_event_outbox` table; canonical JSON **envelopes** are written in the
-  same Postgres transaction as the originating change (`OrderAccepted` on
-  ingress; `OrderWorking` / `OrderRejected` after CAS — default: in `ControlTailer`; with **`postgres-write-path=ingress`**: in `OrderIngressService`).
+  same Postgres transaction as the originating change. `OrderAccepted` is
+  written by `OrderIngressService` on the ingress JVM. `OrderWorking` /
+  `OrderRejected` are written by the projector inside the same transaction
+  that applies the cluster's `OrderAdmittedEvent` to Postgres.
 - `ledger_inflight_outbox` table (Flyway **V4**): optional **post-commit** path for
   the Ledger BUY sync inflight hold when `OMS_LEDGER_INFLIGHT_ASYNC_ENABLED=true`
   (default **false** — synchronous `POST /transactions` in the accept transaction
@@ -42,28 +48,29 @@ and the milestone plan it links to. **Phase 1 exit (UAT soak, §16 #3, prod sess
   **`oms_ledger_inflight_outbox_failed_total`**. Tuning: `OMS_LEDGER_INFLIGHT_OUTBOX_RECONCILER_*`.
 - `DomainFanoutReconciler` + `FanoutClient` drain `domain_event_outbox` to NATS
   JetStream (full envelope as message body) or a no-op transport when NATS is off.
-- `OutboxReconciler` drains `control_outbox` into Chronicle Queue (engineering
-  replay only, NOT a regulatory system of record).
-- `ControlTailer` applies CAS updates on `orders.version` and, on terminal
-  reject paths, records **`OrderRejected`** in the domain outbox; after a
-  successful transition to **`WORKING`**, records **`OrderWorking`**.
+- `OmsAdmissionClusteredService` (cluster) walks risk + buying-power + admission
+  state machine; `OmsPostgresProjector` (`oms-postgres-projector` JVM) projects
+  the resulting `OrderAdmittedEvent` to `orders` (CAS to `WORKING` /
+  `REJECTED`), `control_decisions`, and `domain_event_outbox` in one
+  transaction. `OrderControlAdmission` is the shared admission helper invoked
+  by the projector.
 - Hashed-account-id PII policy enforced by a Micrometer filter and a guard
   test.
 - Optional **Ledger** HTTP client: when `OMS_LEDGER_ENABLED=true`, ingress verifies
-  `ledgerIdentityId` against Ledger for every `ledgerBalanceId`, and `ControlTailer`
-  can reject BUY orders (with `ledgerBalanceId` + `limitPrice`) for insufficient
-  `availableBalance` (`RISK_BUYING_POWER`) before CAS to `WORKING`.
+  `ledgerIdentityId` against Ledger for every `ledgerBalanceId`, and the cluster
+  admission service can reject BUY orders (with `ledgerBalanceId` + `limitPrice`)
+  for insufficient `availableBalance` (`RISK_BUYING_POWER`) before promoting to
+  `WORKING`.
 - Optional **NATS JetStream** fanout: when `OMS_NATS_ENABLED=true`, `NatsFanoutClient`
   publishes envelope JSON after the outbox reconciler sees committed rows.
-- Three operational drill scripts (failover, broken-chronicle,
-  reconciler-under-load) — skeletons that document assertions; bodies grow with
-  later slices.
+- Operational drill scripts (failover, reconciler-under-load) — skeletons that
+  document assertions; bodies grow with later slices.
 
 ## What is in slice 2 (risk + audit)
 
-- Flyway **V5** — `control_decisions` (one row per `ControlTailer.apply` outcome)
-  and `oms_runtime_flags` (interim Postgres-backed **global halt** until Redis/Ops
-  toggles exist).
+- Flyway **V5** — `control_decisions` (one row per admission outcome — projected
+  by `OmsPostgresProjector` from `OrderAdmittedEvent`) and `oms_runtime_flags`
+  (interim Postgres-backed **global halt** until Redis/Ops toggles exist).
 - **Internal HTTP** — `GET` / `PATCH /internal/v1/runtime-flags/global_halt` (same
   `X-OMS-Internal-Key` gate as other `/internal/v1/**` routes) to read/update the
   halt flag for Ops Console proxies.
@@ -75,19 +82,26 @@ and the milestone plan it links to. **Phase 1 exit (UAT soak, §16 #3, prod sess
   default **`OMS_CONTROL_MAX_JOB_AGE_MS`** is **300000** (5 min interim — see
   [system-documentation/plans/oms-phase0-interim-decisions.md](../system-documentation/plans/oms-phase0-interim-decisions.md)).
 
-## What is in slice 3 (return path — simulated broker)
+## What is in slice 3 (return path)
 
 - Flyway **V6** — `executions` (idempotent on `(account_id, venue_exec_ref)`),
   `market_context` (stub JSON merged with venue-attested fields on each trade apply), `orders.cum_filled_quantity`.
-- **`ExecutionReportApplier`** — applies trade and cancel ER-shaped commands;
-  emits **`OrderPartiallyFilled`**, **`OrderFilled`**, **`OrderCancelled`** to
-  `domain_event_outbox`; metrics **`oms_executions_applied_total`**,
-  **`oms_order_filled_events_published_total`**.
-- **`RouteDispatcher`** — `ControlTailer` registers **after-commit** enqueue when
-  CAS reaches **`WORKING`** (no-op when `OMS_ROUTING_BACKEND=noop`).
-- **`SimulatedBrokerDispatcher`** + **`SimulatedReturnPathProjectionWorker`** + **`SimulatedExecutionProgram`**
-  when `OMS_ROUTING_BACKEND=simulated`, drains a queue and fills in three chunks at `limit_price`.
-  **`FixRouteDispatcher`** + QuickFIX/J initiator/outbound/inbound when `OMS_ROUTING_BACKEND=fix` (slice 4; see [docs/return-path.md](docs/return-path.md) and [docs/fix-out.md](docs/fix-out.md)).
+- **Cluster path (Phase 3 of the Aeron Cluster substrate plan):** inbound venue
+  ER from QuickFIX is translated by `FixInboundClusterSink` (`oms-fix-egress`
+  JVM) into `ApplyExecutionReportCommand` and offered to the cluster.
+  `OmsAdmissionClusteredService` walks the order state machine deterministically
+  and emits `ExecutionAppliedEvent`. `OmsPostgresProjector` then writes the
+  `executions` row, the `orders` CAS, the `market_context` merge, the
+  `positions` / `position_history` deltas, the optional free-riding attribution
+  links, and the `domain_event_outbox` envelope (`OrderPartiallyFilled`,
+  `OrderFilled`, `OrderCancelled`, `OrderRejected`) in one transaction.
+  Metrics: `oms_executions_applied_total`, `oms_order_filled_events_published_total`.
+- **Simulated routing backend** — `OMS_ROUTING_BACKEND=simulated`:
+  `SimulatedBrokerDispatcher` + `SimulatedReturnPathProjectionWorker` +
+  `SimulatedExecutionProgram` drain a queue and fill in three chunks at
+  `limit_price`. The simulated path still goes through the legacy
+  `ExecutionReportApplier` (Phase 3 slice 3g-2 will fold it into the projector
+  path and delete it).
 
 - **Slice 5 prep:** FIX outbound **`oms.fix.symbol-map-json`**; optional **tradability** list → **`RISK_INSTRUMENT_NOT_ALLOWED`** ([docs/fix-out.md](docs/fix-out.md), [docs/risk-checks.md](docs/risk-checks.md)).
 
@@ -122,7 +136,7 @@ Flyway migrations run on startup against that database.
 
 **Listen port:** default **8088** (`OMS_HTTP_PORT`) so OMS does not bind **8080** (often used by the marketing website on the same dev host). Override with `OMS_HTTP_PORT` if needed.
 
-**JDK 21 + Chronicle:** `build.gradle.kts` passes OpenHFT’s `--add-opens` / `--add-exports` to **`bootRun`** and **`test`** (see `chronicleJavaModuleOpens`). If you run the fat JAR with plain `java -jar`, pass the same flags (or set `JAVA_TOOL_OPTIONS`) or Chronicle will fail opening the queue on Linux.
+**JDK 21 + Aeron:** `build.gradle.kts` passes the Aeron / Agrona `--add-opens` / `--add-exports` flags to `bootRun*` and `test` (see `lowLatencyJvmModuleOpens`). If you run a fat JAR (cluster-node, postgres-projector, fix-egress, ingress-replica) with plain `java -jar`, pass the same flags (or set `JAVA_TOOL_OPTIONS`) or Aeron will fail to open `Unsafe` / off-heap buffers on Linux.
 
 ### Compose Postgres vs integration tests
 
@@ -137,8 +151,8 @@ requires the Docker daemon (same machine as Gradle); it does not read
 **On GitHub Actions CI,** the workflow starts a **service** Postgres container instead;
 tests point at it via `OMS_CI_JDBC_URL` (see `AbstractPostgresIntegrationTest`).
 
-`BuyingPowerLedgerControlTailerIntegrationTest` also starts an embedded
-**WireMock** Ledger stub (no separate Ledger container).
+Buying-power integration tests start an embedded **WireMock** Ledger stub
+(no separate Ledger container).
 
 ```bash
 curl -s http://localhost:8088/internal/v1/orders \
@@ -174,13 +188,12 @@ tests execute instead of being skipped.
 
 ## Documentation
 
-- [docs/architecture.md](docs/architecture.md) — Postgres-first flow,
-  sequence diagrams, HA stance.
+- [docs/architecture.md](docs/architecture.md) — order admission flow,
+  cluster topology, projector / FIX-egress wiring.
 - [docs/decisions.md](docs/decisions.md) — slice-1 locked decisions
   (idempotency, sharding, time policy, etc.).
 - [docs/pii-policy.md](docs/pii-policy.md) — what may appear where.
-- [docs/replay.md](docs/replay.md) — Chronicle's role and how to replay.
-- [docs/chronicle-tail-driver.md](docs/chronicle-tail-driver.md) — `scheduled` vs `dedicated` tail wake / latency tuning.
+- [docs/replay.md](docs/replay.md) — Aeron Archive recording / replay.
 - [docs/drop-copy-events.md](docs/drop-copy-events.md) — domain-event
   envelope and emit points.
 - [docs/return-path.md](docs/return-path.md) — executions, simulated routing, idempotency, slice-6 fill→positions.

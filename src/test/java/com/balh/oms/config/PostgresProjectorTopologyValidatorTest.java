@@ -40,29 +40,7 @@ class PostgresProjectorTopologyValidatorTest {
         cfg.getFix().setAutoStart(true);
         assertThatThrownBy(() -> PostgresProjectorTopologyValidator.validatePostgresProjectorTopology(env, cfg))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining(OmsProfiles.FIX_WORKER);
-    }
-
-    @Test
-    void projectorWithControlWorker_throws() {
-        MockEnvironment env = new MockEnvironment();
-        env.setActiveProfiles(OmsProfiles.POSTGRES_PROJECTOR, OmsProfiles.CONTROL_WORKER);
-        OmsConfig cfg = new OmsConfig();
-        assertThatThrownBy(() -> PostgresProjectorTopologyValidator.validatePostgresProjectorTopology(env, cfg))
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining(OmsProfiles.POSTGRES_PROJECTOR)
-                .hasMessageContaining(OmsProfiles.CONTROL_WORKER);
-    }
-
-    @Test
-    void projectorWithFixWorker_throws() {
-        MockEnvironment env = new MockEnvironment();
-        env.setActiveProfiles(OmsProfiles.POSTGRES_PROJECTOR, OmsProfiles.FIX_WORKER);
-        OmsConfig cfg = new OmsConfig();
-        assertThatThrownBy(() -> PostgresProjectorTopologyValidator.validatePostgresProjectorTopology(env, cfg))
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining(OmsProfiles.POSTGRES_PROJECTOR)
-                .hasMessageContaining(OmsProfiles.FIX_WORKER);
+                .hasMessageContaining(OmsProfiles.FIX_EGRESS);
     }
 
     @Test

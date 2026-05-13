@@ -5,7 +5,7 @@ import com.balh.oms.chronicle.PendingControlEvent;
 import com.balh.oms.routing.SimulatedReturnPathProjectionWorker;
 import com.balh.oms.settlement.MarkTradeFailedResult;
 import com.balh.oms.settlement.SettlementConfirmProcessor;
-import com.balh.oms.tailer.ControlTailer;
+import com.balh.oms.tailer.OrderControlAdmission;
 import com.balh.oms.test.SettlementBrokerDrainAssertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -26,7 +26,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class SimulatedReturnPathIntegrationTest extends AbstractPostgresIntegrationTest {
 
-    @Autowired ControlTailer controlTailer;
+    @Autowired OrderControlAdmission orderControlAdmission;
     @Autowired ExecutionReportApplier executionReportApplier;
     @Autowired SimulatedReturnPathProjectionWorker simulatedReturnPathProjectionWorker;
     @Autowired JdbcTemplate jdbc;
@@ -48,7 +48,8 @@ class SimulatedReturnPathIntegrationTest extends AbstractPostgresIntegrationTest
     void controlPassThenSimulatedFillsProduceExecutionsAndFilledState() {
         UUID orderId = insertNewOrder("rp-1", "AAPL", "100", "10.00");
         PendingControlEvent ev = event(orderId, 0);
-        assertThat(controlTailer.apply(ev)).isEqualTo(ControlTailer.TailResult.APPLIED);
+        assertThat(orderControlAdmission.persistAdmission(ev))
+                .isEqualTo(OrderControlAdmission.AdmissionResult.APPLIED);
 
         simulatedReturnPathProjectionWorker.processPendingQueueOnce();
 
@@ -124,7 +125,8 @@ class SimulatedReturnPathIntegrationTest extends AbstractPostgresIntegrationTest
     void controlPassThenSimulatedSellFillsAccumulatePendingSellThenDrainClearsIt() {
         UUID orderId = insertNewSellOrderWithInventory("sell-rp-1", "MSFT", "30", "12.00");
         PendingControlEvent ev = event(orderId, 0);
-        assertThat(controlTailer.apply(ev)).isEqualTo(ControlTailer.TailResult.APPLIED);
+        assertThat(orderControlAdmission.persistAdmission(ev))
+                .isEqualTo(OrderControlAdmission.AdmissionResult.APPLIED);
 
         simulatedReturnPathProjectionWorker.processPendingQueueOnce();
 
@@ -170,7 +172,8 @@ class SimulatedReturnPathIntegrationTest extends AbstractPostgresIntegrationTest
     void markTradeFailed_onFirstSellPartialExecution_revertsOneThirdPendingSell() {
         UUID orderId = insertNewSellOrderWithInventory("sell-mf-1", "MSFT", "30", "12.00");
         PendingControlEvent ev = event(orderId, 0);
-        assertThat(controlTailer.apply(ev)).isEqualTo(ControlTailer.TailResult.APPLIED);
+        assertThat(orderControlAdmission.persistAdmission(ev))
+                .isEqualTo(OrderControlAdmission.AdmissionResult.APPLIED);
         simulatedReturnPathProjectionWorker.processPendingQueueOnce();
 
         long firstExecId = jdbc.queryForObject(

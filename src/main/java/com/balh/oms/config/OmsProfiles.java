@@ -8,44 +8,28 @@ public final class OmsProfiles {
     private OmsProfiles() {}
 
     /**
-     * P3 prep: Chronicle tail + control apply + FIX path without order-accept ingress (HTTP {@code OrdersController},
-     * gRPC {@code OrderIngressGrpcServiceImpl}, {@link com.balh.oms.ingress.OrderIngressService}).
-     */
-    public static final String CONTROL_WORKER = "oms-control-worker";
-
-    /**
-     * P4 prep: same “no new-order ingress” as {@link #CONTROL_WORKER}, but this JVM is allowed to run QuickFIX
-     * {@code SocketInitiator} + outbound drain (single initiator per route — do not run two replicas with the same
-     * session store).
-     */
-    public static final String FIX_WORKER = "oms-fix-worker";
-
-    /**
-     * P5 prep: horizontal **ingress** replica — HTTP/gRPC order accept stays on; admission runs in the accept
-     * transaction ({@code oms.control.postgres-write-path=ingress}); Chronicle **append** stays on but the local
-     * {@code ChronicleControlTailReader} is off ({@code oms.chronicle.control-tail-enabled=false}). Do not combine
-     * with {@value #CONTROL_WORKER} or {@value #FIX_WORKER} on the same JVM.
+     * Horizontal ingress replica — HTTP/gRPC order accept stays on; admission is submitted to the cluster as
+     * {@code AcceptOrderCommand} through {@link com.balh.oms.cluster.OmsClusterIngressClient}. Do not combine
+     * with {@value #POSTGRES_PROJECTOR} or {@value #FIX_EGRESS} on the same JVM (TopologyWorkerProfiles).
      */
     public static final String INGRESS_REPLICA = "oms-ingress-replica";
 
     /**
-     * Spring {@code @Profile} expression: load order-accept beans only on the monolith / ingress JVM (not on
-     * {@value #CONTROL_WORKER}, {@value #FIX_WORKER}, {@value #POSTGRES_PROJECTOR}, or {@value #FIX_EGRESS}).
-     * {@value #INGRESS_REPLICA} is an ingress JVM and therefore <strong>does</strong> load order-accept beans.
+     * Spring {@code @Profile} expression: load order-accept beans only on ingress JVMs (not on
+     * {@value #POSTGRES_PROJECTOR} or {@value #FIX_EGRESS}).
      */
     public static final String ORDER_ACCEPT_PROFILE =
-            "!oms-control-worker & !oms-fix-worker & !oms-postgres-projector & !oms-fix-egress";
+            "!oms-postgres-projector & !oms-fix-egress";
 
     /**
      * Spring {@code @Profile} expression: JVMs that submit commands through {@code OmsClusterIngressClient}.
      * Superset of {@link #ORDER_ACCEPT_PROFILE}: ingress JVMs offer {@code AcceptOrderCommand} on the HTTP /
-     * gRPC accept paths, and slice 3d of the Aeron substrate plan adds {@value #FIX_EGRESS} which offers
-     * {@code ApplyExecutionReportCommand} on inbound FIX execution reports. Excludes pure cluster-internal
-     * roles ({@value #CONTROL_WORKER}, {@value #FIX_WORKER}, {@value #POSTGRES_PROJECTOR}) that read state
+     * gRPC accept paths, and {@value #FIX_EGRESS} offers {@code ApplyExecutionReportCommand} on inbound FIX
+     * execution reports. Excludes pure cluster-internal roles ({@value #POSTGRES_PROJECTOR}) that read state
      * from the cluster events recording but never offer commands back.
      */
     public static final String CLUSTER_CLIENT_PROFILE =
-            "!oms-control-worker & !oms-fix-worker & !oms-postgres-projector";
+            "!oms-postgres-projector";
 
     // ------------------------------------------------------------------------
     // ADR 0001 / topology-aeron-cluster — new role profiles.
@@ -64,10 +48,8 @@ public final class OmsProfiles {
     /**
      * Aeron Cluster client — stateless HTTP / gRPC ingress that submits commands
      * (e.g. {@code AcceptOrder}) to the cluster leader and returns the resulting
-     * egress confirmation to the API caller. Deployment, scaled horizontally.
-     *
-     * <p>Replaces the role of {@link #INGRESS_REPLICA} once the cluster scaffold
-     * is wired and Phase 1 of the plan deletes the ingress-side Chronicle path.
+     * egress confirmation to the API caller. Deployment, scaled horizontally. This
+     * is the future home of the role currently implemented by {@link #INGRESS_REPLICA}.
      */
     public static final String CLUSTER_CLIENT = "oms-cluster-client";
 
@@ -83,9 +65,6 @@ public final class OmsProfiles {
      * {@code EnqueueOrderCancel} / {@code MassCancel} events to QuickFIX
      * {@code Session.sendToTarget}. Exactly one replica per FIX route (broker
      * constraint).
-     *
-     * <p>Replaces the role of {@link #FIX_WORKER} once the cluster scaffold is
-     * wired and Phase 3 of the plan deletes the legacy outbound dispatch worker.
      */
     public static final String FIX_EGRESS = "oms-fix-egress";
 }

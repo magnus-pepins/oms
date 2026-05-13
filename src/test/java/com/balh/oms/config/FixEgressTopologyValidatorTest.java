@@ -50,28 +50,6 @@ class FixEgressTopologyValidatorTest {
     }
 
     @Test
-    void fixEgressWithFixWorker_throws() {
-        MockEnvironment env = new MockEnvironment();
-        env.setActiveProfiles(OmsProfiles.FIX_EGRESS, OmsProfiles.FIX_WORKER);
-        OmsConfig cfg = new OmsConfig();
-        assertThatThrownBy(() -> FixEgressTopologyValidator.validateFixEgressTopology(env, cfg))
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining(OmsProfiles.FIX_EGRESS)
-                .hasMessageContaining(OmsProfiles.FIX_WORKER);
-    }
-
-    @Test
-    void fixEgressWithControlWorker_throws() {
-        MockEnvironment env = new MockEnvironment();
-        env.setActiveProfiles(OmsProfiles.FIX_EGRESS, OmsProfiles.CONTROL_WORKER);
-        OmsConfig cfg = new OmsConfig();
-        assertThatThrownBy(() -> FixEgressTopologyValidator.validateFixEgressTopology(env, cfg))
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining(OmsProfiles.FIX_EGRESS)
-                .hasMessageContaining(OmsProfiles.CONTROL_WORKER);
-    }
-
-    @Test
     void fixEgressWithIngressReplica_throws() {
         MockEnvironment env = new MockEnvironment();
         env.setActiveProfiles(OmsProfiles.FIX_EGRESS, OmsProfiles.INGRESS_REPLICA);

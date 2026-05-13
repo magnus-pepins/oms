@@ -15,13 +15,12 @@ import quickfix.field.MsgType;
 
 /**
  * QuickFIX/J {@link Application} adapter: logon registry + inbound app messages →
- * {@link FixInboundExecutionReportSink}.
+ * {@link FixInboundClusterSink}.
  *
- * <p>Slice 3d of the Aeron Cluster substrate plan splits the inbound applier path: the
- * concrete {@link FixInboundExecutionReportSink} bean wired here is either the legacy
- * {@link FixInboundHandler} (every FIX-routing JVM except {@code oms-fix-egress}) or
- * {@code FixInboundClusterSink} (egress only). The dispatch logic in {@link #fromApp} is
- * unchanged.
+ * <p>Phase 3 slice 3d of the Aeron Cluster substrate plan introduced
+ * {@link FixInboundClusterSink} as the inbound applier; slice 3g deleted the legacy
+ * {@code FixInboundHandler} + {@code FixInboundExecutionReportSink} interface, so this class now
+ * routes directly to the cluster sink. The dispatch logic in {@link #fromApp} is unchanged.
  */
 @Component
 @ConditionalOnProperty(name = "oms.routing.backend", havingValue = "fix")
@@ -30,12 +29,12 @@ public class OmsFixApplication implements Application {
     private static final Logger log = LoggerFactory.getLogger(OmsFixApplication.class);
 
     private final FixSessionRegistry fixSessionRegistry;
-    private final FixInboundExecutionReportSink fixInboundSink;
+    private final FixInboundClusterSink fixInboundSink;
     private final FixMassCancelOnDisconnectService massCancelOnDisconnectService;
 
     public OmsFixApplication(
             FixSessionRegistry fixSessionRegistry,
-            FixInboundExecutionReportSink fixInboundSink,
+            FixInboundClusterSink fixInboundSink,
             FixMassCancelOnDisconnectService massCancelOnDisconnectService) {
         this.fixSessionRegistry = fixSessionRegistry;
         this.fixInboundSink = fixInboundSink;

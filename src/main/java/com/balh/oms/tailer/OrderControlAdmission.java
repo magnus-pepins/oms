@@ -26,13 +26,28 @@ import java.util.UUID;
  * Shared control-plane admission: risk, buying power, CAS to {@code WORKING} or reject, {@code control_decisions},
  * {@code domain_event_outbox} fanout rows.
  *
- * <p>Used from {@link com.balh.oms.ingress.OrderIngressService} when {@code oms.control.postgres-write-path=ingress},
- * and from {@link ControlTailer} when {@code oms.control.postgres-write-path=tail}. Does not enqueue outbound routing;
- * {@link ControlTailer} does that after a successful admit on the tail path, or Chronicle consumption does on the
- * ingress path.
+ * <p>The cluster substrate (Phase 2/3 of the Aeron Cluster substrate plan) calls this from
+ * {@link com.balh.oms.projector.OmsPostgresProjector#applyAdmittedEvent} after the cluster admits an order; the
+ * projector hands the {@link AdmissionResult} forward to whatever downstream side effect needs the post-admission
+ * state (e.g. the simulated route enqueue). Outbound routing is enqueued by the projector itself (next to this call),
+ * not here.
  */
 @Component
 public class OrderControlAdmission {
+
+    /**
+     * Outcome of {@link #persistAdmission(PendingControlEvent)}. Lives on this class (not on a tailer) because
+     * Phase 3 slice 3g deleted {@code ControlTailer}; the projector path is the only caller.
+     */
+    public enum AdmissionResult {
+        APPLIED,
+        SKIPPED_VERSION_MISMATCH,
+        STALE_REJECTED,
+        UNKNOWN_ORDER,
+        BUYING_POWER_REJECTED,
+        LEDGER_SERVICE_REJECTED,
+        RISK_PIPELINE_REJECTED
+    }
 
     private static final Logger log = LoggerFactory.getLogger(OrderControlAdmission.class);
 
@@ -79,11 +94,11 @@ public class OrderControlAdmission {
      * Applies control-plane admission for a single {@code OrderAccepted} pending event (same semantics as the legacy
      * tail path, without route dispatch).
      */
-    public ControlTailer.TailResult persistAdmission(PendingControlEvent event) {
+    public AdmissionResult persistAdmission(PendingControlEvent event) {
         return persistAdmissionBody(event);
     }
 
-    private ControlTailer.TailResult persistAdmissionBody(PendingControlEvent event) {
+    private AdmissionResult persistAdmissionBody(PendingControlEvent event) {
         if (stale.isStale(event.orderTimestamp())) {
             boolean updated = orders.updateWithCas(
                     event.orderId(),
@@ -104,13 +119,13 @@ public class OrderControlAdmission {
                         null);
                 publishRejected(event, RejectCode.RISK_STALE_QUEUE);
             }
-            return updated ? ControlTailer.TailResult.STALE_REJECTED : ControlTailer.TailResult.SKIPPED_VERSION_MISMATCH;
+            return updated ? AdmissionResult.STALE_REJECTED : AdmissionResult.SKIPPED_VERSION_MISMATCH;
         }
 
         var row = orders.findById(event.orderId());
         if (row.isEmpty()) {
             log.warn("Control event references unknown orderId={}", event.orderId());
-            return ControlTailer.TailResult.UNKNOWN_ORDER;
+            return AdmissionResult.UNKNOWN_ORDER;
         }
         Order order = row.get();
 
@@ -135,7 +150,7 @@ public class OrderControlAdmission {
                         null);
                 publishRejected(event, code);
             }
-            return updated ? ControlTailer.TailResult.RISK_PIPELINE_REJECTED : ControlTailer.TailResult.SKIPPED_VERSION_MISMATCH;
+            return updated ? AdmissionResult.RISK_PIPELINE_REJECTED : AdmissionResult.SKIPPED_VERSION_MISMATCH;
         }
 
         if (config.getLedger().isEnabled()) {
@@ -159,7 +174,7 @@ public class OrderControlAdmission {
                                 null);
                         publishRejected(event, RejectCode.RISK_BUYING_POWER);
                     }
-                    return updated ? ControlTailer.TailResult.BUYING_POWER_REJECTED : ControlTailer.TailResult.SKIPPED_VERSION_MISMATCH;
+                    return updated ? AdmissionResult.BUYING_POWER_REJECTED : AdmissionResult.SKIPPED_VERSION_MISMATCH;
                 }
                 case REJECT_LEDGER_UNAVAILABLE -> {
                     boolean updated = orders.updateWithCas(
@@ -180,7 +195,7 @@ public class OrderControlAdmission {
                                 null);
                         publishRejected(event, RejectCode.INTERNAL_ERROR);
                     }
-                    return updated ? ControlTailer.TailResult.LEDGER_SERVICE_REJECTED : ControlTailer.TailResult.SKIPPED_VERSION_MISMATCH;
+                    return updated ? AdmissionResult.LEDGER_SERVICE_REJECTED : AdmissionResult.SKIPPED_VERSION_MISMATCH;
                 }
                 case PROCEED -> { /* fall through */ }
             }
@@ -197,7 +212,7 @@ public class OrderControlAdmission {
         if (!updated) {
             log.debug("CAS skipped for orderId={} expectedVersion={} (someone else won the race)",
                     event.orderId(), event.orderVersion());
-            return ControlTailer.TailResult.SKIPPED_VERSION_MISMATCH;
+            return AdmissionResult.SKIPPED_VERSION_MISMATCH;
         }
         int newSeq = event.orderVersion() + 1;
         controlDecisions.record(
@@ -210,7 +225,7 @@ public class OrderControlAdmission {
         orders.findById(event.orderId()).ifPresentOrElse(
                 o -> publishWorking(event, o, newSeq),
                 () -> log.warn("WORKING CAS succeeded but order {} not found for event publish", event.orderId()));
-        return ControlTailer.TailResult.APPLIED;
+        return AdmissionResult.APPLIED;
     }
 
     private void publishRejected(PendingControlEvent event, RejectCode reason) {

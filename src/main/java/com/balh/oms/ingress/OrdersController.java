@@ -33,8 +33,8 @@ import java.util.UUID;
  *   <li>{@link com.balh.oms.reconciler.DomainFanoutReconciler} delivers domain
  *       envelopes to NATS (or no-op) strictly after commit.
  *       This controller is not registered on Spring profiles
- *       {@value com.balh.oms.config.OmsProfiles#CONTROL_WORKER} or
- *       {@value com.balh.oms.config.OmsProfiles#FIX_WORKER}.</li>
+ *       {@value com.balh.oms.config.OmsProfiles#POSTGRES_PROJECTOR} or
+ *       {@value com.balh.oms.config.OmsProfiles#FIX_EGRESS}.</li>
  * </ol>
  *
  * <p>Idempotent re-submissions return {@code 200 OK} with the existing order;

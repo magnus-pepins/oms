@@ -9,7 +9,8 @@ import quickfix.SessionNotFound;
 
 /**
  * Single outbound call site for {@link Session#sendToTarget(quickfix.Message, SessionID)} on the
- * active initiator session (same session {@link FixOutboundDispatchWorker} uses for NOS).
+ * active initiator session. Used by {@code OmsFixEgressService} (NOS replay) and
+ * {@code FixManualMassCancelService} (operator wire path).
  */
 @Component
 @ConditionalOnProperty(name = "oms.routing.backend", havingValue = "fix")

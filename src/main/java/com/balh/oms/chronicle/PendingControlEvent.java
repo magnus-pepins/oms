@@ -4,16 +4,16 @@ import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonInclude;
 
 import java.time.Instant;
-import java.util.List;
-import java.util.Objects;
-import java.util.Optional;
 import java.util.UUID;
 
 /**
- * In-memory domain view of a control-plane event. Persisted in {@code control_outbox.payload} as JSONB wrapping
- * base64 {@link com.balh.oms.proto.control.v1.ControlPendingEvent} (see {@link ControlChroniclePayloadCodec}); appended
- * to Chronicle as {@link ControlChronicleWireFormat#CHRONICLE_PROTO_PREFIX} + protobuf (e.g. {@link ControlChronicleEventTypes#ORDER_ACCEPTED},
- * {@link ControlChronicleEventTypes#CONTROL_PIPELINE_TELEMETRY}).
+ * In-memory domain view of a control-plane admission event.
+ *
+ * <p>Once carried the Chronicle wire-format coupling (proto envelope, telemetry hops, materialized-at
+ * stamps); after Phase 3 slice 3g of the Aeron Cluster substrate plan deleted the chronicle module,
+ * this is just the input record {@link com.balh.oms.tailer.OrderControlAdmission#persistAdmission}
+ * needs from {@link com.balh.oms.cluster.OrderAdmittedEvent}. The package name is legacy — the type
+ * itself is no longer chronicle-bound; renaming it is a follow-on cleanup.
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
 @JsonInclude(JsonInclude.Include.NON_ABSENT)
@@ -24,24 +24,6 @@ public record PendingControlEvent(
         int shardId,
         String accountIdHash,
         Instant orderTimestamp,
-        Instant enqueuedAt,
-        Optional<Instant> chronicleMaterializedAt,
-        List<ControlTelemetryHop> telemetryHops
+        Instant enqueuedAt
 ) {
-    public PendingControlEvent {
-        Objects.requireNonNull(telemetryHops, "telemetryHops");
-        telemetryHops = List.copyOf(telemetryHops);
-    }
-
-    /** Ingress / tests: no reconciler or tail telemetry on the domain row yet. */
-    public PendingControlEvent(
-            String type,
-            UUID orderId,
-            int orderVersion,
-            int shardId,
-            String accountIdHash,
-            Instant orderTimestamp,
-            Instant enqueuedAt) {
-        this(type, orderId, orderVersion, shardId, accountIdHash, orderTimestamp, enqueuedAt, Optional.empty(), List.of());
-    }
 }

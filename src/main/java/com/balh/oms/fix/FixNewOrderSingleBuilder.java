@@ -27,9 +27,8 @@ import java.time.ZoneOffset;
  * <p>Two entry points:
  *
  * <ul>
- *   <li>{@link #build(Order)} — legacy slice-4 path: takes a domain {@link Order} that came back
- *       from a Postgres lookup (typically inside {@code FixOutboundDispatchWorker}). Used by the
- *       legacy in-memory queue dispatcher.</li>
+ *   <li>{@link #build(Order)} — takes a domain {@link Order} loaded from Postgres. Retained for
+ *       {@code FixManualMassCancelService} and any future Postgres-driven repair flows.</li>
  *   <li>{@link #build(OrderAdmittedEvent)} — Phase 3 slice 3b-2 path: takes the cluster-emitted
  *       event directly so {@code OmsFixEgressService} never has to round-trip through Postgres on
  *       the hot send path. The {@code OrderAdmittedEvent} carries every NOS-relevant field
@@ -72,9 +71,9 @@ public class FixNewOrderSingleBuilder {
 
     /**
      * Builds a NOS straight from a cluster-emitted {@link OrderAdmittedEvent}, without consulting
-     * Postgres. This is the path used by {@code OmsFixEgressService} once Phase 3 slice 3b-2
-     * lands; the legacy {@link #build(Order)} stays for the in-memory queue dispatcher until
-     * {@code oms-fix-worker} is retired in slice 3g.
+     * Postgres. This is the only NOS path on {@code OmsFixEgressService}; the legacy
+     * {@link #build(Order)} overload stays for {@code FixManualMassCancelService} and any future
+     * Postgres-driven repair flows.
      *
      * <p>Field mapping mirrors {@link com.balh.oms.persistence.OrdersRepository}'s projector
      * inserts so a NOS built from {@code OrderAdmittedEvent} carries the same numeric values an

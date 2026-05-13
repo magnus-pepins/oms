@@ -59,26 +59,6 @@ oms:
   control:
     # Interim default 5 min — plans/oms-phase0-interim-decisions.md; tune per env.
     max-job-age-ms: ${OMS_CONTROL_MAX_JOB_AGE_MS:300000}
-    tailer-batch-size: ${OMS_TAILER_BATCH_SIZE:100}
-    # tail (default): Chronicle tail applies CAS + fanout. ingress: same writes in the accept transaction; tail dispatches routing only.
-    # Slice 3f deleted control_outbox + OutboxReconciler; this flag still selects between the legacy
-    # ControlTailer/ingress-admission paths and is itself deleted in slice 3g.
-    postgres-write-path: ${OMS_CONTROL_POSTGRES_WRITE_PATH:tail}
-  chronicle:
-    enabled: ${OMS_CHRONICLE_ENABLED:true}
-    # When false, omit ChronicleControlTailReader on this JVM (ingress-only replica in split topology; workers keep true).
-    control-tail-enabled: ${OMS_CHRONICLE_CONTROL_TAIL_ENABLED:true}
-    queue-dir: ${OMS_CHRONICLE_QUEUE_DIR:./queues/control}
-    # Tailer id under queue-dir (Chronicle metadata). One active tail per shared dir in prod unless sharded by design.
-    control-tail-id: ${OMS_CHRONICLE_CONTROL_TAIL_ID:oms-control}
-    # When true (default), tail calls toStart() on boot (full journal replay for that tailer id). When false, resumes persisted index.
-    control-tail-replay-from-start-on-boot: ${OMS_CHRONICLE_CONTROL_TAIL_REPLAY_FROM_START_ON_BOOT:true}
-    roll-cycle: ${OMS_CHRONICLE_ROLL_CYCLE:DAILY}
-    # scheduled | dedicated — see docs/chronicle-tail-driver.md
-    tail-driver: ${OMS_CHRONICLE_TAIL_DRIVER:scheduled}
-    tail-poll-interval-ms: ${OMS_CHRONICLE_TAIL_POLL_INTERVAL_MS:50}
-    tail-batch-max-messages: ${OMS_CHRONICLE_TAIL_BATCH_MAX_MESSAGES:200}
-    tail-dedicated-idle-park-nanos: ${OMS_CHRONICLE_TAIL_DEDICATED_IDLE_PARK_NANOS:100000}
   events:
     nats:
       enabled: ${OMS_NATS_ENABLED:false}
@@ -206,28 +186,19 @@ oms:
     list-max-limit: ${OMS_CORPORATE_ACTION_LIST_MAX_LIMIT:200}
     list-default-limit: ${OMS_CORPORATE_ACTION_LIST_DEFAULT_LIMIT:50}
   fix:
-    # When routing.backend=fix and auto-start=true, starts SocketInitiator + outbound drain scheduler.
+    # When routing.backend=fix and auto-start=true, starts SocketInitiator (oms-fix-egress drives outbound replay).
     auto-start: ${OMS_FIX_AUTO_START:false}
-    outbound-queue-capacity: ${OMS_FIX_OUTBOUND_QUEUE_CAPACITY:10000}
     file-store-path: ${OMS_FIX_FILE_STORE_PATH:./queues/fix}
     socket-connect-host: ${OMS_FIX_SOCKET_CONNECT_HOST:127.0.0.1}
     socket-connect-port: ${OMS_FIX_SOCKET_CONNECT_PORT:9876}
     sender-comp-id: ${OMS_FIX_SENDER_COMP_ID:OMS_INIT}
     target-comp-id: ${OMS_FIX_TARGET_COMP_ID:BROKER_ACCEPT}
     heart-bt-int: ${OMS_FIX_HEART_BT_INT:30}
-    outbound-poll-interval-ms: ${OMS_FIX_OUTBOUND_POLL_INTERVAL_MS:100}
-    # scheduled | dedicated — see docs/fix-outbound-driver.md
-    outbound-driver: ${OMS_FIX_OUTBOUND_DRIVER:scheduled}
-    outbound-dedicated-idle-park-nanos: ${OMS_FIX_OUTBOUND_DEDICATED_IDLE_PARK_NANOS:100000}
-    outbound-dedicated-not-ready-park-nanos: ${OMS_FIX_OUTBOUND_DEDICATED_NOT_READY_PARK_NANOS:50000000}
-    max-outbound-job-age-ms: ${OMS_FIX_MAX_OUTBOUND_JOB_AGE_MS:0}
     venue-id-for-executions: ${OMS_FIX_VENUE_ID_FOR_EXECUTIONS:FIX}
     use-data-dictionary: ${OMS_FIX_USE_DATA_DICTIONARY:false}
     # JSON object: OMS instrument_symbol (case-insensitive key) → broker Symbol on NOS; empty env → {} in Java.
     symbol-map-json: ${OMS_FIX_SYMBOL_MAP_JSON:}
     route-key: ${OMS_FIX_ROUTE_KEY:default}
-    outbound-tokens-per-second: ${OMS_FIX_OUTBOUND_TOKENS_PER_SECOND:0}
-    outbound-token-burst: ${OMS_FIX_OUTBOUND_TOKEN_BURST:100}
     # file | jdbc — jdbc uses Spring DataSource + Flyway oms_fix_sessions / oms_fix_messages (V9).
     session-store-type: ${OMS_FIX_SESSION_STORE_TYPE:file}
     route-state-sod-enabled: ${OMS_FIX_ROUTE_STATE_SOD_ENABLED:false}
@@ -252,7 +223,6 @@ oms:
     manual-mass-cancel-enabled: ${OMS_FIX_MANUAL_MASS_CANCEL_ENABLED:false}
     manual-mass-cancel-wire-enabled: ${OMS_FIX_MANUAL_MASS_CANCEL_WIRE_ENABLED:false}
     manual-mass-cancel-reason-max-chars: ${OMS_FIX_MANUAL_MASS_CANCEL_REASON_MAX_CHARS:512}
-    manual-mass-cancel-wire-queue-wait-ms: ${OMS_FIX_MANUAL_MASS_CANCEL_WIRE_QUEUE_WAIT_MS:30000}
 
 logging:
   level:

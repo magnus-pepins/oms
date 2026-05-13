@@ -14,9 +14,6 @@ class OmsTopologyInfoContributorTest {
     @Test
     void contributesEffectiveTopologyMap() {
         OmsConfig cfg = new OmsConfig();
-        cfg.getControl().setPostgresWritePath("ingress");
-        cfg.getChronicle().setEnabled(true);
-        cfg.getChronicle().setControlTailEnabled(false);
         cfg.getRouting().setBackend("fix");
         cfg.getGrpc().setEnabled(false);
         cfg.getFix().setAutoStart(true);
@@ -31,8 +28,6 @@ class OmsTopologyInfoContributorTest {
         @SuppressWarnings("unchecked")
         Map<String, Object> topology = (Map<String, Object>) info.getDetails().get("oms-topology");
         assertThat(topology).isNotNull();
-        assertThat(topology.get("control.postgres-write-path")).isEqualTo("ingress");
-        assertThat(topology.get("chronicle.control-tail-enabled")).isEqualTo(false);
         assertThat(topology.get("routing.backend")).isEqualTo("fix");
         assertThat(topology.get("grpc.enabled")).isEqualTo(false);
         assertThat(topology.get("fix.auto-start")).isEqualTo(true);

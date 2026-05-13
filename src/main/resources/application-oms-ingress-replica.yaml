@@ -1,12 +1,9 @@
-# P5 prep: horizontal ingress replica — same order-accept surface as the monolith, but no local Chronicle control tail.
-# Admission runs in the accept transaction; workers (oms-control-worker / oms-fix-worker) consume the shared journal.
+# Horizontal ingress replica — same order-accept surface as the monolith. Submits AcceptOrderCommand through
+# OmsClusterIngressClient (cluster.client.enabled=true). Phase 3 slice 3g removed the local Chronicle / control-tail
+# / postgres-write-path knobs, so this profile no longer needs an override block beyond the management port.
 #
-# Do not combine oms-ingress-replica with oms-control-worker or oms-fix-worker on the same process (TopologyWorkerProfiles).
-oms:
-  control:
-    postgres-write-path: ingress
-  chronicle:
-    control-tail-enabled: false
+# Do not combine oms-ingress-replica with oms-postgres-projector or oms-fix-egress on the same JVM
+# (TopologyWorkerProfiles).
 
 management:
   server:

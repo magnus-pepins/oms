@@ -3,7 +3,7 @@
 # This JVM consumes the cluster events recording (OmsClusterWireFormat.EVENTS_CHANNEL /
 # EVENTS_STREAM_ID) via Aeron Archive replay and writes Postgres projection rows. It must NOT run
 # order-accept HTTP/gRPC (ORDER_ACCEPT_PROFILE excludes oms-postgres-projector) and must NOT run a
-# FIX SocketInitiator (one initiator per route lives on oms-fix-worker / oms-fix-egress).
+# FIX SocketInitiator (one initiator per route lives on oms-fix-egress).
 #
 # Slice 2b-2 (now): replay subscription + idempotent orders writes + monotonic cursor advance.
 # Slice 2c will remove the parallel orders write from OrderIngressService.

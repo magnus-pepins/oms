@@ -1,7 +1,5 @@
 package com.balh.oms.config;
 
-import com.balh.oms.chronicle.ChronicleTailDriver;
-import com.balh.oms.fix.FixOutboundDriver;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.context.annotation.Configuration;
 
@@ -29,7 +27,6 @@ public class OmsConfig {
     private final Grpc grpc = new Grpc();
     private final Shard shard = new Shard();
     private final Control control = new Control();
-    private final Chronicle chronicle = new Chronicle();
     private final Events events = new Events();
     private final Ledger ledger = new Ledger();
     private final DomainEvents domainEvents = new DomainEvents();
@@ -49,7 +46,6 @@ public class OmsConfig {
     public Grpc getGrpc() { return grpc; }
     public Shard getShard() { return shard; }
     public Control getControl() { return control; }
-    public Chronicle getChronicle() { return chronicle; }
     public Events getEvents() { return events; }
     public Ledger getLedger() { return ledger; }
     public DomainEvents getDomainEvents() { return domainEvents; }
@@ -90,126 +86,18 @@ public class OmsConfig {
         public void setCount(int count) { this.count = count; }
     }
 
+    /**
+     * Control-plane admission knobs. Phase 3 slice 3g of the Aeron Cluster substrate plan removed
+     * the {@code postgres-write-path} switch (the cluster admission service is now the only writer)
+     * and the unused {@code tailer-batch-size} (only the deleted {@code ChronicleControlTailReader}
+     * read it). {@link #maxJobAgeMs} survives — it still drives {@link com.balh.oms.tailer.StaleJobGuard}
+     * inside {@link com.balh.oms.tailer.OrderControlAdmission}.
+     */
     public static class Control {
         /** Default 5 minutes — see plans/oms-phase0-interim-decisions.md until trading-ops signs a stricter value. */
         private long maxJobAgeMs = 300_000L;
-        private int tailerBatchSize = 100;
-        /**
-         * {@code tail} (default): {@link com.balh.oms.tailer.ControlTailer} applies CAS + fanout when consuming Chronicle.
-         * {@code ingress}: same writes run in the ingress accept transaction; tail is routing dispatch only — see
-         * {@code plans/oms-ingress-control-fix-topology.md} P1. (Phase 2 of the Aeron Cluster
-         * substrate plan replaces this dimension with a cluster-egress projector; until then the
-         * existing {@code TAIL}/{@code INGRESS} switch stays.)
-         */
-        private ControlPostgresWritePath postgresWritePath = ControlPostgresWritePath.TAIL;
         public long getMaxJobAgeMs() { return maxJobAgeMs; }
         public void setMaxJobAgeMs(long v) { this.maxJobAgeMs = v; }
-        public int getTailerBatchSize() { return tailerBatchSize; }
-        public void setTailerBatchSize(int v) { this.tailerBatchSize = v; }
-
-        public ControlPostgresWritePath getPostgresWritePath() {
-            return postgresWritePath;
-        }
-
-        public void setPostgresWritePath(String raw) {
-            this.postgresWritePath = ControlPostgresWritePath.fromProperty(raw);
-        }
-    }
-
-    public static class Chronicle {
-        /** Max length for {@link #setControlTailId(String)} after trim (Chronicle tailer metadata file names). */
-        private static final int CONTROL_TAIL_ID_MAX_CHARS = 128;
-
-        private boolean enabled = true;
-        /**
-         * When {@code false}, this JVM does not register {@link com.balh.oms.chronicle.ChronicleControlTailReader}
-         * (no local consume of the control Chronicle). Use for <strong>ingress-only</strong> replicas in a split
-         * topology; keep {@code true} on control / FIX workers. When order accept is enabled, disabling the tail
-         * requires {@link com.balh.oms.config.ControlPostgresWritePath#INGRESS} — see
-         * {@link com.balh.oms.config.IngressChronicleTailTopologyValidator}.
-         */
-        private boolean controlTailEnabled = true;
-        private String queueDir = "./queues/control";
-        private String rollCycle = "DAILY";
-        /**
-         * Chronicle excerpt tailer id under {@link #queueDir} (see OpenHFT {@code ExcerptTailer}). Default
-         * {@code oms-control}. For **one** active control tail per shared queue directory in production; use distinct
-         * ids only when you intentionally partition readers (separate dirs or an agreed sharding story).
-         */
-        private String controlTailId = "oms-control";
-        private ChronicleTailDriver tailDriver = ChronicleTailDriver.SCHEDULED;
-        private long tailPollIntervalMs = 50L;
-        private int tailBatchMaxMessages = 200;
-        /** Nanoseconds to park the dedicated tail thread when a drain pass finds no data (0 = busy-wait when idle). */
-        private long tailDedicatedIdleParkNanos = 100_000L;
-        /**
-         * When {@code true} (default), {@link com.balh.oms.chronicle.ChronicleControlTailReader} calls
-         * {@code ExcerptTailer.toStart()} on boot (full replay from the queue start for {@link #controlTailId}).
-         * When {@code false}, resumes the persisted Chronicle tail index for that id.
-         */
-        private boolean controlTailReplayFromStartOnBoot = true;
-
-        public boolean isEnabled() {
-            return enabled;
-        }
-
-        public void setEnabled(boolean v) {
-            this.enabled = v;
-        }
-
-        public boolean isControlTailEnabled() {
-            return controlTailEnabled;
-        }
-
-        public void setControlTailEnabled(boolean controlTailEnabled) {
-            this.controlTailEnabled = controlTailEnabled;
-        }
-
-        public String getQueueDir() { return queueDir; }
-        public void setQueueDir(String v) { this.queueDir = v; }
-        public String getControlTailId() {
-            return controlTailId;
-        }
-
-        /**
-         * Sets {@link #controlTailId}. Blank/null resets to {@code oms-control}. Must match {@code [a-zA-Z0-9_.-]+}
-         * and be at most {@value #CONTROL_TAIL_ID_MAX_CHARS} characters after trim.
-         */
-        public void setControlTailId(String raw) {
-            if (raw == null || raw.isBlank()) {
-                this.controlTailId = "oms-control";
-                return;
-            }
-            String t = raw.trim();
-            if (t.length() > CONTROL_TAIL_ID_MAX_CHARS) {
-                throw new IllegalArgumentException(
-                        "oms.chronicle.control-tail-id exceeds " + CONTROL_TAIL_ID_MAX_CHARS + " characters");
-            }
-            if (!t.matches("[a-zA-Z0-9_.-]+")) {
-                throw new IllegalArgumentException(
-                        "oms.chronicle.control-tail-id must match [a-zA-Z0-9_.-]+ (got characters outside that set)");
-            }
-            this.controlTailId = t;
-        }
-
-        public boolean isControlTailReplayFromStartOnBoot() {
-            return controlTailReplayFromStartOnBoot;
-        }
-
-        public void setControlTailReplayFromStartOnBoot(boolean controlTailReplayFromStartOnBoot) {
-            this.controlTailReplayFromStartOnBoot = controlTailReplayFromStartOnBoot;
-        }
-
-        public String getRollCycle() { return rollCycle; }
-        public void setRollCycle(String v) { this.rollCycle = v; }
-        public ChronicleTailDriver getTailDriver() { return tailDriver; }
-        public void setTailDriver(ChronicleTailDriver v) { this.tailDriver = v; }
-        public long getTailPollIntervalMs() { return tailPollIntervalMs; }
-        public void setTailPollIntervalMs(long v) { this.tailPollIntervalMs = v; }
-        public int getTailBatchMaxMessages() { return tailBatchMaxMessages; }
-        public void setTailBatchMaxMessages(int v) { this.tailBatchMaxMessages = v; }
-        public long getTailDedicatedIdleParkNanos() { return tailDedicatedIdleParkNanos; }
-        public void setTailDedicatedIdleParkNanos(long v) { this.tailDedicatedIdleParkNanos = v; }
     }
 
     public static class Events {
@@ -628,7 +516,9 @@ public class OmsConfig {
      * Outbound routing / return-path simulation (slice 3). {@code backend=noop} is the
      * default safe mode; {@code simulated} drives {@link com.balh.oms.routing.SimulatedBrokerDispatcher}
      * + {@link com.balh.oms.routing.SimulatedReturnPathProjectionWorker}; {@code fix} drives QuickFIX/J
-     * ({@link com.balh.oms.fix.FixRouteDispatcher}).
+     * via the {@code oms-fix-egress} JVM (the legacy {@code FixRouteDispatcher} +
+     * {@code FixOutboundDispatchWorker} were removed in Phase 3 slice 3g of the Aeron Cluster
+     * substrate plan).
      */
     public static class Routing {
         private String backend = "noop";
@@ -698,27 +588,12 @@ public class OmsConfig {
      */
     public static class Fix {
         private boolean autoStart = false;
-        private int outboundQueueCapacity = 10_000;
         private String fileStorePath = "./queues/fix";
         private String socketConnectHost = "127.0.0.1";
         private int socketConnectPort = 9876;
         private String senderCompId = "OMS_INIT";
         private String targetCompId = "BROKER_ACCEPT";
         private int heartBtInt = 30;
-        private long outboundPollIntervalMs = 100L;
-        private FixOutboundDriver outboundDriver = FixOutboundDriver.SCHEDULED;
-        /**
-         * When {@link #outboundDriver} is {@link FixOutboundDriver#DEDICATED}, max nanoseconds to block on an empty
-         * outbound queue before polling again ({@code 0} uses {@link com.balh.oms.fix.FixOutboundDispatchWorker} minimum wait).
-         */
-        private long outboundDedicatedIdleParkNanos = 100_000L;
-        /**
-         * When {@link #outboundDriver} is {@link FixOutboundDriver#DEDICATED}, park duration when FIX session is not
-         * logged on or route {@code send_enabled} is false.
-         */
-        private long outboundDedicatedNotReadyParkNanos = 50_000_000L;
-        /** 0 = disabled; otherwise reject WORKING orders at FIX dequeue when older than this (ms). */
-        private long maxOutboundJobAgeMs = 0L;
         /** Venue id stamped on {@code ExecutionTradeCommand} from inbound ERs. */
         private String venueIdForExecutions = "FIX";
         private boolean useDataDictionary = false;
@@ -729,10 +604,6 @@ public class OmsConfig {
         private String symbolMapJson = "{}";
         /** Logical FIX route key for {@code fix_route_state} (default single route). */
         private String routeKey = "default";
-        /** NOS rate limit; {@code <= 0} disables token bucket (default). */
-        private double outboundTokensPerSecond = 0;
-        /** Bucket capacity when rate limiting is enabled. */
-        private int outboundTokenBurst = 100;
         /**
          * {@code file} — {@link quickfix.FileStoreFactory}; {@code jdbc} — {@link quickfix.JdbcStoreFactory}.
          * Default pool is the application {@link javax.sql.DataSource}; optional dedicated pool via
@@ -786,18 +657,8 @@ public class OmsConfig {
         private boolean manualMassCancelWireEnabled = false;
         /** Max UTF-16 length for optional {@code reason} on manual mass-cancel POST. */
         private int manualMassCancelReasonMaxChars = 512;
-        /**
-         * When {@link #manualMassCancelWireEnabled} and {@link #autoStart}, max wait (ms) for {@code OrderMassCancelRequest}
-         * to be sent by {@link com.balh.oms.fix.FixOutboundDispatchWorker} via the shared outbound queue.
-         */
-        private long manualMassCancelWireQueueWaitMs = 30_000L;
-
         public boolean isAutoStart() { return autoStart; }
         public void setAutoStart(boolean autoStart) { this.autoStart = autoStart; }
-        public int getOutboundQueueCapacity() { return outboundQueueCapacity; }
-        public void setOutboundQueueCapacity(int outboundQueueCapacity) {
-            this.outboundQueueCapacity = Math.max(1, outboundQueueCapacity);
-        }
         public String getFileStorePath() { return fileStorePath; }
         public void setFileStorePath(String fileStorePath) { this.fileStorePath = fileStorePath == null ? "./queues/fix" : fileStorePath; }
         public String getSocketConnectHost() { return socketConnectHost; }
@@ -812,36 +673,6 @@ public class OmsConfig {
         public void setTargetCompId(String targetCompId) { this.targetCompId = targetCompId == null ? "BROKER_ACCEPT" : targetCompId; }
         public int getHeartBtInt() { return heartBtInt; }
         public void setHeartBtInt(int heartBtInt) { this.heartBtInt = Math.max(1, heartBtInt); }
-        public long getOutboundPollIntervalMs() { return outboundPollIntervalMs; }
-        public void setOutboundPollIntervalMs(long outboundPollIntervalMs) {
-            this.outboundPollIntervalMs = Math.max(1L, outboundPollIntervalMs);
-        }
-        public FixOutboundDriver getOutboundDriver() {
-            return outboundDriver;
-        }
-        public void setOutboundDriver(FixOutboundDriver outboundDriver) {
-            this.outboundDriver = outboundDriver;
-        }
-        public long getOutboundDedicatedIdleParkNanos() {
-            return outboundDedicatedIdleParkNanos;
-        }
-        public void setOutboundDedicatedIdleParkNanos(long outboundDedicatedIdleParkNanos) {
-            this.outboundDedicatedIdleParkNanos = Math.max(0L, outboundDedicatedIdleParkNanos);
-        }
-        public long getOutboundDedicatedNotReadyParkNanos() {
-            return outboundDedicatedNotReadyParkNanos;
-        }
-        public void setOutboundDedicatedNotReadyParkNanos(long outboundDedicatedNotReadyParkNanos) {
-            this.outboundDedicatedNotReadyParkNanos = Math.max(0L, outboundDedicatedNotReadyParkNanos);
-        }
-        public long getMaxOutboundJobAgeMs() {
-            return maxOutboundJobAgeMs;
-        }
-
-        public void setMaxOutboundJobAgeMs(long maxOutboundJobAgeMs) {
-            this.maxOutboundJobAgeMs = Math.max(0L, maxOutboundJobAgeMs);
-        }
-
         public String getVenueIdForExecutions() { return venueIdForExecutions; }
         public void setVenueIdForExecutions(String venueIdForExecutions) {
             this.venueIdForExecutions = venueIdForExecutions == null ? "FIX" : venueIdForExecutions;
@@ -863,22 +694,6 @@ public class OmsConfig {
 
         public void setRouteKey(String routeKey) {
             this.routeKey = routeKey == null || routeKey.isBlank() ? "default" : routeKey;
-        }
-
-        public double getOutboundTokensPerSecond() {
-            return outboundTokensPerSecond;
-        }
-
-        public void setOutboundTokensPerSecond(double outboundTokensPerSecond) {
-            this.outboundTokensPerSecond = outboundTokensPerSecond;
-        }
-
-        public int getOutboundTokenBurst() {
-            return outboundTokenBurst;
-        }
-
-        public void setOutboundTokenBurst(int outboundTokenBurst) {
-            this.outboundTokenBurst = Math.max(1, outboundTokenBurst);
         }
 
         public String getSessionStoreType() {
@@ -1077,15 +892,6 @@ public class OmsConfig {
 
         public void setManualMassCancelReasonMaxChars(int manualMassCancelReasonMaxChars) {
             this.manualMassCancelReasonMaxChars = Math.min(4000, Math.max(32, manualMassCancelReasonMaxChars));
-        }
-
-        public long getManualMassCancelWireQueueWaitMs() {
-            return manualMassCancelWireQueueWaitMs;
-        }
-
-        public void setManualMassCancelWireQueueWaitMs(long manualMassCancelWireQueueWaitMs) {
-            this.manualMassCancelWireQueueWaitMs =
-                    Math.min(600_000L, Math.max(1_000L, manualMassCancelWireQueueWaitMs));
         }
     }
 

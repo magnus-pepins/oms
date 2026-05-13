@@ -28,11 +28,6 @@ public class OmsTopologyInfoContributor implements InfoContributor {
     @Override
     public void contribute(Info.Builder builder) {
         Map<String, Object> topology = new LinkedHashMap<>();
-        topology.put(
-                "control.postgres-write-path",
-                omsConfig.getControl().getPostgresWritePath().name().toLowerCase());
-        topology.put("chronicle.enabled", omsConfig.getChronicle().isEnabled());
-        topology.put("chronicle.control-tail-enabled", omsConfig.getChronicle().isControlTailEnabled());
         topology.put("routing.backend", omsConfig.getRouting().getBackend());
         topology.put("grpc.enabled", omsConfig.getGrpc().isEnabled());
         topology.put("fix.auto-start", omsConfig.getFix().isAutoStart());

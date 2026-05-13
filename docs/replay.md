@@ -1,49 +1,60 @@
-# Chronicle replay
+# Replay
 
-Chronicle Queue is **engineering replay only**. It is not a regulatory
-system of record. Postgres is.
+OMS state is replayed from the **Aeron Archive** events recording. Postgres is
+a downstream projection; it can be rebuilt deterministically from the
+recording.
 
 ## When you would replay
 
 - Reproducing a production incident in a non-prod environment.
 - Latency / throughput profiling against a real workload.
-- Testing a new control-plane component against historical traffic.
+- Rebuilding a Postgres projection from scratch (operator-driven, e.g. to
+  recover from a corrupt projection or to backfill after a schema change).
 
 ## When you would NOT replay
 
 - Anything that requires a regulator-defensible chain of custody. For
-  that, the source is Postgres + the Beard Admin audit trail.
-- Anything that depends on Chronicle being identical across instances.
-  Chronicle is shard-local in slice 1; replicated journals arrive later
-  if needed.
+  that, the source is Postgres + the Beard Admin audit trail (the projector
+  writes both `domain_event_outbox` and `control_decisions` deterministically
+  from the cluster log, but the regulatory record stays Postgres).
 
-## How to replay (slice 1)
+## How to replay (per-role JVM)
 
-1. Stop the OMS.
-2. Snapshot the Postgres database alongside the Chronicle queue
-   directory (`oms.chronicle.queue-dir`). Both must be from the same
-   point in time.
-3. Restore both into the replay environment.
-4. Start the OMS pointed at the restored datastore. The reconciler will
-   skip rows whose `chronicle_enqueued_at` is already set.
-5. To replay individual control events, write a Chronicle reader (or use
-   the Chronicle Queue CLI tooling) and feed the payloads back through
-   `ControlTailer.apply(...)`.
+### Postgres projector (`oms-postgres-projector`)
 
-## What is in the journal
+The projector advances `aeron_projector_cursor` only after each projection
+transaction commits. Restart resumes from the last committed cursor.
 
-- The exact JSON payload that `OrdersController.persistAccepted` wrote
-  into `control_outbox.payload`. See
-  `chronicle/PendingControlEvent.java`.
-- This is enough for a tailer to apply CAS updates idempotently. It is
-  NOT enough on its own to reconstruct the order — for that, you need
-  the Postgres row.
+To rebuild from scratch:
 
-## Limitations of slice 1
+1. Stop all `oms-postgres-projector` instances.
+2. Truncate `aeron_projector_cursor` (or set the cursor to 0) — and truncate
+   the projection tables you intend to rebuild.
+3. Start the projector. It re-reads the events recording from the beginning
+   and re-applies every event idempotently (`ON CONFLICT DO NOTHING` /
+   version-mismatch CAS).
 
-- Single-node Chronicle. If the disk fails, you lose the journal but
-  not the orders (Postgres is the SoR).
-- Daily roll cycles. Adjust via `oms.chronicle.roll-cycle` if you need
-  finer rotation.
-- No compaction. The directory grows with traffic; ops procedure for
-  archiving / pruning is part of the slice 2 deployment hardening.
+### FIX egress (`oms-fix-egress`)
+
+The egress JVM advances `oms_fix_egress_cursor` only after each successful
+`Session.sendToTarget`. Restart resumes from the last committed cursor.
+Replays must NOT replay already-sent NOS (broker would receive a duplicate);
+the cursor is the dedupe.
+
+## What is in the recording
+
+- The cluster events emitted by `OmsAdmissionClusteredService` —
+  `OrderAdmittedEvent`, `ExecutionAppliedEvent`, etc. (see `OmsClusterWireFormat`
+  and the per-event codecs).
+- This is enough to deterministically reconstruct every projection row OMS
+  writes (`orders`, `executions`, `control_decisions`, `domain_event_outbox`,
+  `market_context`, `positions`, `position_history`).
+
+## Limitations
+
+- The events recording lives on the cluster nodes' Aeron Archive. Standard
+  Aeron Archive operational practice (segment archival, retention,
+  `truncate-recording`) applies.
+- Snapshots are taken by the cluster periodically; restoring a snapshot
+  alongside the recording is the fastest path to rebuilding a cluster member
+  from the journal.

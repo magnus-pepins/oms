@@ -2,40 +2,28 @@ package com.balh.oms.config;
 
 import com.zaxxer.hikari.HikariDataSource;
 import com.balh.oms.fix.FixInitiatorManager;
-import com.balh.oms.fix.FixNewOrderSingleBuilder;
-import com.balh.oms.fix.FixOutboundDispatchWorker;
-import com.balh.oms.fix.FixOutboundDriver;
-import com.balh.oms.fix.FixOutboundOrderDequeue;
-import com.balh.oms.fix.FixOutboundSessionSend;
-import com.balh.oms.fix.FixOutboundTokenBucket;
 import com.balh.oms.fix.OmsFixApplication;
-import com.balh.oms.observability.otel.IngressToFixNosLatencyRecorder;
-import com.balh.oms.persistence.FixRouteStateRepository;
-import com.balh.oms.persistence.OrdersRepository;
-import com.balh.oms.returnpath.ExecutionReportApplier;
-import com.balh.oms.routing.RouteDispatcher;
-import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.context.annotation.Profile;
 import org.springframework.core.env.Environment;
-import org.springframework.scheduling.annotation.SchedulingConfigurer;
-import org.springframework.scheduling.config.ScheduledTaskRegistrar;
 
 import javax.sql.DataSource;
-import java.time.Duration;
 
 /**
- * FIX initiator + outbound scheduler when {@code oms.routing.backend=fix} and {@code oms.fix.auto-start=true}.
+ * QuickFIX/J initiator wiring when {@code oms.routing.backend=fix} and {@code oms.fix.auto-start=true}.
+ *
+ * <p>Phase 3 slice 3g of the Aeron Cluster substrate plan retired the legacy in-memory outbound
+ * queue + {@code FixOutboundDispatchWorker} drain path. The cluster + {@code oms-fix-egress} JVM
+ * now own outbound NOS end-to-end via Aeron Archive replay (see {@code OmsFixEgressService}); this
+ * configuration only stands up the {@link FixInitiatorManager} (QuickFIX {@code SocketInitiator})
+ * so the egress JVM has an open session to send through.
  */
 @Configuration(proxyBeanMethods = false)
 @ConditionalOnProperty(name = "oms.routing.backend", havingValue = "fix")
 public class FixAutoStartBeans {
-
-    private static final long MIN_FIX_OUTBOUND_POLL_INTERVAL_MS = 1L;
 
     @Bean
     @ConditionalOnProperty(name = "oms.fix.auto-start", havingValue = "true")
@@ -63,69 +51,5 @@ public class FixAutoStartBeans {
                         ? (dedicated != null ? dedicated : dataSource)
                         : dataSource;
         return new FixInitiatorManager(omsConfig, application, jdbcMessageStoreDataSource);
-    }
-
-    /**
-     * Legacy in-memory queue dispatcher: drains {@link FixOutboundOrderDequeue} and sends NOS via
-     * {@link FixOutboundSessionSend}. Excluded from {@link OmsProfiles#FIX_EGRESS} (Phase 3 slice
-     * 3b-2) — on that JVM the FIX wire side effect is owned by
-     * {@code OmsFixEgressService.applyAdmittedEvent} on the Aeron Archive replay path, so
-     * keeping the dispatcher around would either (a) idle-poll an empty queue every
-     * {@code oms.fix.outbound-poll-interval-ms} ticks, wasting cycles for no behavioural effect,
-     * or (b) accidentally double-send if some future code path enqueues into {@code
-     * fixOutboundPendingOrderQueue}. The legacy path stays alive for {@code oms-fix-worker}
-     * (deleted in slice 3g once {@code oms-fix-egress} is the production FIX-out JVM).
-     */
-    @Bean
-    @ConditionalOnProperty(name = "oms.fix.auto-start", havingValue = "true")
-    @Profile("!" + OmsProfiles.FIX_EGRESS)
-    FixOutboundDispatchWorker fixOutboundDispatchWorker(
-            RouteDispatcher routeDispatcher,
-            FixOutboundOrderDequeue fixOutboundOrderDequeue,
-            FixOutboundSessionSend fixOutboundSessionSend,
-            OrdersRepository ordersRepository,
-            FixNewOrderSingleBuilder newOrderSingleBuilder,
-            MeterRegistry meterRegistry,
-            OmsConfig omsConfig,
-            ExecutionReportApplier executionReportApplier,
-            FixRouteStateRepository fixRouteStateRepository,
-            FixOutboundTokenBucket fixOutboundTokenBucket,
-            IngressToFixNosLatencyRecorder ingressToFixNosLatencyRecorder) {
-        return new FixOutboundDispatchWorker(
-                routeDispatcher,
-                fixOutboundOrderDequeue,
-                fixOutboundSessionSend,
-                ordersRepository,
-                newOrderSingleBuilder,
-                meterRegistry,
-                omsConfig,
-                executionReportApplier,
-                fixRouteStateRepository,
-                fixOutboundTokenBucket,
-                ingressToFixNosLatencyRecorder);
-    }
-
-    /**
-     * Registers fixed-delay {@link FixOutboundDispatchWorker#drainPendingOutboundOnce()} when
-     * {@code oms.fix.outbound-driver=scheduled}. When {@code dedicated}, this configurer is a no-op so we do not
-     * register duplicate @{@link org.springframework.boot.autoconfigure.condition.ConditionalOnProperty} annotations
-     * (not repeatable on the same element).
-     *
-     * <p>Excluded on {@link OmsProfiles#FIX_EGRESS} for the same reason
-     * {@link #fixOutboundDispatchWorker} is: the egress JVM does not run the in-memory queue
-     * path. Without this exclusion Spring would fail to wire the bean (the worker dependency
-     * is profile-excluded) and the context would crash at startup.
-     */
-    @Bean
-    @ConditionalOnProperty(name = "oms.fix.auto-start", havingValue = "true")
-    @Profile("!" + OmsProfiles.FIX_EGRESS)
-    SchedulingConfigurer fixOutboundPollScheduling(FixOutboundDispatchWorker worker, OmsConfig omsConfig) {
-        return registrar -> {
-            if (omsConfig.getFix().getOutboundDriver() != FixOutboundDriver.SCHEDULED) {
-                return;
-            }
-            long ms = Math.max(MIN_FIX_OUTBOUND_POLL_INTERVAL_MS, omsConfig.getFix().getOutboundPollIntervalMs());
-            registrar.addFixedDelayTask(worker::drainPendingOutboundOnce, Duration.ofMillis(ms));
-        };
     }
 }

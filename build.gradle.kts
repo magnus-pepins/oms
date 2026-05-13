@@ -27,27 +27,18 @@ repositories {
 val quickfixjVersion = "2.3.2"
 
 /**
- * JVM `--add-opens` / `--add-exports` for low-latency JDK-internals access.
- *
- * Used by both Chronicle Queue (OpenHFT memory-mapped I/O — `docs/Java-Version-Support.adoc`)
- * and Aeron / Agrona (off-heap buffers, atomic ops on `Unsafe`). Without them, the relevant
+ * JVM `--add-opens` / `--add-exports` for low-latency JDK-internals access required by
+ * Aeron / Agrona (off-heap buffers, atomic ops on `Unsafe`). Without them, the relevant
  * `bootRun` / cluster-node JVM fails on JDK 21 with `IllegalAccessException` against
  * `sun.nio.ch.*`, `jdk.internal.misc.*`, or `sun.misc.Unsafe`.
- *
- * Kept under one name to avoid drift between Chronicle and Aeron flag lists. Chronicle is
- * being removed per ADR 0001 (`docs/adr/0001-aeron-cluster-substrate.md`); this list will
- * lose the `jdk.compiler` / `java.io` exports when Chronicle goes.
  */
 val lowLatencyJvmModuleOpens =
     listOf(
         "--add-exports=java.base/jdk.internal.ref=ALL-UNNAMED",
         "--add-exports=java.base/sun.nio.ch=ALL-UNNAMED",
         "--add-exports=jdk.unsupported/sun.misc=ALL-UNNAMED",
-        "--add-exports=jdk.compiler/com.sun.tools.javac.file=ALL-UNNAMED",
-        "--add-opens=jdk.compiler/com.sun.tools.javac=ALL-UNNAMED",
         "--add-opens=java.base/java.lang=ALL-UNNAMED",
         "--add-opens=java.base/java.lang.reflect=ALL-UNNAMED",
-        "--add-opens=java.base/java.io=ALL-UNNAMED",
         "--add-opens=java.base/java.util=ALL-UNNAMED",
         "--add-opens=java.base/jdk.internal.misc=ALL-UNNAMED",
     )
@@ -61,7 +52,7 @@ val lowLatencyJvmModuleOpens =
 val springTestContextCacheMaxSize =
     System.getenv("SPRING_TEST_CONTEXT_CACHE_MAX_SIZE")?.toIntOrNull()?.coerceIn(1, 64) ?: 10
 
-/** Protobuf compiler + runtime (control_outbox + Chronicle wire format). */
+/** Protobuf compiler + runtime (legacy ProtoBuf descriptors used by gRPC ingress). */
 val protobufJavaVersion = "4.29.3"
 
 /** gRPC Java stack (ingress); keep aligned with protoc-gen-grpc-java. */
@@ -106,16 +97,6 @@ dependencies {
 
     // Micrometer Prometheus
     implementation("io.micrometer:micrometer-registry-prometheus")
-
-    // Chronicle Queue OSS — durable shard-local journal.
-    // 2026.2 is the latest stable on Maven Central as of this bootstrap.
-    //
-    // TRANSITIONAL per ADR 0001 (Aeron Cluster substrate). Removed when each phase of the plan
-    // deletes the Chronicle code path it replaces. Do not add new call sites.
-    implementation("net.openhft:chronicle-queue:2026.2") {
-        // Avoid the OpenHFT slf4j shim; let Spring Boot's logback own slf4j-api.
-        exclude(group = "org.slf4j", module = "slf4j-api")
-    }
 
     // Aeron family — substrate for the clustered state machine (ADR 0001).
     //
@@ -206,67 +187,11 @@ tasks.named<org.springframework.boot.gradle.tasks.run.BootRun>("bootRun") {
     jvmArgs(lowLatencyJvmModuleOpens)
 }
 
-/** P3 prep: same app as bootRun with Spring profile oms-control-worker (see OmsControlWorkerBootstrap). */
-tasks.register<org.springframework.boot.gradle.tasks.run.BootRun>("bootRunControlWorker") {
-    group = "application"
-    description =
-        "Run OMS with oms-control-worker profile (no new-order ingress; reconciler Chronicle append per application-oms-control-worker.yaml)."
-    classpath = sourceSets["main"].runtimeClasspath
-    mainClass.set("com.balh.oms.OmsControlWorkerBootstrap")
-    jvmArgs(lowLatencyJvmModuleOpens)
-}
-
 tasks.named<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJar") {
     archiveBaseName.set("oms")
 }
 
-/**
- * Second fat JAR: same BOOT-INF layout as bootJar, {@code Start-Class} {@link com.balh.oms.OmsControlWorkerBootstrap}.
- * Requires {@code targetJavaVersion} (Spring Boot 3 BootJar) so the task is wired like the default {@code bootJar}.
- */
-tasks.register<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJarControlWorker") {
-    group = "build"
-    description =
-        "Executable JAR for control-worker entry (Start-Class OmsControlWorkerBootstrap; classifier control-worker)."
-    mainClass.set("com.balh.oms.OmsControlWorkerBootstrap")
-    archiveClassifier.set("control-worker")
-    archiveBaseName.set("oms")
-    targetJavaVersion.set(JavaVersion.VERSION_21)
-    classpath = sourceSets["main"].runtimeClasspath
-}
-
-tasks.named<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJarControlWorker").configure {
-    shouldRunAfter(tasks.named("bootJar"))
-    duplicatesStrategy = org.gradle.api.file.DuplicatesStrategy.EXCLUDE
-}
-
-/** P4 prep: same app as bootRun with Spring profile oms-fix-worker (FIX initiator + outbound; see OmsFixWorkerBootstrap). */
-tasks.register<org.springframework.boot.gradle.tasks.run.BootRun>("bootRunFixWorker") {
-    group = "application"
-    description =
-        "Run OMS with oms-fix-worker profile (no new-order ingress; reconciler Chronicle append; oms.routing.backend=fix and oms.fix.auto-start=true per application-oms-fix-worker.yaml)."
-    classpath = sourceSets["main"].runtimeClasspath
-    mainClass.set("com.balh.oms.OmsFixWorkerBootstrap")
-    jvmArgs(lowLatencyJvmModuleOpens)
-}
-
-tasks.register<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJarFixWorker") {
-    group = "build"
-    description =
-        "Executable JAR for FIX-worker entry (Start-Class OmsFixWorkerBootstrap; classifier fix-worker)."
-    mainClass.set("com.balh.oms.OmsFixWorkerBootstrap")
-    archiveClassifier.set("fix-worker")
-    archiveBaseName.set("oms")
-    targetJavaVersion.set(JavaVersion.VERSION_21)
-    classpath = sourceSets["main"].runtimeClasspath
-}
-
-tasks.named<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJarFixWorker").configure {
-    shouldRunAfter(tasks.named("bootJar"))
-    duplicatesStrategy = org.gradle.api.file.DuplicatesStrategy.EXCLUDE
-}
-
-/** P5 prep: same app as bootRun with Spring profile oms-ingress-replica (order accept + ingress admission; no local control tail; see OmsIngressReplicaBootstrap). */
+/** Horizontal ingress replica — same app as bootRun with Spring profile oms-ingress-replica (order accept; submits AcceptOrderCommand through the cluster client; see OmsIngressReplicaBootstrap). */
 tasks.register<org.springframework.boot.gradle.tasks.run.BootRun>("bootRunIngressReplica") {
     group = "application"
     description =
@@ -296,9 +221,8 @@ tasks.named<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJarIngr
  * ADR 0001 / topology-aeron-cluster Phase 1: cluster-node JVM.
  *
  * Boots an Aeron MediaDriver + Archive + ConsensusModule + ClusteredServiceContainer hosting
- * `OmsAdmissionClusteredService`. **Do not** combine on the same JVM with the legacy worker
- * profiles (`oms-control-worker`, `oms-fix-worker`, `oms-ingress-replica`) — those go away
- * once Phases 2-3 of the plan complete.
+ * `OmsAdmissionClusteredService`. **Do not** combine on the same JVM with `oms-ingress-replica`,
+ * `oms-postgres-projector`, or `oms-fix-egress` (TopologyWorkerProfiles).
  */
 tasks.register<org.springframework.boot.gradle.tasks.run.BootRun>("bootRunClusterNode") {
     group = "application"

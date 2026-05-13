@@ -1,6 +1,6 @@
 # Runbook: `oms-ingress-replica` JVM (horizontal ingress)
 
-P5 prep: same **new-order** HTTP and gRPC surface as the monolith (`@Profile` **`ORDER_ACCEPT_PROFILE`** in `OmsProfiles`). This JVM **appends** to the shared control Chronicle but **does not** run `ChronicleControlTailReader` (`oms.chronicle.control-tail-enabled=false` in `application-oms-ingress-replica.yaml`). Admission for the ingress path uses **`oms.control.postgres-write-path=ingress`** so CAS + domain fanout run in the accept transaction; **`oms-control-worker`** / **`oms-fix-worker`** consume the tail elsewhere.
+Same **new-order** HTTP and gRPC surface as the monolith (`@Profile` **`ORDER_ACCEPT_PROFILE`** in `OmsProfiles`). Submits `AcceptOrderCommand` to the cluster leader through `OmsClusterIngressClient` — the cluster + `oms-postgres-projector` + `oms-fix-egress` JVMs handle admission, projection, and outbound FIX. This JVM never writes `orders` / `executions` directly.
 
 ## Local (Gradle)
 
@@ -31,15 +31,15 @@ docker build -f docker/Dockerfile.ingress-replica --build-arg JAR_FILE=build/lib
 
 ## Verify effective topology
 
-After boot, **`GET http://127.0.0.1:${OMS_INGRESS_REPLICA_MANAGEMENT_SERVER_PORT:-8087}/actuator/info`** includes **`oms-topology`** (`control.postgres-write-path`, `chronicle.control-tail-enabled`, `routing.backend`, …) from `OmsTopologyInfoContributor` — use it to prove this JVM matches the cluster contract (same source of truth as workers for `postgres-write-path`).
+After boot, **`GET http://127.0.0.1:${OMS_INGRESS_REPLICA_MANAGEMENT_SERVER_PORT:-8087}/actuator/info`** includes **`oms-topology`** (`routing.backend`, `grpc.enabled`, `fix.auto-start`, active Spring profiles) from `OmsTopologyInfoContributor`.
 
 ## Preconditions
 
-- Postgres + **same** Chronicle queue directory and **`postgres-write-path`** as the rest of the cluster (see [plans/oms-ingress-control-fix-topology.md](../../../system-documentation/plans/oms-ingress-control-fix-topology.md) P1).
-- **`oms.chronicle.enabled=true`**, **`oms.chronicle.control-tail-enabled=false`**, **`oms.control.postgres-write-path=ingress`** (YAML default).
-- Do **not** activate **`oms-ingress-replica`** together with **`oms-control-worker`** or **`oms-fix-worker`** on the same process (`TopologyWorkerProfiles`).
-- Do **not** run QuickFIX **`SocketInitiator`** here (`oms.routing.backend=fix` + **`oms.fix.auto-start=true`**); use **`oms-fix-worker`** for FIX-out.
+- Postgres reachable for projector reads on the API path (e.g. order-by-id GET, idempotent dedupe lookup) and for the same `domain_event_outbox` writes the monolith does.
+- Cluster client wiring (`oms.cluster.client.enabled=true` in the active topology) so `OrderIngressService` can submit `AcceptOrderCommand` and await the egress reply.
+- Do **not** activate **`oms-ingress-replica`** together with **`oms-postgres-projector`** or **`oms-fix-egress`** on the same process (`TopologyWorkerProfiles`).
+- Do **not** run QuickFIX `SocketInitiator` here (`oms.routing.backend=fix` + **`oms.fix.auto-start=true`**); use **`oms-fix-egress`** for FIX-out.
 
 ## Topology
 
-See [`oms/docs/chronicle-tail-driver.md`](../chronicle-tail-driver.md) and [`oms-control-worker.md`](oms-control-worker.md) for **one** active tail consumer per shared queue directory unless operations explicitly isolates readers.
+See [plans/oms-aeron-cluster-substrate.md](../../../system-documentation/plans/oms-aeron-cluster-substrate.md) for the cluster-substrate topology (one cluster per shard, multiple ingress JVMs as cluster clients, exactly one `oms-fix-egress` per FIX route).

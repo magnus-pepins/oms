@@ -3,7 +3,6 @@ package com.balh.oms.fix;
 import com.balh.oms.cluster.ApplyExecutionReportCommand;
 import com.balh.oms.cluster.OmsClusterIngressClient;
 import com.balh.oms.config.OmsConfig;
-import com.balh.oms.config.OmsProfiles;
 import com.balh.oms.returnpath.ExecutionCancelCommand;
 import com.balh.oms.returnpath.ExecutionTradeCommand;
 import com.balh.oms.returnpath.ExecutionVenueRejectCommand;
@@ -14,7 +13,6 @@ import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
-import org.springframework.context.annotation.Profile;
 import org.springframework.stereotype.Service;
 import quickfix.FieldNotFound;
 import quickfix.Message;
@@ -28,16 +26,19 @@ import java.time.Instant;
 import java.util.Optional;
 
 /**
- * Slice 3d implementation of {@link FixInboundExecutionReportSink} for the {@code oms-fix-egress}
- * JVM. Translates inbound FIX {@code ExecutionReport} (35=8) and {@code OrderCancelReject}
- * (35=9) messages into deterministic {@link ApplyExecutionReportCommand}s and fire-and-forget
- * offers them via {@link OmsClusterIngressClient#submitApplyExecutionReport}.
+ * Inbound FIX {@code ExecutionReport} (35=8) and {@code OrderCancelReject} (35=9) translator:
+ * builds {@link ApplyExecutionReportCommand}s and fire-and-forget submits them via
+ * {@link OmsClusterIngressClient#submitApplyExecutionReport}.
+ *
+ * <p>Introduced in Phase 3 slice 3d of the Aeron Cluster substrate plan; Phase 3 slice 3g
+ * deleted the legacy {@code FixInboundHandler} (Postgres-direct applier on
+ * {@code oms-fix-worker}) so this is now the only inbound sink on every FIX-routing JVM
+ * (monolith and {@code oms-fix-egress}).
  *
  * <p>The cluster service ({@link com.balh.oms.cluster.OmsAdmissionClusteredService}) walks the
  * order state machine and emits {@link com.balh.oms.cluster.ExecutionAppliedEvent} on the side
- * publication; the projector (slice 3e) writes the {@code executions} / {@code orders} /
- * {@code control_decisions} rows from there. No Postgres I/O happens on this path — that is the
- * whole point of slice 3d compared to the legacy {@link FixInboundHandler}.
+ * publication; the projector (slice 3e / 3e-2) writes the {@code executions} / {@code orders} /
+ * {@code domain_event_outbox} rows from there. No Postgres I/O happens on this path.
  *
  * <h2>Idempotency</h2>
  *
@@ -55,10 +56,9 @@ import java.util.Optional;
  *
  * <p>If the inbound message cannot be mapped (no {@code ClOrdID}, no {@code orderId} parseable as
  * UUID, or an {@code ExecType} we do not project) we increment the
- * {@code FixMetrics.METRIC_INBOUND_ER} counter with disposition {@code "ignored"} and return —
- * the same shape as {@link FixInboundHandler} does on the legacy path. We do not throw, because
- * QuickFIX would treat that as a session-level reject, and broker-side replay quirks should not
- * tear down the FIX session.
+ * {@code FixMetrics.METRIC_INBOUND_ER} counter with disposition {@code "ignored"} and return.
+ * We do not throw, because QuickFIX would treat that as a session-level reject and broker-side
+ * replay quirks should not tear down the FIX session.
  *
  * <h2>Determinism boundary</h2>
  *
@@ -69,9 +69,8 @@ import java.util.Optional;
  * fields, which is what makes replay deterministic across leader / follower / cold start.
  */
 @Service
-@Profile(OmsProfiles.FIX_EGRESS)
 @ConditionalOnProperty(name = "oms.routing.backend", havingValue = "fix")
-public class FixInboundClusterSink implements FixInboundExecutionReportSink {
+public class FixInboundClusterSink {
 
     private static final Logger log = LoggerFactory.getLogger(FixInboundClusterSink.class);
 
@@ -100,7 +99,6 @@ public class FixInboundClusterSink implements FixInboundExecutionReportSink {
         this.meterRegistry = meterRegistry;
     }
 
-    @Override
     public void handleExecutionReport(Message message) throws FieldNotFound {
         String venueId = omsConfig.getFix().getVenueIdForExecutions();
         Optional<ExecutionTradeCommand> trade = mapper.tryParseTrade(message, venueId);
@@ -124,7 +122,6 @@ public class FixInboundClusterSink implements FixInboundExecutionReportSink {
         meterRegistry.counter(FixMetrics.METRIC_INBOUND_ER, FixMetrics.TAG_DISPOSITION, "ignored").increment();
     }
 
-    @Override
     public void handleOrderCancelReject(Message message) throws FieldNotFound {
         String venueId = omsConfig.getFix().getVenueIdForExecutions();
         Optional<ExecutionVenueRejectCommand> ocr = mapper.tryParseOrderCancelReject(message, venueId);

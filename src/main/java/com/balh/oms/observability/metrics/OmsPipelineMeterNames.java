@@ -17,19 +17,14 @@ public final class OmsPipelineMeterNames {
     public static final String INGRESS_ACCEPT = "oms.pipeline.ingress.accept";
 
     /**
-     * {@link com.balh.oms.tailer.ControlTailer#apply} transaction (risk, buying power, CAS, domain outbox).
-     * Tag {@code result}: {@link com.balh.oms.tailer.ControlTailer.TailResult} name or {@code exception}.
+     * {@link com.balh.oms.tailer.OrderControlAdmission#persistAdmission} transaction (risk, buying power, CAS,
+     * domain outbox), driven by the {@code OmsPostgresProjector} on cluster {@code OrderAdmittedEvent} replay.
+     * Tag {@code result}: {@link com.balh.oms.tailer.OrderControlAdmission.AdmissionResult} name or {@code exception}.
      */
     public static final String CONTROL_APPLY = "oms.pipeline.control.apply";
 
     /**
-     * Counter when ingress dispatch-only tail skips {@code RouteDispatcher.enqueueWorkingOrder} because
-     * {@code fix_nos_route_enqueue_claim} already contained the order (replay / duplicate delivery).
-     */
-    public static final String CONTROL_INGRESS_DISPATCH_ENQUEUE_CLAIM_SKIP = "oms.pipeline.control.ingress_dispatch.enqueue_claim_skip";
-
-    /**
-     * FIX worker: build NOS + {@code Session.sendToTarget} after token acquired (WORKING order only).
+     * FIX egress: build NOS + {@code Session.sendToTarget} after the cluster admits the order (egress JVM only).
      * Tag {@code outcome}: {@code success}, {@code failure}.
      */
     public static final String FIX_OUTBOUND_NOS = "oms.pipeline.fix.outbound_nos";

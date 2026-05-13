@@ -16,8 +16,8 @@ import org.springframework.context.annotation.Profile;
 
 /**
  * Optional gRPC server for internal order ingress (see {@link OrderIngressGrpcServiceImpl}).
- * Disabled in {@code test} profile and on worker profiles ({@value OmsProfiles#CONTROL_WORKER},
- * {@value OmsProfiles#FIX_WORKER}); bind with {@code oms.grpc.enabled=true}.
+ * Disabled in {@code test} profile and on cluster-only roles ({@value OmsProfiles#POSTGRES_PROJECTOR},
+ * {@value OmsProfiles#FIX_EGRESS}); bind with {@code oms.grpc.enabled=true}.
  */
 @Configuration
 @Profile({"!test", OmsProfiles.ORDER_ACCEPT_PROFILE})

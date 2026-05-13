@@ -52,10 +52,8 @@ public class PostgresProjectorTopologyValidator {
                             + OmsProfiles.POSTGRES_PROJECTOR
                             + " cannot run QuickFIX with oms.routing.backend=fix and oms.fix.auto-start=true "
                             + "(single SocketInitiator per route); use Spring profile "
-                            + OmsProfiles.FIX_WORKER
-                            + " (or, post-Phase-3, "
                             + OmsProfiles.FIX_EGRESS
-                            + ") for the FIX-out JVM.");
+                            + " for the FIX-out JVM.");
         }
     }
 }

@@ -22,7 +22,7 @@ public final class OmsPipelineMetrics {
 
     public static void finishControlApply(MeterRegistry registry, Timer.Sample sample, String result) {
         sample.stop(baseTimer(OmsPipelineMeterNames.CONTROL_APPLY)
-                .description("ControlTailer.apply: stale guard, risk, buying power, CAS, domain outbox")
+                .description("OrderControlAdmission.persistAdmission: stale guard, risk, buying power, CAS, domain outbox")
                 .tag("result", result)
                 .register(registry));
     }

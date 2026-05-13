@@ -1,102 +1,132 @@
-# OMS slice-1 architecture
+# OMS architecture
 
 ## Cash / securities boundary
 
-Slice 1 owns the **securities** side: orders, executions, positions. The cash
-side stays in [Ledger](../../ledger). The OMS calls Ledger for inflight /
-settle / commit; Ledger remains the system of record for money movement.
+OMS owns the **securities** side: orders, executions, positions. The cash side
+stays in [Ledger](../../ledger). OMS calls Ledger for inflight / settle /
+commit; Ledger remains the system of record for money movement.
 
-## Slice 3f status note
+## Cluster substrate (Phase 3 of `oms-aeron-cluster-substrate`)
 
-The control-plane flow described below is the legacy slice-1 chronicle path. Phase 3 slice 3f of [`oms-aeron-cluster-substrate`](../../system-documentation/plans/oms-aeron-cluster-substrate.md) deleted `control_outbox` + `OutboxReconciler`; the cluster's events recording is now the durable handoff and `OmsPostgresProjector` (slice 2d) writes `orders.status=WORKING` + `domain_event_outbox(OrderWorking)` + `control_decisions(PASS)` from `OrderAdmittedEvent` directly. `oms-fix-egress` (slice 3a–d) reads the same recording for outbound NOS. The diagram below is preserved for reference until slice 3g rewrites this page.
+Order admission and execution-report state are handled by an **Aeron Cluster**
+clustered service (`OmsAdmissionClusteredService`). The cluster log is the
+single, ordered, durable record of OMS state changes. Postgres is a downstream
+**projection** rebuilt deterministically from the cluster's events recording.
 
-## Control-plane flow (slice 1)
+The deployable JVMs are:
+
+| Spring profile          | Role                                                                                    | Ingress side  |
+|-------------------------|-----------------------------------------------------------------------------------------|---------------|
+| `oms-cluster-node`      | MediaDriver + Archive + ConsensusModule + ClusteredServiceContainer                     | none          |
+| `oms-ingress-replica`   | HTTP/gRPC accept; submits `AcceptOrderCommand` via `OmsClusterIngressClient`            | offers cmds   |
+| `oms-postgres-projector`| Aeron Archive replay → Postgres projection (orders / executions / domain_event_outbox / market_context / positions / control_decisions) | none          |
+| `oms-fix-egress`        | Singleton FIX SocketInitiator per route; outbound NOS replay + inbound venue ER → cluster | offers cmds   |
+
+`TopologyWorkerProfiles` rejects mutually-incompatible role profiles on the
+same JVM.
+
+## Order admission flow
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant Client as Customer / BFF / FIX-IN
-    participant API as OMS HTTP\n(/internal/v1/orders)
-    participant PG as Postgres\n(orders + control_outbox +\ndomain_event_outbox)
-    participant REC as OutboxReconciler\n(scheduled)
-    participant CHR as Chronicle Queue\n(engineering replay)
-    participant TAIL as ChronicleControlTailReader\n(scheduled or dedicated)
-    participant TLR as ControlTailer
-    participant FAN as DomainFanoutReconciler\n+ FanoutClient\n(NATS optional)
+    participant API as OMS HTTP/gRPC\n(/internal/v1/orders)
+    participant ING as OmsClusterIngressClient\n(ingress JVM)
+    participant CLU as OmsAdmissionClusteredService\n(cluster leader)
+    participant ARC as Aeron Archive\n(events recording)
+    participant PRJ as OmsPostgresProjector\n(oms-postgres-projector)
+    participant FXE as OmsFixEgressService\n(oms-fix-egress)
+    participant PG as Postgres
+    participant FAN as DomainFanoutReconciler\n+ FanoutClient (NATS optional)
 
     Client->>API: POST CreateOrderRequest
-    API->>PG: BEGIN
-    API->>PG: INSERT INTO orders (...)
-    API->>PG: INSERT INTO control_outbox (order_id, version, payload)
-    API->>PG: INSERT INTO domain_event_outbox (order_id, envelope_json)
-    API->>PG: COMMIT
-    API-->>Client: 201 Created
-    FAN->>PG: SELECT domain_event_outbox ... pending
+    API->>PG: INSERT orders + ledger_inflight_outbox + domain_event_outbox(OrderAccepted) (one TX)
+    API->>ING: submit AcceptOrderCommand
+    ING->>CLU: offer command
+    CLU->>CLU: risk + buying-power + state machine
+    CLU->>ARC: emit OrderAdmittedEvent (via egress + recording)
+    par Postgres projection
+        ARC-->>PRJ: replay OrderAdmittedEvent
+        PRJ->>PG: CAS orders → WORKING/REJECTED + control_decisions + domain_event_outbox(OrderWorking/Rejected)
+    and FIX outbound (when oms.routing.backend=fix)
+        ARC-->>FXE: replay OrderAdmittedEvent
+        FXE->>FXE: build NewOrderSingle from event
+        FXE->>FXE: Session.sendToTarget (QuickFIX)
+    end
+    FAN->>PG: SELECT domain_event_outbox WHERE published_at IS NULL
     FAN->>FAN: deliver(envelope JSON)
     FAN->>PG: UPDATE published_at
-    REC->>PG: SELECT ... WHERE chronicle_enqueued_at IS NULL
-    REC->>CHR: append(payload)
-    REC->>PG: UPDATE control_outbox SET chronicle_enqueued_at = NOW()
-    TAIL->>CHR: readBytes (poll)
-    TAIL->>TLR: apply(PendingControlEvent)
-    TLR->>PG: optional Ledger HTTP\n(buying power when enabled)
-    TLR->>PG: CAS UPDATE orders\n(WORKING or REJECTED)
-    TLR->>PG: INSERT INTO domain_event_outbox\n(OrderWorking / OrderRejected envelope)
 ```
 
-**Diagram scope:** the **REC** ↔ **PG** / **CHR** block is the `OutboxReconciler` append path. Phase 1c of the [Aeron Cluster substrate plan](../../system-documentation/plans/oms-aeron-cluster-substrate.md) deleted the `IngressControlChroniclePublisher` after-commit path; every JVM now appends to Chronicle through `OutboxReconciler` (Phase 2 replaces this with cluster-egress projectors). Spring profile **`oms-control-worker`** removes the **Client → API** accept path so REC drains shared Postgres; **`management.server.port`** defaults to **8089** (`OMS_CONTROL_WORKER_MANAGEMENT_SERVER_PORT`) so Actuator is off the main HTTP port. **`oms.grpc.enabled` must be `false`** on that JVM (validator). Runbook: [runbooks/oms-control-worker.md](../runbooks/oms-control-worker.md). The **`test`** profile uses a NoOp journal.
+## Execution-report flow
 
-`control_outbox.payload` is JSONB holding a small wrapper (`v` + base64 protobuf `ControlPendingEvent` with **`google.protobuf.Timestamp`** fields for wall times). Chronicle excerpts are **`OMS\\x01` + protobuf** only. **`chronicle_materialized_at`** is set on the Chronicle message (not the outbox row) when materializing the append, for pipeline / OTel lag. **`OutboxReconciler`** performs the append after `reconciler-age-ms` (see topology plan).
+```mermaid
+sequenceDiagram
+    autonumber
+    participant BRK as Broker (FIX)
+    participant FXE as oms-fix-egress\n(FixInboundClusterSink)
+    participant ING as OmsClusterIngressClient
+    participant CLU as OmsAdmissionClusteredService
+    participant ARC as Aeron Archive
+    participant PRJ as OmsPostgresProjector
+    participant PG as Postgres
 
-The four invariants encoded by this diagram:
+    BRK->>FXE: ExecutionReport / OrderCancelReject
+    FXE->>FXE: translate to ApplyExecutionReportCommand
+    FXE->>ING: submit command
+    ING->>CLU: offer
+    CLU->>CLU: (senderCompId, msgSeqNum) wire dedupe; (orderId, venueExecRef) state dedupe; cumQty / status state machine
+    CLU->>ARC: emit ExecutionAppliedEvent
+    ARC-->>PRJ: replay event
+    PRJ->>PG: INSERT executions + CAS orders cum_filled_quantity / status + market_context merge + positions / position_history + free-riding attribution + domain_event_outbox(OrderPartiallyFilled / OrderFilled / OrderCancelled / OrderRejected) (one TX)
+```
 
-1. **Postgres COMMIT happens before any Chronicle append.** Always — via **`OutboxReconciler`** after `reconciler-age-ms`.
-2. **The control outbox row is inside the same transaction** as the orders row, so
-   crash recovery is trivial: anything visible in `orders` has a matching
-   `control_outbox` row (or a `chronicle_enqueued_at` timestamp). **`OrderAccepted`**
-   domain fanout uses the same transaction via `domain_event_outbox`.**
+## Invariants
+
+1. **The cluster log is the source of truth.** All projections (Postgres,
+   FIX outbound) are derived from the events recording and are idempotent on
+   replay.
+2. **Postgres COMMIT happens after the cluster has emitted the event.** The
+   projector advances `aeron_projector_cursor` only after the projection
+   transaction commits; restart resumes from the last committed cursor.
 3. **Domain events on NATS / drop copy are delivered only after commit.**
-   `OrderAccepted` is written to `domain_event_outbox` in the ingress transaction;
-   **`DomainFanoutReconciler`** publishes the full JSON envelope after commit.
-   **`OrderWorking`** and **`OrderRejected`** use the same outbox pattern inside
-   the tailer's transaction after successful CAS. Enable NATS with `OMS_NATS_ENABLED=true`;
-   otherwise a no-op `FanoutClient` counts deliveries only.
-4. **Tailer mutations are CAS on `orders.version`.** Re-applying the same
-   payload is a no-op.
-
-`ChronicleControlTailReader` polls Chronicle (`readBytes`); it does not use a push callback from the queue. Tailer identity is **`OMS_CHRONICLE_CONTROL_TAIL_ID`** (default `oms-control`); run **one** active tail per shared **`OMS_CHRONICLE_QUEUE_DIR`** in production unless you have an explicit multi-reader design — see [chronicle-tail-driver.md](chronicle-tail-driver.md). **Horizontal ingress** JVMs (`oms-ingress-replica`) omit the tail reader (`oms.chronicle.control-tail-enabled=false`) and use **`oms.control.postgres-write-path=ingress`** for admission in the accept transaction — see [runbooks/oms-ingress-replica.md](runbooks/oms-ingress-replica.md). **Wake latency** (how soon the next `readBytes` runs after an append) depends on `OMS_CHRONICLE_TAIL_DRIVER` (`scheduled` vs `dedicated`) and related settings — see that doc. Other pipeline stages (outbox reconciler, FIX outbound poll, etc.) remain separate schedulers or workers.
+   Envelopes are written to `domain_event_outbox` inside the projector
+   transaction; `DomainFanoutReconciler` publishes the JSON envelope only
+   after the row is visible. Enable NATS with `OMS_NATS_ENABLED=true`.
+4. **Mutations are CAS on `orders.version`.** Re-applying the same event is a
+   no-op.
+5. **Wire-level idempotency** on inbound venue ER comes from the `(senderCompId,
+   msgSeqNum)` dedupe inside the cluster service (snapshot v3 covers this);
+   **state-level idempotency** comes from the `(orderId, venueExecRef)` dedupe
+   in the same service plus the `executions(account_id, venue_exec_ref)` unique
+   constraint.
 
 ## High availability
 
-Slice 1 runs single-instance. HA arrives in slice 1.5:
+- Cluster nodes run as a 3-replica StatefulSet per shard. ConsensusModule
+  handles leader election; `oms-ingress-replica` clients reconnect to the new
+  leader transparently.
+- `oms-postgres-projector` and `oms-fix-egress` are stateless replays from the
+  events recording; restart resumes from the cursor each maintains in
+  Postgres (`aeron_projector_cursor`, `oms_fix_egress_cursor`). For FIX
+  egress, exactly **one** replica may be active per route (broker constraint:
+  one initiator per session).
 
-- Shard ownership via Postgres advisory lock OR k8s lease (decision pinned
-  in slice 1.5 ADR).
-- On primary failure, the standby:
-  - Acquires the shard lease.
-  - Reads `orders` and `control_outbox` to reconstruct in-flight state.
-  - Picks up `control_outbox` rows where `chronicle_enqueued_at IS NULL`.
-- Chronicle remains shard-local. Replicated journals (Chronicle Enterprise,
-  Aeron Cluster, Kafka) are an upgrade path; Postgres-driven recovery is
-  the slice-1.5 default.
+## Loss / recovery
 
-## What about Chronicle losing data?
-
-Because the outbox is the source of truth for "needs to be appended to
-Chronicle", losing a Chronicle file is recoverable:
-
-1. Restart the OMS pointed at a fresh queue directory.
-2. The reconciler re-discovers all unsent rows in `control_outbox` and
-   replays them.
-3. Engineers replaying the journal are aware they must use a Postgres
-   snapshot at the same time horizon — Chronicle alone is not enough.
-
-This is what we mean by "Chronicle is engineering replay only, not a
-regulatory system of record."
+- **Lose a Postgres replica**: replay from cursor rebuilds projection rows
+  deterministically; the cluster has not lost any state.
+- **Lose a cluster node**: ConsensusModule replays the recording on the new
+  leader; in-memory dedupe sets are restored from snapshots.
+- **Lose the events recording**: catastrophic — recovery is engineering-grade
+  (replay archived recording artifacts; reconcile against the last snapshotted
+  cluster state). This is the failure mode the substrate is explicitly
+  designed to make rare and observable.
 
 ## What about NATS losing events?
 
-Domain fanout uses a **transactional outbox** (`domain_event_outbox`). If NATS is
-unreachable, rows stay pending with `published_at IS NULL` until
+Domain fanout uses a **transactional outbox** (`domain_event_outbox`). If NATS
+is unreachable, rows stay pending with `published_at IS NULL` until
 `DomainFanoutReconciler` succeeds; the trading system of record in Postgres is
 unaffected. Tune age, batch, and interval with `OMS_DOMAIN_EVENTS_*`.

@@ -66,9 +66,8 @@ import java.util.concurrent.locks.LockSupport;
  *       {@link OrdersRepository#insertFromAdmittedEvent} (slice 2b-2);</li>
  *   <li>delegates to {@link OrderControlAdmission#persistAdmission} for risk + buying power +
  *       CAS to {@code WORKING} or {@code REJECTED} + {@code control_decisions} row +
- *       {@code domain_event_outbox} envelope (slice 2d, replaces what
- *       {@code OutboxReconciler} → Chronicle → {@link com.balh.oms.tailer.ControlTailer} did
- *       in the legacy topology — which slices 2e/2f delete);</li>
+ *       {@code domain_event_outbox} envelope (slice 2d; slice 3g removed the legacy
+ *       {@code OutboxReconciler} → Chronicle → tail-applier path entirely);</li>
  *   <li>advances the {@code aeron_projector_cursor} monotonically.</li>
  * </ol>
  *
@@ -548,9 +547,11 @@ public class OmsPostgresProjector {
      *       {@code executions.unsettled_funded_by_exec_ids} on the just-inserted row.</li>
      * </ul>
      *
-     * <p>Legacy {@link com.balh.oms.returnpath.ExecutionReportApplier#applyOutboundJobExpired} is
-     * not migrated here — it serves slice-4 outbound-queue expiry on the legacy
-     * {@code oms-fix-worker} JVM, deleted in slice 3g together with the applier.
+     * <p>Outbound-queue expiry ({@code applyOutboundJobExpired}) was not migrated to the cluster
+     * path: {@code oms-fix-egress} sends NOS immediately on each {@code OrderAdmittedEvent} replay
+     * and retries indefinitely on {@code SessionNotFound}, so there is no aged-out outbound job to
+     * reject. Legacy {@code ExecutionReportApplier} survives only on the {@code simulated} routing
+     * backend (slice 3g-2 will fold it into the projector path and delete it).
      *
      * <p><strong>Determinism on derived state.</strong> {@code market_context} /
      * {@code positions} / {@code position_history} / free-riding links are downstream-only; they

@@ -11,6 +11,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Import;
+import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -50,6 +51,16 @@ import static org.awaitility.Awaitility.await;
  */
 @ActiveProfiles({"test", OmsProfiles.FIX_EGRESS})
 @Import(OmsFixEgressInboundErRoundTripItBeans.class)
+// Slice 3e: the JVM-wide cluster events recording is shared with sibling tests (notably
+// OmsPostgresProjectorIT). The egress profile spins up an OmsFixEgressService replay loop, an
+// embedded FIX acceptor, and a QuickFIX initiator (FixInboundClusterSink). If the Spring context is
+// kept in the test-context cache, those components keep running on the cluster's recording and
+// will route a sibling test's freshly-admitted order out via FIX, get a PARTIAL_FILL ER back, and
+// submit ApplyExecutionReportCommand to the cluster — flipping that sibling order to
+// PARTIALLY_FILLED before the sibling test's WORKING assertion polls. Mark the context dirty so
+// Spring tears it down (and with it, the still-running QuickFIX sessions and replay loop) when the
+// class finishes. Same reasoning applies to OmsFixEgressBrokerIT.
+@DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 class OmsFixEgressInboundErRoundTripIT extends AbstractPostgresIntegrationTest {
 
     private static final Duration FIX_LOGON_TIMEOUT = Duration.ofSeconds(45);

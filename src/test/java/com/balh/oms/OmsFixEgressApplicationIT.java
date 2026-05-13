@@ -9,6 +9,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.NoSuchBeanDefinitionException;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.ApplicationContext;
+import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -29,6 +30,11 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * booting a real cluster connection.
  */
 @ActiveProfiles({"test", OmsProfiles.FIX_EGRESS})
+// Slice 3e: see OmsFixEgressInboundErRoundTripIT — the egress profile keeps an OmsFixEgressService
+// replay loop alive against the JVM-wide cluster recording, which would route a sibling test's
+// admitted order out and (with slice 3d's inbound ER → cluster path) potentially flip its
+// projected status before the sibling assertion polls. Tear down the context after this class.
+@DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 class OmsFixEgressApplicationIT extends AbstractPostgresIntegrationTest {
 
     @DynamicPropertySource

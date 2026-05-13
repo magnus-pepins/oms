@@ -1,12 +1,22 @@
 package com.balh.oms.projector;
 
 import com.balh.oms.chronicle.PendingControlEvent;
+import com.balh.oms.cluster.ApplyExecutionReportCommand;
+import com.balh.oms.cluster.ExecutionAppliedEvent;
+import com.balh.oms.cluster.OmsAdmissionClusteredService;
 import com.balh.oms.cluster.OmsClusterWireFormat;
 import com.balh.oms.cluster.OrderAdmittedEvent;
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.config.OmsProfiles;
+import com.balh.oms.domain.Order;
+import com.balh.oms.domain.OrderStatus;
+import com.balh.oms.domain.RejectCode;
+import com.balh.oms.events.DomainEventEnvelopeCodec;
+import com.balh.oms.persistence.DomainEventOutboxRepository;
+import com.balh.oms.persistence.ExecutionsRepository;
 import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.tailer.OrderControlAdmission;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import io.aeron.Aeron;
 import io.aeron.Subscription;
 import io.aeron.archive.client.AeronArchive;
@@ -22,7 +32,10 @@ import org.springframework.stereotype.Component;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.Instant;
+import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -81,10 +94,26 @@ public class OmsPostgresProjector {
 
     public static final String PROJECTOR_ID = "oms-postgres-default";
 
+    /**
+     * Scaling factor for {@link ExecutionAppliedEvent#newCumQtyScaled()} and
+     * {@link ExecutionAppliedEvent#lastQtyScaled()} (1e9 fixed-point — matches
+     * {@link ApplyExecutionReportCommand} and {@link OrderAdmittedEvent#quantityScaled()}).
+     */
+    private static final BigDecimal QUANTITY_SCALE = BigDecimal.valueOf(1_000_000_000L);
+
+    /**
+     * Scaling factor for {@link ExecutionAppliedEvent#lastPxScaled()} (1e6 fixed-point — matches
+     * {@link ApplyExecutionReportCommand}).
+     */
+    private static final BigDecimal PRICE_SCALE = BigDecimal.valueOf(1_000_000L);
+
     private final OmsConfig config;
     private final AeronProjectorCursorRepository cursorRepository;
     private final OrdersRepository ordersRepository;
     private final OrderControlAdmission controlAdmission;
+    private final ExecutionsRepository executionsRepository;
+    private final DomainEventOutboxRepository domainEventOutboxRepository;
+    private final DomainEventEnvelopeCodec envelopeCodec;
     private final TransactionTemplate transactionTemplate;
 
     private final AtomicBoolean running = new AtomicBoolean(false);
@@ -96,11 +125,17 @@ public class OmsPostgresProjector {
             AeronProjectorCursorRepository cursorRepository,
             OrdersRepository ordersRepository,
             OrderControlAdmission controlAdmission,
+            ExecutionsRepository executionsRepository,
+            DomainEventOutboxRepository domainEventOutboxRepository,
+            DomainEventEnvelopeCodec envelopeCodec,
             PlatformTransactionManager transactionManager) {
         this.config = config;
         this.cursorRepository = cursorRepository;
         this.ordersRepository = ordersRepository;
         this.controlAdmission = controlAdmission;
+        this.executionsRepository = executionsRepository;
+        this.domainEventOutboxRepository = domainEventOutboxRepository;
+        this.envelopeCodec = envelopeCodec;
         // Programmatic boundary: the replay loop is a non-Spring thread, so AOP-proxied
         // @Transactional on this bean's own methods would not be intercepted. A
         // TransactionTemplate guarantees orders.insert + persistAdmission + cursor.advance
@@ -360,10 +395,21 @@ public class OmsPostgresProjector {
 
     /**
      * Decodes one fragment and applies it to Postgres inside a single transaction:
-     * {@code orders} insert (idempotent ON CONFLICT) + {@link OrderControlAdmission#persistAdmission}
-     * (CAS to WORKING/REJECTED, {@code control_decisions} row, {@code domain_event_outbox} envelope)
-     * + cursor advance. {@link io.aeron.logbuffer.Header#position()} is the cluster log position
-     * <em>after</em> this fragment.
+     *
+     * <ul>
+     *   <li>{@link OmsClusterWireFormat#TYPE_ID_ORDER_ADMITTED} → {@code orders} insert (idempotent
+     *       ON CONFLICT) + {@link OrderControlAdmission#persistAdmission} (CAS to WORKING /
+     *       REJECTED, {@code control_decisions} row, {@code domain_event_outbox} envelope) +
+     *       cursor advance (slice 2d).</li>
+     *   <li>{@link OmsClusterWireFormat#TYPE_ID_EXECUTION_APPLIED} → {@code executions} insert
+     *       (idempotent on {@code (account_id, venue_exec_ref)}) + {@code orders} CAS to
+     *       PARTIALLY_FILLED / FILLED / CANCELLED / REJECTED + {@code domain_event_outbox}
+     *       envelope (OrderPartiallyFilled / OrderFilled / OrderCancelled / OrderRejected) +
+     *       cursor advance (slice 3e).</li>
+     * </ul>
+     *
+     * <p>{@link io.aeron.logbuffer.Header#position()} is the cluster log position <em>after</em>
+     * this fragment.
      *
      * <p>Crash semantics: if the JVM dies after the transaction commits but before the in-memory
      * {@link #lastAppliedPosition} updates, restart resumes from the persisted cursor — this is
@@ -376,15 +422,29 @@ public class OmsPostgresProjector {
         @Override
         public void onFragment(org.agrona.DirectBuffer buffer, int offset, int length, io.aeron.logbuffer.Header header) {
             int typeId = buffer.getInt(offset + OmsClusterWireFormat.HEADER_TYPE_ID_OFFSET);
-            if (typeId != OmsClusterWireFormat.TYPE_ID_ORDER_ADMITTED) {
-                // Phase 2 only knows about admission events. Future event types (executions, cancels)
-                // decode here in Phase 3+.
-                return;
-            }
-            OrderAdmittedEvent ev = OrderAdmittedEvent.decode(buffer, offset, length);
             long newPosition = header.position();
-            transactionTemplate.executeWithoutResult(status -> applyAdmittedEvent(ev, newPosition));
-            lastAppliedPosition.set(newPosition);
+            switch (typeId) {
+                case OmsClusterWireFormat.TYPE_ID_ORDER_ADMITTED -> {
+                    OrderAdmittedEvent ev = OrderAdmittedEvent.decode(buffer, offset, length);
+                    transactionTemplate.executeWithoutResult(status -> applyAdmittedEvent(ev, newPosition));
+                    lastAppliedPosition.set(newPosition);
+                }
+                case OmsClusterWireFormat.TYPE_ID_EXECUTION_APPLIED -> {
+                    ExecutionAppliedEvent ev = ExecutionAppliedEvent.decode(buffer, offset, length);
+                    transactionTemplate.executeWithoutResult(status -> applyExecutionAppliedEvent(ev, newPosition));
+                    lastAppliedPosition.set(newPosition);
+                }
+                default -> {
+                    // Unknown event types must still advance the cursor so the projector does not stall
+                    // on a recording from a future schema. The cluster's snapshot bump procedure already
+                    // gates schema-incompatible deploys at the cluster service; the projector is a
+                    // downstream consumer that should drain unknown frames silently.
+                    transactionTemplate.executeWithoutResult(status ->
+                            cursorRepository.advance(
+                                    PROJECTOR_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, newPosition));
+                    lastAppliedPosition.set(newPosition);
+                }
+            }
         }
     }
 
@@ -399,6 +459,283 @@ public class OmsPostgresProjector {
         PendingControlEvent pending = toPendingControlEvent(ev);
         controlAdmission.persistAdmission(pending);
         cursorRepository.advance(PROJECTOR_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, newPosition);
+    }
+
+    /**
+     * Single-transaction body for one {@link ExecutionAppliedEvent} (slice 3e). The cluster has
+     * already walked the order state machine deterministically (slice 3c) and emitted this event
+     * with the post-apply state ({@code newCumQtyScaled}, {@code newVersion}, {@code newStatusCode}
+     * plus the execution input the projector needs to write the {@code executions} row without a
+     * second Postgres lookup of the FIX message). This method translates that authoritative result
+     * into the three Postgres rows that the legacy {@link com.balh.oms.returnpath.ExecutionReportApplier}
+     * used to write directly:
+     *
+     * <ol>
+     *   <li>{@code executions} row via {@link ExecutionsRepository#tryInsertTrade} /
+     *       {@code tryInsertCancel} / {@code tryInsertVenueReject} — idempotent on
+     *       {@code (account_id, venue_exec_ref)}; an empty result means we have already applied
+     *       this event in a prior incarnation (cursor crash window) and the rest of the transaction
+     *       is skipped — {@code orders} and {@code domain_event_outbox} were committed together
+     *       in that prior transaction.</li>
+     *   <li>{@code orders} CAS via {@link OrdersRepository#updateFillOrCancelWithCas} (TRADE /
+     *       CANCEL) or {@link OrdersRepository#updateWithCas} (VENUE_REJECT). The cluster owns
+     *       {@code newVersion} so the CAS expectedVersion is {@code newVersion - 1}.</li>
+     *   <li>{@code domain_event_outbox} row carrying {@code OrderPartiallyFilled} /
+     *       {@code OrderFilled} / {@code OrderCancelled} / {@code OrderRejected} envelopes; same
+     *       envelope shapes the legacy applier produced so downstream fanout is unchanged.</li>
+     * </ol>
+     *
+     * <p><strong>Slice 3e scope.</strong> This handler covers the simple-shape projection: the
+     * three rows above. The legacy {@link com.balh.oms.returnpath.ExecutionReportApplier} also
+     * mutates {@code market_context} (NBBO evidence merge), {@code positions} (sell-fill split),
+     * and free-riding attribution links on {@code executions.unsettled_funded_by_exec_ids} — these
+     * remain in the legacy applier and are exercised by callers like
+     * {@link com.balh.oms.fix.FixInboundHandler} on JVMs that still run the legacy queue path
+     * ({@code oms-fix-worker}, deleted in slice 3g) and
+     * {@link com.balh.oms.returnpath.ExecutionReportApplier#applyOutboundJobExpired} (slice 4
+     * outbound-queue expiry, also gone with the worker). Porting them into this projector is
+     * deferred to a follow-up slice 3e-2 before slice 3g deletes the legacy applier.
+     *
+     * <p><strong>Determinism contract.</strong> {@code newStatusCode} on the wire is an
+     * {@link OrderStatus} ordinal; the cluster keeps the byte constants in sync with the enum
+     * (see {@link OmsAdmissionClusteredService} status code section). {@code rejectCodeOrZero}
+     * on a venue reject is a {@link RejectCode} ordinal supplied by the slice 3d
+     * {@link com.balh.oms.fix.FixInboundClusterSink} translator.
+     *
+     * <p><strong>Version contract.</strong> The cluster's in-memory {@code AdmittedOrder.version}
+     * counter and Postgres's {@code orders.version} column are <em>not</em> in lockstep — Postgres
+     * bumps an extra time at admission ({@code NEW → WORKING} CAS inside
+     * {@link OrderControlAdmission#persistAdmission}) that the cluster does not mirror, so a fresh
+     * admission lands at cluster {@code version=0} but Postgres {@code version=1}. The projector's
+     * {@code orders} CAS therefore uses Postgres's current {@code order.version()} as the expected,
+     * not {@code ev.newVersion() - 1}. The domain envelope's {@code newSeq} is the post-CAS Postgres
+     * version ({@code order.version() + 1}); the cluster's {@code ev.newVersion()} is informational
+     * (logged on mismatch but not enforced).
+     */
+    void applyExecutionAppliedEvent(ExecutionAppliedEvent ev, long newPosition) {
+        Optional<Order> opt = ordersRepository.findById(ev.orderId());
+        if (opt.isEmpty()) {
+            // The projector reads the same recording as the slice 2d/2b-2 OrderAdmitted path; the
+            // cluster orders ApplyExecutionReportCommand strictly after the AcceptOrderCommand for
+            // the same orderId, so the orders row must exist by the time we see the
+            // ExecutionAppliedEvent for it. If it does not, log loudly and advance the cursor so the
+            // projector does not stall — the only way to land here is a recording recreation that
+            // truncated the OrderAdmitted event but kept the ExecutionApplied event, which is an
+            // operational anomaly that needs human inspection rather than a silent retry.
+            log.warn(
+                    "Projector: ExecutionAppliedEvent for unknown order {} (venueExecRef={}); skipping.",
+                    ev.orderId(),
+                    ev.venueExecRef());
+            cursorRepository.advance(PROJECTOR_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, newPosition);
+            return;
+        }
+        Order order = opt.get();
+        boolean applied = switch (ev.execTypeCode()) {
+            case ApplyExecutionReportCommand.EXEC_TYPE_TRADE -> applyTradeProjection(ev, order);
+            case ApplyExecutionReportCommand.EXEC_TYPE_CANCEL -> applyCancelProjection(ev, order);
+            case ApplyExecutionReportCommand.EXEC_TYPE_VENUE_REJECT -> applyVenueRejectProjection(ev, order);
+            default -> {
+                log.warn(
+                        "Projector: ExecutionAppliedEvent with unknown execTypeCode {} for order {}; skipping.",
+                        ev.execTypeCode(),
+                        ev.orderId());
+                yield false;
+            }
+        };
+        if (!applied) {
+            // Duplicate replay path: executions row was already committed in a prior transaction;
+            // orders and domain_event_outbox were committed together with it. Just advance the
+            // cursor so we make progress.
+            log.debug(
+                    "Projector: ExecutionAppliedEvent already projected for order {} venueExecRef={};"
+                            + " advancing cursor only.",
+                    ev.orderId(),
+                    ev.venueExecRef());
+        }
+        cursorRepository.advance(PROJECTOR_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, newPosition);
+    }
+
+    /**
+     * @return {@code true} if a fresh {@code executions} row was inserted (and therefore the rest
+     *         of the projection — orders CAS + domain envelope — was applied); {@code false} on
+     *         duplicate replay (caller advances cursor only).
+     */
+    private boolean applyTradeProjection(ExecutionAppliedEvent ev, Order order) {
+        BigDecimal lastQty = scaledToBigDecimal(ev.lastQtyScaled(), QUANTITY_SCALE);
+        BigDecimal lastPx = ev.lastPxScaled() == 0L
+                ? null
+                : scaledToBigDecimal(ev.lastPxScaled(), PRICE_SCALE);
+        BigDecimal newCum = scaledToBigDecimal(ev.newCumQtyScaled(), QUANTITY_SCALE);
+        BigDecimal leaves = order.quantity().subtract(newCum);
+        String raw = ev.rawEnvelopeJson();
+        Optional<Long> insertedId = executionsRepository.tryInsertTrade(
+                order.id(),
+                order.accountId(),
+                ev.venueId(),
+                Instant.ofEpochSecond(0L, ev.venueTsNanos()),
+                ev.venueExecRef(),
+                lastQty,
+                lastPx,
+                leaves,
+                newCum,
+                raw);
+        if (insertedId.isEmpty()) {
+            return false;
+        }
+        OrderStatus newStatus = OrderStatus.values()[ev.newStatusCode()];
+        Instant terminalAt = newStatus == OrderStatus.FILLED ? appliedAtInstant(ev) : null;
+        int pgExpectedVersion = order.version();
+        boolean cas = ordersRepository.updateFillOrCancelWithCas(
+                order.id(), pgExpectedVersion, newCum, newStatus, /* terminalReason = */ null, terminalAt);
+        if (!cas) {
+            // The orders row's Postgres version moved past pgExpectedVersion between findById and
+            // the CAS — possible if a parallel writer (legacy applier on another JVM during the
+            // 3e/3g overlap window) projected a sibling event ahead of us. The executions row we
+            // just inserted is valid; the orders row's eventually-consistent state will reflect
+            // the latest event seen on either path.
+            log.warn(
+                    "Projector: orders CAS missed on TRADE projection for order {} (pgExpectedVersion={});"
+                            + " orders row advanced beyond the projector's read.",
+                    order.id(),
+                    pgExpectedVersion);
+            return true;
+        }
+        int newSeq = pgExpectedVersion + 1;
+        Order refreshed = ordersRepository.findById(order.id()).orElse(order);
+        try {
+            String envelopeJson;
+            if (newStatus == OrderStatus.PARTIALLY_FILLED) {
+                envelopeJson = envelopeCodec.orderPartiallyFilled(
+                        refreshed,
+                        newSeq,
+                        newCum,
+                        lastQty,
+                        lastPx,
+                        ev.venueId(),
+                        ev.venueExecRef());
+            } else {
+                BigDecimal vwap = executionsRepository.weightedAverageTradePrice(order.id());
+                envelopeJson = envelopeCodec.orderFilled(
+                        refreshed,
+                        newSeq,
+                        newCum,
+                        vwap,
+                        ev.venueId(),
+                        ev.venueExecRef());
+            }
+            domainEventOutboxRepository.insert(order.id(), envelopeJson);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("domain event serialisation failed for order " + order.id(), e);
+        }
+        return true;
+    }
+
+    private boolean applyCancelProjection(ExecutionAppliedEvent ev, Order order) {
+        Optional<Long> insertedId = executionsRepository.tryInsertCancel(
+                order.id(),
+                order.accountId(),
+                ev.venueId(),
+                Instant.ofEpochSecond(0L, ev.venueTsNanos()),
+                ev.venueExecRef(),
+                order.cumFilledQuantity(),
+                ev.rawEnvelopeJson());
+        if (insertedId.isEmpty()) {
+            return false;
+        }
+        int pgExpectedVersion = order.version();
+        boolean cas = ordersRepository.updateFillOrCancelWithCas(
+                order.id(),
+                pgExpectedVersion,
+                order.cumFilledQuantity(),
+                OrderStatus.CANCELLED,
+                /* terminalReason = */ null,
+                appliedAtInstant(ev));
+        if (!cas) {
+            log.warn(
+                    "Projector: orders CAS missed on CANCEL projection for order {} (pgExpectedVersion={}).",
+                    order.id(),
+                    pgExpectedVersion);
+            return true;
+        }
+        int newSeq = pgExpectedVersion + 1;
+        Order refreshed = ordersRepository.findById(order.id()).orElse(order);
+        try {
+            domainEventOutboxRepository.insert(
+                    order.id(),
+                    envelopeCodec.orderCancelled(refreshed, newSeq, ev.venueId(), ev.venueExecRef()));
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("domain event serialisation failed for order " + order.id(), e);
+        }
+        return true;
+    }
+
+    private boolean applyVenueRejectProjection(ExecutionAppliedEvent ev, Order order) {
+        Optional<Long> insertedId = executionsRepository.tryInsertVenueReject(
+                order.id(),
+                order.accountId(),
+                ev.venueId(),
+                Instant.ofEpochSecond(0L, ev.venueTsNanos()),
+                ev.venueExecRef(),
+                order.cumFilledQuantity(),
+                ev.rawEnvelopeJson());
+        if (insertedId.isEmpty()) {
+            return false;
+        }
+        RejectCode terminalReason = decodeRejectCode(ev.rejectCodeOrZero());
+        int pgExpectedVersion = order.version();
+        boolean cas = ordersRepository.updateWithCas(
+                order.id(),
+                pgExpectedVersion,
+                OrderStatus.REJECTED,
+                terminalReason,
+                /* acceptedAt = */ null,
+                appliedAtInstant(ev));
+        if (!cas) {
+            log.warn(
+                    "Projector: orders CAS missed on VENUE_REJECT projection for order {} (pgExpectedVersion={}).",
+                    order.id(),
+                    pgExpectedVersion);
+            return true;
+        }
+        int newSeq = pgExpectedVersion + 1;
+        Order refreshed = ordersRepository.findById(order.id()).orElse(order);
+        try {
+            domainEventOutboxRepository.insert(
+                    order.id(),
+                    envelopeCodec.orderRejectedAfterVenue(refreshed, terminalReason, newSeq));
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("domain event serialisation failed for order " + order.id(), e);
+        }
+        return true;
+    }
+
+    private static BigDecimal scaledToBigDecimal(long scaled, BigDecimal scale) {
+        // 1e9 / 1e6 fixed-point on the wire; trailing zeros stripped so column comparisons against
+        // canonical BigDecimal values do not surprise on scale (Postgres NUMERIC tolerates either,
+        // but assertions in tests use isEqualByComparingTo for exactness regardless).
+        return BigDecimal.valueOf(scaled)
+                .divide(scale, /* scale = */ 10, RoundingMode.UNNECESSARY)
+                .stripTrailingZeros();
+    }
+
+    private static Instant appliedAtInstant(ExecutionAppliedEvent ev) {
+        // The cluster's clock unit is ClusterClock millis-by-default (no NANOSECONDS override on
+        // ConsensusModule.Context — see slice 2d note in OmsPostgresProjector#toPendingControlEvent).
+        // Using Instant.now() here matches that path and keeps terminal_at as a Postgres-write-time
+        // fact rather than a wire-time fact; the cluster's authoritative version + status are what
+        // actually drive correctness, and the time column is observability only.
+        return Instant.now();
+    }
+
+    private static RejectCode decodeRejectCode(byte code) {
+        if (code <= 0) {
+            return RejectCode.VENUE_REJECT;
+        }
+        RejectCode[] values = RejectCode.values();
+        if (code >= values.length) {
+            return RejectCode.VENUE_REJECT;
+        }
+        return values[code];
     }
 
     private static PendingControlEvent toPendingControlEvent(OrderAdmittedEvent ev) {

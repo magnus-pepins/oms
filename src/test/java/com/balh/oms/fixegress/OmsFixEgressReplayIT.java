@@ -12,6 +12,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -40,6 +41,10 @@ import static org.awaitility.Awaitility.await;
  * shares the cluster's media driver directory.
  */
 @ActiveProfiles({"test", OmsProfiles.FIX_EGRESS})
+// Slice 3e: see OmsFixEgressInboundErRoundTripIT for the cross-test leak rationale. Tear down the
+// egress Spring context after this class so the OmsFixEgressService replay loop (and any FIX
+// initiator) does not stay alive against the JVM-wide cluster recording.
+@DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 class OmsFixEgressReplayIT extends AbstractPostgresIntegrationTest {
 
     private static final Duration CURSOR_ADVANCE_TIMEOUT = Duration.ofSeconds(20);

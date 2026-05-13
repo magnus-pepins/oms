@@ -14,6 +14,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Import;
+import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -72,6 +73,11 @@ import static org.awaitility.Awaitility.await;
  */
 @ActiveProfiles({"test", OmsProfiles.FIX_EGRESS})
 @Import(OmsFixEgressBrokerItBeans.class)
+// See OmsFixEgressInboundErRoundTripIT for the same rationale: this profile spins up a long-lived
+// OmsFixEgressService replay loop and an embedded acceptor + initiator pair. Slice 3e turns the
+// projector into an ExecutionAppliedEvent consumer, so a still-cached egress context routing a
+// sibling test's order out over FIX would flip that order's projected status mid-test. Mark dirty.
+@DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 class OmsFixEgressBrokerIT extends AbstractPostgresIntegrationTest {
 
     private static final Duration FIX_LOGON_TIMEOUT = Duration.ofSeconds(45);

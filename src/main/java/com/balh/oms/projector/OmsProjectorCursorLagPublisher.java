@@ -11,6 +11,7 @@ import jakarta.annotation.PostConstruct;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Profile;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
@@ -55,6 +56,7 @@ public class OmsProjectorCursorLagPublisher {
 
     private final AtomicReference<Instant> cachedLastAppliedAt = new AtomicReference<>();
 
+    @Autowired
     public OmsProjectorCursorLagPublisher(
             AeronProjectorCursorRepository cursorRepository, MeterRegistry meterRegistry, Clock clock) {
         this(
@@ -65,7 +67,11 @@ public class OmsProjectorCursorLagPublisher {
                 OmsClusterWireFormat.EVENTS_STREAM_ID);
     }
 
-    /** Test-only constructor — accepts custom {@code projectorId} / {@code streamId}. */
+    /**
+     * Test-only constructor — accepts custom {@code projectorId} / {@code streamId}. Spring
+     * ignores this overload because the {@link Autowired @Autowired}-marked one above is the
+     * only candidate.
+     */
     OmsProjectorCursorLagPublisher(
             AeronProjectorCursorRepository cursorRepository,
             MeterRegistry meterRegistry,

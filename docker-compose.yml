@@ -1,4 +1,11 @@
 services:
+  # OMS local dev / IT Postgres. Bound to host port 5440 (NOT the Postgres default
+  # 5432) because the Balh dev workstation's 5432 is already used by the
+  # supabase-db container in the customer-frontend / beard-admin Supabase stack.
+  # When running ITs, set OMS_CI_JDBC_URL=jdbc:postgresql://127.0.0.1:5440/oms so
+  # AbstractPostgresIntegrationTest takes the externally-managed-Postgres path
+  # (avoids Docker Desktop's /var/run/docker.sock socket-redirect issue with the
+  # Testcontainers Java client on macOS — see oms/docs/runbooks/local-multi-jvm-bench.md).
   postgres:
     image: postgres:16-alpine
     container_name: oms-postgres
@@ -7,7 +14,7 @@ services:
       POSTGRES_USER: oms
       POSTGRES_PASSWORD: oms
     ports:
-      - "5432:5432"
+      - "5440:5432"
     volumes:
       - oms-postgres-data:/var/lib/postgresql/data
     healthcheck:

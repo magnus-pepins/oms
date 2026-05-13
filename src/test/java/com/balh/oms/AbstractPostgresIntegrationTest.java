@@ -50,6 +50,18 @@ import java.util.concurrent.locks.LockSupport;
  *       demand. Tests are skipped if Docker is not reachable from the JVM.</li>
  * </ul>
  *
+ * <p><strong>macOS Docker Desktop note:</strong> on a Mac with Docker Desktop, Testcontainers
+ * may fail with {@code "Could not find a valid Docker environment"} even when the daemon is
+ * running and {@code docker ps} works in the shell. The cause is that Docker Desktop's
+ * symlink at {@code /var/run/docker.sock} points to a CLI proxy
+ * ({@code ~/.docker/run/docker.sock}) that responds with an empty {@code /info} body plus a
+ * {@code com.docker.desktop.address} label naming the real daemon socket
+ * ({@code ~/Library/Containers/com.docker.docker/Data/docker-cli.sock}). The Docker CLI
+ * follows that redirect; the Testcontainers Java client (as of {@code 1.20.x}) does not.
+ * Workaround: set {@code OMS_CI_JDBC_URL} to your local OMS Postgres (e.g.
+ * {@code jdbc:postgresql://127.0.0.1:5440/oms} matching {@code oms/docker-compose.yml}). The
+ * runbook {@code oms/docs/runbooks/local-multi-jvm-bench.md} captures the bring-up details.
+ *
  * <h2>Aeron Cluster (Phase 1c slices A + B)</h2>
  *
  * <p>Phase 1c of {@code system-documentation/plans/oms-aeron-cluster-substrate.md} makes the

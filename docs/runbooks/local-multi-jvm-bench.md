@@ -52,6 +52,17 @@ docker compose up -d postgres
 docker compose ps postgres
 ```
 
+The compose file binds Postgres on **host port 5440** (not the Postgres default 5432) so it
+doesn't collide with a Supabase stack already on 5432; see the comment block at the top of
+`oms/docker-compose.yml`. The `OMS_PG_URL` example in `oms/.env.example` is set to
+`jdbc:postgresql://localhost:5440/oms` to match.
+
+If a Postgres container with the same image and port is already running from prior dev work
+(e.g. a manually-created `oms-postgres-tests`), this `docker compose up` will fail with a
+port-binding conflict. Either stop the existing container (`docker rm -f <name>`) or skip
+this compose step entirely — both compose-managed and hand-rolled containers work identically
+once they're on port 5440 with `oms` / `oms` / `oms` for db / user / password.
+
 ### 2. Aeron cluster-node JVM
 
 Single-node cluster (smoke / bench; not a quorum):
@@ -170,6 +181,30 @@ What to compare against:
 - The `oms.fix_egress.lag_seconds` gauge is **end-of-run** (a single snapshot, not a
   distribution). Sustained-load tail latency on the FIX side is best measured by a long-running
   load + a Prometheus `histogram_quantile` over the cursor-lag scrape window in your dashboards.
+
+## Running integration tests against this same Postgres (macOS Docker Desktop sidenote)
+
+Out of scope for the bench itself, but worth capturing here because most operators land on this
+runbook after fighting the same problem: on macOS Docker Desktop, Testcontainers' Java client
+fails with `Could not find a valid Docker environment` even though `docker ps` works fine.
+Cause: `/var/run/docker.sock` is a symlink to `~/.docker/run/docker.sock`, which is Docker
+Desktop's CLI-proxy socket. It returns an empty `/info` body plus a
+`com.docker.desktop.address` label naming the real daemon socket
+(`~/Library/Containers/com.docker.docker/Data/docker-cli.sock`). The Docker CLI follows that
+redirect; the Testcontainers Java client (1.20.x) does not.
+
+`AbstractPostgresIntegrationTest` already supports an externally-managed-Postgres path that
+sidesteps this entirely. With the compose Postgres above:
+
+```bash
+export OMS_CI_JDBC_URL='jdbc:postgresql://127.0.0.1:5440/oms'
+export OMS_CI_JDBC_USER=oms
+export OMS_CI_JDBC_PASSWORD=oms
+./gradlew test
+```
+
+ITs reuse the bench Postgres and Flyway-migrate it on first context boot — no separate
+container needed. (CI uses the same env vars against `services: postgres` in GitHub Actions.)
 
 ## Tear-down
 

@@ -78,13 +78,29 @@ quirks vs the standalone path:
   (Or `DROP DATABASE oms WITH (FORCE); CREATE DATABASE oms WITH OWNER postgres;` to wipe between
   benches; the operator-driven IT base class wipe path is described in `AbstractPostgresIntegrationTest`.)
 
-Then OMS bootRun env on Pop:
+Then OMS bootRun env on Pop. A single sourced env file works across all the bootRun JVMs:
 
 ```bash
+cat > ~/.oms-bench.env << 'EOF'
 export OMS_PG_URL='jdbc:postgresql://127.0.0.1:5432/oms'
-export OMS_PG_USER='postgres.your-tenant-id'   # tenant prefix is REQUIRED
+export OMS_PG_USER='postgres.your-tenant-id'           # tenant prefix is REQUIRED
 export OMS_PG_PASSWORD='your-super-secret-and-long-postgres-password'
+export OMS_INTERNAL_API_KEY='pop-bench-secret-...'     # match in shoot script too
+# Tell projector + fix-egress (steps 4 / 5) where the cluster-node's media-driver lives.
+# The cluster-node defaults to ${OMS_AERON_DIR_BASE:build/aeron-cluster}/media-driver under
+# its own CWD, so the absolute path below is what those JVMs need.
+export OMS_POSTGRES_PROJECTOR_AERON_DIR="$HOME/oms/build/aeron-cluster/media-driver"
+export OMS_FIX_EGRESS_AERON_DIR="$HOME/oms/build/aeron-cluster/media-driver"
+# Disable optional integrations not needed for cluster smoke
+export OMS_LEDGER_ENABLED=false
+export OMS_NATS_ENABLED=false
+EOF
+chmod 600 ~/.oms-bench.env
 ```
+
+`source ~/.oms-bench.env` before each `./gradlew bootRun*` call. The ingress-replica's
+cluster client is fully wired in `application-oms-ingress-replica.yaml` and needs no extra
+env (defaulted to `oms.cluster.client.enabled=true` and `aeron-directory=build/aeron-cluster/media-driver`).
 
 Flyway runs against the `oms` db only (V1→V28). The ledger's own data lives in
 `postgres` / `_supabase` / `_realtime` / `auth` / `storage` databases on the same Postgres
@@ -122,13 +138,23 @@ The ingress-replica needs:
 ### 4. Postgres-projector JVM
 
 ```bash
-./gradlew bootRunPostgresProjector
+OMS_POSTGRES_PROJECTOR_AERON_DIR=$(pwd)/build/aeron-cluster/media-driver \
+  ./gradlew bootRunPostgresProjector
 # Prometheus: http://127.0.0.1:8090/actuator/prometheus
 # main HTTP:  http://127.0.0.1:8093  (auto-started by Spring Boot but not used by the role)
 # applies cluster events (OrderAdmittedEvent, ExecutionAppliedEvent) to Postgres rows
 ```
 
-Without this, the cluster will admit orders but `orders` / `executions` rows never materialise
+`OMS_POSTGRES_PROJECTOR_AERON_DIR` is required for the projector to find the cluster-node's
+events recording. The path must match the cluster-node JVM's actual media-driver directory —
+the cluster-node defaults to `${OMS_AERON_DIR_BASE:build/aeron-cluster}/media-driver` resolved
+relative to its own CWD, which is `~/oms/build/aeron-cluster/media-driver` for the bring-up
+above. The projector profile defaults the YAML key to empty so Spring context-only ITs that
+boot the profile without a media driver continue to short-circuit with a warn log
+(`oms-postgres-projector replay loop skipped: oms.cluster.projector.aeron-directory is empty`)
+— the explicit env var here is the operator-visible signal that you do want a real connection.
+
+Without it, the cluster will admit orders but `orders` / `executions` rows never materialise
 and the `oms.projector.lag_seconds` gauge stays at the cold-start sentinel `-1.0`.
 
 The projector profile defaults the main Spring `server.port` to **8093** (override with
@@ -144,6 +170,7 @@ because Spring Boot's web auto-config insists on a Tomcat. Metrics live on the m
 ./gradlew fixLoopbackAcceptor &
 
 # Then, in another terminal, the egress JVM. Set OMS_FIX_* env to match the loopback config:
+OMS_FIX_EGRESS_AERON_DIR=$(pwd)/build/aeron-cluster/media-driver \
 OMS_FIX_AUTO_START=true \
 OMS_FIX_SOCKET_CONNECT_PORT=9876 \
 OMS_FIX_SENDER_COMP_ID=OMS_INIT \
@@ -152,6 +179,10 @@ OMS_FIX_SENDER_COMP_ID=OMS_INIT \
 # main HTTP:  http://127.0.0.1:8094  (defaulted in application-oms-fix-egress.yaml; not used)
 # Spring property: oms.routing.backend=fix is wired in application-oms-fix-egress.yaml
 ```
+
+`OMS_FIX_EGRESS_AERON_DIR` is required for the same reason `OMS_POSTGRES_PROJECTOR_AERON_DIR`
+is on step 4: the YAML key defaults to empty so Spring context-only ITs short-circuit, and the
+operator-visible env var is what wires the role to the cluster-node's media-driver.
 
 If you skip step 5, the shoot summary will report the FIX-egress scrape as missing, which is
 fine — `oms.fix_egress.lag_seconds` simply won't appear and the derived upper bound will be

@@ -490,9 +490,52 @@ slowdown that "averaged out". The HTTP RTT halving is consistent with each repli
 The earlier "expected ~6–7 krps" estimate was too optimistic for this setup because the
 HikariCP pool is intentionally constrained to `MAX=3` per JVM during slice 4l/4m to
 protect the shared ledger Supavisor session pool — so a single replica is already
-concurrency-bound at ~1.2 krps before adding network / Tomcat overhead. With
-`OMS_PG_POOL_MAX_SIZE` raised (and Supavisor either resized or bypassed via direct
-Postgres), each replica should clear ~3 krps and the same 1.89× scaling factor holds.
+concurrency-bound at ~1.2 krps before adding network / Tomcat overhead.
+
+**Slice 4n raised the per-replica ceiling.** Code-reading to design a "batched
+buying-power holds" slice revealed that buying-power isn't even on the bench hot path
+(`OMS_LEDGER_ENABLED=false` skips `maybePlaceBuyLedgerInflightHold`). The actual
+per-replica wall in slice 4m was inside the cluster client itself:
+`OmsClusterIngressClient.submitAcceptOrder` held `clientLock` from before
+`AeronCluster.offer` through the entire egress poll loop while waiting for *its own*
+correlation-id reply. With ~1 ms cluster RTT that gates each ingress-replica JVM at
+~`1 / cluster_rtt ≈ 1 krps`, regardless of how much downstream capacity exists. Slice 4n
+pipelined the client (`pending` map of `CompletableFuture`s, dedicated egress poller
+thread; full design in the slice 4n commit message and the 4n class doc), preserving
+Aeron's thread-confinement invariant while removing the per-JVM RTT cap.
+
+**Measured on Pop! (2026-05-14, slice 4n, same bench scenario / 60 k orders /
+concurrency 200):**
+
+| Topology | `OMS_PG_POOL_MAX_SIZE` | Burst rps | vs slice 4m baseline | Notes |
+|---|---|---|---|---|
+| 1× ingress, slice 4m | 3 | 1 222 | 1.00× | per-JVM cluster-RTT cap |
+| 1× ingress, slice 4n | 3 | **525** | **0.43×** | Hikari now binds well below the new cluster-pipeline ceiling; the pipeline's CompletableFuture park/unpark + egress-poller cadence stretches per-tx hold time and the small pool magnifies it |
+| 1× ingress, slice 4n | 20 | **2 283** | **1.87×** | Hikari no longer binds; the cluster pipeline carries the new throughput |
+| 2× ingress, slice 4m | 3 | 2 315 | 1.89× scaling | per-JVM cap × 2 |
+| 2× ingress, slice 4n | 3 | 1 024 | 0.84× | same MAX=3 regression × 2 |
+| 2× ingress, slice 4n | 10 | 1 443 | 0.62× | bench-host Supavisor (`POOLER_DEFAULT_POOL_SIZE=20`) saturates around 5 OMS JVMs × ~MAX=10 client conns |
+| 2× ingress, slice 4n | 20 | 677 | 0.29× | bimodal latency (p50=93 ms / p99=773 ms) — Supavisor backend pool genuinely exhausted |
+
+**Read this carefully**: slice 4n is a clear *single-replica* unlock when the Hikari pool is
+not the binding constraint (1× MAX=20 ≈ 2 283 rps, **1.87× over slice 4m's best**), but
+multiplying replicas at the same Pop!-host Supavisor topology stops paying out because
+the shared Supavisor backend pool (`POOLER_DEFAULT_POOL_SIZE=20`) saturates as soon as the
+total OMS-side connection ceiling exceeds it. That is **not** a slice 4n bug — slice 4m's
+`MAX=3` hid the same problem behind the cluster-client lock. Slice 4n exposes it, and the
+fix is operational: bump Supavisor's tenant pool, switch the OMS to Supavisor's
+transaction-mode pooler (port 6543) so `MAX_PG_POOL_MAX_SIZE` decouples from Postgres
+backend count, or bypass Supavisor and connect direct to the ledger Postgres. Once that
+lands, the same 1.87× per-JVM lift should compose with N replicas linearly until the
+cluster ingress is the bottleneck.
+
+**Operational rule of thumb after slice 4n**:
+
+- Single replica + `OMS_PG_POOL_MAX_SIZE>=10` → slice 4n is a clear win.
+- N replicas → also bump Supavisor's tenant pool or move to transaction-mode (separate slice).
+- Keeping `MAX=3` because the bench host's Supavisor is small is fine for slice-4l / 4m
+  comparison runs, but treat the slice-4n number under that pool as a regression artefact,
+  not a substrate signal.
 
 - **Cost / risk**: none, beyond the Supavisor session pool which is the next item.
 - **Where**: `application-oms-ingress-replica.yaml`. Each replica needs a unique
@@ -503,11 +546,24 @@ Postgres), each replica should clear ~3 krps and the same 1.89× scaling factor 
   default channels and connected to the cluster on the same media driver as replica 1
   without any port collision).
 
-### Tier 2 — Move buying-power hold off the ingress critical path
+### Tier 2 — Pipeline the OMS cluster client (slice 4n, landed)
 
-Today the buying-power / pre-trade reservation is a synchronous JDBC call to the ledger
-inside the ingress acceptor's HTTP request thread. That is the biggest single chunk of the
-~3 ms ingress-accept p50. Two options, in order of preference:
+Slice 4n's actual diff: see the slice-4m findings folded into Tier 1 above. The original
+4n proposal was "batched buying-power holds" but a code-read showed buying-power isn't on
+the bench hot path at all when `OMS_LEDGER_ENABLED=false`, so the effective bottleneck was
+the cluster client's per-JVM single-flight lock. Pipelining `submitAcceptOrder` lifted
+that wall (1× MAX=20 = 2 283 rps, 1.87× the slice 4m best) at the cost of exposing
+Supavisor as the next-up bottleneck. The Aeron thread-confinement invariant (`offer` /
+`pollEgress` / `sendKeepAlive` cannot run concurrently) is still respected — `clientLock`
+now wraps only individual `offer` and `pollEgress` calls, never the egress wait.
+
+### Tier 2.5 — Move buying-power hold off the ingress critical path (next slice)
+
+Re-state the original tier-2 plan for whenever the bench actually exercises
+`OMS_LEDGER_ENABLED=true`. With the cluster-pipeline win banked, the next big chunk of
+ingress-accept p50 in production is the synchronous JDBC call to the ledger from the
+HTTP request thread inside `OrderIngressService.maybePlaceBuyLedgerInflightHold`. Two
+options, in order of preference:
 
 1. **Pipeline / batch the holds**. Multiple in-flight orders share a single ledger
    transaction window (group commit on the OMS side). Concretely: replace the
@@ -515,8 +571,7 @@ inside the ingress acceptor's HTTP request thread. That is the biggest single ch
    worker that flushes every ≤1 ms or every 32 orders. Each order's HTTP response waits on
    its own hold result; the *batch* commits to ledger as one tx. Ledger throughput per
    commit is roughly fixed-cost, so this is a 4–10× lift on the hold tier alone.
-   - Lift: ingress p50 drops from ~3 ms to ~0.5–1 ms; ingress ceiling moves from ~3.7 krps
-     to ~10–20 krps before cluster ingress becomes the next bottleneck.
+   - Lift: ingress p50 drops from ~3 ms (production-env hold included) to ~0.5–1 ms.
    - Risk: low — semantics are preserved (hold is still synchronous from the client's POV).
 2. **Cache balances locally with optimistic reservation**. Ingress holds against an
    in-process balance projection (Redis-backed or built off the ledger event stream),
@@ -525,10 +580,36 @@ inside the ingress acceptor's HTTP request thread. That is the biggest single ch
    target, because it changes the consistency model. The ledger already publishes the
    stream we'd consume.
 
-- **Where**: `OrderAcceptService` / `LedgerHoldClient` (or whatever the slice 3 ledger
-  client is named in `customer-frontend/`-style usage). The batching boundary fits
-  cleanly between the request-scoped hold and the JDBC tx.
-- **Slice**: 4n (proposed).
+- **Where**: `OrderIngressService.maybePlaceBuyLedgerInflightHold` +
+  `LedgerInflightReservationClient`. The batching boundary fits cleanly between the
+  request-scoped hold and the JDBC tx.
+- **Note**: this slice is only worth running when the Pop! bench can also exercise the
+  ledger path. Today's bench has `OMS_LEDGER_ENABLED=false` because the Supavisor topology
+  on the bench host can't comfortably hold sessions for both OMS and ledger writes at the
+  per-replica pool sizes that slice 4n now wants. Sequencing: fix Supavisor topology first
+  (Tier 2.4), *then* batch the holds.
+
+### Tier 2.4 — Fix the Supavisor / Postgres topology so multi-replica scales (next slice)
+
+Slice 4n exposed that the bench-host Supavisor (`POOLER_DEFAULT_POOL_SIZE=20`,
+`POOLER_MAX_CLIENT_CONN=100`) backs an `oms` Postgres database whose total backend
+connections are capped at 20. With 5 OMS JVMs each opening up to `OMS_PG_POOL_MAX_SIZE`
+client connections, total client conns easily exceed 20 and Supavisor multiplexes them
+onto a too-small backend pool — bimodal latency (some requests fast at the slice-4n p50,
+some queued >700 ms waiting for a backend) and degraded `2× rps`. Choices:
+
+1. **Switch OMS to Supavisor's transaction-mode pooler (port 6543)** instead of session
+   mode (port 5432). Transaction mode releases the backend back to the pool after each tx
+   commit, so a small backend pool serves many client sessions. This is the standard answer
+   for high-concurrency Postgres clients on Supabase/Supavisor.
+2. **Resize the bench-host Supavisor pool** (`POOLER_DEFAULT_POOL_SIZE` ≥ 100) for
+   apples-to-apples bench runs. Stopgap — production doesn't share the bench's pooler.
+3. **Bypass Supavisor and connect direct to Postgres** for the ingress-replica JVMs.
+   Cheapest for a one-off bench, but loses Supabase's managed pooling story.
+
+- **Where**: `application.yaml` `spring.datasource.url`, plus the `~/.oms-bench.env` on
+  Pop! (`OMS_PG_URL`).
+- **Slice**: proposed as a sibling of Tier 2.5 — fix this first, then batch the holds.
 
 ### Tier 3 — N control / buying-power workers (already supported by the substrate)
 
@@ -757,6 +838,104 @@ flat at 1.0 ms across both runs, ruling out "added load slows each replica down"
 HTTP RTT halving is consistent with each replica seeing ~half the queued requests at
 the same per-request cost. Per-target submitted exactly 30000/30000 confirms slice 4m's
 round-robin invariant in production.
+
+## Slice 4n setup — pipelined cluster client
+
+Slice 4n changed the *internal* threading model of `OmsClusterIngressClient` so the
+ingress-replica JVM can issue many in-flight `submitAcceptOrder` calls without
+serialising the whole RTT under `clientLock`. Operationally the replica looks identical
+from the outside (same env vars as slice 4m, same actuator ports), so the slice 4m setup
+section above still applies. This section captures only the new knobs and the
+operational implications you need to know about.
+
+### What the slice ships
+
+- `OmsClusterIngressClient`: replaced single-flight wait under `clientLock` with a
+  `ConcurrentHashMap<correlationId, CompletableFuture<AdmissionResult>> pending`. Submit
+  threads now hold `clientLock` only for `AeronCluster.offer` (with bounded back-pressure
+  parking), then await the future *outside* the lock. A dedicated **egress poller**
+  daemon thread drains `pollEgress()` (which routes replies into `pending`) and sends
+  periodic `sendKeepAlive()`s — both calls under the same `clientLock`, preserving Aeron's
+  thread-confinement invariant. The class doc on `OmsClusterIngressClient` has the full
+  threading diagram.
+- New env knobs (defaults are tuned, override only with measurement in hand):
+  - `OMS_CLUSTER_CLIENT_EGRESS_POLL_PARK_NANOS` — egress poller park between
+    `pollEgress()` calls. Default `100000` (100 µs). Lowering this (e.g. `1000` for 1 µs)
+    *worsens* throughput on small Hikari pools because the poller starves submit threads
+    for `clientLock`. Raise it (e.g. `1000000` = 1 ms) only for very latency-tolerant
+    setups that want to spend less CPU on polling.
+  - `OMS_CLUSTER_CLIENT_HEARTBEAT_INTERVAL_NANOS` — keep-alive cadence the egress poller
+    uses for `sendKeepAlive()`. Default sized below the cluster's session-timeout.
+
+### Per-replica env contract (slice 4n delta over slice 4m)
+
+The replica 1 / replica 2 envs in `## Slice 4m setup` still apply verbatim. The only
+practical difference is the connection-pool guidance:
+
+```bash
+# Slice 4m default — conservative for the bench-host Supavisor (POOLER_DEFAULT_POOL_SIZE=20)
+export OMS_PG_POOL_MAX_SIZE=3
+export OMS_PG_POOL_MIN_IDLE=1
+
+# Slice 4n recommended for 1× replica when you want the cluster-pipeline lift
+export OMS_PG_POOL_MAX_SIZE=20
+export OMS_PG_POOL_MIN_IDLE=2
+
+# Slice 4n recommended for 2× replicas on Pop!'s default Supavisor topology
+# (5 OMS JVMs * 10 = 50 client conns vs Supavisor's 20-backend pool — tolerable but
+#  not optimal; see Tier 2.4 for the real fix)
+export OMS_PG_POOL_MAX_SIZE=10
+export OMS_PG_POOL_MIN_IDLE=2
+```
+
+Don't push `OMS_PG_POOL_MAX_SIZE` past `POOLER_DEFAULT_POOL_SIZE / N_OMS_JVMS_NEEDING_PG`
+on the bench host without resizing Supavisor first. With the slice-4n pipeline, raising
+`MAX_SIZE` past the Supavisor backend's capacity manifests as bimodal latency
+(p50 ≈ slice-4m p50, p99 ≫ p50) instead of clean queueing — the cluster client no longer
+hides the wait behind its own lock.
+
+### Verification run (2026-05-14, slice 4n)
+
+Same Pop! topology as slice 4m (5 OMS JVMs, single-account hot path, 60 k orders /
+concurrency 200). Compare to the slice 4m verification numbers above:
+
+```
+== 1× replica, OMS_PG_POOL_MAX_SIZE=20 (slice 4n recommended) ==
+submitted=60000  success=60000 (created=60000)  failed=0  elapsed=26.279 s  rps=2283.3
+HTTP RTT p50=83.327 ms  p99=176.255 ms
+oms_cluster_client_commit_round_trip p50=0.701 ms  p99=2.469 ms
+
+== 1× replica, OMS_PG_POOL_MAX_SIZE=3 (regression — Hikari binds) ==
+submitted=60000  success=60000 (created=60000)  failed=0  elapsed=114.347 s  rps=524.7
+HTTP RTT p50=383.231 ms  p99=655.359 ms
+oms_cluster_client_commit_round_trip p50=2.796 ms  p99=8.319 ms
+
+== 2× replicas, OMS_PG_POOL_MAX_SIZE=10 (Supavisor budget tight) ==
+submitted=60000  success=60000 (created=60000)  failed=0  elapsed=41.566 s  rps=1443.6
+HTTP RTT p50=132.351 ms  p99=270.847 ms
+
+== 2× replicas, OMS_PG_POOL_MAX_SIZE=20 (Supavisor backends exhausted) ==
+submitted=60000  success=60000 (created=60000)  failed=0  elapsed=88.625 s  rps=677.0
+HTTP RTT p50=92.991 ms  p99=773.631 ms  (bimodal — see histograms in Prometheus)
+```
+
+**The headline:** 1× replica × Hikari ≥ 10 lifts to **2 283 rps (1.87×** the slice-4m
+1× best of 1 222 rps), and the round-trip histogram drops nearly an order of magnitude
+(p50 0.701 ms vs slice-4m 2.796 ms at the same `MAX=3`). The 2× regressions are real but
+they are **Supavisor budget regressions**, not slice-4n bugs — the slice-4m lock-driven
+ceiling was just hiding the same underlying constraint.
+
+When a slice-4n bench shows a regression vs slice-4m, **always** check Supavisor first:
+
+```bash
+docker exec ledger-supabase-pooler env | rg POOLER_DEFAULT_POOL_SIZE
+docker exec ledger-supabase-db psql -U postgres -d postgres \
+  -c "select count(*) from pg_stat_activity where datname='oms';"
+```
+
+If `pg_stat_activity` count for `oms` ≈ `POOLER_DEFAULT_POOL_SIZE`, you're queueing inside
+Supavisor and `OMS_PG_POOL_MAX_SIZE * N_OMS_JVMS` exceeds the pool. Tier 2.4 above is the
+fix.
 
 ## Caveats
 

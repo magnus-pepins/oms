@@ -45,7 +45,7 @@ All **`control_decisions`** rows written in production originate from **`Control
 | `RISK_RATE_LIMIT` | `ControlRiskEvaluator` | Active |
 | `RISK_NOTIONAL_CAP` | `ControlRiskEvaluator` | Active |
 | `INTERNAL_ERROR` | Control / ingress error paths | Active |
-| `VENUE_REJECT` | FIX / simulated return path (`ExecutionReportApplier`, inbound handler) | Active |
+| `VENUE_REJECT` | FIX inbound: `FixInboundClusterSink` translates `ExecutionReport` `ExecType=Rejected` / `OrderCancelReject` into `ApplyExecutionReportCommand`; cluster + projector apply the reject. | Active |
 | `FIX_OUTBOUND_JOB_EXPIRED` | Outbound stale dequeue (slice 4) | Active |
 | `RISK_SYMBOL_HALT` | Halted symbol list in `ControlRiskEvaluator` | Active |
 | `RISK_CONCENTRATION_LIMIT` | Aggregate BUY position check in `ControlRiskEvaluator` | Active |

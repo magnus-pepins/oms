@@ -18,7 +18,7 @@ This document describes the **securities post-trade** tables and wiring in OMS. 
 
 ### Flyway `V13__execution_sell_fill_position_split.sql`
 
-- **`executions.sell_position_from_pending_buy`** / **`sell_position_from_settled`** — for **SELL** **`TRADE`** rows, how the fill was sourced from **`positions`** (exact unwind on operator **`mark-failed`**). Written in the same transaction as the fill (**`ExecutionReportApplier`** + **`PositionsRepository.recordTradeFill`**).
+- **`executions.sell_position_from_pending_buy`** / **`sell_position_from_settled`** — for **SELL** **`TRADE`** rows, how the fill was sourced from **`positions`** (exact unwind on operator **`mark-failed`**). Written in the same transaction as the fill (**`OmsPostgresProjector.applyTradeProjection`** + **`PositionsRepository.recordTradeFill`**).
 
 ### Flyway `V14__settlement_file_import_batch.sql`
 

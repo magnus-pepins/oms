@@ -21,13 +21,14 @@ import java.util.concurrent.atomic.AtomicInteger;
  * Minimal QuickFIX/J acceptor {@link Application} for {@link OmsFixEgressBrokerIT}: counts
  * inbound {@code NewOrderSingle} and records the {@code ClOrdID} of each one.
  *
- * <p>Unlike {@code FixRoundTripAcceptorApplication}, this acceptor does <strong>not</strong>
- * synthesise an {@code ExecutionReport} reply. Slice 3b-2's IT validates the outbound NOS path
- * only (cluster → Aeron Archive replay → builder → {@code Session.sendToTarget}); inbound ER is
- * slice 3d's responsibility. Replying with an ER here would route through {@code OmsFixApplication}
- * → {@code FixInboundHandler} → {@code ExecutionReportApplier}, which writes Postgres rows that
- * presume an {@code orders} row exists — but in the egress JVM the projector is profile-mutex,
- * so no orders row materialises in this test. Counting + not replying keeps the IT scope tight.
+ * <p>This acceptor does <strong>not</strong> synthesise an {@code ExecutionReport} reply. Slice
+ * 3b-2's IT validates the outbound NOS path only (cluster → Aeron Archive replay → builder →
+ * {@code Session.sendToTarget}); inbound ER is slice 3d's responsibility. Replying with an ER here
+ * would route through {@code OmsFixApplication} → {@code FixInboundClusterSink} → cluster
+ * {@code ApplyExecutionReportCommand}, which presumes an admitted order in the cluster's state
+ * machine — but each test in this class uses a fresh {@code orderId} and we are only counting
+ * outbound NOS, not exercising the ER round-trip. Keeping the acceptor reply-less keeps the IT
+ * scope tight to the slice 3b-2 surface.
  */
 public final class EgressBrokerCountingAcceptorApplication implements Application {
 

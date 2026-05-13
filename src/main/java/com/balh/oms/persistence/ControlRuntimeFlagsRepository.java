@@ -57,10 +57,4 @@ public class ControlRuntimeFlagsRepository {
                 flagKey,
                 value);
     }
-
-    public boolean isCanaryPauseSimulatedFills() {
-        return findBooleanFlagRow(OmsRuntimeFlagKeys.CANARY_PAUSE_SIMULATED_FILLS)
-                .map(GlobalHaltRow::value)
-                .orElse(false);
-    }
 }

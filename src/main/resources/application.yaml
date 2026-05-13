@@ -126,17 +126,13 @@ oms:
     max-aggregate-position-quantity-check-enabled: ${OMS_RISK_MAX_AGGREGATE_POSITION_QUANTITY_CHECK_ENABLED:false}
     max-aggregate-position-quantity: ${OMS_RISK_MAX_AGGREGATE_POSITION_QUANTITY:0}
   routing:
-    # noop | simulated | fix (fix: QuickFIX/J initiator when oms.fix.auto-start=true — see docs/fix-out.md)
+    # noop | fix (fix: QuickFIX/J initiator when oms.fix.auto-start=true — see docs/fix-out.md).
+    # The legacy `simulated` backend was removed in Phase 3 slice 3g-2 of the Aeron Cluster substrate plan.
     backend: ${OMS_ROUTING_BACKEND:noop}
     market-context-stub-json: ${OMS_MARKET_CONTEXT_STUB_JSON:{"stub":true}}
     nbbo-reference-in-market-context-enabled: ${OMS_ROUTING_NBBO_REFERENCE_IN_MARKET_CONTEXT_ENABLED:false}
     nbbo-stub-bid-price: ${OMS_ROUTING_NBBO_STUB_BID_PRICE:0}
     nbbo-stub-ask-price: ${OMS_ROUTING_NBBO_STUB_ASK_PRICE:0}
-    simulated:
-      venue-id: ${OMS_SIMULATED_VENUE_ID:SIM}
-      queue-capacity: ${OMS_SIMULATED_QUEUE_CAPACITY:10000}
-      poll-interval-ms: ${OMS_SIMULATED_POLL_INTERVAL_MS:50}
-      scheduler-enabled: ${OMS_SIMULATED_SCHEDULER_ENABLED:true}
   settlement:
     # Must match a row in custody_accounts (Flyway V11 seeds DEFAULT omnibus).
     default-custody-account-id: ${OMS_SETTLEMENT_DEFAULT_CUSTODY_ACCOUNT_ID:a0000001-0000-4000-8000-000000000001}

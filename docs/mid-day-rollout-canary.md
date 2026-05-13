@@ -3,7 +3,6 @@
 ## What ships today
 
 - **Kill switch:** Postgres `oms_runtime_flags.global_halt` read on each control evaluation; **`GET` / `PATCH /internal/v1/runtime-flags/global_halt`** (internal API key) toggles it. Ops Console wires the PATCH (see Ops Console trading ops slice).
-- **Simulated routing canary pause:** `oms_runtime_flags.canary_pause_simulated_fills` — when **`true`**, **`SimulatedReturnPathProjectionWorker`** skips draining synthetic fills while **`OMS_ROUTING_BACKEND=simulated`**. **`GET` / `PATCH /internal/v1/runtime-flags/canary_pause_simulated_fills`** (same internal API key) toggles it; body shape matches other boolean flags (`value`, optional `updatedBy`).
 - **Broker / FIX stop:** halting control rejects new risk admission; in-flight FIX behaviour remains broker-specific (document in broker UAT runbook).
 
 ## Canary pattern (operator runbook)

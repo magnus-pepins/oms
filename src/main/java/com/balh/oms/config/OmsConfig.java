@@ -513,12 +513,10 @@ public class OmsConfig {
     }
 
     /**
-     * Outbound routing / return-path simulation (slice 3). {@code backend=noop} is the
-     * default safe mode; {@code simulated} drives {@link com.balh.oms.routing.SimulatedBrokerDispatcher}
-     * + {@link com.balh.oms.routing.SimulatedReturnPathProjectionWorker}; {@code fix} drives QuickFIX/J
-     * via the {@code oms-fix-egress} JVM (the legacy {@code FixRouteDispatcher} +
-     * {@code FixOutboundDispatchWorker} were removed in Phase 3 slice 3g of the Aeron Cluster
-     * substrate plan).
+     * Outbound routing / market-context evidence config. {@code backend=noop} is the default safe
+     * mode; {@code fix} drives QuickFIX/J via the {@code oms-fix-egress} JVM (Phase 3 of the Aeron
+     * Cluster substrate plan). The legacy {@code simulated} backend (along with {@code FixRouteDispatcher}
+     * / {@code FixOutboundDispatchWorker} / {@code ExecutionReportApplier}) was removed in slice 3g.
      */
     public static class Routing {
         private String backend = "noop";
@@ -526,7 +524,6 @@ public class OmsConfig {
         private boolean nbboReferenceInMarketContextEnabled = false;
         private BigDecimal nbboStubBidPrice = BigDecimal.ZERO;
         private BigDecimal nbboStubAskPrice = BigDecimal.ZERO;
-        private final Simulated simulated = new Simulated();
 
         public String getBackend() { return backend; }
         public void setBackend(String v) { this.backend = v == null ? "noop" : v; }
@@ -562,24 +559,6 @@ public class OmsConfig {
 
         public void setNbboStubAskPrice(BigDecimal nbboStubAskPrice) {
             this.nbboStubAskPrice = nbboStubAskPrice == null ? BigDecimal.ZERO : nbboStubAskPrice;
-        }
-
-        public Simulated getSimulated() { return simulated; }
-
-        public static class Simulated {
-            private String venueId = "SIM";
-            private int queueCapacity = 10_000;
-            private long pollIntervalMs = 50L;
-            private boolean schedulerEnabled = true;
-
-            public String getVenueId() { return venueId; }
-            public void setVenueId(String venueId) { this.venueId = venueId == null ? "SIM" : venueId; }
-            public int getQueueCapacity() { return queueCapacity; }
-            public void setQueueCapacity(int queueCapacity) { this.queueCapacity = queueCapacity; }
-            public long getPollIntervalMs() { return pollIntervalMs; }
-            public void setPollIntervalMs(long pollIntervalMs) { this.pollIntervalMs = pollIntervalMs; }
-            public boolean isSchedulerEnabled() { return schedulerEnabled; }
-            public void setSchedulerEnabled(boolean schedulerEnabled) { this.schedulerEnabled = schedulerEnabled; }
         }
     }
 

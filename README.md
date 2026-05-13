@@ -96,13 +96,6 @@ and the milestone plan it links to. **Phase 1 exit (UAT soak, §16 #3, prod sess
   links, and the `domain_event_outbox` envelope (`OrderPartiallyFilled`,
   `OrderFilled`, `OrderCancelled`, `OrderRejected`) in one transaction.
   Metrics: `oms_executions_applied_total`, `oms_order_filled_events_published_total`.
-- **Simulated routing backend** — `OMS_ROUTING_BACKEND=simulated`:
-  `SimulatedBrokerDispatcher` + `SimulatedReturnPathProjectionWorker` +
-  `SimulatedExecutionProgram` drain a queue and fill in three chunks at
-  `limit_price`. The simulated path still goes through the legacy
-  `ExecutionReportApplier` (Phase 3 slice 3g-2 will fold it into the projector
-  path and delete it).
-
 - **Slice 5 prep:** FIX outbound **`oms.fix.symbol-map-json`**; optional **tradability** list → **`RISK_INSTRUMENT_NOT_ALLOWED`** ([docs/fix-out.md](docs/fix-out.md), [docs/risk-checks.md](docs/risk-checks.md)).
 
 ## What is NOT in slice 1
@@ -196,7 +189,7 @@ tests execute instead of being skipped.
 - [docs/replay.md](docs/replay.md) — Aeron Archive recording / replay.
 - [docs/drop-copy-events.md](docs/drop-copy-events.md) — domain-event
   envelope and emit points.
-- [docs/return-path.md](docs/return-path.md) — executions, simulated routing, idempotency, slice-6 fill→positions.
+- [docs/return-path.md](docs/return-path.md) — cluster `ExecutionAppliedEvent` → projector → executions / orders / market_context / positions / domain outbox.
 - [docs/settlement.md](docs/settlement.md) — custody, `positions`, broker confirm queue, §12.3 transitions, internal `/internal/v1/settlement/**` (executions list/detail, **manual-actions** stage/list/approve).
 - [docs/fix-out.md](docs/fix-out.md) — FIX slice 4 wiring status.
 - [docs/fix-outbound-driver.md](docs/fix-outbound-driver.md) — `scheduled` vs `dedicated` FIX outbound wake / latency tuning.

@@ -550,8 +550,8 @@ public class OmsPostgresProjector {
      * <p>Outbound-queue expiry ({@code applyOutboundJobExpired}) was not migrated to the cluster
      * path: {@code oms-fix-egress} sends NOS immediately on each {@code OrderAdmittedEvent} replay
      * and retries indefinitely on {@code SessionNotFound}, so there is no aged-out outbound job to
-     * reject. Legacy {@code ExecutionReportApplier} survives only on the {@code simulated} routing
-     * backend (slice 3g-2 will fold it into the projector path and delete it).
+     * reject. The legacy {@code ExecutionReportApplier} was deleted in slice 3g-2 (the simulated
+     * routing backend that was its last consumer was deleted in the same slice).
      *
      * <p><strong>Determinism on derived state.</strong> {@code market_context} /
      * {@code positions} / {@code position_history} / free-riding links are downstream-only; they

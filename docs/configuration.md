@@ -85,15 +85,11 @@ Transport choice vs MQTT: [marketdata-ingestion-path.md](marketdata-ingestion-pa
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `OMS_ROUTING_BACKEND` | `noop` | `noop` — no post-`WORKING` dispatch. `simulated` — `SimulatedBrokerDispatcher` + `SimulatedReturnPathProjectionWorker` emit synthetic fills. `fix` — `FixRouteDispatcher` queues ids for QuickFIX/J outbound (slice 4; initiator send next). |
+| `OMS_ROUTING_BACKEND` | `noop` | `noop` — no post-`WORKING` dispatch. `fix` — QuickFIX/J outbound through `oms-fix-egress` (which reads cluster events recording via Aeron Archive replay; see [fix-out.md](fix-out.md)). The legacy `simulated` backend was removed in Phase 3 slice 3g-2 of the Aeron Cluster substrate plan. |
 | `OMS_MARKET_CONTEXT_STUB_JSON` | `{"stub":true}` | Base JSON merged into `market_context.snapshot_json` on each trade apply; venue ER fields (`instrumentSymbol`, `venueId`, `venueExecRef`, fills, …) are merged on top until marketdata/NBBO integration (slice 5). |
 | `OMS_ROUTING_NBBO_REFERENCE_IN_MARKET_CONTEXT_ENABLED` | `false` | When **`true`**, each trade apply may add **`nbboClassReference`** to venue evidence JSON: HTTP NBBO when **`OMS_MARKETDATA_HTTP_NBBO_IN_MARKET_CONTEXT_ENABLED`**, else stub bid/ask (**`quoteClass=NBBO_STUB`**). |
 | `OMS_ROUTING_NBBO_STUB_BID_PRICE` | `0` | Stub NBBO bid; **`0`** skips NBBO block. |
 | `OMS_ROUTING_NBBO_STUB_ASK_PRICE` | `0` | Stub NBBO ask; **`0`** skips NBBO block. |
-| `OMS_SIMULATED_VENUE_ID` | `SIM` | `venue_id` on synthetic executions. |
-| `OMS_SIMULATED_QUEUE_CAPACITY` | `10000` | Bounded queue for `WORKING` order ids awaiting simulation. |
-| `OMS_SIMULATED_POLL_INTERVAL_MS` | `50` | `@Scheduled` drain interval when simulated backend is enabled. |
-| `OMS_SIMULATED_SCHEDULER_ENABLED` | `true` | When `false`, only explicit `SimulatedReturnPathProjectionWorker.processPendingQueueOnce()` drains the queue (used in integration tests). |
 
 ## Settlement / positions (slice 6)
 
@@ -259,7 +255,7 @@ These metrics are always registered when the corresponding code paths run; they 
 | Meter name | Type | When it records | Related config |
 |------------|------|------------------|----------------|
 | `oms_control_decisions_recorded_total` | `Counter` (tags **`outcome`**, **`reject_code`**) | After each successful **`INSERT`** into **`control_decisions`** via **`ControlDecisionsRepository.record`** (one per control PASS/REJECT audit row). **`reject_code`** tag is **`NONE`** when the persisted reject code is SQL `NULL` (PASS outcomes). | N/A — see [risk-checks.md](risk-checks.md). |
-| `oms.trade.apply` | `Timer` | Each successful **`ExecutionReportApplier.applyTrade`** after pre-checks through DB + market-context merge + execution insert + position update + order CAS + domain outbox (trade ER apply / best-ex evidence path). | **`OMS_ROUTING_NBBO_REFERENCE_IN_MARKET_CONTEXT_ENABLED`**, **`OMS_MARKETDATA_HTTP_*`** — wider path when NBBO evidence is merged. |
+| `oms.trade.apply` | `Timer` | Each successful trade projection inside **`OmsPostgresProjector.applyTradeProjectionTimed`** (consumes cluster `ExecutionAppliedEvent`): execution insert + market-context evidence merge + position update + free-riding attribution + order CAS + domain outbox in one Postgres TX. | **`OMS_ROUTING_NBBO_REFERENCE_IN_MARKET_CONTEXT_ENABLED`**, **`OMS_MARKETDATA_HTTP_*`** — wider path when NBBO evidence is merged. |
 | `oms.marketdata.nbbo.fetch` | `Timer` (`tag` **`source=http`**) | HTTP NBBO fetch inside **`resolveNbbo`** when **`OMS_MARKETDATA_HTTP_NBBO_IN_MARKET_CONTEXT_ENABLED`** and **`OMS_MARKETDATA_HTTP_ENABLED`** are **`true`**. | **`OMS_MARKETDATA_HTTP_BASE_URL`**, timeouts, **`OMS_MARKETDATA_HTTP_NBBO_PATH`**. |
 | `oms.ledger.settlement.outbox.post` | `Timer` | Per-row **`LedgerSettlementPostingClient.postSettlementOutbox`** plus **`markPosted`** when **`OMS_LEDGER_SETTLEMENT_OUTBOX_RECONCILER_ENABLED`** is **`true`** (success path only; failures increment **`oms_ledger_settlement_outbox_failed_total`**). | **`OMS_LEDGER_SETTLEMENT_OUTBOX_RECONCILER_*`**, **`OMS_LEDGER_SETTLEMENT_OUTBOX_ENABLED`**. |
 

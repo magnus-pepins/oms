@@ -8,6 +8,8 @@ import com.balh.oms.cluster.OmsClusterIngressClient;
 import com.balh.oms.cluster.OmsClusterWireFormat;
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.config.OmsProfiles;
+import com.balh.oms.settlement.SettlementConfirmProcessor;
+import com.balh.oms.test.SettlementBrokerDrainAssertions;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -72,6 +74,9 @@ class OmsPostgresProjectorIT extends AbstractPostgresIntegrationTest {
 
     @Autowired
     AeronProjectorCursorRepository cursorRepository;
+
+    @Autowired
+    SettlementConfirmProcessor settlementConfirmProcessor;
 
     private OmsClusterIngressClient testIngressClient;
 
@@ -347,9 +352,10 @@ class OmsPostgresProjectorIT extends AbstractPostgresIntegrationTest {
                 orderId);
         assertThat(partialEnvelopes).isEqualTo(1L);
 
-        // Slice 3e-2: market_context evidence merge — venue ER fields land in snapshot_json the
-        // same shape ExecutionReportApplier#applyTrade produces (MarketContextVenueEvidence
-        // schemaVersion=1; instrumentSymbol + venueExecRef + lastQuantity round-tripped).
+        // Slice 3e-2: market_context evidence merge — venue ER fields land in snapshot_json with
+        // MarketContextVenueEvidence schemaVersion=1 (instrumentSymbol + venueExecRef + lastQuantity
+        // round-tripped); the projector wires the same MarketContextVenueEvidence helper that the
+        // legacy applier used, so the row shape is identical.
         Integer marketContextRows = jdbc.queryForObject(
                 "SELECT COUNT(*)::int FROM market_context WHERE order_id = ?",
                 Integer.class,
@@ -674,7 +680,7 @@ class OmsPostgresProjectorIT extends AbstractPostgresIntegrationTest {
      * Slice 3e-2 — free-riding attribution: when {@code oms.settlement.free-riding-attribution-enabled=true}
      * (turned on at the class level), every BUY {@code TRADE} fill appends prior unsettled BUY
      * execution ids on the same account+symbol to {@code unsettled_funded_by_exec_ids} on the
-     * just-inserted row. Mirrors {@link com.balh.oms.returnpath.ExecutionReportApplier#applyTradeAfterPreChecks}.
+     * just-inserted row. Same algebra the legacy applier used (deleted in slice 3g-2).
      *
      * <p>Flow: admit-then-fill BUY #1, then admit-then-fill BUY #2 against the same account+symbol.
      * BUY #2's execution row should reference BUY #1's execution id in
@@ -812,6 +818,86 @@ class OmsPostgresProjectorIT extends AbstractPostgresIntegrationTest {
                 Long.class,
                 orderId);
         assertThat(partialEnvelopes).isEqualTo(1L);
+    }
+
+    /**
+     * Slice 3g-2 — multi-fill end-to-end: three TRADE applies for {@code ⅓ + ⅓ + ⅓} of the admitted
+     * quantity terminate the order at {@code FILLED} with three {@code executions} rows, then the
+     * settlement broker drain settles every TRADE row and clears the BUY-pending position. Replaces
+     * the legacy {@code SimulatedReturnPathIntegrationTest} BUY scenario verbatim — the unique value
+     * that test held was the multi-fill cumulative behaviour stitched with the broker drain
+     * lifecycle, neither of which any other slice 3e/3e-2 case exercises end-to-end.
+     */
+    @Test
+    void clusterMultiplePartialFills_terminateAsFilledAndSettleViaBrokerDrain() throws Exception {
+        UUID orderId = UUID.randomUUID();
+        UUID accountId = UUID.randomUUID();
+        String idemKey = "projector-it-multi-fill-" + orderId;
+
+        testIngressClient.submitAcceptOrder(sample(orderId, accountId, idemKey), CLUSTER_SUBMIT_TIMEOUT);
+        awaitOrdersStatus(orderId, "WORKING", 1);
+
+        // Order quantity is 10 (sample()'s scaled 10_000_000_000L = 10 with 1e9 scale). Split into
+        // three TRADE fills (3 + 3 + 4) to mirror the legacy 3-way split-in-thirds shape.
+        submitTrade(orderId, /* msgSeq = */ 1, /* venueRef = */ "VENUE-MF-1-" + orderId,
+                /* lastQtyScaled = */ 3_000_000_000L);
+        awaitOrdersStatus(orderId, "PARTIALLY_FILLED", 2);
+
+        submitTrade(orderId, 2, "VENUE-MF-2-" + orderId, 3_000_000_000L);
+        awaitOrdersStatus(orderId, "PARTIALLY_FILLED", 3);
+
+        submitTrade(orderId, 3, "VENUE-MF-3-" + orderId, 4_000_000_000L);
+        awaitOrdersStatus(orderId, "FILLED", 4);
+
+        BigDecimal cumFilled = jdbc.queryForObject(
+                "SELECT cum_filled_quantity FROM orders WHERE id = ?", BigDecimal.class, orderId);
+        assertThat(cumFilled).isEqualByComparingTo("10");
+
+        Long execRows = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM executions WHERE order_id = ? AND exec_type = 'TRADE'",
+                Long.class,
+                orderId);
+        assertThat(execRows).isEqualTo(3L);
+
+        Long partialEnvelopes = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM domain_event_outbox WHERE order_id = ?"
+                        + " AND envelope_json->>'type' = 'OrderPartiallyFilled'",
+                Long.class,
+                orderId);
+        assertThat(partialEnvelopes).isEqualTo(2L);
+        Long filledEnvelopes = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM domain_event_outbox WHERE order_id = ?"
+                        + " AND envelope_json->>'type' = 'OrderFilled'",
+                Long.class,
+                orderId);
+        assertThat(filledEnvelopes).isEqualTo(1L);
+
+        Integer historyRows = jdbc.queryForObject(
+                "SELECT COUNT(*)::int FROM position_history WHERE account_id = ?"
+                        + " AND event_type = 'TRADE_BUY_FILL'",
+                Integer.class,
+                accountId);
+        assertThat(historyRows).isEqualTo(3);
+
+        SettlementBrokerDrainAssertions.assertFullBrokerLifecycleSettles(
+                jdbc, settlementConfirmProcessor, orderId, /* expectedTradeExecs = */ 3, new BigDecimal("10"));
+    }
+
+    private void submitTrade(UUID orderId, int msgSeq, String venueRef, long lastQtyScaled) throws Exception {
+        ApplyExecutionReportCommand trade = new ApplyExecutionReportCommand(
+                testIngressClient.nextCorrelationId(),
+                orderId,
+                lastQtyScaled,
+                /* lastPxScaled = */ 150_000_000L,
+                instantToNanos(),
+                msgSeq,
+                ApplyExecutionReportCommand.EXEC_TYPE_TRADE,
+                /* rejectCodeOrZero = */ (byte) 0,
+                "VENUE",
+                venueRef,
+                /* senderCompId = */ "",
+                "{\"kind\":\"ExecutionReport\",\"execType\":\"TRADE\"}");
+        testIngressClient.submitApplyExecutionReport(trade, CLUSTER_SUBMIT_TIMEOUT);
     }
 
     private void awaitOrdersStatus(UUID orderId, String expectedStatus, int expectedVersion) {

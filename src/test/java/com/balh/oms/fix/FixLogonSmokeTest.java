@@ -33,8 +33,10 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Proves QuickFIX/J is on the classpath and a minimal acceptor/initiator pair can log on.
- * Slice 4 wires the same stack to {@link FixRouteDispatcher} + {@code ExecutionReportApplier}.
+ * Proves QuickFIX/J is on the classpath and a minimal acceptor/initiator pair can log on. The
+ * end-to-end FIX path (cluster → {@code oms-fix-egress} → broker → {@code FixInboundClusterSink} →
+ * cluster {@code ApplyExecutionReportCommand} → projector) is covered by {@code OmsFixEgressBrokerIT}
+ * + {@code OmsFixEgressInboundErRoundTripIT}; this test only proves the QuickFIX/J handshake.
  */
 class FixLogonSmokeTest {
 

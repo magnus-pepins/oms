@@ -6,10 +6,12 @@ internal drop copy, ops dashboards, external drop copy (via FIX, slice 2+).
 Slice 1 ships the contract and a **transactional outbox** (`domain_event_outbox`)
 drained by `DomainFanoutReconciler`. **NATS JetStream** (`FanoutClient`) is
 optional when `OMS_NATS_ENABLED=true`. **`OrderRejected`** and **`OrderWorking`**
-are written to the same outbox inside `ControlTailer` after successful CAS.
+are written to the same outbox inside `OmsPostgresProjector` (after the cluster
+admits an order) via `OrderControlAdmission.persistAdmission`.
 **`OrderPartiallyFilled`**, **`OrderFilled`**, and **`OrderCancelled`** are written
-by `ExecutionReportApplier` (slice 3) after execution rows apply; applied **trades** also write **`positions`** / **`position_history`** (slice 6 — see `docs/settlement.md`). External FIX
-drop copy reuses the same envelope shapes in slice 4+.
+by `OmsPostgresProjector` after each `ExecutionAppliedEvent` is applied; applied
+**trades** also write **`positions`** / **`position_history`** (see `docs/settlement.md`).
+External FIX drop copy reuses the same envelope shapes.
 
 ## Envelope (wire schema)
 
@@ -90,13 +92,12 @@ event-specific record:
 
 | Event              | Emitted from                        | Trigger                                                  |
 |--------------------|-------------------------------------|----------------------------------------------------------|
-| `OrderAccepted`    | `OrderIngressService.persistAccepted` | Same Postgres transaction as `orders` + `control_outbox` insert; reconciler delivers after commit. |
-| `OrderRejected`    | `ControlTailer.apply`               | Same transaction as successful CAS to `REJECTED` (stale queue, buying power, ledger error). |
-| `OrderWorking`     | `ControlTailer.apply`               | Same transaction as successful CAS to `WORKING`.                               |
-| `OrderPartiallyFilled` | `ExecutionReportApplier.applyTrade` | After successful CAS to `PARTIALLY_FILLED` (slice 3). |
-| `OrderFilled`      | `ExecutionReportApplier.applyTrade` | After successful CAS to `FILLED` (slice 3). |
-| `OrderCancelled`   | `ExecutionReportApplier.applyCancel`| After successful CAS to `CANCELLED` (slice 3). |
-| Execution events   | Slice 4+ FIX gateway                | Same applier path as simulated fills once FIX lands.                       |
+| `OrderAccepted`    | `OrderIngressService.persistAccepted` | Same Postgres transaction as `orders` insert + cluster `AcceptOrderCommand` submission. |
+| `OrderRejected`    | `OmsPostgresProjector` (via `OrderControlAdmission.persistAdmission`) | Same transaction as successful CAS to `REJECTED` (stale queue, buying power, ledger error) on cluster `OrderAdmittedEvent` replay. |
+| `OrderWorking`     | `OmsPostgresProjector` (via `OrderControlAdmission.persistAdmission`) | Same transaction as successful CAS to `WORKING` on cluster `OrderAdmittedEvent` replay.                               |
+| `OrderPartiallyFilled` | `OmsPostgresProjector.applyTradeProjection` | Same transaction as `executions` insert + `orders` CAS to `PARTIALLY_FILLED` on cluster `ExecutionAppliedEvent` replay. |
+| `OrderFilled`      | `OmsPostgresProjector.applyTradeProjection` | Same transaction as `executions` insert + `orders` CAS to `FILLED` on cluster `ExecutionAppliedEvent` replay. |
+| `OrderCancelled`   | `OmsPostgresProjector.applyCancelProjection` | Same transaction as `executions` insert + `orders` CAS to `CANCELLED` on cluster `ExecutionAppliedEvent` replay. |
 
 ## Mandatory rule
 

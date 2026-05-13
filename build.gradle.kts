@@ -112,6 +112,12 @@ dependencies {
     // LMAX Disruptor — in-process pipelining (used post-PG-commit only)
     implementation("com.lmax:disruptor:4.0.0")
 
+    // HdrHistogram — Phase 4 slice 4e cluster bench harness records commit-round-trip
+    // latencies into a lossless high-dynamic-range histogram so p50/p95/p99/p99.9 are
+    // accurate to the underlying recording resolution (no Micrometer-style summary
+    // bucket truncation at the tail). Tiny (~150 KB) jar, zero transitive deps.
+    implementation("org.hdrhistogram:HdrHistogram:2.2.2")
+
     // Logging — Spring Boot brings logback-classic by default; OK for slice 1.
     implementation("org.slf4j:slf4j-api:2.0.16")
 
@@ -334,6 +340,24 @@ tasks.register<JavaExec>("clusterSnapshot") {
         "Request an Aeron Cluster snapshot via ClusterTool.snapshot(...). Env: OMS_AERON_CLUSTER_DIR or OMS_AERON_DIR_BASE."
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("com.balh.oms.cluster.admin.OmsClusterSnapshotAdminTool")
+    jvmArgs(lowLatencyJvmModuleOpens)
+}
+
+/**
+ * Phase 4 slice 4e (cluster bench harness): boot a single-node in-process Aeron Cluster, run a
+ * steady-state AcceptOrderCommand offer loop at OMS_BENCH_THROUGHPUT_OPS_PER_S for
+ * OMS_BENCH_DURATION_S, capture HdrHistogram of commit-round-trip latencies, write summary.md +
+ * histogram.hgrm under OMS_BENCH_REPORT_DIR (default build/reports/cluster-bench/<timestamp>).
+ * See system-documentation/plans/oms-aeron-cluster-substrate.md § Phase 4 slice 4e.
+ */
+tasks.register<JavaExec>("clusterBench") {
+    group = "verification"
+    description =
+        "Run the OMS cluster bench harness (HdrHistogram of commit-round-trip)." +
+                " Env: OMS_BENCH_DURATION_S, OMS_BENCH_THROUGHPUT_OPS_PER_S, OMS_BENCH_WARMUP_S," +
+                " OMS_BENCH_TIMEOUT_MS, OMS_BENCH_REPORT_DIR, OMS_BENCH_AERON_DIR_BASE."
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.balh.oms.cluster.bench.OmsClusterBenchHarness")
     jvmArgs(lowLatencyJvmModuleOpens)
 }
 

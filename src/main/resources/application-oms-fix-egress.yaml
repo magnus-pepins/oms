@@ -61,6 +61,13 @@ oms:
   fix:
     auto-start: ${OMS_FIX_EGRESS_AUTO_START:true}
 
+# Main HTTP port: the FIX-egress role does not serve order-accept HTTP, but Spring Boot's auto-config
+# still binds an embedded Tomcat to ${OMS_HTTP_PORT:8088}. Default the fix-egress to 8094 here so a
+# single-host bench (cluster-node + ingress-replica on 8088 + projector on 8093 + fix-egress) does
+# not collide. Override OMS_FIX_EGRESS_HTTP_PORT when binding elsewhere.
+server:
+  port: ${OMS_FIX_EGRESS_HTTP_PORT:8094}
+
 # Separate management port so probes/metrics do not share the main HTTP connector with other roles deployed nearby.
 management:
   server:

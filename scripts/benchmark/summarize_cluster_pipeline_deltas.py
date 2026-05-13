@@ -125,7 +125,14 @@ def _quantile_from_delta_buckets(
 
 
 def _scrape_total(text: str, base: str) -> Optional[Tuple[float, float]]:
-    """Returns (sum_seconds, count) for a Prometheus timer, summed across all label permutations."""
+    """Returns (sum_seconds, count) for a Prometheus timer, summed across all label permutations.
+
+    Returns None only when the timer name does not appear in the scrape at all (Micrometer hasn't
+    registered the meter yet on this JVM). When the meter is registered but a particular label combo
+    only appeared mid-run (e.g. the `outcome="created"` line on `oms_pipeline_ingress_accept` is
+    absent in the pre-scrape because the run is the first time it fires), the missing combo
+    contributes 0 to the sum/count totals and the per-label combos that DID exist still get summed.
+    """
     sum_re = re.compile(rf'^{re.escape(base)}_seconds_sum(?:\{{[^}}]*\}})?\s+([0-9.eE+-]+)\s*$')
     count_re = re.compile(rf'^{re.escape(base)}_seconds_count(?:\{{[^}}]*\}})?\s+([0-9.eE+-]+)\s*$')
     s = 0.0
@@ -199,20 +206,28 @@ def _summarise_timers(
             print(f"{indent}{base}: (not found in scrape — meter not registered yet on this JVM?)")
             continue
         any_data = True
-        if before_total is None or after_total is None:
-            d_count = None
-            d_mean_ms: Optional[float] = None
-        else:
-            d_sum = max(after_total[0] - before_total[0], 0.0)
-            d_count = max(after_total[1] - before_total[1], 0.0)
-            d_mean_ms = (d_sum / d_count * MS_PER_S) if d_count > 0 else None
+        # Treat a missing pre-scrape entry as (0, 0): the meter or label combo only registered
+        # mid-run, so the run's full sum/count IS the delta. This keeps Δcount/mean honest when
+        # outcome-tagged labels (e.g. `outcome="created"`) appear only after the first observation.
+        before_sum, before_count = before_total if before_total is not None else (0.0, 0.0)
+        after_sum, after_count = after_total if after_total is not None else (0.0, 0.0)
+        d_sum = max(after_sum - before_sum, 0.0)
+        d_count = max(after_count - before_count, 0.0)
+        d_mean_ms: Optional[float] = (d_sum / d_count * MS_PER_S) if d_count > 0 else None
         p50 = _quantile_from_delta_buckets(before_b, after_b, P50_QUANTILE)
         p99 = _quantile_from_delta_buckets(before_b, after_b, P99_QUANTILE)
-        count_str = "—" if d_count is None else f"{int(d_count)}"
+        count_str = f"{int(d_count)}" if d_count > 0 else "—"
         mean_str = "—" if d_mean_ms is None else f"{d_mean_ms:.3f} ms"
+        # Distinguish "no buckets emitted by this timer" from "buckets present but zero increments":
+        # the former means percentile histograms were never enabled on the meter (e.g. slice 4c's
+        # commit_round_trip ships sum/count only — use clusterBench for HdrHistogram tail latency).
+        no_buckets_emitted = not after_b
+        if no_buckets_emitted and (p50 is None and p99 is None):
+            quantile_part = "p50/p99 unavailable (no histogram buckets — sum/count only; use clusterBench)"
+        else:
+            quantile_part = f"p50={_fmt_ms_or_dash(p50)}, p99={_fmt_ms_or_dash(p99)}"
         print(
-            f"{indent}{base}: Δcount={count_str}, mean={mean_str}, "
-            f"p50={_fmt_ms_or_dash(p50)}, p99={_fmt_ms_or_dash(p99)}"
+            f"{indent}{base}: Δcount={count_str}, mean={mean_str}, {quantile_part}"
         )
         print(f"{indent}  ({description})")
     if not any_data:

@@ -1,9 +1,22 @@
 # Horizontal ingress replica — same order-accept surface as the monolith. Submits AcceptOrderCommand through
-# OmsClusterIngressClient (cluster.client.enabled=true). Phase 3 slice 3g removed the local Chronicle / control-tail
-# / postgres-write-path knobs, so this profile no longer needs an override block beyond the management port.
+# OmsClusterIngressClient. Phase 3 slice 3g removed the local Chronicle / control-tail / postgres-write-path
+# knobs.
 #
 # Do not combine oms-ingress-replica with oms-postgres-projector or oms-fix-egress on the same JVM
 # (TopologyWorkerProfiles).
+
+oms:
+  cluster:
+    client:
+      # Required on this profile: OrderIngressService takes OmsClusterIngressClient as a non-optional
+      # dependency. Defaulted true here so the profile is bootable without extra env wiring; flip via
+      # OMS_CLUSTER_CLIENT_ENABLED=false only in profile-test contexts that mock the client.
+      enabled: ${OMS_CLUSTER_CLIENT_ENABLED:true}
+      # Defaults to the cluster-node bootstrap's media-driver path when both JVMs run on the same host
+      # (oms/docs/runbooks/local-multi-jvm-bench.md). Override OMS_CLUSTER_CLIENT_AERON_DIRECTORY when the
+      # ingress-replica is on a separate host from the cluster member it talks to (Phase 5 / k8s).
+      aeron-directory: ${OMS_CLUSTER_CLIENT_AERON_DIRECTORY:${OMS_AERON_MEDIA_DRIVER_DIR:${OMS_AERON_DIR_BASE:build/aeron-cluster}/media-driver}}
+      ingress-endpoints: ${OMS_CLUSTER_CLIENT_INGRESS_ENDPOINTS:0=localhost:20110}
 
 management:
   server:

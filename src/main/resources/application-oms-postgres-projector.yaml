@@ -33,6 +33,13 @@ oms:
       # recording onto a fresh subscription stream, not the original publication stream.
       replay-stream-id: ${OMS_POSTGRES_PROJECTOR_REPLAY_STREAM_ID:4321}
 
+# Main HTTP port: the projector role does not serve order-accept HTTP, but Spring Boot's auto-config
+# still binds an embedded Tomcat to ${OMS_HTTP_PORT:8088}. On a single-host bench that collides with
+# the ingress-replica also on 8088, so default the projector to 8093 here. Override
+# OMS_POSTGRES_PROJECTOR_HTTP_PORT when binding elsewhere.
+server:
+  port: ${OMS_POSTGRES_PROJECTOR_HTTP_PORT:8093}
+
 # Separate management port so probes/metrics do not share the main HTTP connector with other roles deployed nearby.
 management:
   server:

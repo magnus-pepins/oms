@@ -7,6 +7,9 @@ import io.aeron.cluster.client.EgressListener;
 import io.aeron.cluster.codecs.EventCode;
 import io.aeron.exceptions.DriverTimeoutException;
 import io.aeron.logbuffer.Header;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Metrics;
+import io.micrometer.core.instrument.Timer;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import org.agrona.DirectBuffer;
@@ -14,11 +17,13 @@ import org.agrona.ErrorHandler;
 import org.agrona.ExpandableArrayBuffer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Profile;
 import org.springframework.stereotype.Component;
 
 import java.time.Duration;
+import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
@@ -175,8 +180,76 @@ public class OmsClusterIngressClient {
     private volatile Thread heartbeatThread;
     private volatile boolean closing;
 
+    // ---- Phase 4 slice 4c: commit-round-trip timer ----
+    // Single timer name `oms.cluster.client.commit_round_trip` covers both submit methods so a
+    // single SLO ("p99 of caller-side cluster wait") works across the OMS topology. The `command`
+    // tag distinguishes the two semantic shapes — accept_order is offer + egress reply round-trip,
+    // apply_execution_report is fire-and-forget offer (cluster reply lands on a recorded side
+    // stream consumed by the projector, not as session egress; see submitApplyExecutionReport's
+    // class doc) — so dashboards / alerts can filter on `command` for the right SLO.
+    //
+    // Timers are pre-registered for all 6 (command × outcome) combinations so /actuator/prometheus
+    // shows zero-counts on cold boot. Without that, Prometheus alert expressions like
+    // `rate(...{outcome="commit"}[5m]) == 0` would silently match nothing instead of firing.
+
+    static final String TIMER_NAME = "oms.cluster.client.commit_round_trip";
+    static final String TAG_COMMAND = "command";
+    static final String TAG_OUTCOME = "outcome";
+    static final String COMMAND_ACCEPT_ORDER = "accept_order";
+    static final String COMMAND_APPLY_EXECUTION_REPORT = "apply_execution_report";
+
+    /**
+     * Per-submit terminal state. Maps to the {@code outcome} tag on
+     * {@link #TIMER_NAME} ({@link #lowerName()} is the tag value seen by Prometheus).
+     */
+    enum Outcome {
+        /** Method completed normally (egress reply arrived for accept; offer succeeded for apply). */
+        COMMIT,
+        /** Method threw {@link TimeoutException} — back-pressure or egress wait exceeded the caller's deadline. */
+        TIMEOUT,
+        /** Any other failure (not-connected, interrupted, decode error, Aeron exception). */
+        ERROR;
+
+        String lowerName() {
+            return name().toLowerCase(java.util.Locale.ROOT);
+        }
+    }
+
+    private final MeterRegistry meterRegistry;
+    private final EnumMap<Outcome, Timer> acceptOrderTimers;
+    private final EnumMap<Outcome, Timer> applyExecutionReportTimers;
+
+    /**
+     * Back-compat overload used by ITs and other tests that don't care about meter assertions.
+     * Meters register against {@link Metrics#globalRegistry}, which is a noop-safe composite when
+     * no actual registry is attached. Production wiring goes through the {@code @Autowired} ctor
+     * below so {@code /actuator/prometheus} on the cluster-client JVMs sees the real timers.
+     */
     public OmsClusterIngressClient(OmsConfig config) {
+        this(config, Metrics.globalRegistry);
+    }
+
+    @Autowired
+    public OmsClusterIngressClient(OmsConfig config, MeterRegistry meterRegistry) {
         this.config = Objects.requireNonNull(config, "config").getCluster().getClient();
+        this.meterRegistry = Objects.requireNonNull(meterRegistry, "meterRegistry");
+        this.acceptOrderTimers = registerTimers(meterRegistry, COMMAND_ACCEPT_ORDER);
+        this.applyExecutionReportTimers = registerTimers(meterRegistry, COMMAND_APPLY_EXECUTION_REPORT);
+    }
+
+    private static EnumMap<Outcome, Timer> registerTimers(MeterRegistry registry, String command) {
+        EnumMap<Outcome, Timer> timers = new EnumMap<>(Outcome.class);
+        for (Outcome o : Outcome.values()) {
+            timers.put(
+                    o,
+                    Timer.builder(TIMER_NAME)
+                            .description(
+                                    "Wall-clock time spent inside OmsClusterIngressClient submit methods waiting on the cluster"
+                                            + " (offer + egress reply for accept_order; offer + back-pressure park for apply_execution_report).")
+                            .tags(TAG_COMMAND, command, TAG_OUTCOME, o.lowerName())
+                            .register(registry));
+        }
+        return timers;
     }
 
     /**
@@ -313,26 +386,34 @@ public class OmsClusterIngressClient {
 
         long deadlineNanos = System.nanoTime() + timeout.toNanos();
 
-        clientLock.lockInterruptibly();
+        Timer.Sample sample = Timer.start(meterRegistry);
+        Outcome outcome = Outcome.ERROR;
         try {
-            AeronCluster active = client;
-            if (active == null) {
-                throw new IllegalStateException("OMS cluster client is not connected");
-            }
-            long offerResult;
-            do {
-                offerResult = active.offer(buffer, 0, written);
-                if (offerResult < 0L) {
-                    if (System.nanoTime() > deadlineNanos) {
-                        throw new TimeoutException(
-                                "cluster offer back-pressure timeout for ApplyExecutionReportCommand orderId="
-                                        + cmd.orderId() + " venueExecRef=" + cmd.venueExecRef());
-                    }
-                    parkOrThrow(config.getOfferBackpressureParkNanos());
+            clientLock.lockInterruptibly();
+            try {
+                AeronCluster active = client;
+                if (active == null) {
+                    throw new IllegalStateException("OMS cluster client is not connected");
                 }
-            } while (offerResult < 0L);
+                long offerResult;
+                do {
+                    offerResult = active.offer(buffer, 0, written);
+                    if (offerResult < 0L) {
+                        if (System.nanoTime() > deadlineNanos) {
+                            outcome = Outcome.TIMEOUT;
+                            throw new TimeoutException(
+                                    "cluster offer back-pressure timeout for ApplyExecutionReportCommand orderId="
+                                            + cmd.orderId() + " venueExecRef=" + cmd.venueExecRef());
+                        }
+                        parkOrThrow(config.getOfferBackpressureParkNanos());
+                    }
+                } while (offerResult < 0L);
+                outcome = Outcome.COMMIT;
+            } finally {
+                clientLock.unlock();
+            }
         } finally {
-            clientLock.unlock();
+            sample.stop(applyExecutionReportTimers.get(outcome));
         }
     }
 
@@ -356,43 +437,53 @@ public class OmsClusterIngressClient {
 
         long deadlineNanos = System.nanoTime() + timeout.toNanos();
 
-        clientLock.lockInterruptibly();
+        Timer.Sample sample = Timer.start(meterRegistry);
+        Outcome outcome = Outcome.ERROR;
         try {
-            AeronCluster active = client;
-            if (active == null) {
-                throw new IllegalStateException("OMS cluster client is not connected");
-            }
+            clientLock.lockInterruptibly();
+            try {
+                AeronCluster active = client;
+                if (active == null) {
+                    throw new IllegalStateException("OMS cluster client is not connected");
+                }
 
-            long offerResult;
-            do {
-                offerResult = active.offer(buffer, 0, written);
-                if (offerResult < 0L) {
-                    if (System.nanoTime() > deadlineNanos) {
-                        throw new TimeoutException(
-                                "cluster offer back-pressure timeout for correlationId=" + cmd.correlationId());
+                long offerResult;
+                do {
+                    offerResult = active.offer(buffer, 0, written);
+                    if (offerResult < 0L) {
+                        if (System.nanoTime() > deadlineNanos) {
+                            outcome = Outcome.TIMEOUT;
+                            throw new TimeoutException(
+                                    "cluster offer back-pressure timeout for correlationId=" + cmd.correlationId());
+                        }
+                        parkOrThrow(config.getOfferBackpressureParkNanos());
                     }
-                    parkOrThrow(config.getOfferBackpressureParkNanos());
-                }
-            } while (offerResult < 0L);
+                } while (offerResult < 0L);
 
-            while (true) {
-                AdmissionResult result = received.remove(cmd.correlationId());
-                if (result != null) {
-                    return result;
+                while (true) {
+                    AdmissionResult result = received.remove(cmd.correlationId());
+                    if (result != null) {
+                        outcome = Outcome.COMMIT;
+                        return result;
+                    }
+                    active.pollEgress();
+                    result = received.remove(cmd.correlationId());
+                    if (result != null) {
+                        outcome = Outcome.COMMIT;
+                        return result;
+                    }
+                    if (System.nanoTime() > deadlineNanos) {
+                        outcome = Outcome.TIMEOUT;
+                        throw new TimeoutException(
+                                "cluster egress wait timeout for correlationId=" + cmd.correlationId());
+                    }
+                    parkOrThrow(config.getEgressPollParkNanos());
                 }
-                active.pollEgress();
-                result = received.remove(cmd.correlationId());
-                if (result != null) {
-                    return result;
-                }
-                if (System.nanoTime() > deadlineNanos) {
-                    throw new TimeoutException(
-                            "cluster egress wait timeout for correlationId=" + cmd.correlationId());
-                }
-                parkOrThrow(config.getEgressPollParkNanos());
+            } finally {
+                clientLock.unlock();
             }
         } finally {
-            clientLock.unlock();
+            sample.stop(acceptOrderTimers.get(outcome));
         }
     }
 

@@ -10,6 +10,7 @@ import io.aeron.cluster.service.ClusteredService;
 import io.aeron.logbuffer.Header;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.DistributionSummary;
+import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Metrics;
 import io.micrometer.core.instrument.Tags;
@@ -170,6 +171,24 @@ public class OmsAdmissionClusteredService implements ClusteredService {
     private final DistributionSummary snapshotWriteBytes;
     private final DistributionSummary snapshotLoadBytes;
 
+    /**
+     * Phase 4 slice 4h — drives the {@code oms.cluster.snapshot.age_seconds} freshness gauge that
+     * the snapshot-freshness alert in {@code oms/docs/cluster-slo.md} is wired against.
+     *
+     * <p>Updated only on successful {@link #onTakeSnapshot(ExclusivePublication)} completion. Initial
+     * value is set to the wall-clock time of service construction so a freshly booted cluster
+     * reports a small, growing age (rather than the full epoch) until the first snapshot fires.
+     * {@link #loadSnapshot(Image)} deliberately does <em>not</em> reset the timestamp: Aeron does
+     * not expose the original write time of a loaded snapshot, and treating "load" as "fresh"
+     * would hide the case where a member booted from a stale snapshot file with no subsequent
+     * snapshot cron tick. The cluster bootstrap re-constructs this service per JVM, so the
+     * "construct time = boot time" invariant holds.
+     *
+     * <p>{@code volatile} because the consensus-module thread writes via {@code onTakeSnapshot}
+     * and the metrics-exporter HTTP thread reads via the {@link Gauge} accessor.
+     */
+    private volatile long lastSnapshotWriteEpochMs;
+
     private Cluster cluster;
 
     /**
@@ -235,6 +254,33 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                 .baseUnit("bytes")
                 .tags(loadTags)
                 .register(meterRegistry);
+        // Phase 4 slice 4h — snapshot freshness gauge. Pre-registered so /metrics exposes the name on
+        // a freshly booted cluster, and so dashboards / alerts wire to a present series before the
+        // first snapshot. See class-level javadoc on `lastSnapshotWriteEpochMs` for the
+        // "init = construct time, never reset by load" rationale.
+        this.lastSnapshotWriteEpochMs = System.currentTimeMillis();
+        Gauge.builder("oms.cluster.snapshot.age_seconds", this, OmsAdmissionClusteredService::currentSnapshotAgeSeconds)
+                .description(
+                        "Wall-clock seconds since the leader last successfully wrote a snapshot via"
+                                + " onTakeSnapshot. Initial value = service-construct time (so a fresh boot"
+                                + " starts near zero); not reset by snapshot load.")
+                .baseUnit("seconds")
+                .register(meterRegistry);
+    }
+
+    /**
+     * Phase 4 slice 4h — accessor for the {@code oms.cluster.snapshot.age_seconds} gauge.
+     * Returns wall-clock seconds since {@link #lastSnapshotWriteEpochMs} (construct time on a
+     * fresh boot; reset on every successful {@code onTakeSnapshot}).
+     */
+    private double currentSnapshotAgeSeconds() {
+        long ageMs = System.currentTimeMillis() - lastSnapshotWriteEpochMs;
+        if (ageMs < 0L) {
+            // Defensive: clock skew on the host can briefly go backwards. Clamp to zero so the
+            // gauge never goes negative (which would be confusing in a freshness alert query).
+            return 0.0;
+        }
+        return ageMs / 1000.0;
     }
 
     @Override
@@ -377,6 +423,9 @@ public class OmsAdmissionClusteredService implements ClusteredService {
         sample.stop(snapshotWriteTimer);
         snapshotWriteCounter.increment();
         snapshotWriteBytes.record(p);
+        // Phase 4 slice 4h — drives oms.cluster.snapshot.age_seconds. Set AFTER the publish loop
+        // returns success, so a back-pressured publish that throws does not advance freshness.
+        lastSnapshotWriteEpochMs = System.currentTimeMillis();
     }
 
     private void loadSnapshot(Image snapshotImage) {

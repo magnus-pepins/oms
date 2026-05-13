@@ -32,6 +32,7 @@ Exit codes:
    - `oms_cluster_snapshot_events_total{outcome="write"}` — incremented every time the leader runs `onTakeSnapshot`.
    - `oms_cluster_snapshot_duration_seconds_count{outcome="write"}` and `..._sum{outcome="write"}` — count and total time spent in `onTakeSnapshot`.
    - `oms_cluster_snapshot_bytes_sum{outcome="write"}` — total bytes written across all snapshots since process start.
+   - `oms_cluster_snapshot_age_seconds` (slice 4h) — wall-clock seconds since the leader last successfully wrote a snapshot. Should drop to ~0 immediately after `clusterSnapshot` succeeds; climbs at 1 s/s thereafter. Drives the `OmsClusterSnapshotStale` / `OmsClusterSnapshotVeryStale` Prometheus alerts (`oms/docs/cluster-slo.md`).
 
    If the metric counts are unchanged after `clusterSnapshot` returned `0`, the leader hasn't actually run the snapshot yet — wait or check the leader's logs.
 2. Tail the cluster-node logs for `OmsAdmissionClusteredService` for any errors during snapshot publish (`snapshot publication closed` would surface here).
@@ -57,3 +58,4 @@ Exit codes:
 - Substrate plan: `system-documentation/plans/oms-aeron-cluster-substrate.md` § Phase 4 slice 4a (operator path) and slice 4b (snapshot observability).
 - Snapshot schema definition: `OmsAdmissionClusteredService.SNAPSHOT_SCHEMA_VERSION` (currently v3, slice 3d).
 - Slice 4b meter ids: `oms.cluster.snapshot.duration` (Timer), `oms.cluster.snapshot.events` (Counter), `oms.cluster.snapshot.bytes` (DistributionSummary, baseUnit=`bytes`); all tagged `outcome ∈ {write, load}`.
+- Slice 4h meter id: `oms.cluster.snapshot.age_seconds` (Gauge, baseUnit=`seconds`, untagged) — drives the snapshot-freshness alert. Cross-link: `oms/docs/cluster-slo.md` § Snapshot freshness.

@@ -11,21 +11,32 @@ import com.balh.oms.config.OmsProfiles;
 import com.balh.oms.domain.Order;
 import com.balh.oms.domain.OrderStatus;
 import com.balh.oms.domain.RejectCode;
+import com.balh.oms.domain.Side;
 import com.balh.oms.events.DomainEventEnvelopeCodec;
+import com.balh.oms.marketdata.MarketdataNbboQuote;
+import com.balh.oms.marketdata.MarketdataPlatformHttpClient;
 import com.balh.oms.persistence.DomainEventOutboxRepository;
 import com.balh.oms.persistence.ExecutionsRepository;
+import com.balh.oms.persistence.MarketContextRepository;
 import com.balh.oms.persistence.OrdersRepository;
+import com.balh.oms.persistence.PositionsRepository;
+import com.balh.oms.persistence.SellFillPositionSplit;
+import com.balh.oms.returnpath.ExecutionTradeCommand;
+import com.balh.oms.returnpath.MarketContextVenueEvidence;
 import com.balh.oms.tailer.OrderControlAdmission;
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.aeron.Aeron;
 import io.aeron.Subscription;
 import io.aeron.archive.client.AeronArchive;
 import io.aeron.logbuffer.FragmentHandler;
+import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import org.agrona.CloseHelper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Profile;
 import org.springframework.stereotype.Component;
@@ -35,8 +46,10 @@ import org.springframework.transaction.support.TransactionTemplate;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.Instant;
+import java.util.List;
 import java.util.Optional;
 import java.util.OptionalLong;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
@@ -107,6 +120,21 @@ public class OmsPostgresProjector {
      */
     private static final BigDecimal PRICE_SCALE = BigDecimal.valueOf(1_000_000L);
 
+    // Slice 3e-2: keep the legacy applier's metric names so existing Grafana dashboards
+    // (oms_executions_applied_total, oms_order_filled_events_published_total,
+    // oms_free_riding_attribution_merges_total, oms.trade.apply, oms.marketdata.nbbo.fetch)
+    // continue working when the projector becomes the sole writer. Names mirror
+    // ExecutionReportApplier verbatim — operations should not be able to tell which path emitted
+    // the metric, only that the count moved when an ER was applied.
+    private static final String METRIC_EXECUTIONS_APPLIED = "oms_executions_applied_total";
+    private static final String TAG_OUTCOME = "outcome";
+    private static final String OUTCOME_INSERTED = "inserted";
+    private static final String OUTCOME_DUPLICATE = "duplicate";
+    private static final String METRIC_ORDER_FILLED_EVENTS = "oms_order_filled_events_published_total";
+    private static final String METRIC_FREE_RIDING_ATTRIBUTION = "oms_free_riding_attribution_merges_total";
+    private static final String TIMER_TRADE_APPLY = "oms.trade.apply";
+    private static final String TIMER_NBBO_FETCH = "oms.marketdata.nbbo.fetch";
+
     private final OmsConfig config;
     private final AeronProjectorCursorRepository cursorRepository;
     private final OrdersRepository ordersRepository;
@@ -114,6 +142,11 @@ public class OmsPostgresProjector {
     private final ExecutionsRepository executionsRepository;
     private final DomainEventOutboxRepository domainEventOutboxRepository;
     private final DomainEventEnvelopeCodec envelopeCodec;
+    private final MarketContextRepository marketContextRepository;
+    private final PositionsRepository positionsRepository;
+    private final ObjectProvider<MarketdataPlatformHttpClient> marketdataHttp;
+    private final MeterRegistry meterRegistry;
+    private final ObjectMapper objectMapper;
     private final TransactionTemplate transactionTemplate;
 
     private final AtomicBoolean running = new AtomicBoolean(false);
@@ -128,6 +161,11 @@ public class OmsPostgresProjector {
             ExecutionsRepository executionsRepository,
             DomainEventOutboxRepository domainEventOutboxRepository,
             DomainEventEnvelopeCodec envelopeCodec,
+            MarketContextRepository marketContextRepository,
+            PositionsRepository positionsRepository,
+            ObjectProvider<MarketdataPlatformHttpClient> marketdataHttp,
+            MeterRegistry meterRegistry,
+            ObjectMapper objectMapper,
             PlatformTransactionManager transactionManager) {
         this.config = config;
         this.cursorRepository = cursorRepository;
@@ -136,6 +174,11 @@ public class OmsPostgresProjector {
         this.executionsRepository = executionsRepository;
         this.domainEventOutboxRepository = domainEventOutboxRepository;
         this.envelopeCodec = envelopeCodec;
+        this.marketContextRepository = marketContextRepository;
+        this.positionsRepository = positionsRepository;
+        this.marketdataHttp = marketdataHttp;
+        this.meterRegistry = meterRegistry;
+        this.objectMapper = objectMapper;
         // Programmatic boundary: the replay loop is a non-Spring thread, so AOP-proxied
         // @Transactional on this bean's own methods would not be intercepted. A
         // TransactionTemplate guarantees orders.insert + persistAdmission + cursor.advance
@@ -485,16 +528,39 @@ public class OmsPostgresProjector {
      *       envelope shapes the legacy applier produced so downstream fanout is unchanged.</li>
      * </ol>
      *
-     * <p><strong>Slice 3e scope.</strong> This handler covers the simple-shape projection: the
-     * three rows above. The legacy {@link com.balh.oms.returnpath.ExecutionReportApplier} also
-     * mutates {@code market_context} (NBBO evidence merge), {@code positions} (sell-fill split),
-     * and free-riding attribution links on {@code executions.unsettled_funded_by_exec_ids} — these
-     * remain in the legacy applier and are exercised by callers like
-     * {@link com.balh.oms.fix.FixInboundHandler} on JVMs that still run the legacy queue path
-     * ({@code oms-fix-worker}, deleted in slice 3g) and
-     * {@link com.balh.oms.returnpath.ExecutionReportApplier#applyOutboundJobExpired} (slice 4
-     * outbound-queue expiry, also gone with the worker). Porting them into this projector is
-     * deferred to a follow-up slice 3e-2 before slice 3g deletes the legacy applier.
+     * <p><strong>Slice 3e-2 scope.</strong> The handler also writes the side effects the legacy
+     * {@link com.balh.oms.returnpath.ExecutionReportApplier} produced inside the same transaction:
+     *
+     * <ul>
+     *   <li>{@link MarketContextRepository#mergeVenueFillEvidence} on TRADE — best-execution
+     *       evidence patch built from the venue ER fields plus an optional NBBO reference (stub
+     *       config or live HTTP via {@link MarketdataPlatformHttpClient} when
+     *       {@code oms.marketdata.enabled=true} and the NBBO flags are on).</li>
+     *   <li>{@link MarketContextRepository#ensureStubSnapshot} on VENUE_REJECT — guarantees a
+     *       {@code market_context} row exists for orders that reject before any trade.</li>
+     *   <li>{@link PositionsRepository#recordTradeFill} on TRADE — BUY fills credit the buy /
+     *       custody account; SELL fills decrement and produce a
+     *       {@link SellFillPositionSplit} which is persisted on the {@code executions} row for
+     *       the operator mark-failed unwind path.</li>
+     *   <li>Free-riding attribution merge on TRADE BUY (when
+     *       {@code oms.settlement.free-riding-attribution-enabled=true}) — finds prior unsettled
+     *       BUY {@code executions} for the same account+symbol and appends them to
+     *       {@code executions.unsettled_funded_by_exec_ids} on the just-inserted row.</li>
+     * </ul>
+     *
+     * <p>Legacy {@link com.balh.oms.returnpath.ExecutionReportApplier#applyOutboundJobExpired} is
+     * not migrated here — it serves slice-4 outbound-queue expiry on the legacy
+     * {@code oms-fix-worker} JVM, deleted in slice 3g together with the applier.
+     *
+     * <p><strong>Determinism on derived state.</strong> {@code market_context} /
+     * {@code positions} / {@code position_history} / free-riding links are downstream-only; they
+     * are not part of the cluster's order state machine. The cluster's
+     * {@code (orderId, venueExecRef)} dedupe + the projector's
+     * {@code executions(account_id, venue_exec_ref)} unique constraint together guarantee these
+     * side effects fire exactly once per applied ER. Replay re-emits the same
+     * {@link ExecutionAppliedEvent} bytes (snapshot v3 covers both indexes); the projector skips
+     * the side effects when {@code tryInsertTrade} returns empty (already-applied row), so there
+     * is no double-counting on positions / history / market_context merges.
      *
      * <p><strong>Determinism contract.</strong> {@code newStatusCode} on the wire is an
      * {@link OrderStatus} ordinal; the cluster keeps the byte constants in sync with the enum
@@ -557,10 +623,17 @@ public class OmsPostgresProjector {
 
     /**
      * @return {@code true} if a fresh {@code executions} row was inserted (and therefore the rest
-     *         of the projection — orders CAS + domain envelope — was applied); {@code false} on
-     *         duplicate replay (caller advances cursor only).
+     *         of the projection — market_context + positions + free-riding + orders CAS + domain
+     *         envelope — was applied); {@code false} on duplicate replay (caller advances cursor
+     *         only). Wrapped in {@link #TIMER_TRADE_APPLY} so the legacy applier's dashboard panel
+     *         keeps measuring the same span: best-ex evidence merge + insert + CAS + envelope.
      */
     private boolean applyTradeProjection(ExecutionAppliedEvent ev, Order order) {
+        return Boolean.TRUE.equals(
+                meterRegistry.timer(TIMER_TRADE_APPLY).record(() -> applyTradeProjectionTimed(ev, order)));
+    }
+
+    private Boolean applyTradeProjectionTimed(ExecutionAppliedEvent ev, Order order) {
         BigDecimal lastQty = scaledToBigDecimal(ev.lastQtyScaled(), QUANTITY_SCALE);
         BigDecimal lastPx = ev.lastPxScaled() == 0L
                 ? null
@@ -568,6 +641,15 @@ public class OmsPostgresProjector {
         BigDecimal newCum = scaledToBigDecimal(ev.newCumQtyScaled(), QUANTITY_SCALE);
         BigDecimal leaves = order.quantity().subtract(newCum);
         String raw = ev.rawEnvelopeJson();
+
+        // Slice 3e-2: best-execution evidence merge runs BEFORE the executions insert (mirrors
+        // legacy applier order). On duplicate replay the merge is still safe — it is an idempotent
+        // upsert and Postgres `||` is associative on JSON, so re-applying the same patch yields
+        // the same snapshot_json. We accept this minor cost on the duplicate path because the
+        // legacy applier did the same and downstream best-ex consumers expect at-least-once on
+        // the merge.
+        mergeMarketContextEvidenceForTrade(order, ev, lastQty, lastPx, leaves, newCum);
+
         Optional<Long> insertedId = executionsRepository.tryInsertTrade(
                 order.id(),
                 order.accountId(),
@@ -580,8 +662,34 @@ public class OmsPostgresProjector {
                 newCum,
                 raw);
         if (insertedId.isEmpty()) {
+            meterRegistry.counter(METRIC_EXECUTIONS_APPLIED, TAG_OUTCOME, OUTCOME_DUPLICATE).increment();
             return false;
         }
+        meterRegistry.counter(METRIC_EXECUTIONS_APPLIED, TAG_OUTCOME, OUTCOME_INSERTED).increment();
+
+        // Slice 3e-2: free-riding attribution links must be appended to the just-inserted row
+        // before the orders CAS so the link write commits in the same transaction. Excludes the
+        // just-inserted execution from the lookup (legacy semantics — a row cannot fund itself).
+        if (config.getSettlement().isFreeRidingAttributionEnabled() && order.side() == Side.BUY) {
+            List<Long> funding = executionsRepository.findUnsettledBuyTradeExecutionIdsForAttribution(
+                    order.accountId(),
+                    order.instrumentSymbol(),
+                    insertedId.get(),
+                    config.getSettlement().getFreeRidingAttributionMaxFundingExecutions());
+            if (!funding.isEmpty()) {
+                executionsRepository.appendUnsettledFundedByExecutionIds(insertedId.get(), funding);
+                meterRegistry.counter(METRIC_FREE_RIDING_ATTRIBUTION).increment();
+            }
+        }
+
+        // Slice 3e-2: positions + position_history. SELL fills also write back the
+        // pending-buy-vs-settled split onto the executions row so the operator mark-failed unwind
+        // path (PositionsRepository#revertPositionForMarkTradeFailed) can reverse this fill exactly.
+        UUID custody = UUID.fromString(config.getSettlement().getDefaultCustodyAccountId());
+        Optional<SellFillPositionSplit> sellSplit =
+                positionsRepository.recordTradeFill(order, insertedId.get(), lastQty, custody);
+        sellSplit.ifPresent(split -> executionsRepository.updateSellFillPositionSplit(insertedId.get(), split));
+
         OrderStatus newStatus = OrderStatus.values()[ev.newStatusCode()];
         Instant terminalAt = newStatus == OrderStatus.FILLED ? appliedAtInstant(ev) : null;
         int pgExpectedVersion = order.version();
@@ -622,6 +730,7 @@ public class OmsPostgresProjector {
                         vwap,
                         ev.venueId(),
                         ev.venueExecRef());
+                meterRegistry.counter(METRIC_ORDER_FILLED_EVENTS).increment();
             }
             domainEventOutboxRepository.insert(order.id(), envelopeJson);
         } catch (JsonProcessingException e) {
@@ -640,8 +749,10 @@ public class OmsPostgresProjector {
                 order.cumFilledQuantity(),
                 ev.rawEnvelopeJson());
         if (insertedId.isEmpty()) {
+            meterRegistry.counter(METRIC_EXECUTIONS_APPLIED, TAG_OUTCOME, OUTCOME_DUPLICATE).increment();
             return false;
         }
+        meterRegistry.counter(METRIC_EXECUTIONS_APPLIED, TAG_OUTCOME, OUTCOME_INSERTED).increment();
         int pgExpectedVersion = order.version();
         boolean cas = ordersRepository.updateFillOrCancelWithCas(
                 order.id(),
@@ -670,6 +781,13 @@ public class OmsPostgresProjector {
     }
 
     private boolean applyVenueRejectProjection(ExecutionAppliedEvent ev, Order order) {
+        // Slice 3e-2: legacy applier writes a stub-only market_context row before the executions
+        // insert so orders that reject before any trade still appear in best-ex evidence reports
+        // ("we routed it, the venue rejected it"). Idempotent upsert (ON CONFLICT DO NOTHING) so
+        // a partial-fill-then-reject scenario does not stomp the trade-time merged snapshot.
+        marketContextRepository.ensureStubSnapshot(
+                order.id(), config.getRouting().getMarketContextStubJson());
+
         Optional<Long> insertedId = executionsRepository.tryInsertVenueReject(
                 order.id(),
                 order.accountId(),
@@ -679,8 +797,10 @@ public class OmsPostgresProjector {
                 order.cumFilledQuantity(),
                 ev.rawEnvelopeJson());
         if (insertedId.isEmpty()) {
+            meterRegistry.counter(METRIC_EXECUTIONS_APPLIED, TAG_OUTCOME, OUTCOME_DUPLICATE).increment();
             return false;
         }
+        meterRegistry.counter(METRIC_EXECUTIONS_APPLIED, TAG_OUTCOME, OUTCOME_INSERTED).increment();
         RejectCode terminalReason = decodeRejectCode(ev.rejectCodeOrZero());
         int pgExpectedVersion = order.version();
         boolean cas = ordersRepository.updateWithCas(
@@ -707,6 +827,92 @@ public class OmsPostgresProjector {
             throw new IllegalStateException("domain event serialisation failed for order " + order.id(), e);
         }
         return true;
+    }
+
+    /**
+     * Builds the venue-evidence JSON patch via {@link MarketContextVenueEvidence#toJsonPatch} and
+     * merges it into {@code market_context.snapshot_json} (slice 3e-2). The optional NBBO reference
+     * comes from {@link #resolveNbbo} — config-stub when {@code oms.routing.nbbo-reference-...} is
+     * on, live HTTP when {@code oms.marketdata.enabled=true} + {@code nbbo-in-market-context} on.
+     *
+     * <p>Why we synthesise an {@link ExecutionTradeCommand} from the
+     * {@link ExecutionAppliedEvent}: the legacy {@link MarketContextVenueEvidence} helper signature
+     * takes the legacy command type. Reusing it here keeps the JSON patch byte-for-byte identical
+     * to the legacy applier's output during the slice 3e-2 / 3g overlap, so downstream best-ex
+     * consumers see exactly the same evidence shape from either writer.
+     */
+    private void mergeMarketContextEvidenceForTrade(
+            Order order,
+            ExecutionAppliedEvent ev,
+            BigDecimal lastQty,
+            BigDecimal lastPx,
+            BigDecimal leaves,
+            BigDecimal newCum) {
+        Instant venueTs = Instant.ofEpochSecond(0L, ev.venueTsNanos());
+        ExecutionTradeCommand syntheticCmd = new ExecutionTradeCommand(
+                order.id(),
+                ev.venueId(),
+                venueTs,
+                ev.venueExecRef(),
+                lastQty,
+                lastPx,
+                leaves,
+                newCum);
+        try {
+            Optional<MarketContextVenueEvidence.NbboQuoteRef> nbbo = resolveNbbo(order, venueTs);
+            String patch = MarketContextVenueEvidence.toJsonPatch(objectMapper, order, syntheticCmd, nbbo);
+            marketContextRepository.mergeVenueFillEvidence(
+                    order.id(),
+                    venueTs,
+                    config.getRouting().getMarketContextStubJson(),
+                    patch);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException(
+                    "market_context evidence serialisation failed for order " + order.id(), e);
+        }
+    }
+
+    /**
+     * Resolves an optional NBBO reference for the market_context patch. Mirrors
+     * {@link com.balh.oms.returnpath.ExecutionReportApplier#resolveNbbo} so the projector and
+     * legacy applier produce identical patches given the same config:
+     *
+     * <ul>
+     *   <li>if {@code oms.routing.nbbo-reference-in-market-context-enabled=false} → empty;</li>
+     *   <li>else if {@code oms.marketdata.enabled=true} +
+     *       {@code oms.marketdata.nbbo-in-market-context-enabled=true} and the
+     *       {@link MarketdataPlatformHttpClient} bean is present → live HTTP fetch (timed in
+     *       {@link #TIMER_NBBO_FETCH});</li>
+     *   <li>else if both stub prices are positive → config-stub reference;</li>
+     *   <li>else → empty (e.g. NBBO flag on but stub prices zero — patch carries venue fields
+     *       only, no {@code nbboClassReference}).</li>
+     * </ul>
+     */
+    private Optional<MarketContextVenueEvidence.NbboQuoteRef> resolveNbbo(Order order, Instant venueTs) {
+        var routing = config.getRouting();
+        if (!routing.isNbboReferenceInMarketContextEnabled()) {
+            return Optional.empty();
+        }
+        var marketdata = config.getMarketdata();
+        if (marketdata.isNbboInMarketContextEnabled() && marketdata.isEnabled()) {
+            MarketdataPlatformHttpClient client = marketdataHttp.getIfAvailable();
+            if (client != null) {
+                Optional<MarketdataNbboQuote> live = meterRegistry
+                        .timer(TIMER_NBBO_FETCH, "source", "http")
+                        .record(() -> client.fetchNbbo(order.instrumentSymbol()));
+                if (live != null && live.isPresent()) {
+                    MarketdataNbboQuote q = live.get();
+                    return Optional.of(new MarketContextVenueEvidence.NbboQuoteRef(
+                            q.bid(), q.ask(), q.asOf(), "NBBO_MARKETDATA_HTTP"));
+                }
+            }
+        }
+        BigDecimal bid = routing.getNbboStubBidPrice();
+        BigDecimal ask = routing.getNbboStubAskPrice();
+        if (bid.compareTo(BigDecimal.ZERO) <= 0 || ask.compareTo(BigDecimal.ZERO) <= 0) {
+            return Optional.empty();
+        }
+        return Optional.of(new MarketContextVenueEvidence.NbboQuoteRef(bid, ask, venueTs));
     }
 
     private static BigDecimal scaledToBigDecimal(long scaled, BigDecimal scale) {

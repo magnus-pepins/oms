@@ -46,9 +46,22 @@ class OmsPostgresProjectorIT extends AbstractPostgresIntegrationTest {
     private static final Duration ROW_VISIBLE_TIMEOUT = Duration.ofSeconds(20);
     private static final Duration CLUSTER_SUBMIT_TIMEOUT = Duration.ofSeconds(10);
 
+    /**
+     * Default custody account from {@code OmsConfig.Settlement.defaultCustodyAccountId} (fixture
+     * V11). The projector hands this UUID to {@link com.balh.oms.persistence.PositionsRepository}
+     * for every TRADE fill, so positions-side assertions in this IT use the same id.
+     */
+    private static final String DEFAULT_CUSTODY_ACCOUNT_ID = "a0000001-0000-4000-8000-000000000001";
+
     @DynamicPropertySource
     static void registerProjectorProperties(DynamicPropertyRegistry registry) {
         registry.add("oms.cluster.projector.aeron-directory", AbstractPostgresIntegrationTest::testClusterAeronDirectory);
+        // Slice 3e-2: turn on free-riding attribution so {@link #freeRidingAttribution_secondBuyFundedByFirst}
+        // exercises the projector's executions.unsettled_funded_by_exec_ids merge. The flag is a
+        // no-op for the rest of the tests in this class because each test uses a fresh accountId
+        // and the per-test truncate (SQL_TRUNCATE_ORDERS_AND_SETTLEMENT) clears `executions`, so
+        // the prior-unsettled-BUY lookup returns empty and the merge is skipped.
+        registry.add("oms.settlement.free-riding-attribution-enabled", () -> "true");
     }
 
     @Autowired
@@ -333,6 +346,53 @@ class OmsPostgresProjectorIT extends AbstractPostgresIntegrationTest {
                 Long.class,
                 orderId);
         assertThat(partialEnvelopes).isEqualTo(1L);
+
+        // Slice 3e-2: market_context evidence merge — venue ER fields land in snapshot_json the
+        // same shape ExecutionReportApplier#applyTrade produces (MarketContextVenueEvidence
+        // schemaVersion=1; instrumentSymbol + venueExecRef + lastQuantity round-tripped).
+        Integer marketContextRows = jdbc.queryForObject(
+                "SELECT COUNT(*)::int FROM market_context WHERE order_id = ?",
+                Integer.class,
+                orderId);
+        assertThat(marketContextRows).isEqualTo(1);
+        String venueRefSnapshot = jdbc.queryForObject(
+                "SELECT snapshot_json->>'venueExecRef' FROM market_context WHERE order_id = ?",
+                String.class,
+                orderId);
+        assertThat(venueRefSnapshot).isEqualTo(venueRef);
+        String symbolSnapshot = jdbc.queryForObject(
+                "SELECT snapshot_json->>'instrumentSymbol' FROM market_context WHERE order_id = ?",
+                String.class,
+                orderId);
+        assertThat(symbolSnapshot).isEqualTo("AAPL");
+        Integer schemaVersion = jdbc.queryForObject(
+                "SELECT (snapshot_json->>'schemaVersion')::int FROM market_context WHERE order_id = ?",
+                Integer.class,
+                orderId);
+        assertThat(schemaVersion).isEqualTo(1);
+
+        // Slice 3e-2: positions BUY fill — quantity_total + quantity_pending_buy_settle bumped to
+        // the fill qty against the default custody account; position_history TRADE_BUY_FILL row.
+        BigDecimal positionTotal = jdbc.queryForObject(
+                "SELECT quantity_total FROM positions WHERE account_id = ?"
+                        + " AND instrument_symbol = 'AAPL' AND custody_account_id = ?",
+                BigDecimal.class,
+                accountId,
+                UUID.fromString(DEFAULT_CUSTODY_ACCOUNT_ID));
+        assertThat(positionTotal).isEqualByComparingTo("4");
+        BigDecimal positionPendingBuy = jdbc.queryForObject(
+                "SELECT quantity_pending_buy_settle FROM positions WHERE account_id = ?"
+                        + " AND instrument_symbol = 'AAPL' AND custody_account_id = ?",
+                BigDecimal.class,
+                accountId,
+                UUID.fromString(DEFAULT_CUSTODY_ACCOUNT_ID));
+        assertThat(positionPendingBuy).isEqualByComparingTo("4");
+        Long historyRows = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM position_history WHERE account_id = ?"
+                        + " AND event_type = 'TRADE_BUY_FILL'",
+                Long.class,
+                accountId);
+        assertThat(historyRows).isEqualTo(1L);
     }
 
     /**
@@ -481,6 +541,210 @@ class OmsPostgresProjectorIT extends AbstractPostgresIntegrationTest {
                 Long.class,
                 orderId);
         assertThat(rejectExecutions).isEqualTo(1L);
+
+        // Slice 3e-2: legacy applier wrote a stub-only market_context row before tryInsertVenueReject
+        // so orders that reject pre-trade still appear in best-ex evidence reports. The projector
+        // now does the same. The "{\"stub\":true}" default comes from OmsConfig.Routing.
+        Boolean stubSnapshot = jdbc.queryForObject(
+                "SELECT (snapshot_json->>'stub')::boolean FROM market_context WHERE order_id = ?",
+                Boolean.class,
+                orderId);
+        assertThat(stubSnapshot).isTrue();
+    }
+
+    /**
+     * Slice 3e-2 — SELL fill: sell-side TRADE drains a pre-existing position and records the
+     * pending-buy-vs-settled split on {@code executions} so the operator mark-failed unwind path
+     * can reverse the fill exactly. The flow:
+     *
+     * <ol>
+     *   <li>seed a {@code positions} row with {@code quantity_total = 10}, all in
+     *       {@code quantity_pending_buy_settle} — this is what an unsettled BUY fill would have
+     *       produced under the legacy applier;</li>
+     *   <li>admit a SELL order for 4 units against the same account+symbol;</li>
+     *   <li>fully fill it via the cluster.</li>
+     * </ol>
+     *
+     * <p>Expected end state: {@code quantity_pending_buy_settle = 6} (4 drained from pending-buy
+     * because the seeded position had no settled units yet), {@code quantity_pending_sell_settle
+     * = 4} (the SELL fill is in flight to broker settlement), {@code quantity_total = 6};
+     * {@code executions.sell_position_from_pending_buy = 4} on the inserted TRADE row;
+     * {@code position_history.TRADE_SELL_FILL} row carrying {@code quantity_delta = -4}.
+     */
+    @Test
+    void clusterSellFill_drainsPositionAndRecordsSplitOnExecutions() throws Exception {
+        UUID orderId = UUID.randomUUID();
+        UUID accountId = UUID.randomUUID();
+        String idemKey = "projector-it-sell-" + orderId;
+        UUID custody = UUID.fromString(DEFAULT_CUSTODY_ACCOUNT_ID);
+
+        // Seed an unsettled BUY position the SELL fill will drain. Legacy applier produces the
+        // same shape from a TRADE_BUY_FILL on a fresh symbol; we shortcut to it here so the test
+        // can assert a single SELL apply without first running a BUY round-trip.
+        jdbc.update(
+                "INSERT INTO positions (account_id, instrument_symbol, custody_account_id,"
+                        + " quantity_total, quantity_pending_buy_settle, quantity_settled,"
+                        + " quantity_pending_sell_settle, updated_at)"
+                        + " VALUES (?, 'AAPL', ?, 10, 10, 0, 0, NOW())",
+                accountId,
+                custody);
+
+        AcceptOrderCommand sell = new AcceptOrderCommand(
+                testIngressClient.nextCorrelationId(),
+                orderId,
+                instantToNanos(),
+                /* quantityScaled = */ 10_000_000_000L,
+                /* limitPriceScaledOrZero = */ 150_000_000L,
+                /* shardId = */ 0,
+                AcceptOrderCommand.SIDE_SELL,
+                AcceptOrderCommand.TIF_DAY,
+                accountId.toString(),
+                idemKey,
+                "projector-it-hash",
+                "AAPL",
+                /* ledgerBalanceIdOrNull = */ null);
+        testIngressClient.submitAcceptOrder(sell, CLUSTER_SUBMIT_TIMEOUT);
+        awaitOrdersStatus(orderId, "WORKING", 1);
+
+        String venueRef = "VENUE-SELL-" + orderId;
+        ApplyExecutionReportCommand fill = new ApplyExecutionReportCommand(
+                testIngressClient.nextCorrelationId(),
+                orderId,
+                /* lastQtyScaled = */ 4_000_000_000L,
+                /* lastPxScaled = */ 150_500_000L,
+                instantToNanos(),
+                /* msgSeqNum = */ 1,
+                ApplyExecutionReportCommand.EXEC_TYPE_TRADE,
+                (byte) 0,
+                "VENUE",
+                venueRef,
+                "",
+                "{\"kind\":\"ExecutionReport\"}");
+        testIngressClient.submitApplyExecutionReport(fill, CLUSTER_SUBMIT_TIMEOUT);
+
+        awaitOrdersStatus(orderId, "PARTIALLY_FILLED", 2);
+
+        await().atMost(ROW_VISIBLE_TIMEOUT).pollInterval(Duration.ofMillis(50)).untilAsserted(() -> {
+            BigDecimal pendingBuy = jdbc.queryForObject(
+                    "SELECT quantity_pending_buy_settle FROM positions WHERE account_id = ?"
+                            + " AND instrument_symbol = 'AAPL' AND custody_account_id = ?",
+                    BigDecimal.class,
+                    accountId,
+                    custody);
+            assertThat(pendingBuy).isEqualByComparingTo("6");
+        });
+
+        BigDecimal pendingSell = jdbc.queryForObject(
+                "SELECT quantity_pending_sell_settle FROM positions WHERE account_id = ?"
+                        + " AND instrument_symbol = 'AAPL' AND custody_account_id = ?",
+                BigDecimal.class,
+                accountId,
+                custody);
+        assertThat(pendingSell).isEqualByComparingTo("4");
+        BigDecimal total = jdbc.queryForObject(
+                "SELECT quantity_total FROM positions WHERE account_id = ?"
+                        + " AND instrument_symbol = 'AAPL' AND custody_account_id = ?",
+                BigDecimal.class,
+                accountId,
+                custody);
+        assertThat(total).isEqualByComparingTo("6");
+
+        BigDecimal sellFromPb = jdbc.queryForObject(
+                "SELECT sell_position_from_pending_buy FROM executions"
+                        + " WHERE order_id = ? AND exec_type = 'TRADE'",
+                BigDecimal.class,
+                orderId);
+        assertThat(sellFromPb).isEqualByComparingTo("4");
+        BigDecimal sellFromSettled = jdbc.queryForObject(
+                "SELECT sell_position_from_settled FROM executions"
+                        + " WHERE order_id = ? AND exec_type = 'TRADE'",
+                BigDecimal.class,
+                orderId);
+        assertThat(sellFromSettled).isEqualByComparingTo("0");
+
+        Long sellHistoryRows = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM position_history WHERE account_id = ?"
+                        + " AND event_type = 'TRADE_SELL_FILL'",
+                Long.class,
+                accountId);
+        assertThat(sellHistoryRows).isEqualTo(1L);
+    }
+
+    /**
+     * Slice 3e-2 — free-riding attribution: when {@code oms.settlement.free-riding-attribution-enabled=true}
+     * (turned on at the class level), every BUY {@code TRADE} fill appends prior unsettled BUY
+     * execution ids on the same account+symbol to {@code unsettled_funded_by_exec_ids} on the
+     * just-inserted row. Mirrors {@link com.balh.oms.returnpath.ExecutionReportApplier#applyTradeAfterPreChecks}.
+     *
+     * <p>Flow: admit-then-fill BUY #1, then admit-then-fill BUY #2 against the same account+symbol.
+     * BUY #2's execution row should reference BUY #1's execution id in
+     * {@code unsettled_funded_by_exec_ids} (the only prior unsettled trade execution for that
+     * account+symbol — first BUY's settlement_status defaults to {@code executed}, which the
+     * lookup treats as "still in flight").
+     */
+    @Test
+    void freeRidingAttribution_secondBuyFundedByFirst() throws Exception {
+        UUID accountId = UUID.randomUUID();
+
+        UUID firstOrderId = UUID.randomUUID();
+        testIngressClient.submitAcceptOrder(
+                sample(firstOrderId, accountId, "fr-it-1-" + firstOrderId), CLUSTER_SUBMIT_TIMEOUT);
+        awaitOrdersStatus(firstOrderId, "WORKING", 1);
+        String firstVenueRef = "VENUE-FR-1-" + firstOrderId;
+        testIngressClient.submitApplyExecutionReport(
+                tradeForFreeRiding(firstOrderId, firstVenueRef, /* msgSeq = */ 1),
+                CLUSTER_SUBMIT_TIMEOUT);
+        awaitOrdersStatus(firstOrderId, "FILLED", 2);
+        Long firstExecutionId = jdbc.queryForObject(
+                "SELECT id FROM executions WHERE order_id = ? AND exec_type = 'TRADE'",
+                Long.class,
+                firstOrderId);
+        assertThat(firstExecutionId).isNotNull();
+
+        UUID secondOrderId = UUID.randomUUID();
+        testIngressClient.submitAcceptOrder(
+                sample(secondOrderId, accountId, "fr-it-2-" + secondOrderId), CLUSTER_SUBMIT_TIMEOUT);
+        awaitOrdersStatus(secondOrderId, "WORKING", 1);
+        String secondVenueRef = "VENUE-FR-2-" + secondOrderId;
+        testIngressClient.submitApplyExecutionReport(
+                tradeForFreeRiding(secondOrderId, secondVenueRef, /* msgSeq = */ 2),
+                CLUSTER_SUBMIT_TIMEOUT);
+        awaitOrdersStatus(secondOrderId, "FILLED", 2);
+
+        await().atMost(ROW_VISIBLE_TIMEOUT).pollInterval(Duration.ofMillis(50)).untilAsserted(() -> {
+            Long fundingId = jdbc.queryForObject(
+                    "SELECT (unsettled_funded_by_exec_ids)[1] FROM executions"
+                            + " WHERE order_id = ? AND exec_type = 'TRADE'",
+                    Long.class,
+                    secondOrderId);
+            assertThat(fundingId)
+                    .as("second BUY references the first BUY's execution id in unsettled_funded_by_exec_ids")
+                    .isEqualTo(firstExecutionId);
+        });
+
+        // First BUY's array stays empty (it was the prior trade; no earlier unsettled fills exist).
+        Object firstFunding = jdbc.queryForObject(
+                "SELECT unsettled_funded_by_exec_ids FROM executions"
+                        + " WHERE order_id = ? AND exec_type = 'TRADE'",
+                Object.class,
+                firstOrderId);
+        assertThat(firstFunding).asString().isIn("{}", "[]", "");
+    }
+
+    private ApplyExecutionReportCommand tradeForFreeRiding(UUID orderId, String venueRef, int msgSeq) {
+        return new ApplyExecutionReportCommand(
+                testIngressClient.nextCorrelationId(),
+                orderId,
+                /* lastQtyScaled = */ 10_000_000_000L,
+                /* lastPxScaled = */ 150_500_000L,
+                instantToNanos(),
+                msgSeq,
+                ApplyExecutionReportCommand.EXEC_TYPE_TRADE,
+                (byte) 0,
+                "VENUE",
+                venueRef,
+                "",
+                "{\"kind\":\"ExecutionReport\"}");
     }
 
     /**

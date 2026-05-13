@@ -114,7 +114,7 @@ class OrderIngressServiceClusterGateTest {
                                     cmd.orderId(),
                                     /* version = */ 0,
                                     /* duplicate = */ false,
-                                    /* acceptedAtNanos = */ 1L));
+                                    /* acceptedAtMillis = */ 1L));
                 });
 
         OrderIngressService.IngressResult result = service.persistAccepted(buyRequest());
@@ -142,7 +142,7 @@ class OrderIngressServiceClusterGateTest {
                                     clusterOriginalOrderId,
                                     /* version = */ 0,
                                     /* duplicate = */ true,
-                                    /* acceptedAtNanos = */ 1L));
+                                    /* acceptedAtMillis = */ 1L));
                 });
 
         OrderIngressService.IngressResult result = service.persistAccepted(buyRequest());

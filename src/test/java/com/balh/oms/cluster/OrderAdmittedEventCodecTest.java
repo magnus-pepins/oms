@@ -22,7 +22,7 @@ class OrderAdmittedEventCodecTest {
         OrderAdmittedEvent original = new OrderAdmittedEvent(
                 UUID.fromString("00000000-0000-4000-8000-000000000123"),
                 /* clientTimestampNanos = */ 1_700_000_000_111_222_333L,
-                /* acceptedAtNanos = */ 1_700_000_000_999_888_777L,
+                /* acceptedAtMillis = */ 1_700_000_000_999L,
                 /* quantityScaled = */ 10_500_000_000L,
                 /* limitPriceScaledOrZero = */ 250_500_000L,
                 /* shardId = */ 7,
@@ -85,11 +85,11 @@ class OrderAdmittedEventCodecTest {
                 "GOOG",
                 "ledger-3");
 
-        OrderAdmittedEvent ev = OrderAdmittedEvent.fromAdmittedCommand(cmd, /* acceptedAtNanos = */ 5_000_000L, 0);
+        OrderAdmittedEvent ev = OrderAdmittedEvent.fromAdmittedCommand(cmd, /* acceptedAtMillis = */ 5_000_000L, 0);
 
         assertThat(ev.orderId()).isEqualTo(cmd.orderId());
         assertThat(ev.clientTimestampNanos()).isEqualTo(cmd.clientTimestampNanos());
-        assertThat(ev.acceptedAtNanos()).isEqualTo(5_000_000L);
+        assertThat(ev.acceptedAtMillis()).isEqualTo(5_000_000L);
         assertThat(ev.quantityScaled()).isEqualTo(cmd.quantityScaled());
         assertThat(ev.limitPriceScaledOrZero()).isEqualTo(cmd.limitPriceScaledOrZero());
         assertThat(ev.shardId()).isEqualTo(cmd.shardId());

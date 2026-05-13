@@ -18,6 +18,7 @@ import com.balh.oms.marketdata.MarketdataPlatformHttpClient;
 import com.balh.oms.persistence.DomainEventOutboxRepository;
 import com.balh.oms.persistence.ExecutionsRepository;
 import com.balh.oms.persistence.MarketContextRepository;
+import com.balh.oms.observability.metrics.OmsPipelineMetrics;
 import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.persistence.PositionsRepository;
 import com.balh.oms.persistence.SellFillPositionSplit;
@@ -37,6 +38,7 @@ import org.agrona.CloseHelper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Profile;
 import org.springframework.stereotype.Component;
@@ -45,6 +47,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.time.Clock;
 import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
@@ -147,11 +150,13 @@ public class OmsPostgresProjector {
     private final MeterRegistry meterRegistry;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate transactionTemplate;
+    private final Clock wallClock;
 
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicReference<Long> lastAppliedPosition = new AtomicReference<>(0L);
     private Thread replayThread;
 
+    @Autowired
     public OmsPostgresProjector(
             OmsConfig config,
             AeronProjectorCursorRepository cursorRepository,
@@ -166,6 +171,43 @@ public class OmsPostgresProjector {
             MeterRegistry meterRegistry,
             ObjectMapper objectMapper,
             PlatformTransactionManager transactionManager) {
+        this(
+                config,
+                cursorRepository,
+                ordersRepository,
+                controlAdmission,
+                executionsRepository,
+                domainEventOutboxRepository,
+                envelopeCodec,
+                marketContextRepository,
+                positionsRepository,
+                marketdataHttp,
+                meterRegistry,
+                objectMapper,
+                transactionManager,
+                Clock.systemUTC());
+    }
+
+    /**
+     * Visible for tests: inject a deterministic {@link Clock} so unit tests can pin
+     * {@code System.currentTimeMillis()}-equivalent values when asserting on the per-event
+     * admit-to-projector Timer (Phase 4j). Production wiring uses {@code Clock.systemUTC()}.
+     */
+    OmsPostgresProjector(
+            OmsConfig config,
+            AeronProjectorCursorRepository cursorRepository,
+            OrdersRepository ordersRepository,
+            OrderControlAdmission controlAdmission,
+            ExecutionsRepository executionsRepository,
+            DomainEventOutboxRepository domainEventOutboxRepository,
+            DomainEventEnvelopeCodec envelopeCodec,
+            MarketContextRepository marketContextRepository,
+            PositionsRepository positionsRepository,
+            ObjectProvider<MarketdataPlatformHttpClient> marketdataHttp,
+            MeterRegistry meterRegistry,
+            ObjectMapper objectMapper,
+            PlatformTransactionManager transactionManager,
+            Clock wallClock) {
         this.config = config;
         this.cursorRepository = cursorRepository;
         this.ordersRepository = ordersRepository;
@@ -178,6 +220,7 @@ public class OmsPostgresProjector {
         this.marketdataHttp = marketdataHttp;
         this.meterRegistry = meterRegistry;
         this.objectMapper = objectMapper;
+        this.wallClock = wallClock;
         // Programmatic boundary: the replay loop is a non-Spring thread, so AOP-proxied
         // @Transactional on this bean's own methods would not be intercepted. A
         // TransactionTemplate guarantees orders.insert + persistAdmission + cursor.advance
@@ -501,6 +544,14 @@ public class OmsPostgresProjector {
         PendingControlEvent pending = toPendingControlEvent(ev);
         controlAdmission.persistAdmission(pending);
         cursorRepository.advance(PROJECTOR_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, newPosition);
+        // Phase 4j per-event histogram: cluster-admit -> projector-applied. Recorded after the last
+        // SQL operation in this fragment's transaction; the actual COMMIT happens when the wrapping
+        // TransactionTemplate lambda returns (sub-ms after this point in the fast-path). If any of
+        // the SQL above throws, the exception exits the lambda before this line and the Timer stays
+        // silent for the failed event.
+        long latencyMs = wallClock.millis() - ev.acceptedAtMillis();
+        OmsPipelineMetrics.recordClusterAdmitToProjector(
+                meterRegistry, PROJECTOR_ID, ev.side(), ev.timeInForceCode(), latencyMs);
     }
 
     /**
@@ -926,11 +977,10 @@ public class OmsPostgresProjector {
     }
 
     private static Instant appliedAtInstant(ExecutionAppliedEvent ev) {
-        // The cluster's clock unit is ClusterClock millis-by-default (no NANOSECONDS override on
-        // ConsensusModule.Context — see slice 2d note in OmsPostgresProjector#toPendingControlEvent).
-        // Using Instant.now() here matches that path and keeps terminal_at as a Postgres-write-time
-        // fact rather than a wire-time fact; the cluster's authoritative version + status are what
-        // actually drive correctness, and the time column is observability only.
+        // ev.appliedAtMillis() carries the cluster's epoch-millis timestamp (Phase 4j rename) but we
+        // intentionally use Instant.now() here so terminal_at reflects Postgres-write time, not the
+        // cluster apply time. The cluster's authoritative version + status are what drive correctness;
+        // this column is observability only.
         return Instant.now();
     }
 
@@ -950,10 +1000,9 @@ public class OmsPostgresProjector {
         // pre-trade risk decisions are unsafe?"). For a downstream projector, the cluster log is
         // the source of truth and replaying older events on restart is normal — a stale guard
         // would erroneously reject legitimate admissions during catch-up. Use Instant.now() so
-        // staleness measures projector-apply latency, which is by definition near-zero. We
-        // deliberately do NOT decode ev.acceptedAtNanos() here: the cluster's time unit is
-        // ClusterClock millis-by-default but the wire field is named *Nanos; correcting that is
-        // a separate, contained fix (see OmsAdmissionClusteredService and OmsClusterNodeBootstrap).
+        // staleness measures projector-apply latency, which is by definition near-zero.
+        // (Phase 4j renamed ev.acceptedAtNanos() to ev.acceptedAtMillis() to match the actual
+        // Aeron Cluster unit; we still ignore it here for the StaleJobGuard rationale above.)
         Instant now = Instant.now();
         return new PendingControlEvent(
                 "OrderAccepted",

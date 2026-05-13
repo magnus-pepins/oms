@@ -43,7 +43,7 @@ class FixNewOrderSingleBuilderTest {
         return new OrderAdmittedEvent(
                 ORDER_ID,
                 /* clientTimestampNanos = */ 0L,
-                /* acceptedAtNanos = */ 0L,
+                /* acceptedAtMillis = */ 0L,
                 qtyScaled,
                 priceScaledOrZero,
                 /* shardId = */ 0,

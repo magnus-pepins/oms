@@ -7,12 +7,17 @@
 #
 # What you get:
 # - HTTP `time_total` p50/p95/p99 from the curl loop (ingress-replica HTTP commit window).
-# - Per-role Prometheus deltas: ingress-replica timers (`oms.pipeline.ingress.accept` slice 1,
-#   `oms.cluster.client.commit_round_trip` slice 4c) + projector / fix-egress lag gauges
-#   (slice 4d) + cluster-node snapshot freshness (slice 4h).
+# - Per-role Prometheus deltas:
+#     - ingress-replica: `oms.pipeline.ingress.accept` (slice 1) and
+#       `oms.cluster.client.commit_round_trip` (slice 4c, percentile-histogram-enabled in slice 4j).
+#     - postgres-projector: `oms.pipeline.cluster_admit_to_projector` (slice 4j) +
+#       end-of-run `oms.projector.lag_seconds` gauge (slice 4d).
+#     - fix-egress: `oms.pipeline.cluster_admit_to_fix_nos` (slice 4j) +
+#       end-of-run `oms.fix_egress.lag_seconds` gauge (slice 4d).
+#     - cluster-node: `oms.cluster.snapshot.age_seconds` (slice 4h).
 # - A derived end-of-run "ingress→NOS upper bound" = commit_round_trip_p99 + fix_egress_lag_seconds.
-#   NOT a per-order histogram (the slice-3b-2 cross-JVM cut deleted that single-process sample).
-#   For HdrHistogram-grade cluster-path tail latency use `./gradlew clusterBench` (slice 4e).
+#   Still computed as a sanity cross-check against the slice-4j per-event histogram. For
+#   HdrHistogram-grade cluster-path tail latency use `./gradlew clusterBench` (slice 4e).
 #
 # Prereqs (Pop! server / Linux dev box; macOS works for HTTP-only side):
 #   curl, jq, python3
@@ -78,10 +83,14 @@ scrape() {
   curl -fsS "$url" -o "$out" 2>/dev/null || true
 }
 
-# --- baseline scrapes (ingress-replica is the only one we need pre AND post for
-# histogram deltas; projector / fix-egress / cluster-node we read at the end so the
-# gauge values reflect end-of-run state, which is what the SLO doc describes) ---
-scrape "$INGRESS_PROM_URL" "$SCRATCH/ingress_before.txt"
+# --- baseline scrapes ---
+# Slice 4j: projector + fix-egress now also publish per-event histograms
+# (`oms.pipeline.cluster_admit_to_projector`, `oms.pipeline.cluster_admit_to_fix_nos`),
+# so we capture pre-scrapes on those roles too. Cluster-node still only contributes
+# the end-of-run snapshot-freshness gauge.
+scrape "$INGRESS_PROM_URL"    "$SCRATCH/ingress_before.txt"
+scrape "$PROJECTOR_PROM_URL"  "$SCRATCH/projector_before.txt"
+scrape "$FIX_EGRESS_PROM_URL" "$SCRATCH/fix_egress_before.txt"
 
 ok=0
 created=0
@@ -141,7 +150,9 @@ echo ""
 python3 "$DELTA_PROM_PY" \
   --ingress-before "$SCRATCH/ingress_before.txt" \
   --ingress-after "$SCRATCH/ingress_after.txt" \
+  --projector-before "$SCRATCH/projector_before.txt" \
   --projector-after "$SCRATCH/projector_after.txt" \
+  --fix-egress-before "$SCRATCH/fix_egress_before.txt" \
   --fix-egress-after "$SCRATCH/fix_egress_after.txt" \
   --cluster-node-after "$SCRATCH/cluster_node_after.txt" \
   --created "$created" \

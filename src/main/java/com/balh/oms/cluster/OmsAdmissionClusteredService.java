@@ -460,7 +460,7 @@ public class OmsAdmissionClusteredService implements ClusteredService {
     // ------------------------------------------------------------------------
 
     private void applyAcceptOrder(
-            ClientSession session, long clusterTimestampNs, DirectBuffer buffer, int offset, int length) {
+            ClientSession session, long clusterTimestampMillis, DirectBuffer buffer, int offset, int length) {
         AcceptOrderCommand cmd = AcceptOrderCommand.decode(buffer, offset, length);
 
         IdempotencyKey key = new IdempotencyKey(cmd.accountId(), cmd.clientIdempotencyKey());
@@ -468,7 +468,7 @@ public class OmsAdmissionClusteredService implements ClusteredService {
         if (existing != null) {
             // Idempotent re-hit. The projector already saw the first emission; do not re-emit on the side
             // publication. Per-session egress still tells the originating client {duplicate=true}.
-            emitAccepted(session, cmd.correlationId(), existing, clusterTimestampNs, true);
+            emitAccepted(session, cmd.correlationId(), existing, clusterTimestampMillis, true);
             return;
         }
 
@@ -484,14 +484,14 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                 cmd.timeInForceCode(),
                 cmd.ledgerBalanceIdOrNull(),
                 /* version = */ 0,
-                clusterTimestampNs,
+                clusterTimestampMillis,
                 /* statusCode = */ STATUS_WORKING,
                 /* cumQtyScaled = */ 0L);
         idempotencyIndex.put(key, admitted);
         orderIndex.put(admitted.orderId(), admitted);
 
-        emitAdmitted(cmd, clusterTimestampNs, admitted.version());
-        emitAccepted(session, cmd.correlationId(), admitted, clusterTimestampNs, false);
+        emitAdmitted(cmd, clusterTimestampMillis, admitted.version());
+        emitAccepted(session, cmd.correlationId(), admitted, clusterTimestampMillis, false);
     }
 
     /**
@@ -523,7 +523,7 @@ public class OmsAdmissionClusteredService implements ClusteredService {
      * want a late venue retry to flap a terminal order back to a live state.
      */
     private void applyExecutionReport(
-            long clusterTimestampNs, DirectBuffer buffer, int offset, int length) {
+            long clusterTimestampMillis, DirectBuffer buffer, int offset, int length) {
         ApplyExecutionReportCommand cmd = ApplyExecutionReportCommand.decode(buffer, offset, length);
 
         // Wire-level (senderCompId, msgSeqNum) dedupe (slice 3d). Empty senderCompId opts out —
@@ -603,7 +603,7 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                 order.timeInForceCode(),
                 order.ledgerBalanceIdOrNull(),
                 newVersion,
-                order.acceptedAtNanos(),
+                order.acceptedAtMillis(),
                 newStatus,
                 newCumQty);
         orderIndex.put(mutated.orderId(), mutated);
@@ -626,11 +626,11 @@ public class OmsAdmissionClusteredService implements ClusteredService {
             seenSeqs.add(cmd.msgSeqNum());
         }
 
-        emitExecutionApplied(cmd, mutated, clusterTimestampNs);
+        emitExecutionApplied(cmd, mutated, clusterTimestampMillis);
     }
 
     private void emitExecutionApplied(
-            ApplyExecutionReportCommand cmd, AdmittedOrder mutated, long appliedAtNanos) {
+            ApplyExecutionReportCommand cmd, AdmittedOrder mutated, long appliedAtMillis) {
         if (eventsPublication == null) {
             return;
         }
@@ -640,7 +640,7 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                 cmd.lastQtyScaled(),
                 cmd.lastPxScaled(),
                 cmd.venueTsNanos(),
-                appliedAtNanos,
+                appliedAtMillis,
                 mutated.version(),
                 cmd.execTypeCode(),
                 mutated.statusCode(),
@@ -659,13 +659,13 @@ public class OmsAdmissionClusteredService implements ClusteredService {
         }
     }
 
-    private void emitAdmitted(AcceptOrderCommand cmd, long acceptedAtNanos, int version) {
+    private void emitAdmitted(AcceptOrderCommand cmd, long acceptedAtMillis, int version) {
         if (eventsPublication == null) {
             // Defensive: cluster is shutting down. Not expected on the apply path; the consensus module
             // halts message delivery before onTerminate, but we guard so a late frame does not NPE.
             return;
         }
-        OrderAdmittedEvent ev = OrderAdmittedEvent.fromAdmittedCommand(cmd, acceptedAtNanos, version);
+        OrderAdmittedEvent ev = OrderAdmittedEvent.fromAdmittedCommand(cmd, acceptedAtMillis, version);
         int len = ev.encode(eventsBuffer, 0);
         long pos;
         while ((pos = eventsPublication.offer(eventsBuffer, 0, len)) < 0L) {
@@ -682,10 +682,10 @@ public class OmsAdmissionClusteredService implements ClusteredService {
             ClientSession session,
             long correlationId,
             AdmittedOrder admitted,
-            long acceptedAtNanos,
+            long acceptedAtMillis,
             boolean duplicate) {
         OrderAcceptedEvent ev = new OrderAcceptedEvent(
-                correlationId, admitted.orderId(), admitted.version(), duplicate, acceptedAtNanos);
+                correlationId, admitted.orderId(), admitted.version(), duplicate, acceptedAtMillis);
         int len = ev.encode(egressBuffer, 0);
         long pos;
         while ((pos = session.offer(egressBuffer, 0, len)) < 0L) {
@@ -861,7 +861,7 @@ public class OmsAdmissionClusteredService implements ClusteredService {
             byte timeInForceCode,
             String ledgerBalanceIdOrNull,
             int version,
-            long acceptedAtNanos,
+            long acceptedAtMillis,
             byte statusCode,
             long cumQtyScaled) {
 
@@ -873,7 +873,7 @@ public class OmsAdmissionClusteredService implements ClusteredService {
             p += Long.BYTES;
             buffer.putInt(p, version);
             p += Integer.BYTES;
-            buffer.putLong(p, acceptedAtNanos);
+            buffer.putLong(p, acceptedAtMillis);
             p += Long.BYTES;
             buffer.putLong(p, quantityScaled);
             p += Long.BYTES;
@@ -903,7 +903,7 @@ public class OmsAdmissionClusteredService implements ClusteredService {
             p += Long.BYTES;
             int version = buffer.getInt(p);
             p += Integer.BYTES;
-            long acceptedAtNanos = buffer.getLong(p);
+            long acceptedAtMillis = buffer.getLong(p);
             p += Long.BYTES;
             long quantityScaled = buffer.getLong(p);
             p += Long.BYTES;
@@ -939,14 +939,14 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                     timeInForceCode,
                     ledgerBalanceId,
                     version,
-                    acceptedAtNanos,
+                    acceptedAtMillis,
                     statusCode,
                     cumQtyScaled);
         }
 
         int encodedLength() {
             int p = 0;
-            // 6 longs (msb, lsb, acceptedAtNanos, quantityScaled, limitPriceScaledOrZero, cumQtyScaled).
+            // 6 longs (msb, lsb, acceptedAtMillis, quantityScaled, limitPriceScaledOrZero, cumQtyScaled).
             p += Long.BYTES * 6;
             // 1 int (version).
             p += Integer.BYTES;

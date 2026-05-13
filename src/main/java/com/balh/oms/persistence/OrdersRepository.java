@@ -181,7 +181,12 @@ public class OrdersRepository {
                 : BigDecimal.valueOf(ev.limitPriceScaledOrZero())
                         .divide(BigDecimal.valueOf(AcceptOrderCommand.PRICE_SCALE), 10, RoundingMode.UNNECESSARY);
         Instant receivedAt = nanosToInstant(ev.clientTimestampNanos());
-        Instant acceptedAt = nanosToInstant(ev.acceptedAtNanos());
+        // ev.acceptedAtMillis() is the Aeron Cluster timestamp (epoch millis; ConsensusModule.Context
+        // default TimeUnit.MILLISECONDS — verified in OmsClusterNodeBootstrap.buildConsensusModuleContext
+        // which does not override timeUnit). Earlier code mistakenly fed it through nanosToInstant, which
+        // collapsed accepted_at to year 1970. Phase 4j slice closes the OrderAdmittedEvent rename and the
+        // matching arithmetic fix in one diff.
+        Instant acceptedAt = Instant.ofEpochMilli(ev.acceptedAtMillis());
         UUID accountId = UUID.fromString(ev.accountId());
         return new MapSqlParameterSource()
                 .addValue("id", ev.orderId())

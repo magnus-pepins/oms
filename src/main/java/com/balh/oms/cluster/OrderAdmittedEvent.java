@@ -25,8 +25,11 @@ import java.util.UUID;
  * <pre>
  *   offset 16  long  orderIdMsb
  *   offset 24  long  orderIdLsb
- *   offset 32  long  clientTimestampNanos        (received_at)
- *   offset 40  long  acceptedAtNanos              (cluster timestamp, accepted_at)
+ *   offset 32  long  clientTimestampNanos        (received_at; epoch nanos, ingress wall-time)
+ *   offset 40  long  acceptedAtMillis             (accepted_at; cluster timestamp in epoch millis,
+ *                                                   per Aeron Cluster {@code ConsensusModule.Context.timeUnit()}
+ *                                                   default {@code TimeUnit.MILLISECONDS}; not subtractable
+ *                                                   from {@code clientTimestampNanos} without unit conversion)
  *   offset 48  long  quantityScaled               (1e9 fixed-point)
  *   offset 56  long  limitPriceScaledOrZero       (1e6 fixed-point; 0 = market)
  *   offset 64  int   shardId
@@ -50,7 +53,7 @@ import java.util.UUID;
 public record OrderAdmittedEvent(
         UUID orderId,
         long clientTimestampNanos,
-        long acceptedAtNanos,
+        long acceptedAtMillis,
         long quantityScaled,
         long limitPriceScaledOrZero,
         int shardId,
@@ -75,11 +78,11 @@ public record OrderAdmittedEvent(
      * Convenience: build an event from an admitted command + the cluster's accepted-at timestamp.
      * Lives here (not in the service) so test code and the codec round-trip share one source of mapping.
      */
-    public static OrderAdmittedEvent fromAdmittedCommand(AcceptOrderCommand cmd, long acceptedAtNanos, int version) {
+    public static OrderAdmittedEvent fromAdmittedCommand(AcceptOrderCommand cmd, long acceptedAtMillis, int version) {
         return new OrderAdmittedEvent(
                 cmd.orderId(),
                 cmd.clientTimestampNanos(),
-                acceptedAtNanos,
+                acceptedAtMillis,
                 cmd.quantityScaled(),
                 cmd.limitPriceScaledOrZero(),
                 cmd.shardId(),
@@ -106,7 +109,7 @@ public record OrderAdmittedEvent(
         p += Long.BYTES;
         buffer.putLong(p, clientTimestampNanos);
         p += Long.BYTES;
-        buffer.putLong(p, acceptedAtNanos);
+        buffer.putLong(p, acceptedAtMillis);
         p += Long.BYTES;
         buffer.putLong(p, quantityScaled);
         p += Long.BYTES;
@@ -158,7 +161,7 @@ public record OrderAdmittedEvent(
         p += Long.BYTES;
         long clientTimestampNanos = buffer.getLong(p);
         p += Long.BYTES;
-        long acceptedAtNanos = buffer.getLong(p);
+        long acceptedAtMillis = buffer.getLong(p);
         p += Long.BYTES;
         long quantityScaled = buffer.getLong(p);
         p += Long.BYTES;
@@ -189,7 +192,7 @@ public record OrderAdmittedEvent(
         return new OrderAdmittedEvent(
                 new UUID(msb, lsb),
                 clientTimestampNanos,
-                acceptedAtNanos,
+                acceptedAtMillis,
                 quantityScaled,
                 limitPriceScaledOrZero,
                 shardId,

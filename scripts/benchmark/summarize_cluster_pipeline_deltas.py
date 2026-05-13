@@ -10,13 +10,20 @@ Inputs:
 - A `created` count from the shoot loop (HTTP 201s) so per-request averages are honest.
 
 Outputs:
-- Histogram-based p50/p99 in milliseconds for ingress-replica timers (Δ count and sum across the run).
+- Histogram-based p50/p99 (ms) for ingress-replica timers (`oms.pipeline.ingress.accept`,
+  `oms.cluster.client.commit_round_trip` — the latter publishes percentile histograms since
+  slice 4j).
+- Slice 4j: histogram-based p50/p99 (ms) for the new per-event pipeline timers
+  `oms.pipeline.cluster_admit_to_projector` (postgres-projector JVM) and
+  `oms.pipeline.cluster_admit_to_fix_nos` (fix-egress JVM). Both timers measure
+  `now_ms - OrderAdmittedEvent.acceptedAtMillis()` after the consumer finished applying the
+  event, so they expose the actual cross-JVM admit-to-write / admit-to-NOS distribution.
 - Gauge values from projector + fix-egress at end-of-run (`oms.projector.lag_seconds`,
   `oms.fix_egress.lag_seconds`); flags sentinel `-1.0` separately ("publisher has no row yet").
 - Snapshot freshness sanity from cluster-node `oms.cluster.snapshot.age_seconds` (slice 4h).
 - A derived "ingress→NOS upper bound" = ingress-replica `oms.cluster.client.commit_round_trip` p99
-  + end-of-run `oms.fix_egress.lag_seconds` (NOT a per-order histogram; an honest upper-bound proxy
-  for the cross-JVM wall clock that lost its single-process sample point in slice 3b-2).
+  + end-of-run `oms.fix_egress.lag_seconds`. Kept as a sanity cross-check against the new
+  per-event histogram; the slice-4j histogram is the primary signal.
 
 Per ecosystem `config-and-limits` rule: thresholds and metric names live as named module-level
 constants below.
@@ -35,9 +42,28 @@ from typing import Dict, List, Optional, Tuple
 
 INGRESS_TIMERS_MS: List[Tuple[str, str]] = [
     ("oms_pipeline_ingress_accept", "Ingress: Postgres accept tx (commit)"),
-    ("oms_cluster_client_commit_round_trip", "Cluster client: commit round-trip (slice 4c)"),
+    (
+        "oms_cluster_client_commit_round_trip",
+        "Cluster client: commit round-trip (slice 4c, percentile-histogram-enabled in slice 4j)",
+    ),
 ]
 """Ingress-replica histogram timers (Prometheus base names; `_seconds_*` suffixes are appended)."""
+
+PROJECTOR_TIMERS_MS: List[Tuple[str, str]] = [
+    (
+        "oms_pipeline_cluster_admit_to_projector",
+        "Projector: cluster admit \u2192 orders UPSERT + control admission committed (slice 4j)",
+    ),
+]
+"""Postgres-projector histogram timers introduced in slice 4j."""
+
+FIX_EGRESS_TIMERS_MS: List[Tuple[str, str]] = [
+    (
+        "oms_pipeline_cluster_admit_to_fix_nos",
+        "FIX egress: cluster admit \u2192 NewOrderSingle on the wire (slice 4j)",
+    ),
+]
+"""FIX-egress histogram timers introduced in slice 4j."""
 
 PROJECTOR_GAUGES: List[Tuple[str, str]] = [
     ("oms_projector_lag_seconds", "Projector: cursor lag (slice 4d)"),
@@ -218,12 +244,16 @@ def _summarise_timers(
         p99 = _quantile_from_delta_buckets(before_b, after_b, P99_QUANTILE)
         count_str = f"{int(d_count)}" if d_count > 0 else "—"
         mean_str = "—" if d_mean_ms is None else f"{d_mean_ms:.3f} ms"
-        # Distinguish "no buckets emitted by this timer" from "buckets present but zero increments":
-        # the former means percentile histograms were never enabled on the meter (e.g. slice 4c's
-        # commit_round_trip ships sum/count only — use clusterBench for HdrHistogram tail latency).
+        # All timers we summarise here ship percentile histograms (slice 4j enabled them on
+        # commit_round_trip). If buckets are still missing, the producer JVM hasn't been
+        # restarted with the new code yet — flag that explicitly so the operator knows it's a
+        # deploy-state artifact, not a permanent "use clusterBench" caveat.
         no_buckets_emitted = not after_b
         if no_buckets_emitted and (p50 is None and p99 is None):
-            quantile_part = "p50/p99 unavailable (no histogram buckets — sum/count only; use clusterBench)"
+            quantile_part = (
+                "p50/p99 unavailable (no histogram buckets in scrape — JVM may pre-date slice 4j;"
+                " restart it or use clusterBench for HdrHistogram tail latency)"
+            )
         else:
             quantile_part = f"p50={_fmt_ms_or_dash(p50)}, p99={_fmt_ms_or_dash(p99)}"
         print(
@@ -272,7 +302,9 @@ def main(argv: List[str]) -> int:
     )
     parser.add_argument("--ingress-before", type=Path)
     parser.add_argument("--ingress-after", type=Path)
+    parser.add_argument("--projector-before", type=Path)
     parser.add_argument("--projector-after", type=Path)
+    parser.add_argument("--fix-egress-before", type=Path)
     parser.add_argument("--fix-egress-after", type=Path)
     parser.add_argument("--cluster-node-after", type=Path)
     parser.add_argument(
@@ -291,7 +323,9 @@ def main(argv: List[str]) -> int:
 
     ingress_before = _read_or_none(args.ingress_before)
     ingress_after = _read_or_none(args.ingress_after)
+    projector_before = _read_or_none(args.projector_before)
     projector_after = _read_or_none(args.projector_after)
+    fix_before = _read_or_none(args.fix_egress_before)
     fix_after = _read_or_none(args.fix_egress_after)
     cluster_after = _read_or_none(args.cluster_node_after)
 
@@ -300,6 +334,22 @@ def main(argv: List[str]) -> int:
         INGRESS_TIMERS_MS,
         ingress_before,
         ingress_after,
+    )
+    print()
+
+    _summarise_timers(
+        "Postgres-projector timer (Δ between pre/post scrape, slice 4j)",
+        PROJECTOR_TIMERS_MS,
+        projector_before,
+        projector_after,
+    )
+    print()
+
+    _summarise_timers(
+        "FIX-egress timer (Δ between pre/post scrape, slice 4j)",
+        FIX_EGRESS_TIMERS_MS,
+        fix_before,
+        fix_after,
     )
     print()
 
@@ -333,7 +383,7 @@ def main(argv: List[str]) -> int:
         if crt_p99 is not None and fix_lag_real is not None:
             upper_bound_ms = (crt_p99 + fix_lag_real) * MS_PER_S
             print(
-                "Derived (NOT a per-order histogram — an honest upper-bound proxy):"
+                "Derived (sanity cross-check against the slice-4j per-event histogram):"
             )
             print(
                 f"  ingress\u2192NOS upper bound \u2248 commit_round_trip_p99 + fix_egress_lag_seconds"
@@ -343,13 +393,10 @@ def main(argv: List[str]) -> int:
                 f" = {upper_bound_ms:.1f} ms ({upper_bound_ms / MS_PER_S:.3f} s)"
             )
             print(
-                "  (replaces the deleted slice-3b-2 cross-JVM oms.fix.ingress_to_nos histogram;"
+                "  Slice 4j: prefer `oms.pipeline.cluster_admit_to_fix_nos` p50/p99 above as the"
             )
             print(
-                "   end-of-run lag is a snapshot, not a distribution — re-bench with"
-            )
-            print(
-                "   `clusterBench` for HdrHistogram-grade tail latency on the cluster path)"
+                "  primary admit\u2192NOS signal; this proxy is kept as a no-NTP-alignment-needed cross-check."
             )
         else:
             print(

@@ -159,6 +159,9 @@ class OmsFixEgressBrokerIT extends AbstractPostgresIntegrationTest {
     @Autowired
     FixOutboundSessionSend fixOutboundSessionSend;
 
+    @Autowired
+    io.micrometer.core.instrument.MeterRegistry meterRegistry;
+
     private OmsClusterIngressClient testIngressClient;
 
     @BeforeEach
@@ -254,7 +257,12 @@ class OmsFixEgressBrokerIT extends AbstractPostgresIntegrationTest {
         //    singleton stay alive). The new instance reads the cursor row that scenario 2 wrote
         //    and resumes replay from cursorAfterFirstSend.
         OmsFixEgressService restarted =
-                new OmsFixEgressService(omsConfig, cursorRepository, newOrderSingleBuilder, fixOutboundSessionSend);
+                new OmsFixEgressService(
+                        omsConfig,
+                        cursorRepository,
+                        meterRegistry,
+                        newOrderSingleBuilder,
+                        fixOutboundSessionSend);
         restarted.init();
         try {
             // Quiet period: let the restarted egress open replay subscription and confirm no

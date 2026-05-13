@@ -2,6 +2,7 @@ package com.balh.oms.cluster;
 
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.config.OmsProfiles;
+import com.balh.oms.observability.metrics.OmsPipelineLatencyBounds;
 import io.aeron.cluster.client.AeronCluster;
 import io.aeron.cluster.client.EgressListener;
 import io.aeron.cluster.codecs.EventCode;
@@ -247,6 +248,14 @@ public class OmsClusterIngressClient {
                                     "Wall-clock time spent inside OmsClusterIngressClient submit methods waiting on the cluster"
                                             + " (offer + egress reply for accept_order; offer + back-pressure park for apply_execution_report).")
                             .tags(TAG_COMMAND, command, TAG_OUTCOME, o.lowerName())
+                            // Phase 4j: enable bucket histogram so summarize_cluster_pipeline_deltas.py
+                            // can extract p50/p99 from /actuator/prometheus the same way as the other
+                            // pipeline timers. Without this, only count + sum surface, which is what
+                            // surfaced as the "no buckets for commit_round_trip" caveat in the
+                            // summarize script.
+                            .publishPercentileHistogram()
+                            .minimumExpectedValue(Duration.ofMillis(OmsPipelineLatencyBounds.MICROMETER_MIN_EXPECTED_MS))
+                            .maximumExpectedValue(Duration.ofMillis(OmsPipelineLatencyBounds.MICROMETER_MAX_EXPECTED_MS))
                             .register(registry));
         }
         return timers;

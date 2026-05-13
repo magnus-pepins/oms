@@ -6,10 +6,12 @@ import com.balh.oms.config.OmsConfig;
 import com.balh.oms.config.OmsProfiles;
 import com.balh.oms.fix.FixNewOrderSingleBuilder;
 import com.balh.oms.fix.FixOutboundSessionSend;
+import com.balh.oms.observability.metrics.OmsPipelineMetrics;
 import io.aeron.Aeron;
 import io.aeron.Subscription;
 import io.aeron.archive.client.AeronArchive;
 import io.aeron.logbuffer.FragmentHandler;
+import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import org.agrona.CloseHelper;
@@ -22,6 +24,7 @@ import org.springframework.stereotype.Component;
 import quickfix.SessionNotFound;
 import quickfix.fix44.NewOrderSingle;
 
+import java.time.Clock;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
@@ -128,18 +131,40 @@ public class OmsFixEgressService {
     private final OmsFixEgressCursorRepository cursorRepository;
     private final FixNewOrderSingleBuilder newOrderSingleBuilder;
     private final FixOutboundSessionSend fixOutboundSessionSend;
+    private final MeterRegistry meterRegistry;
+    private final Clock wallClock;
 
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicReference<Long> lastAppliedPosition = new AtomicReference<>(0L);
     private Thread replayThread;
 
+    @Autowired
     public OmsFixEgressService(
             OmsConfig config,
             OmsFixEgressCursorRepository cursorRepository,
+            MeterRegistry meterRegistry,
             @Autowired(required = false) FixNewOrderSingleBuilder newOrderSingleBuilder,
             @Autowired(required = false) FixOutboundSessionSend fixOutboundSessionSend) {
+        this(config, cursorRepository, meterRegistry, Clock.systemUTC(), newOrderSingleBuilder, fixOutboundSessionSend);
+    }
+
+    /**
+     * Visible for tests: inject a deterministic {@link Clock} so unit tests can pin
+     * {@code System.currentTimeMillis()}-equivalent values when asserting on the per-event
+     * admit-to-NOS Timer. Production wiring goes through the public constructor with
+     * {@code Clock.systemUTC()}.
+     */
+    OmsFixEgressService(
+            OmsConfig config,
+            OmsFixEgressCursorRepository cursorRepository,
+            MeterRegistry meterRegistry,
+            Clock wallClock,
+            FixNewOrderSingleBuilder newOrderSingleBuilder,
+            FixOutboundSessionSend fixOutboundSessionSend) {
         this.config = config;
         this.cursorRepository = cursorRepository;
+        this.meterRegistry = meterRegistry;
+        this.wallClock = wallClock;
         this.newOrderSingleBuilder = newOrderSingleBuilder;
         this.fixOutboundSessionSend = fixOutboundSessionSend;
     }
@@ -453,6 +478,7 @@ public class OmsFixEgressService {
      *     {@code false} if the apply was aborted (shutdown during session-not-ready wait).
      */
     boolean applyAdmittedEvent(OrderAdmittedEvent ev, long newPosition) {
+        boolean fixSendObserved = false;
         if (newOrderSingleBuilder != null && fixOutboundSessionSend != null) {
             NewOrderSingle nos = newOrderSingleBuilder.build(ev);
             long parkNanos = config.getCluster().getFixEgress().getSessionNotReadyParkNanos();
@@ -463,6 +489,7 @@ public class OmsFixEgressService {
                 }
                 try {
                     fixOutboundSessionSend.send(nos);
+                    fixSendObserved = true;
                     break;
                 } catch (SessionNotFound e) {
                     log.warn(
@@ -477,6 +504,14 @@ public class OmsFixEgressService {
                 // un-advanced so the next start replays this fragment.
                 return false;
             }
+        }
+        if (fixSendObserved) {
+            // Phase 4j per-event histogram: record cluster-admit -> NOS-on-wire only when the FIX
+            // send actually happened. Cursor-only context-IT mode (FIX beans absent) keeps the
+            // Timer silent, matching its "did the NOS leave?" semantic.
+            long latencyMs = wallClock.millis() - ev.acceptedAtMillis();
+            OmsPipelineMetrics.recordClusterAdmitToFixNos(
+                    meterRegistry, EGRESS_ID, ev.side(), ev.timeInForceCode(), latencyMs);
         }
         cursorRepository.advance(EGRESS_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, newPosition);
         return true;

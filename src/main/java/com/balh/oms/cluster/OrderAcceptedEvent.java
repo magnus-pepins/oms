@@ -21,7 +21,9 @@ import java.util.UUID;
  *   offset 32  int   version           (orders.version after CAS)
  *   offset 36  byte  duplicate          (0 == fresh, 1 == idempotent re-hit)
  *   offset 37  byte  reserved (3 bytes padding to align)
- *   offset 40  long  acceptedAtNanos    (cluster-supplied wall time)
+ *   offset 40  long  acceptedAtMillis   (cluster-supplied wall time, epoch millis;
+ *                                          per Aeron Cluster {@code ConsensusModule.Context.timeUnit()}
+ *                                          default {@code TimeUnit.MILLISECONDS})
  * </pre>
  */
 public record OrderAcceptedEvent(
@@ -29,7 +31,7 @@ public record OrderAcceptedEvent(
         UUID orderId,
         int version,
         boolean duplicate,
-        long acceptedAtNanos) {
+        long acceptedAtMillis) {
 
     public OrderAcceptedEvent {
         Objects.requireNonNull(orderId, "orderId");
@@ -55,7 +57,7 @@ public record OrderAcceptedEvent(
         buffer.putByte(p++, (byte) 0);
         buffer.putByte(p++, (byte) 0);
         buffer.putByte(p++, (byte) 0);
-        buffer.putLong(p, acceptedAtNanos);
+        buffer.putLong(p, acceptedAtMillis);
         p += Long.BYTES;
 
         return p - offset;
@@ -76,7 +78,7 @@ public record OrderAcceptedEvent(
         p += Integer.BYTES;
         boolean duplicate = buffer.getByte(p) == 1;
         p += 4;
-        long acceptedAtNanos = buffer.getLong(p);
-        return new OrderAcceptedEvent(correlationId, new UUID(msb, lsb), version, duplicate, acceptedAtNanos);
+        long acceptedAtMillis = buffer.getLong(p);
+        return new OrderAcceptedEvent(correlationId, new UUID(msb, lsb), version, duplicate, acceptedAtMillis);
     }
 }

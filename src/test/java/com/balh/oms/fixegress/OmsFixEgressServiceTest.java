@@ -1,0 +1,183 @@
+package com.balh.oms.fixegress;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+import com.balh.oms.cluster.AcceptOrderCommand;
+import com.balh.oms.cluster.OmsClusterWireFormat;
+import com.balh.oms.cluster.OrderAdmittedEvent;
+import com.balh.oms.config.OmsConfig;
+import com.balh.oms.fix.FixNewOrderSingleBuilder;
+import com.balh.oms.fix.FixOutboundSessionSend;
+import com.balh.oms.observability.metrics.OmsPipelineMeterNames;
+import com.balh.oms.observability.metrics.OmsPipelineMetrics;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Tags;
+import io.micrometer.core.instrument.Timer;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+import quickfix.fix44.NewOrderSingle;
+
+import java.lang.reflect.Field;
+import java.time.Clock;
+import java.time.Instant;
+import java.time.ZoneOffset;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+/**
+ * Unit-level coverage for {@link OmsFixEgressService#applyAdmittedEvent}: the cursor advance
+ * (slice 3b-1) and the Phase 4j cluster-admit-to-NOS Timer recorded after a successful FIX send.
+ *
+ * <p>Stubs the FIX builder + send so we never stand up QuickFIX, and pins {@link Clock} so the
+ * Timer's recorded duration is exactly {@code now - ev.acceptedAtMillis()} without flake.
+ */
+@ExtendWith(MockitoExtension.class)
+class OmsFixEgressServiceTest {
+
+    private static final long ACCEPTED_AT_MS = 1_700_000_000_000L;
+    private static final long NOW_MS = ACCEPTED_AT_MS + 17L;
+    private static final long FRAGMENT_POSITION = 4096L;
+
+    @Mock private OmsFixEgressCursorRepository cursorRepository;
+    @Mock private FixNewOrderSingleBuilder builder;
+    @Mock private FixOutboundSessionSend send;
+
+    private MeterRegistry meterRegistry;
+    private OmsConfig config;
+    private OmsFixEgressService service;
+
+    @BeforeEach
+    void setUp() {
+        meterRegistry = new SimpleMeterRegistry();
+        config = new OmsConfig();
+        Clock pinned = Clock.fixed(Instant.ofEpochMilli(NOW_MS), ZoneOffset.UTC);
+        service = new OmsFixEgressService(
+                config, cursorRepository, meterRegistry, pinned, builder, send);
+        // applyAdmittedEvent's send loop checks running.get(); init() sets it true via PostConstruct,
+        // but we skip init() so the replay thread doesn't spin up. Flip the flag directly so the
+        // synchronous send-and-record path under test executes the way it would in production.
+        flipRunning(service, true);
+    }
+
+    private static void flipRunning(OmsFixEgressService svc, boolean value) {
+        try {
+            Field f = OmsFixEgressService.class.getDeclaredField("running");
+            f.setAccessible(true);
+            ((AtomicBoolean) f.get(svc)).set(value);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("failed to flip running flag for test", e);
+        }
+    }
+
+    @Test
+    void applyAdmittedEvent_recordsAdmitToFixNosTimer_andAdvancesCursor() throws Exception {
+        OrderAdmittedEvent ev = sampleAdmitted(AcceptOrderCommand.SIDE_BUY, AcceptOrderCommand.TIF_DAY);
+        NewOrderSingle nos = new NewOrderSingle();
+        when(builder.build(ev)).thenReturn(nos);
+        when(send.hasActiveSession()).thenReturn(true);
+
+        boolean advanced = service.applyAdmittedEvent(ev, FRAGMENT_POSITION);
+
+        assertThat(advanced).isTrue();
+        verify(send).send(nos);
+        verify(cursorRepository)
+                .advance(OmsFixEgressService.EGRESS_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, FRAGMENT_POSITION);
+
+        Timer timer = meterRegistry.find(OmsPipelineMeterNames.CLUSTER_ADMIT_TO_FIX_NOS)
+                .tags(Tags.of(
+                        OmsPipelineMetrics.TAG_EGRESS_ID, OmsFixEgressService.EGRESS_ID,
+                        OmsPipelineMetrics.TAG_SIDE, "buy",
+                        OmsPipelineMetrics.TAG_TIF, "day"))
+                .timer();
+        assertThat(timer)
+                .as("admit-to-fix-nos Timer registered with expected (egress, side, tif) tags")
+                .isNotNull();
+        assertThat(timer.count()).isEqualTo(1L);
+        assertThat(timer.totalTime(java.util.concurrent.TimeUnit.MILLISECONDS))
+                .isEqualTo((double) (NOW_MS - ACCEPTED_AT_MS));
+    }
+
+    @Test
+    void applyAdmittedEvent_negativeLatencyClampedToZero() throws Exception {
+        // Wall-clock now < admit timestamp simulates rare NTP slew backwards. Timer must still
+        // record a non-negative duration; otherwise Micrometer rejects the sample.
+        long acceptedInTheFuture = NOW_MS + 5_000L;
+        OrderAdmittedEvent ev = new OrderAdmittedEvent(
+                UUID.randomUUID(),
+                /* clientTimestampNanos = */ 0L,
+                /* acceptedAtMillis = */ acceptedInTheFuture,
+                /* quantityScaled = */ 1L,
+                /* limitPriceScaledOrZero = */ 0L,
+                /* shardId = */ 0,
+                /* version = */ 0,
+                AcceptOrderCommand.SIDE_SELL,
+                AcceptOrderCommand.TIF_IOC,
+                "acct",
+                "idem",
+                "hash",
+                "AAPL",
+                /* ledgerBalanceIdOrNull = */ null);
+        when(builder.build(ev)).thenReturn(new NewOrderSingle());
+        when(send.hasActiveSession()).thenReturn(true);
+
+        boolean advanced = service.applyAdmittedEvent(ev, FRAGMENT_POSITION);
+
+        assertThat(advanced).isTrue();
+        Timer timer = meterRegistry.find(OmsPipelineMeterNames.CLUSTER_ADMIT_TO_FIX_NOS)
+                .tags(Tags.of(
+                        OmsPipelineMetrics.TAG_EGRESS_ID, OmsFixEgressService.EGRESS_ID,
+                        OmsPipelineMetrics.TAG_SIDE, "sell",
+                        OmsPipelineMetrics.TAG_TIF, "ioc"))
+                .timer();
+        assertThat(timer).isNotNull();
+        assertThat(timer.count()).isEqualTo(1L);
+        assertThat(timer.totalTime(java.util.concurrent.TimeUnit.MILLISECONDS))
+                .as("Math.max(0, ...) clamp keeps NTP-slew samples at 0 ms instead of negative")
+                .isEqualTo(0.0);
+    }
+
+    @Test
+    void applyAdmittedEvent_cursorOnlyMode_doesNotRecordFixNosTimer() {
+        // Drop the FIX beans (context-only IT shape) — service falls back to cursor-only behaviour
+        // and the per-event Timer must stay silent because no NOS was actually emitted.
+        Clock pinned = Clock.fixed(Instant.ofEpochMilli(NOW_MS), ZoneOffset.UTC);
+        OmsFixEgressService cursorOnly = new OmsFixEgressService(
+                config, cursorRepository, meterRegistry, pinned, /* builder = */ null, /* send = */ null);
+        flipRunning(cursorOnly, true);
+
+        OrderAdmittedEvent ev = sampleAdmitted(AcceptOrderCommand.SIDE_BUY, AcceptOrderCommand.TIF_DAY);
+        boolean advanced = cursorOnly.applyAdmittedEvent(ev, FRAGMENT_POSITION);
+
+        assertThat(advanced).isTrue();
+        verify(cursorRepository)
+                .advance(OmsFixEgressService.EGRESS_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, FRAGMENT_POSITION);
+        assertThat(meterRegistry.find(OmsPipelineMeterNames.CLUSTER_ADMIT_TO_FIX_NOS).timer())
+                .as("cursor-only mode emits no NOS — admit-to-fix-nos Timer must stay unregistered")
+                .isNull();
+    }
+
+    private static OrderAdmittedEvent sampleAdmitted(byte side, byte tif) {
+        return new OrderAdmittedEvent(
+                UUID.randomUUID(),
+                /* clientTimestampNanos = */ 0L,
+                /* acceptedAtMillis = */ ACCEPTED_AT_MS,
+                /* quantityScaled = */ 1L,
+                /* limitPriceScaledOrZero = */ 0L,
+                /* shardId = */ 0,
+                /* version = */ 0,
+                side,
+                tif,
+                "acct",
+                "idem",
+                "hash",
+                "AAPL",
+                /* ledgerBalanceIdOrNull = */ null);
+    }
+}

@@ -32,7 +32,9 @@ import java.util.UUID;
  *   offset 40  long  lastQtyScaled              (1e9 fixed-point; 0 for non-trade)
  *   offset 48  long  lastPxScaled               (1e6 fixed-point; 0 for non-trade or no price)
  *   offset 56  long  venueTsNanos               (echoed from the command)
- *   offset 64  long  appliedAtNanos             (cluster timestamp at apply)
+ *   offset 64  long  appliedAtMillis            (cluster timestamp at apply, epoch millis;
+ *                                                  Aeron Cluster {@code ConsensusModule.Context.timeUnit()}
+ *                                                  default {@code TimeUnit.MILLISECONDS})
  *   offset 72  int   newVersion                 (post-apply order.version)
  *   offset 76  byte  execTypeCode               (echoed; 0 == TRADE, 1 == CANCEL, 2 == VENUE_REJECT)
  *   offset 77  byte  newStatusCode              (post-apply order.status; OrderStatus ordinal)
@@ -55,7 +57,7 @@ public record ExecutionAppliedEvent(
         long lastQtyScaled,
         long lastPxScaled,
         long venueTsNanos,
-        long appliedAtNanos,
+        long appliedAtMillis,
         int newVersion,
         byte execTypeCode,
         byte newStatusCode,
@@ -94,7 +96,7 @@ public record ExecutionAppliedEvent(
         p += Long.BYTES;
         buffer.putLong(p, venueTsNanos);
         p += Long.BYTES;
-        buffer.putLong(p, appliedAtNanos);
+        buffer.putLong(p, appliedAtMillis);
         p += Long.BYTES;
         buffer.putInt(p, newVersion);
         p += Integer.BYTES;
@@ -143,7 +145,7 @@ public record ExecutionAppliedEvent(
         p += Long.BYTES;
         long venueTsNanos = buffer.getLong(p);
         p += Long.BYTES;
-        long appliedAtNanos = buffer.getLong(p);
+        long appliedAtMillis = buffer.getLong(p);
         p += Long.BYTES;
         int newVersion = buffer.getInt(p);
         p += Integer.BYTES;
@@ -166,7 +168,7 @@ public record ExecutionAppliedEvent(
                 lastQtyScaled,
                 lastPxScaled,
                 venueTsNanos,
-                appliedAtNanos,
+                appliedAtMillis,
                 newVersion,
                 execTypeCode,
                 newStatusCode,

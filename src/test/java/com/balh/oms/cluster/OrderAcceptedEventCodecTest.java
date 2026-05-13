@@ -24,7 +24,7 @@ class OrderAcceptedEventCodecTest {
                 UUID.fromString("00000000-0000-4000-8000-000000000123"),
                 /* version = */ 0,
                 /* duplicate = */ false,
-                /* acceptedAtNanos = */ 1_700_000_000_111_222_333L);
+                /* acceptedAtMillis = */ 1_700_000_000_111L);
 
         ExpandableArrayBuffer buf = new ExpandableArrayBuffer(ENCODE_BUFFER_CAPACITY);
         int written = original.encode(buf, DECODE_OFFSET);

@@ -435,6 +435,30 @@ tasks.register<JavaExec>("clusterBench") {
 }
 
 /**
+ * Phase 4 slice 4k (ingress burst tool): JDK 21 HttpClient + virtual threads firing
+ * concurrent {@code POST /internal/v1/orders} requests at a running OMS ingress-replica.
+ * Records HTTP RTT into HdrHistogram and prints p50/p95/p99/p999. Pair with
+ * {@code scripts/benchmark/burst-ingress-orders.sh} for pre/post Prometheus scrapes.
+ * Env: OMS_INTERNAL_API_KEY (required), OMS_BURST_URL, OMS_BURST_TOTAL,
+ * OMS_BURST_CONCURRENCY, OMS_BURST_RPS_CAP, OMS_BURST_ACCOUNT_POOL, OMS_BURST_INSTRUMENT,
+ * OMS_BURST_QUANTITY, OMS_BURST_LIMIT_PRICE, OMS_BURST_REQUEST_TIMEOUT_S, OMS_BURST_WARMUP.
+ * See system-documentation/plans/oms-clean-latency-story.plan.md § Slice 4k.
+ */
+tasks.register<JavaExec>("bootRunBurst") {
+    group = "verification"
+    description =
+        "Burst POST /internal/v1/orders against a running ingress-replica (slice 4k)." +
+                " Env: OMS_INTERNAL_API_KEY (required), OMS_BURST_URL, OMS_BURST_TOTAL," +
+                " OMS_BURST_CONCURRENCY, OMS_BURST_RPS_CAP, OMS_BURST_ACCOUNT_POOL," +
+                " OMS_BURST_INSTRUMENT, OMS_BURST_QUANTITY, OMS_BURST_LIMIT_PRICE," +
+                " OMS_BURST_REQUEST_TIMEOUT_S, OMS_BURST_WARMUP."
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.balh.oms.ingress.bench.IngressBurstMain")
+    jvmArgs(lowLatencyJvmModuleOpens)
+    standardInput = System.`in`
+}
+
+/**
  * Micrometer's prometheus registry pins {@code io.prometheus:prometheus-metrics-*} 1.2.x while the OTel
  * Prometheus exporter brings 1.3.x textformats — mixed jars cause {@code NoSuchMethodError} at startup.
  */

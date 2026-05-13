@@ -16,19 +16,46 @@ production-shaped Linux JVM **without** waiting for k8s.
 |---|---|---|
 | Ingress-replica HTTP commit latency (client-side) | `curl time_total` p50/p95/p99 | shoot-ingress-orders.sh |
 | Ingress-replica TX commit latency (server-side) | `oms.pipeline.ingress.accept_seconds` Δ histogram | summarize_cluster_pipeline_deltas.py |
-| Cluster-client commit round-trip (slice 4c) | `oms.cluster.client.commit_round_trip_seconds` Δ histogram | summarize_cluster_pipeline_deltas.py |
+| Cluster-client commit round-trip (slice 4c, slice 4j histograms) | `oms.cluster.client.commit_round_trip_seconds` Δ histogram | summarize_cluster_pipeline_deltas.py |
+| Cluster admit → projector applied (slice 4j) | `oms.pipeline.cluster_admit_to_projector_seconds` Δ histogram | summarize_cluster_pipeline_deltas.py |
+| Cluster admit → FIX NOS on the wire (slice 4j) | `oms.pipeline.cluster_admit_to_fix_nos_seconds` Δ histogram | summarize_cluster_pipeline_deltas.py |
 | Projector cursor lag at end of run (slice 4d) | `oms.projector.lag_seconds` gauge | summarize_cluster_pipeline_deltas.py |
 | FIX-egress cursor lag at end of run (slice 4d) | `oms.fix_egress.lag_seconds` gauge | summarize_cluster_pipeline_deltas.py |
 | Snapshot freshness (slice 4h) | `oms.cluster.snapshot.age_seconds` gauge | summarize_cluster_pipeline_deltas.py |
 | Cluster-path tail latency, GC-corrected | HdrHistogram p50/p99/p99.9/max (in-process) | `./gradlew clusterBench` (slice 4e) |
 
-**What it does NOT measure**: a per-order ingress→NOS wall-clock distribution. That single-process
-OTel histogram (`oms.fix.ingress_to_nos`) was deleted in slice 4i because the cross-JVM
-stop-the-clock hook was orphaned in the slice-3b-2 / 3g topology cut. The closest honest substitute
-is the derived **upper bound** = `commit_round_trip_p99 + fix_egress_lag_seconds` printed at the end
-of the summary; it conflates the cluster path with whatever projection / FIX session backlog exists
-at scrape time, but it's the best you get without re-introducing a wire-format change to carry the
-ingress start-time through cluster events.
+**Slice 4j replaces the old "no per-order distribution" caveat**: the new
+`oms.pipeline.cluster_admit_to_fix_nos` histogram on the FIX-egress JVM and
+`oms.pipeline.cluster_admit_to_projector` on the projector JVM both record `now_ms -
+ev.acceptedAtMillis()` at end-of-apply, so we get an actual per-event distribution across the
+cluster boundary. The derived `commit_round_trip_p99 + fix_egress_lag_seconds` upper bound stays
+as a sanity cross-check — when the histograms and the upper bound diverge dramatically, scrape
+timing or NTP skew is usually the cause.
+
+## What the latency story looks like
+
+Three Timers cover the order's path through the OMS topology. Same-host runs (Pop! /
+single-Linux-node) keep the wall-clock comparable trivially: every JVM reads kernel
+`CLOCK_REALTIME` via `System.currentTimeMillis()`, so the differences below are within the
+kernel-clock granularity. Cross-host (k8s) runs require NTP/PTP within bucket resolution; the
+1 ms / 2 ms / 5 ms / … buckets in `OmsPipelineLatencyBounds` were picked so 5 ms of NTP slew is
+just one bucket of error, which dashboards can render visibly without misleading on the median.
+
+| Timer | JVM | Stop-the-clock | What it includes | Buying-power / risk visibility |
+|---|---|---|---|---|
+| `oms.pipeline.ingress.accept` | ingress-replica | DB transaction commit | Ingress JVM Postgres write (`domain_event_outbox`, optional `ledger_inflight_outbox`) | Pre-admission: `maybePlaceBuyLedgerInflightHold` HTTP call to ledger when enabled (synchronous in this transaction) |
+| `oms.cluster.client.commit_round_trip` | ingress-replica | Cluster client `submitAcceptOrder` returns | Ingress JVM cluster-client offer + cluster-egress reply round-trip | Same — the synchronous ledger inflight hold is included if it ran before the cluster submit |
+| `oms.pipeline.cluster_admit_to_projector` | postgres-projector | After `cursorRepository.advance` returns | Cluster admit → projector orders/executions UPSERT + control admission committed | Post-admission: `OrderControlAdmission` (risk + buying-power) runs **inside** this Timer's window — a slow risk evaluator widens this Timer, not the FIX one |
+| `oms.pipeline.cluster_admit_to_fix_nos` | fix-egress | Right after `Session.sendToTarget` returns successfully | Cluster admit → NOS on the wire (FIX builder + QuickFIX FileStore fsync + TCP write) | **Not on this path**: fix-egress consumes `OrderAdmittedEvent` directly off the cluster events recording, so post-admission risk lives in the projector Timer above, not here |
+
+The egress histogram is the latency story when the question is "how fast did the order leave OMS";
+the projector histogram is the latency story when the question is "how fast did Postgres see this
+order with risk decisions applied". Pre-trade ledger checks (the synchronous inflight hold) only
+show up in the ingress-replica Timers and are an HTTP-call cost from the ingress JVM, not part of
+the cluster substrate.
+
+Negative samples (NTP slew backwards) are clamped to 0 ms by the recording call sites
+(`Math.max(0L, now - acceptedAtMillis)`); the Micrometer Timer never receives a negative duration.
 
 ## Bring-up sequence
 
@@ -237,15 +264,18 @@ HTTP only — curl time_total to ingress-replica (seconds; client-observed, incl
   p50=0.005642  p95=0.007312  p99=0.008710
 ```
 
-Notes on the asymmetric output:
+Notes on the output (the asymmetric "no histogram buckets" caveat for `commit_round_trip` is
+gone with slice 4j — that meter now publishes percentile histograms):
 
-- `oms_cluster_client_commit_round_trip` (slice 4c) is registered without
-  `publishPercentileHistogram(true)`, so the Prometheus scrape carries `_sum` / `_count` but
-  no `_bucket{le=...}` series. The summary explicitly flags this and points at `clusterBench`,
-  which records the same metric in HdrHistogram with coordinated-omission correction.
-- `oms_pipeline_ingress_accept` does carry buckets, so its p50 / p99 are real (they reference
-  Micrometer's bucket-edge `le` values, not interpolated quantiles — round up by one bucket
-  for safety).
+- `oms_cluster_client_commit_round_trip` carries buckets since slice 4j, so its p50 / p99 are
+  real (Micrometer bucket-edge `le` values; round up by one bucket for safety). For
+  HdrHistogram-grade tail with coordinated-omission correction, `clusterBench` (slice 4e) is
+  still the right tool.
+- `oms_pipeline_ingress_accept` p50 / p99 read the same way.
+- The slice-4j cross-JVM histograms (`oms_pipeline_cluster_admit_to_projector` and
+  `oms_pipeline_cluster_admit_to_fix_nos`) need the projector / fix-egress JVMs to have been
+  restarted after slice 4j — the summarize script flags "no histogram buckets in scrape" if
+  the JVM still runs older code.
 - `oms_cluster_snapshot_age_seconds` ≈ cluster-node uptime when no operator snapshot has
   fired during the run; not an SLO violation. Trigger a snapshot mid-run with
   `./gradlew clusterSnapshot` (see `oms-cluster-node-snapshot.md`) to exercise the gauge.
@@ -256,10 +286,82 @@ What to compare against:
   network frame overhead.
 - `oms_pipeline_ingress_accept` p99 vs `oms_cluster_client_commit_round_trip` p99 — the gap is
   Postgres TX commit (`domain_event_outbox` insert + optional ledger inflight).
-- `oms_projector_lag_seconds` and `oms_fix_egress_lag_seconds` against the SLO doc thresholds
-  (5 s warn / 30 s critical; see [cluster-slo.md](../cluster-slo.md)).
+- `oms_cluster_client_commit_round_trip` p99 vs `oms_pipeline_cluster_admit_to_fix_nos` p99 —
+  the gap is the cluster's events-publication → fix-egress replay → FIX builder + send window
+  (slice 4j answers the per-event "is FIX egress saturated or just paced?" question with this
+  histogram).
+- `oms_pipeline_cluster_admit_to_projector` p99 against the SLO doc thresholds (per-event
+  freshness instead of an end-of-run gauge).
+- `oms_projector_lag_seconds` and `oms_fix_egress_lag_seconds` remain useful as
+  end-of-run/steady-state gauges (5 s warn / 30 s critical; see
+  [cluster-slo.md](../cluster-slo.md)).
 - `oms_cluster_snapshot_age_seconds` — only meaningful if you've taken a snapshot via
   `./gradlew clusterSnapshot` during the run.
+
+## Slice 4j + 4k evidence (Pop! May 2026)
+
+Reference run on the Pop!_OS 24.04 server (Linux 6.18, Temurin 21.0.10, 48 cores, 251 GB RAM,
+Postgres = ledger Supabase pooler on 5432). Documented here so future operators know what
+"healthy" looks like.
+
+### Slice 4j: 1 k serial shoot (`shoot-ingress-orders.sh`, `SHOOT_COUNT=1000`)
+
+Per-event histograms across the cluster boundary (the `(no histogram buckets)` caveat from
+slice 4i is gone):
+
+```
+oms_pipeline_ingress_accept             p50=3.495 ms   p99=5.592 ms   (1000 samples)
+oms_cluster_client_commit_round_trip    p50=3.495 ms   p99=5.592 ms   (1000 samples)
+oms_pipeline_cluster_admit_to_projector p50=3.146 ms   p99=5.592 ms   (1000 samples; slice 4j)
+oms_pipeline_cluster_admit_to_fix_nos   p50=2.097 ms   p99=4.194 ms   (1000 samples; slice 4j)
+HTTP time_total (curl)                  p50=5.402 ms   p99=7.394 ms
+```
+
+The slice-4i hypothesis "items 1+2 (FileStore fsync + cursor UPDATE) account for the ~21 ms
+amortised" is **falsified** by this run: at ingress-paced load the FIX egress's per-event cost
+is ~2 ms p50 / ~4 ms p99. The ~21 ms in the slice-4i shoot was the curl/jq spawn overhead
+between requests, not OMS internals.
+
+### Slice 4k: concurrent burst (`burst-ingress-orders.sh`, JDK 21 HttpClient + virtual threads)
+
+`OMS_BURST_TOTAL=1000` at three concurrency levels, single account ID (intentional cache-friendly
+hot path):
+
+| concurrency | HTTP RTT p50 | HTTP RTT p99 | rps offered | egress p50 | egress p99 | projector p50 | projector p99 |
+|---|---|---|---|---|---|---|---|
+| 50  | 14.1 ms | 88.6 ms  | 2629 | 358 ms | 626 ms | 447 ms | 716 ms |
+| 100 | 29.0 ms | 88.1 ms  | 2611 | 358 ms | 626 ms | 447 ms | 716 ms |
+| 200 | 54.8 ms | 126.6 ms | 2721 | 358 ms | 626 ms | 447 ms | 716 ms |
+
+Both consumers (FIX egress + Postgres projector) hit a flat ceiling — the histogram p50/p99
+do not move once concurrency exceeds the consumer's serial-apply budget. Ingress accept stays
+at p99 ≤ 7 ms throughout, so Postgres-write + cluster-commit are NOT the bottleneck. The
+flat-ceiling shape is consistent with serial-event processing on each consumer (one Postgres
+UPSERT per admitted order on the projector; one FIX `Session.sendToTarget` + FileStore fsync +
+`oms_fix_egress_cursor` UPDATE per admit on the egress).
+
+### Slice 4 throughput decision
+
+With 4j + 4k evidence in hand, the **explicit decision** is to NOT pursue batched cursor
+advance or in-memory FIX message store now. Rationale:
+
+- At the production-shaped workloads we actually serve (Trading Desk single-digit rps,
+  customer-frontend dozens of orders/sec), per-event admit-to-NOS p99 is ~4 ms — far below any
+  realistic SLO (`cluster-slo.md` warns at 5 s, criticals at 30 s).
+- Bursts of 1 k orders at 2 700 rps from the burst tool are not a real workload. They exist
+  to find the consumer ceiling, not to set the SLO target.
+- Batched cursor advance widens the at-least-once window from 1 to N orders. Equivalent to
+  FIX `PossDupFlag` / `DupClOrdID` only if the broker actually dedups on `DupClOrdID`. We do
+  not have that broker analysis yet, so doing it now would land strictness regressions for a
+  latency improvement we do not need.
+- An in-memory FIX message store with Aeron-backed durability would replace the FileStore's
+  resend-history role; the blast radius for FIX session-layer recovery (broker
+  `Resend Request`, `Logon` with `MsgSeqNum`) is large and a complete design has not been done.
+
+The instrumentation (slice 4j histograms + slice 4k burst tool) is sufficient to reopen this
+decision when an actual customer workload demands it. The bench harness itself is the
+artefact; the dashboards already render the new histograms automatically (Micrometer +
+percentile-histogram-enabled timers).
 
 ## Caveats
 

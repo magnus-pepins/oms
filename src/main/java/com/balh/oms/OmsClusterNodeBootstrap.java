@@ -2,6 +2,7 @@ package com.balh.oms;
 
 import com.balh.oms.cluster.OmsAdmissionClusteredService;
 import com.balh.oms.cluster.OmsClusterWireFormat;
+import com.balh.oms.cluster.admin.OmsClusterNodeMetricsExporter;
 import io.aeron.Aeron;
 import io.aeron.archive.Archive;
 import io.aeron.archive.ArchiveThreadingMode;
@@ -143,6 +144,12 @@ public final class OmsClusterNodeBootstrap {
 
         CountDownLatch shutdownLatch = new CountDownLatch(1);
 
+        // Slice 4b: stand the metrics exporter up first so OmsAdmissionClusteredService can register
+        // its snapshot meters into a registry that is already serving /metrics. Order on shutdown is the
+        // reverse: container -> events recording -> media driver -> metrics exporter.
+        OmsClusterNodeMetricsExporter metricsExporter =
+                new OmsClusterNodeMetricsExporter(OmsClusterNodeMetricsExporter.resolveMetricsPortFromEnv());
+
         ClusteredMediaDriver clusteredMediaDriver = ClusteredMediaDriver.launch(
                 buildMediaDriverContext(paths),
                 buildArchiveContext(paths),
@@ -155,7 +162,7 @@ public final class OmsClusterNodeBootstrap {
         EventsRecordingHandle eventsRecording = startEventsRecording(paths);
 
         ClusteredServiceContainer container = ClusteredServiceContainer.launch(
-                buildServiceContainerContext(paths));
+                buildServiceContainerContext(paths, new OmsAdmissionClusteredService(metricsExporter.meterRegistry())));
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             log.info("OMS cluster-node received shutdown signal");
@@ -169,6 +176,11 @@ public final class OmsClusterNodeBootstrap {
                 clusteredMediaDriver.close();
             } catch (Exception e) {
                 log.warn("error closing clustered media driver", e);
+            }
+            try {
+                metricsExporter.close();
+            } catch (Exception e) {
+                log.warn("error closing cluster-node metrics exporter", e);
             }
             shutdownLatch.countDown();
         }, "oms-cluster-node-shutdown"));
@@ -311,11 +323,28 @@ public final class OmsClusterNodeBootstrap {
         }
     }
 
+    /**
+     * Default-service overload used by tests that don't care about snapshot metrics. Delegates to
+     * {@link #buildServiceContainerContext(ClusterNodePaths, OmsAdmissionClusteredService)} with a
+     * fresh {@link OmsAdmissionClusteredService} (default ctor; meters land in
+     * {@code Metrics.globalRegistry}).
+     */
     public static ClusteredServiceContainer.Context buildServiceContainerContext(ClusterNodePaths paths) {
+        return buildServiceContainerContext(paths, new OmsAdmissionClusteredService());
+    }
+
+    /**
+     * Slice 4b overload: caller supplies the {@link OmsAdmissionClusteredService} (typically built
+     * with the cluster-node metrics exporter's {@code MeterRegistry}). Tests that assert on snapshot
+     * observability use this overload to register meters into a {@code SimpleMeterRegistry} they can
+     * inspect after the cluster runs.
+     */
+    public static ClusteredServiceContainer.Context buildServiceContainerContext(
+            ClusterNodePaths paths, OmsAdmissionClusteredService service) {
         return new ClusteredServiceContainer.Context()
                 .aeronDirectoryName(paths.aeronDirectory())
                 .clusterDir(new File(paths.clusterServicesDir()))
-                .clusteredService(new OmsAdmissionClusteredService())
+                .clusteredService(service)
                 .archiveContext(new AeronArchive.Context()
                         .aeronDirectoryName(paths.aeronDirectory())
                         .controlRequestChannel("aeron:ipc?term-length=64k")

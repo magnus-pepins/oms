@@ -8,6 +8,12 @@ import io.aeron.cluster.service.ClientSession;
 import io.aeron.cluster.service.Cluster;
 import io.aeron.cluster.service.ClusteredService;
 import io.aeron.logbuffer.Header;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.DistributionSummary;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Metrics;
+import io.micrometer.core.instrument.Tags;
+import io.micrometer.core.instrument.Timer;
 import org.agrona.CloseHelper;
 import org.agrona.DirectBuffer;
 import org.agrona.ExpandableArrayBuffer;
@@ -18,6 +24,7 @@ import org.slf4j.LoggerFactory;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 
@@ -149,6 +156,20 @@ public class OmsAdmissionClusteredService implements ClusteredService {
      */
     private final ExpandableArrayBuffer eventsBuffer = new ExpandableArrayBuffer(INITIAL_BUFFER_CAPACITY);
 
+    // ---- Phase 4 slice 4b: snapshot observability ----
+    // Cluster-resident code is plain Java + Agrona (no Spring magic in ClusteredService, per ADR 0001
+    // §Discipline). The MeterRegistry is supplied via the constructor by OmsClusterNodeBootstrap; tests
+    // that don't care about metrics use the default ctor and Metrics.globalRegistry (safe noop fallback
+    // for unit tests).
+
+    private final MeterRegistry meterRegistry;
+    private final Timer snapshotWriteTimer;
+    private final Timer snapshotLoadTimer;
+    private final Counter snapshotWriteCounter;
+    private final Counter snapshotLoadCounter;
+    private final DistributionSummary snapshotWriteBytes;
+    private final DistributionSummary snapshotLoadBytes;
+
     private Cluster cluster;
 
     /**
@@ -165,6 +186,56 @@ public class OmsAdmissionClusteredService implements ClusteredService {
      * them; the projector reads from the recording, not from the live publication.
      */
     private ExclusivePublication eventsPublication;
+
+    /**
+     * Default constructor — meters register against {@link Metrics#globalRegistry}. Used by tests that
+     * do not assert on snapshot observability and by historical call sites; production
+     * {@code OmsClusterNodeBootstrap} uses {@link #OmsAdmissionClusteredService(MeterRegistry)} so the
+     * embedded Prometheus exporter actually sees the meters.
+     */
+    public OmsAdmissionClusteredService() {
+        this(Metrics.globalRegistry);
+    }
+
+    /**
+     * Phase 4 slice 4b: meters wired through the cluster-node JVM's
+     * {@code OmsClusterNodeMetricsExporter}. {@code outcome} tag distinguishes
+     * snapshot writes (leader-driven by {@code onTakeSnapshot}) from snapshot loads
+     * (replica recovery via {@code onStart(snapshotImage != null)}). Pre-registers all 6 meters so
+     * {@code /metrics} exposes the names with zero-counts on a freshly booted cluster (operators can
+     * set up dashboards / alerts before the first snapshot fires).
+     */
+    public OmsAdmissionClusteredService(MeterRegistry meterRegistry) {
+        this.meterRegistry = Objects.requireNonNull(meterRegistry, "meterRegistry");
+        Tags writeTags = Tags.of("outcome", "write");
+        Tags loadTags = Tags.of("outcome", "load");
+        this.snapshotWriteTimer = Timer.builder("oms.cluster.snapshot.duration")
+                .description("Wall-clock time spent inside OmsAdmissionClusteredService.onTakeSnapshot / loadSnapshot.")
+                .tags(writeTags)
+                .register(meterRegistry);
+        this.snapshotLoadTimer = Timer.builder("oms.cluster.snapshot.duration")
+                .description("Wall-clock time spent inside OmsAdmissionClusteredService.onTakeSnapshot / loadSnapshot.")
+                .tags(loadTags)
+                .register(meterRegistry);
+        this.snapshotWriteCounter = Counter.builder("oms.cluster.snapshot.events")
+                .description("Snapshot writes (outcome=write) and loads (outcome=load) seen by the cluster service.")
+                .tags(writeTags)
+                .register(meterRegistry);
+        this.snapshotLoadCounter = Counter.builder("oms.cluster.snapshot.events")
+                .description("Snapshot writes (outcome=write) and loads (outcome=load) seen by the cluster service.")
+                .tags(loadTags)
+                .register(meterRegistry);
+        this.snapshotWriteBytes = DistributionSummary.builder("oms.cluster.snapshot.bytes")
+                .description("Bytes written to the snapshot publication (write) or consumed from the snapshot image (load).")
+                .baseUnit("bytes")
+                .tags(writeTags)
+                .register(meterRegistry);
+        this.snapshotLoadBytes = DistributionSummary.builder("oms.cluster.snapshot.bytes")
+                .description("Bytes written to the snapshot publication (write) or consumed from the snapshot image (load).")
+                .baseUnit("bytes")
+                .tags(loadTags)
+                .register(meterRegistry);
+    }
 
     @Override
     public void onStart(Cluster cluster, Image snapshotImage) {
@@ -227,6 +298,7 @@ public class OmsAdmissionClusteredService implements ClusteredService {
 
     @Override
     public void onTakeSnapshot(ExclusivePublication snapshotPublication) {
+        Timer.Sample sample = Timer.start(meterRegistry);
         ExpandableArrayBuffer buffer = new ExpandableArrayBuffer(INITIAL_BUFFER_CAPACITY);
         int p = 0;
         buffer.putInt(p, SNAPSHOT_MAGIC);
@@ -302,9 +374,13 @@ public class OmsAdmissionClusteredService implements ClusteredService {
             }
             Thread.yield();
         }
+        sample.stop(snapshotWriteTimer);
+        snapshotWriteCounter.increment();
+        snapshotWriteBytes.record(p);
     }
 
     private void loadSnapshot(Image snapshotImage) {
+        Timer.Sample sample = Timer.start(meterRegistry);
         SnapshotLoader loader = new SnapshotLoader();
         while (!snapshotImage.isEndOfStream()) {
             int frags = snapshotImage.poll(loader, 1);
@@ -312,6 +388,9 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                 Thread.yield();
             }
         }
+        sample.stop(snapshotLoadTimer);
+        snapshotLoadCounter.increment();
+        snapshotLoadBytes.record(loader.totalBytes);
         log.info("loaded admission snapshot: orders={}", orderIndex.size());
     }
 
@@ -613,8 +692,17 @@ public class OmsAdmissionClusteredService implements ClusteredService {
     }
 
     private final class SnapshotLoader implements io.aeron.logbuffer.FragmentHandler {
+
+        /**
+         * Total bytes across all snapshot fragments seen by this loader. Snapshots today fit in a
+         * single fragment, but we sum-on-fragment so the metric stays correct if Phase 2+ ever
+         * splits the snapshot across multiple Aeron messages (see class doc §Snapshot format).
+         */
+        private long totalBytes;
+
         @Override
         public void onFragment(DirectBuffer buffer, int offset, int length, Header header) {
+            totalBytes += length;
             int p = offset;
             int magic = buffer.getInt(p);
             p += Integer.BYTES;

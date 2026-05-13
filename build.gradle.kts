@@ -323,6 +323,21 @@ tasks.register<JavaExec>("fixLoopbackAcceptor") {
 }
 
 /**
+ * Phase 4 slice 4a (operator-driven snapshot): trigger an Aeron Cluster snapshot on a running
+ * cluster member. Cluster dir resolved from `OMS_AERON_CLUSTER_DIR` (preferred) or
+ * `<OMS_AERON_DIR_BASE>/consensus-module`. See `docs/runbooks/oms-cluster-node-snapshot.md` and
+ * `system-documentation/plans/oms-aeron-cluster-substrate.md` § Phase 4 slice 4a.
+ */
+tasks.register<JavaExec>("clusterSnapshot") {
+    group = "application"
+    description =
+        "Request an Aeron Cluster snapshot via ClusterTool.snapshot(...). Env: OMS_AERON_CLUSTER_DIR or OMS_AERON_DIR_BASE."
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.balh.oms.cluster.admin.OmsClusterSnapshotAdminTool")
+    jvmArgs(lowLatencyJvmModuleOpens)
+}
+
+/**
  * Micrometer's prometheus registry pins {@code io.prometheus:prometheus-metrics-*} 1.2.x while the OTel
  * Prometheus exporter brings 1.3.x textformats — mixed jars cause {@code NoSuchMethodError} at startup.
  */

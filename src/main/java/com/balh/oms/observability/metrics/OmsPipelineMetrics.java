@@ -15,21 +15,8 @@ public final class OmsPipelineMetrics {
     public static void finishIngressAccept(MeterRegistry registry, Timer.Sample sample, String outcome) {
         sample.stop(baseTimer(OmsPipelineMeterNames.INGRESS_ACCEPT)
                 .description(
-                        "Postgres transaction for internal order accept until commit (orders + control_outbox + domain_event_outbox)")
+                        "Postgres transaction for internal order accept until commit (domain_event_outbox + optional ledger_inflight_outbox); orders writes moved to OmsPostgresProjector in slice 2c")
                 .tag("outcome", outcome)
-                .register(registry));
-    }
-
-    public static void recordOutboxToChronicleLag(MeterRegistry registry, Duration lag) {
-        baseTimer(OmsPipelineMeterNames.CONTROL_OUTBOX_TO_CHRONICLE_LAG)
-                .description("Wall time from control_outbox.enqueued_at until Chronicle append succeeded")
-                .register(registry)
-                .record(lag.compareTo(Duration.ZERO) < 0 ? Duration.ZERO : lag);
-    }
-
-    public static void finishChronicleAppend(MeterRegistry registry, Timer.Sample sample) {
-        sample.stop(baseTimer(OmsPipelineMeterNames.CONTROL_CHRONICLE_APPEND)
-                .description("Chronicle append plus control_outbox markAppended for one row")
                 .register(registry));
     }
 

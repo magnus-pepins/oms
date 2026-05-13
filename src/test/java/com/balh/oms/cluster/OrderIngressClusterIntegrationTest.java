@@ -32,8 +32,8 @@ import static org.awaitility.Awaitility.await;
  *
  * <ul>
  *   <li>Fresh {@code POST /internal/v1/orders} commits via the cluster and (after the projector
- *       daemon applies) writes the same {@code orders} / {@code control_outbox} /
- *       {@code domain_event_outbox} rows the legacy Chronicle path produced.</li>
+ *       daemon applies) writes the same {@code orders} / {@code domain_event_outbox} rows the
+ *       legacy Chronicle path produced.</li>
  *   <li>A duplicate post (same {@code accountId} + {@code clientIdempotencyKey}) is detected by
  *       the cluster, returns the original {@code orderId}, and does not create a second
  *       {@code orders} row (option (A): cluster gate is authoritative).</li>
@@ -41,8 +41,10 @@ import static org.awaitility.Awaitility.await;
  *
  * <p>Phase 2 slice 2c moves the {@code orders} INSERT out of the ingress transaction; the
  * orders row materialises via the JVM-wide test projector daemon shortly after the HTTP
- * response. {@code control_outbox} / {@code domain_event_outbox} continue to commit inside the
- * ingress transaction in slice 2c (slice 2d/2e retire those rows).
+ * response. Phase 3 slice 3f drops the {@code control_outbox} write too (the projector emits
+ * {@code OrderWorking} envelopes from {@code OrderAdmittedEvent} directly), so only
+ * {@code domain_event_outbox} (and the optional ledger inflight outbox for BUYs) stays in the
+ * ingress transaction.
  *
  * <p>Complement to {@link OmsClusterIngressClientIT} (cluster client in isolation) and
  * {@link com.balh.oms.ingress.OrderIngressServiceClusterGateTest} (Mockito unit test of the gate
@@ -68,21 +70,13 @@ class OrderIngressClusterIntegrationTest extends AbstractPostgresIntegrationTest
         assertThat(res.getBody()).isNotNull();
         UUID orderId = UUID.fromString((String) res.getBody().get("id"));
 
-        // outbox / domain-fanout still commit inside the ingress transaction in slice 2c.
-        Long outboxCount = jdbc.queryForObject(
-                "SELECT COUNT(*) FROM control_outbox WHERE order_id = ?",
-                Long.class,
-                orderId);
-        assertThat(outboxCount)
-                .as("ingress transaction still writes control_outbox in slice 2c (slice 2e retires it)")
-                .isEqualTo(1L);
-
+        // domain-fanout still commits inside the ingress transaction; control_outbox was deleted in slice 3f.
         Long domainOutboxCount = jdbc.queryForObject(
                 "SELECT COUNT(*) FROM domain_event_outbox WHERE order_id = ?",
                 Long.class,
                 orderId);
         assertThat(domainOutboxCount)
-                .as("ingress transaction still writes domain_event_outbox in slice 2c")
+                .as("ingress transaction still writes domain_event_outbox after slice 3f")
                 .isEqualTo(1L);
 
         // Phase 2 slice 2c: the orders row arrives via the test projector daemon.

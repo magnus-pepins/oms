@@ -9,21 +9,12 @@ public final class OmsPipelineMeterNames {
     private OmsPipelineMeterNames() {}
 
     /**
-     * Internal accept: single Postgres transaction (orders + control_outbox + domain_event_outbox) until commit.
+     * Internal accept: Postgres transaction for the ingress JVM until commit (domain_event_outbox +
+     * optional ledger_inflight_outbox); orders writes moved to OmsPostgresProjector in slice 2c and
+     * control_outbox was deleted in slice 3f.
      * Tag {@code outcome}: {@code created}, {@code duplicate}, {@code error}.
      */
     public static final String INGRESS_ACCEPT = "oms.pipeline.ingress.accept";
-
-    /**
-     * Wall clock from {@code control_outbox.enqueued_at} until Chronicle append + mark appended succeeds.
-     * Measures queue wait + reconciler tick (not HTTP thread).
-     */
-    public static final String CONTROL_OUTBOX_TO_CHRONICLE_LAG = "oms.pipeline.control.outbox_to_chronicle_lag";
-
-    /**
-     * Reconciler-local work: Chronicle append + {@code markAppended} for one outbox row.
-     */
-    public static final String CONTROL_CHRONICLE_APPEND = "oms.pipeline.control.chronicle_append";
 
     /**
      * {@link com.balh.oms.tailer.ControlTailer#apply} transaction (risk, buying power, CAS, domain outbox).

@@ -6,6 +6,10 @@ Slice 1 owns the **securities** side: orders, executions, positions. The cash
 side stays in [Ledger](../../ledger). The OMS calls Ledger for inflight /
 settle / commit; Ledger remains the system of record for money movement.
 
+## Slice 3f status note
+
+The control-plane flow described below is the legacy slice-1 chronicle path. Phase 3 slice 3f of [`oms-aeron-cluster-substrate`](../../system-documentation/plans/oms-aeron-cluster-substrate.md) deleted `control_outbox` + `OutboxReconciler`; the cluster's events recording is now the durable handoff and `OmsPostgresProjector` (slice 2d) writes `orders.status=WORKING` + `domain_event_outbox(OrderWorking)` + `control_decisions(PASS)` from `OrderAdmittedEvent` directly. `oms-fix-egress` (slice 3a–d) reads the same recording for outbound NOS. The diagram below is preserved for reference until slice 3g rewrites this page.
+
 ## Control-plane flow (slice 1)
 
 ```mermaid

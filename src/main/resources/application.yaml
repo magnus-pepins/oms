@@ -60,14 +60,10 @@ oms:
     # Interim default 5 min — plans/oms-phase0-interim-decisions.md; tune per env.
     max-job-age-ms: ${OMS_CONTROL_MAX_JOB_AGE_MS:300000}
     tailer-batch-size: ${OMS_TAILER_BATCH_SIZE:100}
-    # ingress-after-commit (default): append + mark in ingress JVM after commit (disables OutboxReconciler for control); requires oms.chronicle.enabled=true.
-    # reconciler: OutboxReconciler drains control_outbox → Chronicle (control-worker JVM, integration tests, recovery).
-    # tail (default): Chronicle tail applies CAS + fanout. ingress: same writes in the accept transaction; tail dispatches routing only (P1).
+    # tail (default): Chronicle tail applies CAS + fanout. ingress: same writes in the accept transaction; tail dispatches routing only.
+    # Slice 3f deleted control_outbox + OutboxReconciler; this flag still selects between the legacy
+    # ControlTailer/ingress-admission paths and is itself deleted in slice 3g.
     postgres-write-path: ${OMS_CONTROL_POSTGRES_WRITE_PATH:tail}
-  outbox:
-    reconciler-age-ms: ${OMS_OUTBOX_RECONCILER_AGE_MS:2000}
-    reconciler-batch-size: ${OMS_OUTBOX_RECONCILER_BATCH_SIZE:100}
-    reconciler-interval-ms: ${OMS_OUTBOX_RECONCILER_INTERVAL_MS:500}
   chronicle:
     enabled: ${OMS_CHRONICLE_ENABLED:true}
     # When false, omit ChronicleControlTailReader on this JVM (ingress-only replica in split topology; workers keep true).

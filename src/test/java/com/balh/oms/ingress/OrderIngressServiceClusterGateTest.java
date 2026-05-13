@@ -1,6 +1,5 @@
 package com.balh.oms.ingress;
 
-import com.balh.oms.chronicle.ControlChroniclePayloadCodec;
 import com.balh.oms.cluster.AcceptOrderCommand;
 import com.balh.oms.cluster.AdmissionResult;
 import com.balh.oms.cluster.OmsClusterIngressClient;
@@ -14,7 +13,6 @@ import com.balh.oms.ledger.LedgerBalanceClient;
 import com.balh.oms.ledger.LedgerInflightReservationClient;
 import com.balh.oms.observability.PiiHash;
 import com.balh.oms.observability.otel.IngressToFixNosLatencyRecorder;
-import com.balh.oms.persistence.ControlOutboxRepository;
 import com.balh.oms.persistence.DomainEventOutboxRepository;
 import com.balh.oms.persistence.LedgerInflightOutboxRepository;
 import com.balh.oms.persistence.OrdersRepository;
@@ -41,24 +39,21 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * Phase 1c slice B / Phase 2 slice 2c unit test: verifies {@link OrderIngressService} routes
- * admission through the (now mandatory) {@link OmsClusterIngressClient}, surfaces cluster
- * failures as the right {@link ClusterAdmissionException} HTTP status, and (since slice 2c) does
- * NOT write an orders row inside the ingress transaction.
+ * Phase 1c slice B / Phase 2 slice 2c / Phase 3 slice 3f unit test: verifies
+ * {@link OrderIngressService} routes admission through the (now mandatory)
+ * {@link OmsClusterIngressClient}, surfaces cluster failures as the right
+ * {@link ClusterAdmissionException} HTTP status, does NOT write an orders row inside the ingress
+ * transaction (slice 2c), and (slice 3f) does NOT write a {@code control_outbox} row either —
+ * only {@code domain_event_outbox} (and the optional BUY ledger inflight outbox) survive on the
+ * ingress hot path.
  *
- * <p>Plan: {@code system-documentation/plans/oms-aeron-cluster-substrate.md}. Slice 2c removed
- * the {@code orders} INSERT from {@code persistAcceptedBody}; the projector JVM now owns it.
- * The full HTTP + Postgres + cluster integration test lives in
- * {@link com.balh.oms.cluster.OrderIngressClusterIntegrationTest}; this test exercises the
- * cluster-gate logic in-process for fast feedback without Docker.
+ * <p>Plan: {@code system-documentation/plans/oms-aeron-cluster-substrate.md}.
  */
 class OrderIngressServiceClusterGateTest {
 
     private OrdersRepository orders;
-    private ControlOutboxRepository controlOutbox;
     private DomainEventOutboxRepository domainEventOutbox;
     private DomainEventEnvelopeCodec domainEventEnvelopeCodec;
-    private ControlChroniclePayloadCodec controlPayloadCodec;
     private ObjectMapper objectMapper;
     private PiiHash piiHash;
     private LedgerInflightOutboxRepository ledgerInflightOutbox;
@@ -73,10 +68,8 @@ class OrderIngressServiceClusterGateTest {
     @SuppressWarnings("unchecked")
     void setUp() {
         orders = mock(OrdersRepository.class);
-        controlOutbox = mock(ControlOutboxRepository.class);
         domainEventOutbox = mock(DomainEventOutboxRepository.class);
         domainEventEnvelopeCodec = mock(DomainEventEnvelopeCodec.class);
-        controlPayloadCodec = mock(ControlChroniclePayloadCodec.class);
         objectMapper = mock(ObjectMapper.class);
         piiHash = mock(PiiHash.class);
         ledgerInflightOutbox = mock(LedgerInflightOutboxRepository.class);
@@ -90,9 +83,6 @@ class OrderIngressServiceClusterGateTest {
         config.getCluster().getClient().setSubmitTimeoutMs(2_000L);
 
         when(piiHash.hash(any())).thenReturn("hash");
-        when(controlPayloadCodec.outboxPayloadJson(any())).thenReturn("{}");
-        when(controlOutbox.insert(any(), any(Integer.class), any(), any()))
-                .thenReturn(new ControlOutboxRepository.InsertResult(1L, java.time.Instant.now()));
 
         ObjectProvider<LedgerInflightReservationClient> ledgerInflight =
                 (ObjectProvider<LedgerInflightReservationClient>) mock(ObjectProvider.class);
@@ -103,11 +93,9 @@ class OrderIngressServiceClusterGateTest {
 
         service = new OrderIngressService(
                 orders,
-                controlOutbox,
                 domainEventOutbox,
                 domainEventEnvelopeCodec,
                 config,
-                controlPayloadCodec,
                 objectMapper,
                 piiHash,
                 ledgerInflight,
@@ -120,7 +108,7 @@ class OrderIngressServiceClusterGateTest {
     }
 
     @Test
-    void freshAccept_callsCluster_doesNotInsertOrders_writesOutboxAndDomainFanout() throws Exception {
+    void freshAccept_callsCluster_doesNotInsertOrders_writesDomainFanout() throws Exception {
         when(cluster.submitAcceptOrder(any(AcceptOrderCommand.class), any(Duration.class)))
                 .thenAnswer(invocation -> {
                     AcceptOrderCommand cmd = invocation.getArgument(0);
@@ -141,8 +129,8 @@ class OrderIngressServiceClusterGateTest {
         verify(cluster).submitAcceptOrder(any(AcceptOrderCommand.class), any(Duration.class));
         verify(orders, never())
                 .insert(any(Order.class));
-        verify(controlOutbox)
-                .insert(eq(result.order().id()), any(Integer.class), any(), any());
+        verify(domainEventOutbox)
+                .insert(eq(result.order().id()), any());
     }
 
     @Test
@@ -170,7 +158,6 @@ class OrderIngressServiceClusterGateTest {
                 .as("response must echo the cluster's original orderId so callers see a single identity")
                 .isEqualTo(clusterOriginalOrderId);
         verify(orders, never()).insert(any(Order.class));
-        verify(controlOutbox, never()).insert(any(), any(Integer.class), any(), any());
         verify(domainEventOutbox, never()).insert(any(), any());
     }
 
@@ -194,7 +181,6 @@ class OrderIngressServiceClusterGateTest {
                     assertThat(e.getErrorCode()).isEqualTo("cluster_rejected");
                 });
         verify(orders, never()).insert(any());
-        verify(controlOutbox, never()).insert(any(), any(Integer.class), any(), any());
         verify(domainEventOutbox, never()).insert(any(), any());
     }
 
@@ -209,7 +195,6 @@ class OrderIngressServiceClusterGateTest {
                     assertThat(e.getErrorCode()).isEqualTo("cluster_admission_timeout");
                 });
         verify(orders, never()).insert(any());
-        verify(controlOutbox, never()).insert(any(), any(Integer.class), any(), any());
         verify(domainEventOutbox, never()).insert(any(), any());
     }
 
@@ -224,7 +209,6 @@ class OrderIngressServiceClusterGateTest {
                     assertThat(e.getErrorCode()).isEqualTo("cluster_unavailable");
                 });
         verify(orders, never()).insert(any());
-        verify(controlOutbox, never()).insert(any(), any(Integer.class), any(), any());
         verify(domainEventOutbox, never()).insert(any(), any());
     }
 

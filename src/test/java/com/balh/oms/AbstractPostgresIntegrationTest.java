@@ -118,7 +118,7 @@ public abstract class AbstractPostgresIntegrationTest {
      * leak across test classes inside the JVM-wide Spring context cache.
      */
     public static final String SQL_TRUNCATE_ORDERS_AND_SETTLEMENT =
-            "TRUNCATE TABLE control_decisions, control_outbox, domain_event_outbox,"
+            "TRUNCATE TABLE control_decisions, domain_event_outbox,"
                     + " ledger_inflight_outbox, executions, market_context,"
                     + " corporate_action_event, manual_settlement_actions, ledger_settlement_outbox,"
                     + " broker_settlement_confirm, settlement_file_import_batch, position_history,"

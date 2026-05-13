@@ -1,7 +1,11 @@
 package com.balh.oms.chronicle;
 
 /**
- * Wire constants for Chronicle excerpts and {@code control_outbox} JSONB wrapping.
+ * Wire constants for Chronicle excerpts.
+ *
+ * <p>Slice 3f (oms-aeron-cluster-substrate plan) removed the {@code OUTBOX_*} JSONB-wrapper
+ * constants together with the {@code control_outbox} table; only the Chronicle excerpt prefix
+ * survives, and slice 3g removes that too along with the rest of the chronicle module.
  */
 public final class ControlChronicleWireFormat {
 
@@ -14,15 +18,6 @@ public final class ControlChronicleWireFormat {
     public static final byte[] CHRONICLE_PROTO_PREFIX = new byte[] {'O', 'M', 'S', 0x01};
 
     public static final int CHRONICLE_PROTO_PREFIX_LENGTH = CHRONICLE_PROTO_PREFIX.length;
-
-    /**
-     * {@code control_outbox.payload} JSON object uses this value under key {@link #OUTBOX_JSON_KEY_FORMAT} to mean
-     * {@link #OUTBOX_JSON_KEY_PROTO_BASE64} holds a base64-encoded {@code ControlPendingEvent} protobuf.
-     */
-    public static final int OUTBOX_PAYLOAD_FORMAT_PROTO_WRAPPED = 2;
-
-    public static final String OUTBOX_JSON_KEY_FORMAT = "v";
-    public static final String OUTBOX_JSON_KEY_PROTO_BASE64 = "d";
 
     public static boolean chronicleExcerptStartsWithProtoPrefix(byte[] excerpt) {
         return startsWithPrefix(excerpt, CHRONICLE_PROTO_PREFIX);

@@ -26,12 +26,12 @@ import java.util.UUID;
  * <p>The {@link #createOrder} flow enforces the slice-1 invariant:
  * <ol>
  *   <li>{@link OrderIngressService#persistAccepted} runs the mandatory cluster admission and
- *       (only then) the single Postgres transaction (orders insert +
- *       {@code control_outbox} insert + {@code domain_event_outbox} insert + COMMIT).</li>
+ *       (only then) the single Postgres transaction ({@code domain_event_outbox} insert +
+ *       optional {@code ledger_inflight_outbox} insert + COMMIT). The {@code orders} INSERT
+ *       moved to {@link com.balh.oms.projector.OmsPostgresProjector} in slice 2c, and
+ *       {@code control_outbox} was deleted in slice 3f of the Aeron Cluster substrate plan.</li>
  *   <li>{@link com.balh.oms.reconciler.DomainFanoutReconciler} delivers domain
- *       envelopes to NATS (or no-op) strictly after commit.</li>
- *   <li>Chronicle append + {@code control_outbox.chronicle_enqueued_at}: asynchronous
- *       {@link com.balh.oms.reconciler.OutboxReconciler} after {@code oms.outbox.reconciler-age-ms}.
+ *       envelopes to NATS (or no-op) strictly after commit.
  *       This controller is not registered on Spring profiles
  *       {@value com.balh.oms.config.OmsProfiles#CONTROL_WORKER} or
  *       {@value com.balh.oms.config.OmsProfiles#FIX_WORKER}.</li>

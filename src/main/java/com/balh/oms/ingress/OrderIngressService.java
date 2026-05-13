@@ -1,7 +1,5 @@
 package com.balh.oms.ingress;
 
-import com.balh.oms.chronicle.ControlChroniclePayloadCodec;
-import com.balh.oms.chronicle.PendingControlEvent;
 import com.balh.oms.cluster.AcceptOrderCommand;
 import com.balh.oms.cluster.AdmissionResult;
 import com.balh.oms.cluster.OmsClusterIngressClient;
@@ -12,7 +10,6 @@ import com.balh.oms.domain.OrderStatus;
 import com.balh.oms.domain.ShardKey;
 import com.balh.oms.observability.PiiHash;
 import com.balh.oms.events.DomainEventEnvelopeCodec;
-import com.balh.oms.persistence.ControlOutboxRepository;
 import com.balh.oms.persistence.DomainEventOutboxRepository;
 import com.balh.oms.persistence.LedgerInflightOutboxRepository;
 import com.balh.oms.observability.metrics.OmsPipelineMetrics;
@@ -50,8 +47,8 @@ import java.util.concurrent.TimeoutException;
  * {@link AcceptOrderCommand} and blocks until the cluster emits {@code OrderAccepted} or
  * {@code OrderRejected}.
  *
- * <p>Phase 2 slice 2c (this revision) removes the {@code orders} INSERT from the ingress
- * transaction. {@code orders} is now a downstream projection of the cluster log, written by the
+ * <p>Phase 2 slice 2c removed the {@code orders} INSERT from the ingress transaction.
+ * {@code orders} is a downstream projection of the cluster log, written by the
  * {@code oms-postgres-projector} JVM (see {@link com.balh.oms.projector.OmsPostgresProjector}
  * and the V25 migration that drops the FK constraints back to {@code orders(id)}). HTTP 200/201
  * means cluster-committed; the orders row appears in Postgres after the projector applies the
@@ -60,9 +57,12 @@ import java.util.concurrent.TimeoutException;
  * Awaitility, and the {@code INGRESS} control-Postgres-write-path branch is gone — slice 2d
  * subsumes its work into the projector.
  *
- * <p>The {@code control_outbox}, {@code domain_event_outbox}, and (for BUY orders) the optional
- * {@code ledger_inflight_outbox} writes still happen here in slice 2c; they are retired by
- * later Phase 2 slices (2d/2e) once the projector covers their consumers.
+ * <p>Phase 3 slice 3f drops the {@code control_outbox} insert too: the projector emits
+ * {@code OrderWorking} into {@code domain_event_outbox} directly from {@code OrderAdmittedEvent}
+ * (slice 2d), and the {@code oms-fix-egress} JVM drives FIX outbound from the cluster's events
+ * recording (slices 3a–3d), so no row in {@code control_outbox} ever has a downstream consumer.
+ * The {@code domain_event_outbox} insert (for {@code OrderAccepted}) and the optional BUY
+ * {@code ledger_inflight_outbox} insert are still done here.
  *
  * <p>This is a separate Spring bean (not a controller method) because Spring's
  * {@code @Transactional} relies on AOP proxies and self-invocation through
@@ -79,11 +79,9 @@ public class OrderIngressService {
     private static final String METRIC_LEDGER_INFLIGHT_HOLD = "oms_ledger_inflight_hold";
 
     private final OrdersRepository orders;
-    private final ControlOutboxRepository outbox;
     private final DomainEventOutboxRepository domainEventOutbox;
     private final DomainEventEnvelopeCodec domainEventEnvelopeCodec;
     private final OmsConfig config;
-    private final ControlChroniclePayloadCodec controlPayloadCodec;
     private final ObjectMapper objectMapper;
     private final PiiHash piiHash;
     private final ObjectProvider<LedgerInflightReservationClient> ledgerInflightReservation;
@@ -96,11 +94,9 @@ public class OrderIngressService {
 
     public OrderIngressService(
             OrdersRepository orders,
-            ControlOutboxRepository outbox,
             DomainEventOutboxRepository domainEventOutbox,
             DomainEventEnvelopeCodec domainEventEnvelopeCodec,
             OmsConfig config,
-            ControlChroniclePayloadCodec controlPayloadCodec,
             ObjectMapper objectMapper,
             PiiHash piiHash,
             ObjectProvider<LedgerInflightReservationClient> ledgerInflightReservation,
@@ -111,11 +107,9 @@ public class OrderIngressService {
             OrderControlAdmission orderControlAdmission,
             OmsClusterIngressClient clusterIngressClient) {
         this.orders = orders;
-        this.outbox = outbox;
         this.domainEventOutbox = domainEventOutbox;
         this.domainEventEnvelopeCodec = domainEventEnvelopeCodec;
         this.config = config;
-        this.controlPayloadCodec = controlPayloadCodec;
         this.objectMapper = objectMapper;
         this.piiHash = piiHash;
         this.ledgerInflightReservation = ledgerInflightReservation;
@@ -187,26 +181,15 @@ public class OrderIngressService {
         }
 
         if (!created) {
-            // Duplicate at the cluster: the orders row + outbox/fanout side-tables were already
-            // produced by the original submission. Return without re-writing them; the projector
-            // does NOT re-emit OrderAdmittedEvent on idempotent re-hits (see slice 2b-1), and
-            // re-inserting the side-tables would create spurious extra control / domain envelopes.
+            // Duplicate at the cluster: the orders row + domain fanout were already produced by
+            // the original submission. Return without re-writing them; the projector does NOT
+            // re-emit OrderAdmittedEvent on idempotent re-hits (see slice 2b-1), and re-inserting
+            // the side-tables would create spurious extra domain envelopes.
             return new IngressResult(order, false);
         }
 
         maybePlaceBuyLedgerInflightHold(order);
 
-        Instant controlOutboxEnqueuedAt = Instant.now();
-        PendingControlEvent controlEvent = new PendingControlEvent(
-                "OrderAccepted",
-                id,
-                order.version(),
-                order.shardId(),
-                order.accountIdHash(),
-                order.acceptedAt(),
-                controlOutboxEnqueuedAt);
-        String controlPayload = serializePayload(controlEvent);
-        outbox.insert(id, order.version(), controlPayload, controlOutboxEnqueuedAt);
         try {
             domainEventOutbox.insert(id, domainEventEnvelopeCodec.orderAccepted(order));
         } catch (JsonProcessingException e) {
@@ -424,10 +407,6 @@ public class OrderIngressService {
             log.error("Failed to serialise ledger inflight outbox payload for orderId={}", order.id(), e);
             throw new RuntimeException("ledger inflight outbox payload serialisation failed", e);
         }
-    }
-
-    private String serializePayload(PendingControlEvent ev) {
-        return controlPayloadCodec.outboxPayloadJson(ev);
     }
 
     private static String normalizeLedgerBalanceId(String raw) {

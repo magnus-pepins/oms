@@ -11,8 +11,10 @@ Mirrors plan §14.14. The implementation enforcement points are
 
 ## Where raw `account_id` is allowed
 
-- Postgres rows in `orders` and `control_outbox`. This is the system of
-  record; access is gated by DB-level controls.
+- Postgres rows in `orders` (and the read-side projections `executions`,
+  `positions`, `domain_event_outbox`, `control_decisions`, `market_context`).
+  Access is gated by DB-level controls. (`control_outbox` was deleted in slice
+  3f of the Aeron Cluster substrate plan.)
 - Audit-grade trace logs **only when** `oms.pii.audit-trace-enabled=true`.
   This flag is `false` in dev and prod by default and is changed only for
   short, time-bounded investigations (incident triage, regulator request).

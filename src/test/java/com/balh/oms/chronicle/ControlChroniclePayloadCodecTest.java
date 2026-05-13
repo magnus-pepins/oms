@@ -1,8 +1,5 @@
 package com.balh.oms.chronicle;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.datatype.jdk8.Jdk8Module;
-import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
@@ -10,36 +7,24 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+/**
+ * Slice 3f (oms-aeron-cluster-substrate plan) deleted the JSON outbox encode / decode path
+ * along with the {@code control_outbox} table. Only the direct Chronicle encode + decode
+ * round-trip remains; slice 3g removes the rest of the chronicle module entirely.
+ */
 class ControlChroniclePayloadCodecTest {
 
-    private static ObjectMapper objectMapper() {
-        return new ObjectMapper()
-                .registerModule(new JavaTimeModule())
-                .registerModule(new Jdk8Module());
-    }
-
-    private final ControlChroniclePayloadCodec codec = new ControlChroniclePayloadCodec(objectMapper());
+    private final ControlChroniclePayloadCodec codec = new ControlChroniclePayloadCodec();
 
     @Test
-    void roundTrip_outboxJson_chronicleBytes_domainEvent() {
+    void chronicleAppendBytes_thenDecode_preservesEventAndStampsMaterialization() {
         Instant t1 = Instant.parse("2026-05-10T12:00:00Z");
         Instant t2 = Instant.parse("2026-05-10T12:00:01Z");
         var ev = new PendingControlEvent("OrderAccepted", UUID.randomUUID(), 0, 3, "h", t1, t2);
 
-        String outbox = codec.outboxPayloadJson(ev);
-        assertThat(outbox).contains("\"v\":2").contains("\"d\":");
-
-        PendingControlEvent fromOutbox = codec.decodeFromOutboxPayloadText(outbox);
-        assertThat(fromOutbox)
-                .usingRecursiveComparison()
-                .ignoringFields("telemetryHops")
-                .isEqualTo(ev);
-        assertThat(fromOutbox.telemetryHops()).hasSize(1);
-        assertThat(fromOutbox.telemetryHops().getFirst().stage()).isEqualTo(PipelineTelemetryStages.INGRESS);
-        assertThat(fromOutbox.telemetryHops().getFirst().observedAt()).isEqualTo(ev.enqueuedAt());
-
-        byte[] chronicle = codec.chronicleAppendBytesFromOutboxPayloadText(outbox);
+        byte[] chronicle = codec.chronicleAppendBytes(ev);
         assertThat(ControlChronicleWireFormat.chronicleExcerptStartsWithProtoPrefix(chronicle)).isTrue();
+
         PendingControlEvent fromChronicle = codec.decodeChronicleExcerpt(chronicle);
         assertThat(fromChronicle)
                 .usingRecursiveComparison()
@@ -60,8 +45,7 @@ class ControlChroniclePayloadCodecTest {
         Instant t1 = Instant.parse("2026-05-10T12:00:00Z");
         Instant t2 = Instant.parse("2026-05-10T12:00:01Z");
         var ev = new PendingControlEvent("OrderAccepted", UUID.randomUUID(), 1, 0, "x", t1, t2);
-        String outbox = codec.outboxPayloadJson(ev);
-        byte[] chronicleOrderAccepted = codec.chronicleAppendBytesFromOutboxPayloadText(outbox);
+        byte[] chronicleOrderAccepted = codec.chronicleAppendBytes(ev);
         PendingControlEvent applied = codec.decodeChronicleExcerpt(chronicleOrderAccepted);
         assertThat(applied.type()).isEqualTo(ControlChronicleEventTypes.ORDER_ACCEPTED);
 

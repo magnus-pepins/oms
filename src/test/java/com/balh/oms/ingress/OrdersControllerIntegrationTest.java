@@ -74,12 +74,8 @@ class OrdersControllerIntegrationTest extends AbstractPostgresIntegrationTest {
         assertThat(res.getBody()).isNotNull();
         UUID orderId = UUID.fromString((String) res.getBody().get("id"));
 
-        // outbox / domain-fanout rows are still written inside the ingress transaction (slice 2d/2e
-        // delete those paths). They commit before the controller returns.
-        Long outboxCount = jdbc.queryForObject(
-                "SELECT COUNT(*) FROM control_outbox WHERE order_id = ?", Long.class, orderId);
-        assertThat(outboxCount).isEqualTo(1L);
-
+        // The domain-fanout row is still written inside the ingress transaction (control_outbox
+        // was deleted in slice 3f); it commits before the controller returns.
         Long domainOutboxCount = jdbc.queryForObject(
                 "SELECT COUNT(*) FROM domain_event_outbox WHERE order_id = ?", Long.class, orderId);
         assertThat(domainOutboxCount).isEqualTo(1L);

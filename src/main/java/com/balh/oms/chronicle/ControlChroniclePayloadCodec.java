@@ -2,88 +2,34 @@ package com.balh.oms.chronicle;
 
 import com.balh.oms.proto.control.v1.ControlPendingEvent;
 import com.balh.oms.proto.control.v1.TelemetryHop;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.Timestamp;
 import org.springframework.stereotype.Component;
 
 import java.time.Instant;
 import java.util.Arrays;
-import java.util.Base64;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
 import static com.balh.oms.chronicle.ControlChronicleWireFormat.CHRONICLE_PROTO_PREFIX;
 import static com.balh.oms.chronicle.ControlChronicleWireFormat.CHRONICLE_PROTO_PREFIX_LENGTH;
-import static com.balh.oms.chronicle.ControlChronicleWireFormat.OUTBOX_JSON_KEY_FORMAT;
-import static com.balh.oms.chronicle.ControlChronicleWireFormat.OUTBOX_JSON_KEY_PROTO_BASE64;
-import static com.balh.oms.chronicle.ControlChronicleWireFormat.OUTBOX_PAYLOAD_FORMAT_PROTO_WRAPPED;
 import static com.balh.oms.chronicle.ControlChronicleWireFormat.chronicleExcerptStartsWithProtoPrefix;
 
 /**
- * Encodes/decodes control payloads: {@code control_outbox} stores JSONB with a base64 protobuf body; Chronicle stores
- * {@link ControlChronicleWireFormat#CHRONICLE_PROTO_PREFIX} + protobuf.
+ * Encodes/decodes control payloads: Chronicle excerpts carry
+ * {@link ControlChronicleWireFormat#CHRONICLE_PROTO_PREFIX} + protobuf body.
+ *
+ * <p>Slice 3f (oms-aeron-cluster-substrate plan) removed the JSON-wrapped outbox payload helpers
+ * because the {@code control_outbox} table is gone — only the direct Chronicle encode / decode
+ * path survives, and slice 3g removes that too along with the rest of the chronicle module.
  */
 @Component
 public final class ControlChroniclePayloadCodec {
 
-    private final ObjectMapper objectMapper;
-
-    public ControlChroniclePayloadCodec(ObjectMapper objectMapper) {
-        this.objectMapper = objectMapper;
-    }
-
-    /** JSON string suitable for {@code CAST(:payload AS jsonb)} — wrapped protobuf. */
-    public String outboxPayloadJson(PendingControlEvent event) {
-        try {
-            String b64 = Base64.getEncoder().encodeToString(toProtoForOutbox(event).toByteArray());
-            ObjectNode n = objectMapper.createObjectNode();
-            n.put(OUTBOX_JSON_KEY_FORMAT, OUTBOX_PAYLOAD_FORMAT_PROTO_WRAPPED);
-            n.put(OUTBOX_JSON_KEY_PROTO_BASE64, b64);
-            return objectMapper.writeValueAsString(n);
-        } catch (Exception e) {
-            throw new IllegalStateException("control outbox proto wrap failed for orderId=" + event.orderId(), e);
-        }
-    }
-
-    /**
-     * Bytes appended to Chronicle for this outbox row (prefix + protobuf). Expects v2 wrapped JSON only; stamps
-     * {@code chronicle_materialized_at} and a reconciler telemetry hop.
-     */
-    public byte[] chronicleAppendBytesFromOutboxPayloadText(String outboxPayloadText) {
-        try {
-            JsonNode root = objectMapper.readTree(outboxPayloadText);
-            requireWrappedProtoOutbox(root);
-            byte[] body = Base64.getDecoder().decode(root.path(OUTBOX_JSON_KEY_PROTO_BASE64).asText());
-            ControlPendingEvent parsed = ControlPendingEvent.parseFrom(body);
-            return chronicleBytesWithMaterialization(parsed);
-        } catch (IllegalStateException e) {
-            throw e;
-        } catch (Exception e) {
-            throw new IllegalStateException("control outbox payload decode failed", e);
-        }
-    }
-
-    /** Decode for tests / diagnostics: outbox {@code payload::text} → domain event. */
-    public PendingControlEvent decodeFromOutboxPayloadText(String outboxPayloadText) {
-        try {
-            JsonNode root = objectMapper.readTree(outboxPayloadText);
-            requireWrappedProtoOutbox(root);
-            byte[] body = Base64.getDecoder().decode(root.path(OUTBOX_JSON_KEY_PROTO_BASE64).asText());
-            return fromProto(ControlPendingEvent.parseFrom(body));
-        } catch (IllegalStateException e) {
-            throw e;
-        } catch (Exception e) {
-            throw new IllegalStateException("control outbox payload decode failed", e);
-        }
-    }
-
     /** Chronicle bytes for a domain event (stamps materialization + reconciler hop). */
     public byte[] chronicleAppendBytes(PendingControlEvent event) {
-        return chronicleBytesWithMaterialization(toProtoForOutbox(event));
+        return chronicleBytesWithMaterialization(toProtoForChronicle(event));
     }
 
     /**
@@ -133,20 +79,6 @@ public final class ControlChroniclePayloadCodec {
         }
     }
 
-    private static void requireWrappedProtoOutbox(JsonNode root) {
-        if (!root.isObject()
-                || !root.path(OUTBOX_JSON_KEY_FORMAT).isInt()
-                || root.path(OUTBOX_JSON_KEY_FORMAT).asInt() != OUTBOX_PAYLOAD_FORMAT_PROTO_WRAPPED
-                || !root.path(OUTBOX_JSON_KEY_PROTO_BASE64).isTextual()) {
-            throw new IllegalStateException(
-                    "control outbox payload must be v%d proto-wrapped (keys %s, %s); legacy flat JSON is not supported"
-                            .formatted(
-                                    OUTBOX_PAYLOAD_FORMAT_PROTO_WRAPPED,
-                                    OUTBOX_JSON_KEY_FORMAT,
-                                    OUTBOX_JSON_KEY_PROTO_BASE64));
-        }
-    }
-
     private static byte[] chronicleBytesWithMaterialization(ControlPendingEvent base) {
         Instant now = Instant.now();
         Timestamp t = instantToTimestamp(now);
@@ -165,12 +97,8 @@ public final class ControlChroniclePayloadCodec {
         return out;
     }
 
-    private static byte[] controlPendingEventToBytes(ControlPendingEvent p) {
-        return p.toByteArray();
-    }
-
-    /** Protobuf for outbox / base64 (no {@code chronicle_materialized_at}; ingress hop on {@code telemetry_hops}). */
-    private static ControlPendingEvent toProtoForOutbox(PendingControlEvent e) {
+    /** Protobuf for Chronicle (no {@code chronicle_materialized_at}; ingress hop on {@code telemetry_hops}). */
+    private static ControlPendingEvent toProtoForChronicle(PendingControlEvent e) {
         ControlPendingEvent.Builder b = ControlPendingEvent.newBuilder()
                 .setType(e.type())
                 .setOrderId(e.orderId().toString())

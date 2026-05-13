@@ -29,7 +29,6 @@ public class OmsConfig {
     private final Grpc grpc = new Grpc();
     private final Shard shard = new Shard();
     private final Control control = new Control();
-    private final Outbox outbox = new Outbox();
     private final Chronicle chronicle = new Chronicle();
     private final Events events = new Events();
     private final Ledger ledger = new Ledger();
@@ -50,7 +49,6 @@ public class OmsConfig {
     public Grpc getGrpc() { return grpc; }
     public Shard getShard() { return shard; }
     public Control getControl() { return control; }
-    public Outbox getOutbox() { return outbox; }
     public Chronicle getChronicle() { return chronicle; }
     public Events getEvents() { return events; }
     public Ledger getLedger() { return ledger; }
@@ -116,18 +114,6 @@ public class OmsConfig {
         public void setPostgresWritePath(String raw) {
             this.postgresWritePath = ControlPostgresWritePath.fromProperty(raw);
         }
-    }
-
-    public static class Outbox {
-        private long reconcilerAgeMs = 2000L;
-        private int reconcilerBatchSize = 100;
-        private long reconcilerIntervalMs = 500L;
-        public long getReconcilerAgeMs() { return reconcilerAgeMs; }
-        public void setReconcilerAgeMs(long v) { this.reconcilerAgeMs = v; }
-        public int getReconcilerBatchSize() { return reconcilerBatchSize; }
-        public void setReconcilerBatchSize(int v) { this.reconcilerBatchSize = v; }
-        public long getReconcilerIntervalMs() { return reconcilerIntervalMs; }
-        public void setReconcilerIntervalMs(long v) { this.reconcilerIntervalMs = v; }
     }
 
     public static class Chronicle {

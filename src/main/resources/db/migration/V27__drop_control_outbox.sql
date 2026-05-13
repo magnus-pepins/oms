@@ -1,0 +1,29 @@
+-- Phase 3 slice 3f of system-documentation/plans/oms-aeron-cluster-substrate.md.
+--
+-- The cluster substrate replaces the control_outbox -> Chronicle path:
+--   * slice 2b-1 -> the cluster emits OrderAdmittedEvent on the events recording.
+--   * slice 2d   -> OmsPostgresProjector consumes that event, runs OrderControlAdmission,
+--                   and writes orders.status=WORKING + control_decisions(PASS) +
+--                   domain_event_outbox(OrderWorking) in one transaction. No outbox row
+--                   is needed for the WORKING transition any more.
+--   * slice 3a-d -> oms-fix-egress reads the same events recording via Aeron Archive
+--                   replay and drives QuickFIX outbound; control_outbox -> Chronicle ->
+--                   FIX is no longer the path.
+--
+-- That leaves control_outbox unused: nothing produces a Chronicle frame from it
+-- (IngressControlChroniclePublisher was removed in Phase 1c slice C); slice 3f
+-- removes the OrderIngressService writer + OutboxReconciler reader; slice 3g
+-- finally removes ControlTailer / oms-fix-worker / the Chronicle module itself.
+--
+-- DROP TABLE is safe because:
+--   * V25 already removed the FK from control_outbox to orders(id), and no other
+--     table holds a FK to control_outbox (V1 only declares a FK FROM control_outbox).
+--   * The partial index idx_control_outbox_pending is dropped implicitly with the table.
+--   * Production has no consumer of control_outbox after slice 3f deploys; new admissions
+--     skip it entirely.
+--
+-- If a deploy needs to roll back to slice 3e behaviour, a forward-only schema means
+-- control_outbox has to be re-created from the V1 definition; we explicitly accept this
+-- per the substrate plan's "no Chronicle backward-compat" stance.
+
+DROP TABLE IF EXISTS control_outbox;

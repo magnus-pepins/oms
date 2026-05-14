@@ -29,9 +29,10 @@
 -- production-shape table could be much longer.
 -- flyway:executeInTransaction=false
 
+-- Note: COMMENT ON INDEX kept in the migration file's own header above (Flyway 10 with
+-- executeInTransaction=false does not allow mixing CREATE INDEX CONCURRENTLY with a
+-- transactional COMMENT statement in the same migration). Migration file is the
+-- canonical source of doc; pg_description carries no extra value here.
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_domain_event_outbox_pending_id
     ON domain_event_outbox (id)
     WHERE published_at IS NULL;
-
-COMMENT ON INDEX idx_domain_event_outbox_pending_id IS
-    'Partial index on (id) WHERE published_at IS NULL. Lets the planner satisfy DomainFanoutReconciler''s ORDER BY id LIMIT N FOR UPDATE SKIP LOCKED with an index walk over only unpublished rows, instead of falling back to domain_event_outbox_pkey + Filter (which walks the whole table when the unpublished set is small relative to total rows). See ## Profile-led pivot in docs/runbooks/local-multi-jvm-bench.md for the EXPLAIN ANALYZE that motivated this.';

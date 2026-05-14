@@ -29,9 +29,9 @@
 -- last_attempt_at) ordering, V4 is unused after V30+V31 but kept for safety).
 -- flyway:executeInTransaction=false
 
+-- Note: COMMENT ON INDEX kept in the migration file's own header above (same reason as V30
+-- — Flyway 10 + executeInTransaction=false rejects mixing non-transactional CREATE INDEX
+-- CONCURRENTLY with transactional COMMENT in the same migration).
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_ledger_inflight_outbox_pending_id
     ON ledger_inflight_outbox (id)
     WHERE published_at IS NULL AND compensated_at IS NULL;
-
-COMMENT ON INDEX idx_ledger_inflight_outbox_pending_id IS
-    'Partial index on (id) WHERE published_at IS NULL AND compensated_at IS NULL. Lets the planner satisfy LedgerInflightOutboxReconciler''s ORDER BY id LIMIT N FOR UPDATE SKIP LOCKED with an index walk over only pending+uncompensated rows, avoiding the pkey scan + Filter that walked 42 972 rows on Pop! 2026-05-14 to surface the first 200. See ## Profile-led pivot in docs/runbooks/local-multi-jvm-bench.md plus the post-V30 verification that motivated this index.';

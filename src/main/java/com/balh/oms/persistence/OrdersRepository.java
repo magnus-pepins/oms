@@ -195,11 +195,11 @@ public class OrdersRepository {
                 .addValue("shard_id", ev.shardId())
                 .addValue("status", OrderStatus.NEW.name())
                 .addValue("terminal_reason", null)
-                .addValue("side", sideName(ev.side()))
+                .addValue("side", AcceptOrderCommand.sideName(ev.side()))
                 .addValue("instrument_symbol", ev.instrumentSymbol())
                 .addValue("quantity", quantity)
                 .addValue("limit_price", limitPrice)
-                .addValue("time_in_force", timeInForceName(ev.timeInForceCode()))
+                .addValue("time_in_force", AcceptOrderCommand.timeInForceName(ev.timeInForceCode()))
                 .addValue("received_at", Timestamp.from(receivedAt))
                 .addValue("accepted_at", Timestamp.from(acceptedAt))
                 .addValue("terminal_at", null)
@@ -214,23 +214,9 @@ public class OrdersRepository {
         return Instant.ofEpochSecond(seconds, nanoAdjustment);
     }
 
-    private static String sideName(byte sideCode) {
-        return switch (sideCode) {
-            case AcceptOrderCommand.SIDE_BUY -> Side.BUY.name();
-            case AcceptOrderCommand.SIDE_SELL -> Side.SELL.name();
-            default -> throw new IllegalArgumentException("unknown side code: " + sideCode);
-        };
-    }
-
-    private static String timeInForceName(byte tif) {
-        return switch (tif) {
-            case AcceptOrderCommand.TIF_DAY -> "DAY";
-            case AcceptOrderCommand.TIF_IOC -> "IOC";
-            case AcceptOrderCommand.TIF_FOK -> "FOK";
-            case AcceptOrderCommand.TIF_GTC -> "GTC";
-            default -> throw new IllegalArgumentException("unknown time-in-force code: " + tif);
-        };
-    }
+    // sideName / timeInForceName moved to AcceptOrderCommand (Phase 4 Tier 2.5 phase D-3) so
+    // the projector's domain-envelope-from-OrderAdmittedEvent path shares one canonical mapping
+    // with this orders-row mapping. Calls below are static imports through AcceptOrderCommand.
 
     public Optional<Order> findById(UUID id) {
         var rows = jdbc.query(SELECT_BY_ID_SQL,

@@ -1,6 +1,8 @@
 package com.balh.oms.events;
 
 import com.balh.oms.chronicle.PendingControlEvent;
+import com.balh.oms.cluster.AcceptOrderCommand;
+import com.balh.oms.cluster.OrderAdmittedEvent;
 import com.balh.oms.domain.Order;
 import com.balh.oms.domain.RejectCode;
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -9,6 +11,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.Instant;
 import java.util.UUID;
 
@@ -42,6 +45,47 @@ public class DomainEventEnvelopeCodec {
                 order.timeInForce(),
                 order.acceptedAt());
         return envelope("OrderAccepted", order.id(), payload);
+    }
+
+    /**
+     * Phase 4 Tier 2.5 phase D-3: build an {@code OrderAccepted} envelope from the cluster's
+     * {@link OrderAdmittedEvent} so the projector can emit the envelope after the cluster log
+     * is durable, instead of the ingress JVM emitting it inside its own outbox tx. Same shape
+     * as {@link #orderAccepted(Order)} (payload type, schema version, type tag) so downstream
+     * NATS / desk / drop-copy consumers cannot tell which writer produced the row.
+     *
+     * <p>Field mapping (mirrors {@link com.balh.oms.persistence.OrdersRepository#insertFromAdmittedEvent}
+     * so the {@code orders} row and the {@code OrderAccepted} envelope agree byte-for-byte on
+     * side / TIF / qty / limit / acceptedAt):
+     * <ul>
+     *   <li>{@code side} byte → {@link AcceptOrderCommand#sideName(byte)}</li>
+     *   <li>{@code timeInForceCode} byte → {@link AcceptOrderCommand#timeInForceName(byte)}</li>
+     *   <li>{@code quantityScaled} (1e9 fixed-point) → {@link BigDecimal} with scale 10,
+     *       {@link RoundingMode#UNNECESSARY} (cluster guarantees no precision loss)</li>
+     *   <li>{@code limitPriceScaledOrZero} (1e6 fixed-point; 0 = market) → {@code null} for
+     *       market orders, otherwise scale 10 {@link BigDecimal}</li>
+     *   <li>{@code acceptedAtMillis} → {@link Instant#ofEpochMilli(long)}</li>
+     * </ul>
+     */
+    public String orderAcceptedFromAdmitted(OrderAdmittedEvent ev) throws JsonProcessingException {
+        BigDecimal quantity = BigDecimal.valueOf(ev.quantityScaled())
+                .divide(BigDecimal.valueOf(AcceptOrderCommand.QUANTITY_SCALE), 10, RoundingMode.UNNECESSARY);
+        BigDecimal limitPrice = ev.limitPriceScaledOrZero() == 0L
+                ? null
+                : BigDecimal.valueOf(ev.limitPriceScaledOrZero())
+                        .divide(BigDecimal.valueOf(AcceptOrderCommand.PRICE_SCALE), 10, RoundingMode.UNNECESSARY);
+        var payload = new OrderAcceptedEvent(
+                ev.orderId(),
+                ev.version(),
+                ev.shardId(),
+                ev.accountIdHash(),
+                AcceptOrderCommand.sideName(ev.side()),
+                ev.instrumentSymbol(),
+                quantity,
+                limitPrice,
+                AcceptOrderCommand.timeInForceName(ev.timeInForceCode()),
+                Instant.ofEpochMilli(ev.acceptedAtMillis()));
+        return envelope("OrderAccepted", ev.orderId(), payload);
     }
 
     public String orderRejected(PendingControlEvent event, RejectCode reason, int newSeq) throws JsonProcessingException {

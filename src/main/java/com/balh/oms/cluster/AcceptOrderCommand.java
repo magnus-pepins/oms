@@ -72,6 +72,37 @@ public record AcceptOrderCommand(
     public static final byte TIF_FOK = 2;
     public static final byte TIF_GTC = 3;
 
+    /**
+     * Map a wire {@code SIDE_*} byte to the canonical domain string ({@code "BUY"} / {@code "SELL"}).
+     * Lives on the wire-format type so projector and {@link com.balh.oms.events.DomainEventEnvelopeCodec}
+     * can build {@code orders} rows and domain envelopes from the same {@link OrderAdmittedEvent}
+     * without each owning its own switch (Phase 4 Tier 2.5 phase D-3).
+     *
+     * @throws IllegalArgumentException on an unknown code (signals a wire format upgrade that
+     *     was not yet propagated — fail loud rather than silently project an unknown side).
+     */
+    public static String sideName(byte sideCode) {
+        return switch (sideCode) {
+            case SIDE_BUY -> "BUY";
+            case SIDE_SELL -> "SELL";
+            default -> throw new IllegalArgumentException("unknown side code: " + sideCode);
+        };
+    }
+
+    /**
+     * Map a wire {@code TIF_*} byte to the canonical {@code time_in_force} string. See
+     * {@link #sideName(byte)} for the rationale.
+     */
+    public static String timeInForceName(byte tif) {
+        return switch (tif) {
+            case TIF_DAY -> "DAY";
+            case TIF_IOC -> "IOC";
+            case TIF_FOK -> "FOK";
+            case TIF_GTC -> "GTC";
+            default -> throw new IllegalArgumentException("unknown time-in-force code: " + tif);
+        };
+    }
+
     public AcceptOrderCommand {
         Objects.requireNonNull(orderId, "orderId");
         Objects.requireNonNull(accountId, "accountId");

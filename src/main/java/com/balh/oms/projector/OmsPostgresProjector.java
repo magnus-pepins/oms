@@ -551,9 +551,30 @@ public class OmsPostgresProjector {
      * tests can drive admission directly from a synthesised event when standing up an Aeron-less
      * Spring context is wasteful (the live IT in {@code OmsPostgresProjectorIT} still drives the
      * full path through the cluster).
+     *
+     * <p>Phase 4 Tier 2.5 phase D-3: emits the {@code OrderAccepted} domain envelope here on
+     * fresh admission (gated on {@link OrdersRepository#insertFromAdmittedEvent}'s boolean
+     * return) instead of having the ingress JVM emit it inside its own outbox tx. The
+     * {@code orders} row was the existing idempotency key for this projector pass; using its
+     * "fresh insert vs replay no-op" signal gives the envelope insert the same idempotency
+     * without a separate unique-index migration on {@code domain_event_outbox} (whose
+     * {@code order_id} is intentionally not unique — multiple events per order are normal).
      */
     void applyAdmittedEvent(OrderAdmittedEvent ev, long newPosition) {
-        ordersRepository.insertFromAdmittedEvent(ev);
+        boolean freshAdmission = ordersRepository.insertFromAdmittedEvent(ev);
+        if (freshAdmission) {
+            // First time we project this admit: emit OrderAccepted into the fanout outbox so
+            // downstream consumers see the same {received → working → ...} sequence they used
+            // to see when ingress wrote it. On replay (recording recreation, cluster cursor
+            // rewind) freshAdmission == false and the envelope is not re-written; the
+            // domain_event_outbox row from the original projection stands.
+            try {
+                domainEventOutboxRepository.insert(ev.orderId(), envelopeCodec.orderAcceptedFromAdmitted(ev));
+            } catch (JsonProcessingException e) {
+                throw new IllegalStateException(
+                        "OrderAccepted envelope serialisation failed for orderId=" + ev.orderId(), e);
+            }
+        }
         PendingControlEvent pending = toPendingControlEvent(ev);
         controlAdmission.persistAdmission(pending);
         // Phase 4 Tier 2.5 phase D-1: idempotently backfill ledger_inflight_outbox if the

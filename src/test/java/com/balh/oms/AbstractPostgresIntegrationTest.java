@@ -2,7 +2,11 @@ package com.balh.oms;
 
 import com.balh.oms.cluster.OmsClusterWireFormat;
 import com.balh.oms.cluster.OrderAdmittedEvent;
+import com.balh.oms.events.DomainEventEnvelopeCodec;
+import com.balh.oms.persistence.DomainEventOutboxRepository;
 import com.balh.oms.persistence.OrdersRepository;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 import io.aeron.Aeron;
@@ -439,6 +443,13 @@ public abstract class AbstractPostgresIntegrationTest {
      *       {@link com.balh.oms.projector.OmsPostgresProjectorIT} uses a different projector
      *       identity / cursor, so this daemon does not interfere with it.</li>
      * </ul>
+     *
+     * <p>Phase 4 Tier 2.5 phase D-3: the production projector now also writes the
+     * {@code OrderAccepted} envelope into {@code domain_event_outbox} on a fresh admission
+     * (because ingress stopped doing it to drop the per-request Postgres tx). This daemon
+     * mirrors that behaviour so integration tests like {@code NatsDomainFanoutIntegrationTest}
+     * still observe an OrderAccepted row in {@code domain_event_outbox} after a successful
+     * {@code POST /internal/v1/orders}.
      */
     public static final class TestPostgresProjectorSingleton {
 
@@ -454,6 +465,8 @@ public abstract class AbstractPostgresIntegrationTest {
 
         private final HikariDataSource dataSource;
         private final OrdersRepository ordersRepository;
+        private final DomainEventOutboxRepository domainEventOutboxRepository;
+        private final DomainEventEnvelopeCodec domainEventEnvelopeCodec;
         private final Aeron aeron;
         private final AeronArchive archive;
         private final Subscription replay;
@@ -463,6 +476,8 @@ public abstract class AbstractPostgresIntegrationTest {
         private TestPostgresProjectorSingleton(
                 HikariDataSource dataSource,
                 OrdersRepository ordersRepository,
+                DomainEventOutboxRepository domainEventOutboxRepository,
+                DomainEventEnvelopeCodec domainEventEnvelopeCodec,
                 Aeron aeron,
                 AeronArchive archive,
                 Subscription replay,
@@ -470,6 +485,8 @@ public abstract class AbstractPostgresIntegrationTest {
                 AtomicBoolean running) {
             this.dataSource = dataSource;
             this.ordersRepository = ordersRepository;
+            this.domainEventOutboxRepository = domainEventOutboxRepository;
+            this.domainEventEnvelopeCodec = domainEventEnvelopeCodec;
             this.aeron = aeron;
             this.archive = archive;
             this.replay = replay;
@@ -506,7 +523,10 @@ public abstract class AbstractPostgresIntegrationTest {
             hc.setPoolName("oms-test-projector");
             hc.setConnectionTimeout(Long.parseLong(HIKARI_CONNECTION_TIMEOUT_MS));
             HikariDataSource ds = new HikariDataSource(hc);
-            OrdersRepository orders = new OrdersRepository(new NamedParameterJdbcTemplate(ds));
+            NamedParameterJdbcTemplate jdbc = new NamedParameterJdbcTemplate(ds);
+            OrdersRepository orders = new OrdersRepository(jdbc);
+            DomainEventOutboxRepository domainEventOutbox = new DomainEventOutboxRepository(jdbc);
+            DomainEventEnvelopeCodec domainEventCodec = new DomainEventEnvelopeCodec(new ObjectMapper());
 
             Aeron aeron = Aeron.connect(new Aeron.Context().aeronDirectoryName(aeronDir));
             AeronArchive archive = AeronArchive.connect(new AeronArchive.Context()
@@ -525,10 +545,11 @@ public abstract class AbstractPostgresIntegrationTest {
 
             AtomicBoolean running = new AtomicBoolean(true);
             Thread thread = new Thread(
-                    () -> replayLoop(replay, orders, running), "oms-test-projector-daemon");
+                    () -> replayLoop(replay, orders, domainEventOutbox, domainEventCodec, running),
+                    "oms-test-projector-daemon");
             thread.setDaemon(true);
             TestPostgresProjectorSingleton instance = new TestPostgresProjectorSingleton(
-                    ds, orders, aeron, archive, replay, thread, running);
+                    ds, orders, domainEventOutbox, domainEventCodec, aeron, archive, replay, thread, running);
             thread.start();
             return instance;
         }
@@ -576,7 +597,11 @@ public abstract class AbstractPostgresIntegrationTest {
         }
 
         private static void replayLoop(
-                Subscription replay, OrdersRepository orders, AtomicBoolean running) {
+                Subscription replay,
+                OrdersRepository orders,
+                DomainEventOutboxRepository domainEventOutbox,
+                DomainEventEnvelopeCodec domainEventCodec,
+                AtomicBoolean running) {
             FragmentHandler handler = (buffer, offset, length, header) -> {
                 int typeId = buffer.getInt(offset + OmsClusterWireFormat.HEADER_TYPE_ID_OFFSET);
                 if (typeId != OmsClusterWireFormat.TYPE_ID_ORDER_ADMITTED) {
@@ -584,7 +609,20 @@ public abstract class AbstractPostgresIntegrationTest {
                 }
                 OrderAdmittedEvent ev = OrderAdmittedEvent.decode(buffer, offset, length);
                 try {
-                    orders.insertFromAdmittedEvent(ev);
+                    boolean fresh = orders.insertFromAdmittedEvent(ev);
+                    if (fresh) {
+                        // Mirror production OmsPostgresProjector D-3: emit the OrderAccepted
+                        // envelope here so domain-fanout integration tests still see the row.
+                        try {
+                            domainEventOutbox.insert(
+                                    ev.orderId(), domainEventCodec.orderAcceptedFromAdmitted(ev));
+                        } catch (JsonProcessingException e) {
+                            throw new IllegalStateException(
+                                    "OrderAccepted envelope serialisation failed for orderId="
+                                            + ev.orderId(),
+                                    e);
+                        }
+                    }
                 } catch (RuntimeException e) {
                     // Swallow per-fragment errors so the daemon doesn't die on a single bad row.
                     // Tests that care will see the missing row and time out; the JVM logs will show

@@ -9,8 +9,6 @@ import com.balh.oms.domain.Order;
 import com.balh.oms.domain.OrderStatus;
 import com.balh.oms.domain.ShardKey;
 import com.balh.oms.observability.PiiHash;
-import com.balh.oms.events.DomainEventEnvelopeCodec;
-import com.balh.oms.persistence.DomainEventOutboxRepository;
 import com.balh.oms.persistence.LedgerInflightOutboxRepository;
 import com.balh.oms.observability.metrics.OmsPipelineMetrics;
 import com.balh.oms.persistence.OrdersRepository;
@@ -30,8 +28,6 @@ import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.context.annotation.Profile;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.PlatformTransactionManager;
-import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
 import java.time.Duration;
@@ -65,13 +61,21 @@ import java.util.concurrent.TimeoutException;
  * {@code OrderWorking} into {@code domain_event_outbox} directly from {@code OrderAdmittedEvent}
  * (slice 2d), and the {@code oms-fix-egress} JVM drives FIX outbound from the cluster's events
  * recording (slices 3a–3d), so no row in {@code control_outbox} ever has a downstream consumer.
- * The {@code domain_event_outbox} insert (for {@code OrderAccepted}) and the optional BUY
- * {@code ledger_inflight_outbox} insert are still done here.
  *
- * <p>This is a separate Spring bean (not a controller method) because Spring's
- * {@code @Transactional} relies on AOP proxies and self-invocation through
- * {@code this} would skip the proxy. Keeping this in its own bean is what actually opens the
- * transaction at the right boundary.
+ * <p>Phase 4 Tier 2.5 phase D-3 retired the {@code domain_event_outbox.insert(OrderAccepted)}
+ * from this method too: the projector emits the {@code OrderAccepted} envelope from the
+ * cluster's {@link com.balh.oms.cluster.OrderAdmittedEvent} (gated on the
+ * {@code orders} ON-CONFLICT-DO-NOTHING insert returning a fresh row, mirroring the existing
+ * idempotency for {@code OrderWorking}). The only Postgres write that may still happen on
+ * the ingress hot path is the optional BUY-async {@code ledger_inflight_outbox} insert
+ * (slice 4p / D-1), which a single auto-committing JDBC statement can do without a Spring
+ * transaction — Hikari's default {@code autoCommit=true} commits per-statement.
+ *
+ * <p>Net effect: SELL and BUY-without-inflight orders open <strong>zero</strong> Postgres
+ * connections on the hot path; BUY-with-inflight-async opens one connection just long
+ * enough for the single INSERT (sub-millisecond). The {@link
+ * org.springframework.transaction.support.TransactionTemplate} that D-1 left in place is
+ * gone — there is nothing to demarcate.
  */
 @Service
 @Profile(OmsProfiles.ORDER_ACCEPT_PROFILE)
@@ -83,8 +87,6 @@ public class OrderIngressService {
     private static final String METRIC_LEDGER_INFLIGHT_HOLD = "oms_ledger_inflight_hold";
 
     private final OrdersRepository orders;
-    private final DomainEventOutboxRepository domainEventOutbox;
-    private final DomainEventEnvelopeCodec domainEventEnvelopeCodec;
     private final OmsConfig config;
     private final ObjectMapper objectMapper;
     private final PiiHash piiHash;
@@ -95,12 +97,9 @@ public class OrderIngressService {
     private final MeterRegistry meterRegistry;
     private final OrderControlAdmission orderControlAdmission;
     private final OmsClusterIngressClient clusterIngressClient;
-    private final TransactionTemplate transactionTemplate;
 
     public OrderIngressService(
             OrdersRepository orders,
-            DomainEventOutboxRepository domainEventOutbox,
-            DomainEventEnvelopeCodec domainEventEnvelopeCodec,
             OmsConfig config,
             ObjectMapper objectMapper,
             PiiHash piiHash,
@@ -110,11 +109,8 @@ public class OrderIngressService {
             LedgerInflightOutboxRepository ledgerInflightOutbox,
             MeterRegistry meterRegistry,
             OrderControlAdmission orderControlAdmission,
-            OmsClusterIngressClient clusterIngressClient,
-            PlatformTransactionManager transactionManager) {
+            OmsClusterIngressClient clusterIngressClient) {
         this.orders = orders;
-        this.domainEventOutbox = domainEventOutbox;
-        this.domainEventEnvelopeCodec = domainEventEnvelopeCodec;
         this.config = config;
         this.objectMapper = objectMapper;
         this.piiHash = piiHash;
@@ -125,7 +121,6 @@ public class OrderIngressService {
         this.meterRegistry = meterRegistry;
         this.orderControlAdmission = orderControlAdmission;
         this.clusterIngressClient = clusterIngressClient;
-        this.transactionTemplate = new TransactionTemplate(transactionManager);
     }
 
     /**
@@ -160,23 +155,29 @@ public class OrderIngressService {
      * {@code OmsClusterIngressClient.submitAcceptOrder → CompletableFuture.get} (waiting on
      * the Aeron cluster commit reply) <em>inside</em> {@code transactionTemplate.execute}.
      * The Aeron cluster commit RTT (mean ~0.9 ms, p999 ~11 ms) was being charged against
-     * the Hikari connection-hold budget. Pulling the cluster admit out of the tx drops
-     * conn-hold from ~3-8 ms (admit + INSERTs + commit) to ~0.5-1 ms (INSERTs + commit).
+     * the Hikari connection-hold budget.
      *
-     * <p><strong>Durability gap closure (D-1).</strong> The cluster log is the source of
-     * truth for "this order was admitted"; it commits independently of the Postgres tx.
-     * If the ingress JVM crashes between {@link #submitToClusterOrThrow} returning and the
-     * tx committing, the order is in the cluster but the {@code domain_event_outbox} +
-     * {@code ledger_inflight_outbox} rows are missing. {@code OmsPostgresProjector} closes
-     * the financial-correctness half of that gap by idempotently backfilling the
-     * {@code ledger_inflight_outbox} row from {@link com.balh.oms.cluster.OrderAdmittedEvent}
-     * (D-1; uses {@code uq_ledger_inflight_outbox_order_id} → {@code ON CONFLICT DO NOTHING}
-     * so the happy-path INSERT here stays authoritative). The {@code domain_event_outbox}
-     * {@code OrderAccepted} envelope is best-effort: a crash here means downstream consumers
-     * see {@code OrderWorking} (emitted by the projector via
-     * {@link OrderControlAdmission#persistAdmission}) without the preceding
-     * {@code OrderAccepted}; this is acceptable today (status fanout is the contract, the
-     * "received" stage is informational).
+     * <p>Phase 4 Tier 2.5 phase D-3 retired the Spring tx entirely: the projector emits the
+     * {@code OrderAccepted} envelope from {@link com.balh.oms.cluster.OrderAdmittedEvent}
+     * (gated on {@link OrdersRepository#insertFromAdmittedEvent} returning a fresh insert),
+     * so the only Postgres write that may still happen here is the optional BUY-async
+     * {@code ledger_inflight_outbox} INSERT inside {@link #maybePlaceBuyLedgerInflightHold}.
+     * That single statement auto-commits via Hikari's default {@code autoCommit=true};
+     * a {@code TransactionTemplate} would only widen the conn-hold window without buying
+     * any consistency.
+     *
+     * <p><strong>Durability gap closure (D-1 + D-3).</strong> The cluster log is the source
+     * of truth for "this order was admitted"; it commits independently of any Postgres
+     * write here. If the ingress JVM crashes after {@link #submitToClusterOrThrow} returns,
+     * the projector idempotently backfills both
+     * <ul>
+     *   <li>the {@code ledger_inflight_outbox} row (D-1, via
+     *       {@code uq_ledger_inflight_outbox_order_id} ON CONFLICT DO NOTHING), and</li>
+     *   <li>the {@code OrderAccepted} envelope (D-3, gated on the projector's own
+     *       {@code orders} ON CONFLICT DO NOTHING returning a fresh insert).</li>
+     * </ul>
+     * The whole "ingress crashed mid-write" state therefore no longer leaves missing rows
+     * downstream; the projector reconstructs both from the cluster's authoritative event.
      *
      * <p>Behaviour-preserving: error semantics for verify + cluster admit are unchanged
      * ({@code ledger_identity_required} / {@code ledger_identity_mismatch} /
@@ -189,7 +190,7 @@ public class OrderIngressService {
     public IngressResult persistAccepted(CreateOrderRequest req) {
         Timer.Sample ingressSample = Timer.start(meterRegistry);
         try {
-            // Pre-tx phase: HTTP / cluster work that must NOT hold a Hikari connection.
+            // Pre-cluster phase: HTTP / cluster work that must NOT hold a Hikari connection.
             //   1. Ledger balance/identity verify (HTTP; pulled out of tx in C-2).
             //   2. Aeron cluster admit (CompletableFuture wait; pulled out of tx in D-1).
             // Both can fail and short-circuit before any Postgres conn is acquired.
@@ -214,48 +215,25 @@ public class OrderIngressService {
 
             if (!created) {
                 // Duplicate at the cluster: the orders row + outbox rows were already produced by
-                // the original submission. Return without opening a tx; the projector does NOT
+                // the original submission. Return without touching Postgres; the projector does NOT
                 // re-emit OrderAdmittedEvent on idempotent re-hits (see slice 2b-1), and re-inserting
-                // the side-tables would create spurious extra domain envelopes / ledger holds.
+                // the side tables would create spurious extra domain envelopes / ledger holds.
                 OmsPipelineMetrics.finishIngressAccept(meterRegistry, ingressSample, "duplicate");
                 return new IngressResult(order, false);
             }
 
-            // Tx phase: Postgres outbox writes only. Capture in finals for the lambda capture.
-            // The Aeron commit has already happened, so the cluster log is durable independent
-            // of this tx; the projector backfills ledger_inflight_outbox from the cluster event
-            // if this tx never commits (D-1, see method-level Javadoc).
-            UUID finalId = id;
-            Order finalOrder = order;
-            IngressResult result = transactionTemplate.execute(status -> persistAcceptedBody(finalId, finalOrder));
-            if (result == null) {
-                throw new IllegalStateException("transactionTemplate returned null IngressResult");
-            }
+            // D-3 post-cluster phase: at most one auto-committing JDBC INSERT
+            // (ledger_inflight_outbox, BUY-async path only). No Spring tx — Hikari's default
+            // autoCommit=true commits per statement, and the projector backfills this row from
+            // the cluster event if we crash before this method returns (see Javadoc above).
+            maybePlaceBuyLedgerInflightHold(order);
+
             OmsPipelineMetrics.finishIngressAccept(meterRegistry, ingressSample, "created");
-            return result;
+            return new IngressResult(order, true);
         } catch (RuntimeException e) {
             OmsPipelineMetrics.finishIngressAccept(meterRegistry, ingressSample, "error");
             throw e;
         }
-    }
-
-    /**
-     * The Postgres-transactional portion of {@link #persistAccepted}. Caller must have
-     * already run {@link #maybeVerifyLedgerBalanceBinding} (C-2 — Ledger HTTP) and
-     * {@link #submitToClusterOrThrow} (D-1 — Aeron cluster admit). This body only does
-     * the residual outbox-side INSERTs that benefit from being one tx (so a fanout row
-     * is never written without its matching ledger inflight hold for BUY orders, modulo
-     * the projector backfill described on {@link #persistAccepted}).
-     */
-    private IngressResult persistAcceptedBody(UUID id, Order order) {
-        maybePlaceBuyLedgerInflightHold(order);
-        try {
-            domainEventOutbox.insert(id, domainEventEnvelopeCodec.orderAccepted(order));
-        } catch (JsonProcessingException e) {
-            log.error("Failed to serialise domain fanout envelope for orderId={}", id, e);
-            throw new RuntimeException("domain event envelope serialisation failed", e);
-        }
-        return new IngressResult(order, true);
     }
 
     private Order buildOrder(

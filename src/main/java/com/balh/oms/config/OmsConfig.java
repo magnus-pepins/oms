@@ -77,6 +77,24 @@ public class OmsConfig {
         public void setPort(int port) { this.port = Math.max(1, Math.min(port, 65535)); }
     }
 
+    /**
+     * Sharding knobs. Pinned in {@code oms/docs/decisions.md} §4: shard key is {@code account_id},
+     * hash function is {@code xxh64} (via {@code net.openhft:zero-allocation-hashing}, encoded in
+     * {@link com.balh.oms.domain.ShardKey}), and slice 1 ships at {@code count = 1}. The mapping
+     * function exists from day one so call sites do not change when shards grow.
+     *
+     * <ul>
+     *   <li>{@link #count} — number of shards in the OMS topology. Default {@code 1}. Phase 4
+     *       Tier 2.5 phase E-1 caps this at {@link com.balh.oms.cluster.OmsClusterShardRouter#E1_MAX_SHARD_COUNT}
+     *       on the ingress JVM until E-3 wires multi-bean injection of
+     *       {@link com.balh.oms.cluster.OmsClusterIngressClient}; setting it higher fails fast at
+     *       Spring context load with an explicit message naming the slice that lifts the cap.</li>
+     *   <li>{@link #id} — this JVM's shard id (only meaningful on per-shard JVM roles like
+     *       {@code oms-cluster-node} / {@code oms-postgres-projector} once those become
+     *       per-shard in E-3). Currently used as a {@code shard_id} tag on Micrometer meters
+     *       (see {@code MetricsConfig}). Default {@code 0}.</li>
+     * </ul>
+     */
     public static class Shard {
         private int id = 0;
         private int count = 1;

@@ -3,6 +3,7 @@ package com.balh.oms.ingress;
 import com.balh.oms.cluster.AcceptOrderCommand;
 import com.balh.oms.cluster.AdmissionResult;
 import com.balh.oms.cluster.OmsClusterIngressClient;
+import com.balh.oms.cluster.OmsClusterShardRouter;
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.config.OmsProfiles;
 import com.balh.oms.domain.Order;
@@ -101,7 +102,14 @@ public class OrderIngressService {
     private final ObjectProvider<LedgerBalanceClient> ledgerBalanceClient;
     private final MeterRegistry meterRegistry;
     private final OrderControlAdmission orderControlAdmission;
-    private final OmsClusterIngressClient clusterIngressClient;
+    /**
+     * Phase 4 Tier 2.5 phase E-1 — admit submission goes through the shard router so this
+     * service does not need to know which {@link OmsClusterIngressClient} owns the target shard.
+     * At {@code shardCount=1} the router resolves to the single client (byte-identical to the
+     * pre-E-1 direct injection); at higher shard counts (E-3+) the router fans out to N clients
+     * keyed by {@code accountId} hash without changing this call site.
+     */
+    private final OmsClusterShardRouter clusterShardRouter;
 
     public OrderIngressService(
             OrdersRepository orders,
@@ -112,7 +120,7 @@ public class OrderIngressService {
             ObjectProvider<LedgerBalanceClient> ledgerBalanceClient,
             MeterRegistry meterRegistry,
             OrderControlAdmission orderControlAdmission,
-            OmsClusterIngressClient clusterIngressClient) {
+            OmsClusterShardRouter clusterShardRouter) {
         this.orders = orders;
         this.config = config;
         this.piiHash = piiHash;
@@ -121,7 +129,7 @@ public class OrderIngressService {
         this.ledgerBalanceClient = ledgerBalanceClient;
         this.meterRegistry = meterRegistry;
         this.orderControlAdmission = orderControlAdmission;
-        this.clusterIngressClient = clusterIngressClient;
+        this.clusterShardRouter = clusterShardRouter;
     }
 
     /**
@@ -212,7 +220,13 @@ public class OrderIngressService {
             String ledgerBalanceId = normalizeLedgerBalanceId(req.ledgerBalanceId());
             Order order = buildOrder(id, req, shardId, accountIdHash, ledgerBalanceId, now);
 
-            AdmissionResult ar = submitToClusterOrThrow(clusterIngressClient, order, accountIdHash, now);
+            // Slice E-1: route the admit to the cluster client owning this shard. At
+            // shardCount=1 this is byte-identical to using the singleton client directly; at
+            // shardCount>1 (E-3+) the router fans out to N clients without touching this method.
+            // Passing the already-computed shardId (rather than re-deriving from accountId) keeps
+            // the order's recorded shard and its admitting cluster identical by construction.
+            OmsClusterIngressClient cluster = clusterShardRouter.forShard(shardId);
+            AdmissionResult ar = submitToClusterOrThrow(cluster, order, accountIdHash, now);
             AdmissionResult.Accepted accepted = (AdmissionResult.Accepted) ar;
             boolean created = !accepted.event().duplicate();
             if (accepted.event().duplicate() && !accepted.event().orderId().equals(id)) {

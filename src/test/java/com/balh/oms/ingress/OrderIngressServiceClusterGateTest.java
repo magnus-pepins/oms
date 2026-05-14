@@ -3,6 +3,7 @@ package com.balh.oms.ingress;
 import com.balh.oms.cluster.AcceptOrderCommand;
 import com.balh.oms.cluster.AdmissionResult;
 import com.balh.oms.cluster.OmsClusterIngressClient;
+import com.balh.oms.cluster.OmsClusterShardRouter;
 import com.balh.oms.cluster.OrderAcceptedEvent;
 import com.balh.oms.cluster.OrderRejectedEvent;
 import com.balh.oms.config.OmsConfig;
@@ -22,6 +23,7 @@ import org.springframework.http.HttpStatus;
 
 import java.math.BigDecimal;
 import java.time.Duration;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.TimeoutException;
 
@@ -87,6 +89,11 @@ class OrderIngressServiceClusterGateTest {
         // INSERT moved to the projector (which materialises the row from the cluster's
         // OrderAdmittedEvent via insertIfAbsent). The class now opens zero Postgres
         // connections on the hot path on every branch.
+        //
+        // Phase 4 Tier 2.5 phase E-1: the service now takes an OmsClusterShardRouter rather than
+        // an OmsClusterIngressClient directly. At shardCount=1 the router is a 1-entry passthrough
+        // wrapping the same mock client used by the rest of this test, so behaviour is unchanged.
+        OmsClusterShardRouter router = new OmsClusterShardRouter(1, Map.of(0, cluster));
         service = new OrderIngressService(
                 orders,
                 config,
@@ -96,7 +103,7 @@ class OrderIngressServiceClusterGateTest {
                 ledgerBalance,
                 new SimpleMeterRegistry(),
                 orderControlAdmission,
-                cluster);
+                router);
     }
 
     @Test

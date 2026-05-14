@@ -557,13 +557,15 @@ Supavisor as the next-up bottleneck. The Aeron thread-confinement invariant (`of
 `pollEgress` / `sendKeepAlive` cannot run concurrently) is still respected — `clientLock`
 now wraps only individual `offer` and `pollEgress` calls, never the egress wait.
 
-### Tier 2.5 — Move buying-power hold off the ingress critical path (next slice)
+### Tier 2.5 — Move buying-power hold off the ingress critical path (slice 4p + 4q)
 
-Re-state the original tier-2 plan for whenever the bench actually exercises
-`OMS_LEDGER_ENABLED=true`. With the cluster-pipeline win banked, the next big chunk of
-ingress-accept p50 in production is the synchronous JDBC call to the ledger from the
-HTTP request thread inside `OrderIngressService.maybePlaceBuyLedgerInflightHold`. Two
-options, in order of preference:
+With the cluster-pipeline win banked (4n) and Supavisor unblocked (4o), the next big
+chunk of ingress-accept p50 in production is the synchronous JDBC call to the ledger
+from the HTTP request thread inside `OrderIngressService.maybePlaceBuyLedgerInflightHold`.
+Phased: **slice 4p** lands the async outbox + a new `CancelOrderCommand` so failed
+holds correctly cancel the working order (phase A); **slice 4q** layers an opt-in
+sync-semantics path back on top via an in-request coalescer (phase C). The
+two-options-in-this-section design from earlier is retained for context:
 
 1. **Pipeline / batch the holds**. Multiple in-flight orders share a single ledger
    transaction window (group commit on the OMS side). Concretely: replace the
@@ -589,14 +591,18 @@ options, in order of preference:
   per-replica pool sizes that slice 4n now wants. Sequencing: fix Supavisor topology first
   (Tier 2.4), *then* batch the holds.
 
-### Tier 2.4 — Fix the Supavisor / Postgres topology so multi-replica scales (next slice)
+### Tier 2.4 — Fix the Supavisor / Postgres topology so multi-replica scales (slice 4o, **landed**)
 
-Slice 4n exposed that the bench-host Supavisor (`POOLER_DEFAULT_POOL_SIZE=20`,
-`POOLER_MAX_CLIENT_CONN=100`) backs an `oms` Postgres database whose total backend
-connections are capped at 20. With 5 OMS JVMs each opening up to `OMS_PG_POOL_MAX_SIZE`
-client connections, total client conns easily exceed 20 and Supavisor multiplexes them
-onto a too-small backend pool — bimodal latency (some requests fast at the slice-4n p50,
-some queued >700 ms waiting for a backend) and degraded `2× rps`. Choices:
+Shipped in slice 4o (this section is kept for the design rationale — operator
+instructions are in `## Slice 4o setup` further down). Slice 4n exposed that the
+bench-host Supavisor (`POOLER_DEFAULT_POOL_SIZE=20`, `POOLER_MAX_CLIENT_CONN=100`)
+backs an `oms` Postgres database whose total backend connections were capped at 20.
+With 5 OMS JVMs each opening up to `OMS_PG_POOL_MAX_SIZE` client connections, total
+client conns easily exceed 20 and Supavisor multiplexes them onto a too-small backend
+pool — bimodal latency (some requests fast at the slice-4n p50, some queued >700 ms
+waiting for a backend) and degraded `2× rps`. Slice 4o picked **all three** of the
+mitigations below; both step 1 (resize) and step 2 (transaction-mode flip + 
+`prepareThreshold=0`) landed; option 3 (bypass Supavisor) was deferred as a fallback.
 
 1. **Switch OMS to Supavisor's transaction-mode pooler (port 6543)** instead of session
    mode (port 5432). Transaction mode releases the backend back to the pool after each tx
@@ -934,8 +940,138 @@ docker exec ledger-supabase-db psql -U postgres -d postgres \
 ```
 
 If `pg_stat_activity` count for `oms` ≈ `POOLER_DEFAULT_POOL_SIZE`, you're queueing inside
-Supavisor and `OMS_PG_POOL_MAX_SIZE * N_OMS_JVMS` exceeds the pool. Tier 2.4 above is the
-fix.
+Supavisor and `OMS_PG_POOL_MAX_SIZE * N_OMS_JVMS` exceeds the pool. Slice 4o (next section)
+is the fix.
+
+## Slice 4o setup — Supavisor topology + transaction-mode pooler (Tier 2.4)
+
+Slice 4o exposes the bench-host Supavisor saturation that slice 4n made visible. Two
+operational changes, sequenced for clean attribution. **No OMS code change** — the
+connection string is fully env-driven via `OMS_PG_URL`.
+
+### Step 1 — resize the bench-host Supavisor
+
+Edit `ledger/docker/supabase/.env` on the bench host:
+
+```bash
+POOLER_DEFAULT_POOL_SIZE=50      # was 20 — backend pool per tenant
+POOLER_MAX_CLIENT_CONN=300       # was 100 — incoming-client cap
+```
+
+Then recreate the pooler (note: the supabase stack on Pop! runs under compose project
+`ledger-dev`, not the directory-default `ledger-supabase` — pass `-p ledger-dev` so the
+pooler joins the same `ledger-dev_default` Docker network as `ledger-supabase-db`,
+otherwise it lands on a fresh network and can't resolve `db:5432`):
+
+```bash
+docker rm -f ledger-supabase-pooler
+cd ~/ledger/docker/supabase
+docker compose -p ledger-dev up -d --no-deps supavisor
+# wait for healthy
+for i in $(seq 1 20); do
+  h=$(docker inspect -f '{{.State.Health.Status}}' ledger-supabase-pooler 2>/dev/null)
+  echo "$i: $h"; [ "$h" = healthy ] && break; sleep 3
+done
+docker exec ledger-supabase-pooler env | grep POOLER_DEFAULT_POOL_SIZE   # confirms 50
+```
+
+Headroom check before bumping further: `POOLER_DEFAULT_POOL_SIZE` must stay below
+Postgres `max_connections` minus the connections used by the rest of the supabase stack
+(realtime, postgrest, gotrue, meta) and the ledger app itself. On Pop! today
+`max_connections=100` and the non-OMS supabase stack steady-state uses ~32 backends,
+so 50 + 32 + ~10 ledger ≈ 92 backends — comfortably under 100.
+
+### Step 2 — flip OMS to Supavisor's transaction-mode pooler (port 6543)
+
+Edit `~/.oms-bench.env` on the bench host:
+
+```bash
+# was: jdbc:postgresql://127.0.0.1:5432/oms              (Supavisor session mode)
+export OMS_PG_URL='jdbc:postgresql://127.0.0.1:6543/oms?prepareThreshold=0&socketTimeout=10'
+```
+
+`prepareThreshold=0` is **mandatory** with transaction-mode pooling. PgJDBC
+auto-promotes statements to server-side prepared after the 5th call by default
+(`prepareThreshold=5`). Supavisor's transaction mode (like pgbouncer's) re-routes
+each transaction to whichever backend is free, so the cached `S_1` handle on the
+previous backend won't exist on the next one — symptom is sporadic
+`prepared statement "S_1" does not exist` errors at high concurrency. Setting
+`prepareThreshold=0` disables server-side prepare entirely; the small wire-level
+difference is offset many times over by no longer queueing on a tiny backend pool.
+
+`socketTimeout=10` is a 10-second guard against a wedged backend silently
+hanging the request thread; the bench's `oms.cluster.client.submit-timeout-ms` is
+2 s but the JDBC layer can hold longer if no timeout is set.
+
+Then restart **all OMS JVMs that hold a Hikari pool** (cluster-node doesn't):
+
+```bash
+# stop replicas + projector + fix-egress (cluster-node + fix loopback stay up)
+for cls in OmsIngressReplicaBootstrap OmsPostgresProjectorBootstrap OmsFixEgressBootstrap; do
+  for p in $(pgrep -f "$cls"); do kill -TERM "$p"; done
+done
+sleep 8
+# any survivors get sigkill, then relaunch with the new env via your standard launch script
+```
+
+After relaunch, sanity-check that transaction-mode is doing its job — backend count
+to the `oms` database in `pg_stat_activity` should be **dramatically lower** than the
+sum of `OMS_PG_POOL_MAX_SIZE` across all JVMs:
+
+```bash
+docker exec ledger-supabase-db psql -U postgres -t -c \
+  "select count(*) from pg_stat_activity where datname='oms';"
+# session-mode (port 5432) at 4 JVMs * MAX=20 = 80 client conns: this returns ~80
+# transaction-mode (port 6543), same client conns: this returns ~5–10
+```
+
+That ratio is the structural unlock. With transaction mode, the OMS-side
+`OMS_PG_POOL_MAX_SIZE` decouples from the Supavisor backend count — N replicas at
+`MAX=20` consume only as many backends as concurrent transactions actually need.
+
+### Verification run (2026-05-14, slice 4o)
+
+Same Pop! topology as slice 4n (5 OMS JVMs, single-account hot path, 60 k orders /
+concurrency 200). Compare to slice 4n:
+
+```
+== 2× replicas, MAX=20, slice 4o step 1 (resize-only, port 5432 session mode) ==
+submitted=60000  success=60000  failed=0  elapsed=22.408 s  rps=2 677.6
+HTTP RTT p50=72.319 ms  p99=115.583 ms
+oms_cluster_client_commit_round_trip p50=2.447 ms  p99=5.592 ms
+
+== 2× replicas, MAX=20, slice 4o step 2 (resize + tx-mode, port 6543) ==
+submitted=60000  success=60000  failed=0  elapsed=9.471 s  rps=6 335.2
+HTTP RTT p50=31.103 ms  p99=73.087 ms
+oms_cluster_client_commit_round_trip p50=1.398 ms  p99=3.845 ms
+```
+
+**The headline**: resize-only clears the slice-4n `2× MAX=20 = 677 rps` bimodal
+regression (3.95× lift). Adding transaction-mode pooling on top is a further 2.37×
+(6 335 rps total — **9.36× over the slice-4n regression at the same scenario, and
+2.74× over slice 4m's 2 315 rps best**). Cluster-client commit p50 dropped from
+2.447 ms (session-mode contention) to 1.398 ms (tx-mode, no Supavisor queueing).
+
+### When to revert (rollback)
+
+If transaction mode breaks something you didn't expect (e.g. you add a code path
+that expects session-state continuity), revert by:
+
+1. Edit `~/.oms-bench.env`: change port back to `5432`, drop `prepareThreshold=0`.
+2. Restart the affected JVMs.
+
+Zero data impact — the underlying Postgres is the same, only the Supavisor frontend
+port changes.
+
+### Future-proofing — advisory locks (currently unused)
+
+[`oms/docs/shard-lease.md`](../shard-lease.md) describes `pg_try_advisory_lock` as
+one option for outbox-reconciler leader election. **Not implemented today** (zero
+hits in `src/main`), but if it ever lands, that DataSource has to stay on **session
+mode (port 5432)** because advisory-lock state is connection-scoped and gets
+released on transaction-mode commit. The pattern would be: keep the default OMS
+DataSource on `6543`, register a separate `@Configuration` DataSource pointed at
+`5432` and inject it specifically into the leader-election bean.
 
 ## Caveats
 

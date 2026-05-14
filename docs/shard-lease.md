@@ -25,6 +25,16 @@ The remaining single-writer concerns sit outside the cluster service:
    process start; heartbeat in a background thread. The lock is
    connection-scoped; it must be held on one dedicated JDBC connection for the
    lifetime of the process, not per-request pool connections.
+
+   **Pooler interaction (slice 4o)** — once the OMS DataSource defaults to
+   Supavisor's transaction-mode pooler (port `6543`), advisory-lock state is
+   incompatible because the pooler may route each transaction to a different
+   backend, dropping the lock between calls. If this option is ever
+   implemented, register a **second `@Configuration` DataSource** pointed at
+   Supavisor's session-mode listener (`5432`) or directly at Postgres, and
+   inject it specifically into the leader-election bean. Verified today: zero
+   callers of `pg_advisory_lock` / `pg_try_advisory_lock` in `src/main`, so the
+   blanket port-6543 default is safe.
 2. **Kubernetes Lease** (`coordination.k8s.io/v1` `Lease`) — sidecar or
    in-process leader election; good when OMS is already on k8s.
 3. **External coordinator** (etcd, Consul) — heavier but explicit TTL and

@@ -2998,6 +2998,131 @@ overhead.
   `~/.oms-bench.env`; the post-D-7-experiment baseline is the same
   D-9 stack, threads.max=200 default, ready for D-6.
 
+## Tier 2.5 phase D-6 verification — admit batching at the cluster client (Pop! 2026-05-14)
+
+Code: commit `oms@ee90d9e` (`oms: tier-2.5 phase D-6 — admit batching at the
+cluster client`). Wire format adds `TYPE_ID_BATCH_ACCEPT_ORDER = 4` plus
+`BatchAcceptOrderCommand` (16-byte shared header + int count + N inner-length-prefixed
+`AcceptOrderCommand` bodies, MAX_COUNT=256). `OmsClusterIngressClient` gains an opt-in
+admit-batcher daemon thread that drains an `ArrayBlockingQueue` and packs N admits into
+one Aeron cluster log slot; `OmsAdmissionClusteredService.applyBatchAcceptOrder`
+dispatches each inner body through the existing `applyAcceptOrder` path. Default off
+(slice 4n single-message path remains the safe baseline); flip
+`OMS_CLUSTER_CLIENT_ADMIT_BATCH_ENABLED=true` per ingress to opt in.
+
+### TL;DR
+
+| Leg                      | Config                                         | c1600 rps | c2400 rps (peak)  | c3200 rps |
+|--------------------------|------------------------------------------------|-----------|--------------------|-----------|
+| **A — D-9 baseline**     | `admit-batch=false` (today's main)             | 54 835    | **55 909**         | 55 408    |
+| **B — D-6 batch=1**      | `admit-batch=true, max=1, flush=50 µs`         | 54 118    | 53 157             | 55 844    |
+| **C — D-6 batch=8**      | `admit-batch=true, max=8, flush=50 µs`         | 55 045    | **56 590** (+1.2 %)| 56 086    |
+| **D — D-6 batch=16**     | `admit-batch=true, max=16, flush=50 µs`        | 52 547    | 53 453             | 51 730    |
+| **E — D-6 batch=8 falsifier** | `admit-batch=true, max=8, **flush=500 µs**` | 47 677    | 50 391             | 52 119    |
+
+**The predicted "2–3× lift with batchSize ≈ 8–16" did not materialise.** Best peak rps
+with admit-batching enabled was leg C at 56 590 — **+1.2 % over the D-9 baseline**, well
+inside Pop! single-host run-to-run noise (legs A vs leg-9 main commit at 55 909 vs
+57 282 = ±2.4 %). Larger `maxBatchSize=16` slightly *regressed* (peak 53 453); longer
+`flush=500 µs` regressed peak by **−11 %** (50 391 at c2400). All 5 legs × 1.92 M+
+admits succeeded, no failures.
+
+### Where the predicted lift went
+
+The cluster commit RTT *did* improve modestly with batching, but the throughput wall
+was already past it:
+
+| Leg                 | c2400 ingress accept (ms) | c2400 cluster RTT (ms) | rps    |
+|---------------------|---------------------------|-------------------------|--------|
+| A baseline          | 3.249                     | 3.200                   | 55 909 |
+| B batch=1           | 3.173                     | 3.121                   | 53 157 |
+| **C batch=8**       | **2.989** (−8 %)          | **2.945** (−8 %)        | 56 590 |
+| D batch=16          | 3.174                     | 3.121                   | 53 453 |
+| E batch=8 flush=500 | 3.346 (+3 %)              | 3.289 (+3 %)            | 50 391 |
+
+* Leg C *did* shave ~8 % off both ingress accept time and cluster RTT — proof the
+  batcher daemon is functioning and amortising at least *some* per-frame overhead.
+* But peak rps moved only +1.2 %. By Little's law (200 threads × 2 ingresses ÷ 3 ms ≈
+  133 k rps theoretical thread-bound ceiling) and observed mean RTT 27.5 ms / c2400 =
+  87 k thread-bound ceiling, we are **well below** the ingress-thread budget either
+  way. The wall is **downstream of `submitAcceptOrder`** — most of cluster commit RTT
+  is per-admit cluster-service work (`applyAcceptOrder` idempotency lookup +
+  `OrderAcceptedEvent` allocation + `events.offer` egress publication), which runs
+  exactly the same N times whether the inbound was batched or not.
+
+### Falsifying "longer flush would help"
+
+Leg E ran `batchSize=8, flush=500 µs` (10× longer flush). Hypothesis: at Pop!'s
+per-ingress arrival of ~28 k/s (= 1 admit per ~36 µs), legs B/C/D probably saw
+effective batch sizes ≪ configured `maxBatchSize` because the daemon's 50 µs flush
+timer kept firing first. A longer flush should produce real multi-admit batches and,
+if the per-frame cluster framing is the wall, should lift peak rps.
+
+**Falsified.** Leg E peak (52 119 at c3200) regressed −7 % vs leg C; cluster RTT *grew*
+to 3.289 ms (+11 %) at c2400 because the daemon now waits up to 500 µs before flushing
+even a single admit. The added wait completely overwhelmed any framing-amortisation
+gain. Conclusion: the per-admit cluster CPU cost dominates per-frame framing cost on
+this single-host rig.
+
+### Where the threads went (jstack at c1600, ingress1)
+
+| Frame                                                | A baseline | C batch=8 | D batch=16 |
+|------------------------------------------------------|------------|-----------|------------|
+| `OmsClusterIngressClient.submitAcceptOrder*` (cluster reply wait) | 181 / 214 (85 %) | 187 / 214 (87 %) | 140 / 214 (65 %) |
+| `LockSupport.parkNanos` (other / waiter.get)         | 0          | 0         | 55 (26 %)  |
+| Tomcat NIO selector / idle pool                      | 33         | 27        | 19         |
+
+Legs A and C show essentially the same shape: 80–90 % of Tomcat exec threads parked on
+the cluster reply, just like in the post-D-9 c1600 jstack (174/214). Leg D
+(`maxBatchSize=16`) starts spreading threads into batcher-park frames — when the
+configured batch size approaches the in-flight count, threads can park inside
+`submitAcceptOrderViaBatcher` for the per-batch flush rather than directly in
+`submitAcceptOrder`. The total wait shape is unchanged.
+
+### Lessons (D-6 specific)
+
+* **D-6 is correct as-implemented but the predicted lift didn't materialise on Pop!.**
+  All 1.92 M+ admits across legs B/C/D + leg E succeeded with zero failures; the wire
+  format, daemon, and cluster-side dispatch all work. Best lift was +1.2 %, inside
+  noise.
+* **The wall is per-admit cluster-service CPU, not framing.** The
+  `applyAcceptOrder → events.offer` egress publication runs N times per batch
+  regardless of inbound batching. Batching at the cluster *client* amortises only the
+  Aeron frame send + leader dispatch (~2–3 % of total cluster time).
+* **Falsification before commit-to-implementation is cheap.** This run cost ~80 min
+  wall-clock for a finding that says "the predicted next lever isn't the right
+  lever". Cheaper than committing to a longer optimisation arc and finding out 3
+  slices in.
+* **D-6 ships behind `OMS_CLUSTER_CLIENT_ADMIT_BATCH_ENABLED=false` (default off).**
+  The infrastructure is useful — across-network deployments may see a larger framing
+  share, where the same code may pay off. On Pop! single-host benches it stays off.
+* **What the wall actually is — hypothesis, not asserted.** The remaining
+  `submitAcceptOrder` wait on each accept is 2.9–3.0 ms. Plausible bottlenecks:
+  (1) cluster-service `events.offer` back-pressure from the projector's slower
+  consume rate; (2) Aeron media-driver conductor capacity for the single ingress
+  publication; (3) Pop! single-host CPU contention between ingress + cluster +
+  projector + reconciler all on one box. None of these is observably refuted by the
+  current data.
+
+### Recommended next slices (post-D-6)
+
+* **Phase D-11 (new) — egress event batching from the cluster service.** If the
+  per-admit `events.offer` is the actual wall (hypothesis above), batching the
+  cluster's *outbound* egress events into one Aeron frame per batch *would* amortise
+  the right cost. This requires changing the egress wire format and the
+  `OmsClusterIngressClient` egress polling loop to demux N events per frame —
+  meaningfully bigger lift than D-6 inbound. Verify the hypothesis by reading
+  `aeron_publication_back_pressure_ratio` on the events publication or adding a
+  micrometer timer around `events.offer` in `applyAcceptOrder` first.
+* **Phase D-10 — projector decoupling.** Still on the list. If projector-side back-up
+  is starving the cluster `events.offer`, splitting projector + reconciler onto
+  separate JVMs / scheduler pools would relieve that. Bench-only-relevant on Pop!,
+  but the structural concern remains for production.
+* **Phase D-7 — Tomcat thread bump.** Stays disproven. Don't revisit until cluster /
+  egress wall lifts.
+* **Phase D-5 — split projector + fix-egress onto a separate Supavisor tenant.**
+  Stays deprioritised.
+
 ## Caveats
 
 - This is a **single-host single-cluster-node** rig. It does NOT exercise consensus, leader

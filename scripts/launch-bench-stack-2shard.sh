@@ -29,13 +29,14 @@
 #     aeronDirBase     $HOME/oms/build/aeron-cluster
 #     OMS_PG_URL       jdbc:postgresql://127.0.0.1:6543/oms
 #
-#   shard 1 (offset by +1000 / +100 on management/HTTP ports):
+#   shard 1:
 #     cluster-members  0,localhost:21110,localhost:21220,localhost:21330,localhost:21440,localhost:9010
 #     archive ctrl     aeron:udp?endpoint=localhost:9010   (NEW env: OMS_AERON_ARCHIVE_CONTROL_CHANNEL)
 #     ingress http     8188   ingress mgmt 8187   cluster metrics 9089
-#     projector http   9093   projector mgmt 9090
+#     projector http   8193   projector mgmt 8190
+#                      (NB: 9090/9093 are taken by Pop!'s obs-prometheus / obs-alertmanager)
 #     aeronDirBase     $HOME/oms/build/aeron-cluster-1
-#     OMS_PG_URL       jdbc:postgresql://127.0.0.1:6543/oms_1
+#     OMS_PG_URL       jdbc:postgresql://127.0.0.1:5432/oms_1   (session-mode for fresh Flyway)
 #
 # Sources ~/.oms-bench.env for the credentials/api-key surface, then layers shard-specific
 # env on top. Shard-specific env can be tuned via ~/.oms-bench-2shard-shard{0,1}.env if
@@ -112,8 +113,11 @@ shard_env_1() {
   export OMS_AERON_ARCHIVE_CONTROL_CHANNEL="aeron:udp?endpoint=localhost:9010"
   export OMS_CLUSTER_NODE_METRICS_PORT=9089
   export OMS_POSTGRES_PROJECTOR_AERON_DIR="$OMS_AERON_DIR_BASE/media-driver"
-  export OMS_POSTGRES_PROJECTOR_HTTP_PORT=9093
-  export OMS_POSTGRES_PROJECTOR_MANAGEMENT_SERVER_PORT=9090
+  # Pop! has obs-prometheus on 9090 and obs-alertmanager on 9093, so shard 1's projector
+  # ports cannot follow the +1000 offset blindly. Use the +100 offset namespace
+  # (8193 / 8190) like the ingress side does. Shard 0 keeps the unmodified defaults.
+  export OMS_POSTGRES_PROJECTOR_HTTP_PORT=8193
+  export OMS_POSTGRES_PROJECTOR_MANAGEMENT_SERVER_PORT=8190
   export OMS_HTTP_PORT=8188
   export OMS_INGRESS_REPLICA_MANAGEMENT_SERVER_PORT=8187
   export OMS_CLUSTER_CLIENT_AERON_DIRECTORY="$OMS_AERON_DIR_BASE/media-driver"

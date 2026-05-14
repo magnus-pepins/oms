@@ -27,23 +27,45 @@ import java.util.concurrent.atomic.AtomicLong;
  * Coalesces BUY inflight holds onto Ledger {@code POST /transactions/bulk?inflight=true&atomic=false}
  * (Phase 4 slice 4q of the Aeron Cluster substrate plan).
  *
- * <p><b>Why this exists.</b> Slice 4p moved the per-order Ledger HTTP off the ingress critical
- * path by enqueuing each hold to {@code ledger_inflight_outbox} and letting
- * {@link com.balh.oms.reconciler.LedgerInflightOutboxReconciler} drive Ledger after commit. That
- * lifted ingress rps from 279 → 764 on Pop! (Bench A/B in the runbook). The remaining bottleneck
- * is server-side: every hold mutates the source {@code balances.version} row, and the outbox
- * reconciler still posts one transaction per HTTP, so cross-JVM bursts still serialise on Ledger.
- * The bulk endpoint iterates the batch sequentially within a <em>single</em> HTTP, so the OCC
- * race surface drops by a factor of {@code maxBatchSize}.
+ * <p><b>Status.</b> <em>Off by default and currently a regression vs slice 4p — do NOT enable
+ * in production until slice 4r lands.</em> The class is preserved on {@code main} so the next
+ * slice can iterate on the dispatch loop; the bulk dispatcher
+ * ({@link LedgerInflightBulkDispatcher}) and the outbox-fallback wiring on the failure path
+ * compose cleanly and slice 4r will reuse them. Pop! 2026-05-14 A/B (5000 orders / concurrency
+ * 50, 2× ingress replicas, real Ledger HTTP, same Postgres state across A and B): outbox path
+ * = 768 rps / HTTP RTT p50 16.7 ms, coalescer path = 95 rps / p50 431 ms. Root cause (verified
+ * against {@code oms_ledger_inflight_coalescer_flush_seconds} and {@code _submit_seconds}):
+ * the accept thread blocks on the per-item future returned by {@link #submit} and only one
+ * daemon flush thread per JVM consumes the queue, so each JVM ceilings at "one bulk POST in
+ * flight at a time" while slice 4p stays fire-and-forget at accept (the outbox row is
+ * committed in the same tx as the accept; Ledger HTTP is entirely off the ingress critical
+ * path). The intra-batch OCC reduction landed as designed; the regression is in the
+ * accept-side coupling, not in the bulk dispatcher itself. Full numbers / math sanity-check /
+ * slice 4r roadmap live in {@code oms/docs/runbooks/local-multi-jvm-bench.md}
+ * {@code ## Slice 4q evidence} / {@code ## Slice 4q verdict + roadmap}.
  *
- * <p><b>Topology.</b> Operators choose between two paths:
+ * <p><b>Original design intent (preserved for slice 4r).</b> Slice 4p moved the per-order
+ * Ledger HTTP off the ingress critical path by enqueuing each hold to
+ * {@code ledger_inflight_outbox} and letting
+ * {@link com.balh.oms.reconciler.LedgerInflightOutboxReconciler} drive Ledger after commit;
+ * that lifted ingress rps from 279 → 764 on Pop!. The remaining bottleneck is server-side:
+ * every hold mutates the source {@code balances.version} row, so cross-JVM bursts serialise
+ * on Ledger's OCC retry. The bulk endpoint iterates the batch sequentially within a
+ * <em>single</em> HTTP so the intra-batch OCC race surface drops by a factor of
+ * {@code maxBatchSize}. What this slice missed: a synchronous per-item future + single flush
+ * thread reintroduces the accept-side serialisation property that slice 4p removed.
+ *
+ * <p><b>Topology.</b> Operators choose between three paths in
+ * {@link com.balh.oms.ingress.OrderIngressService#maybePlaceBuyLedgerInflightHold}:
  * <ul>
- *   <li><b>Outbox path</b> (slice 4p) — {@code oms.ledger.inflight-async-enabled=true},
+ *   <li><b>Outbox path (slice 4p) — current production default.</b>
+ *       {@code oms.ledger.inflight-async-enabled=true},
  *       {@code oms.ledger.inflight-coalescer-enabled=false}. Each accept inserts a row into
  *       {@code ledger_inflight_outbox} <em>inside</em> the accept transaction; the reconciler
  *       drives Ledger after commit. Strongest durability (no in-memory gap), one Ledger HTTP
- *       per order.</li>
- *   <li><b>Coalescer path</b> (slice 4q) — {@code oms.ledger.inflight-async-enabled=false},
+ *       per order, accept never blocks on Ledger.</li>
+ *   <li><b>Coalescer path (slice 4q) — currently a regression, off by default.</b>
+ *       {@code oms.ledger.inflight-async-enabled=false},
  *       {@code oms.ledger.inflight-coalescer-enabled=true}. Accept hands the hold to this
  *       coalescer's MPSC queue and waits on a per-item future; the daemon flush thread
  *       batches up to {@link OmsConfig.Ledger#getInflightCoalescerMaxBatchSize()} items and
@@ -56,6 +78,9 @@ import java.util.concurrent.atomic.AtomicLong;
  *       because it only graduates rows that crossed
  *       {@link OmsConfig.Ledger#getInflightCompensatorAttemptsThreshold()}, and a row that
  *       never existed cannot graduate.</li>
+ *   <li><b>Sync path</b> — both flags off, accept POSTs Ledger inline. Operationally the
+ *       fallback for non-burst topologies; serialises on Ledger's OCC retry under load
+ *       (slice 4p Bench A measured 279 rps / 92 % failures at 50-way concurrency on Pop!).</li>
  * </ul>
  *
  * <p><b>Lifecycle.</b> {@link #start()} spins up the daemon thread; {@link #stop()} signals

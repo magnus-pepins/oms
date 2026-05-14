@@ -1169,15 +1169,19 @@ If you suspect the async path is masking a behaviour change, set
 already accepted on the async path keep being driven by the reconciler regardless of the
 flag flip; only newly-accepted orders take the sync path again.
 
-## Slice 4q — `LedgerInflightCoalescer` topology + operator contract
+## Slice 4q — `LedgerInflightCoalescer` topology + bench-driven verdict
 
 Slice 4q ships the in-process MPSC queue + daemon flush thread that coalesces BUY inflight
-holds onto Ledger's `POST /transactions/bulk?inflight=true&atomic=false`. The
-`### Slice 4q evidence` block below is filled in by the first Pop! run; this section
-documents the topology, the operator contract, and the rollback path so a fresh operator
-can flip the flag without reading the slice's commit history.
+holds onto Ledger's `POST /transactions/bulk?inflight=true&atomic=false`. The first Pop!
+A/B (numbers in `### Slice 4q evidence` below) shows that, **as designed in this slice, the
+coalescer is a regression vs slice 4p**: the design replaced the slice 4p "fire-and-forget
+at accept" property with a synchronous wait on a per-batch bulk HTTP, and the daemon flush
+thread became the new bottleneck. The feature is shipped, defaults to **off**, and stays
+off until slice 4r redesigns the dispatch loop (see `### Slice 4q verdict + roadmap`
+below). Production should remain on slice 4p (`OMS_LEDGER_INFLIGHT_ASYNC_ENABLED=true`,
+coalescer off) until that redesign lands and re-benches.
 
-**Why slice 4q lifts where 4p plateaus**: the slice 4p outbox path still posts one Ledger
+**Original hypothesis (slice plan)**: the slice 4p outbox path still posts one Ledger
 transaction per HTTP, so a 50-way ingress burst still hits a 50-way `balances.version` OCC
 race surface server-side — just driven by the reconciler tick instead of the ingress
 thread. Slice 4q's bulk endpoint iterates the batch sequentially within a single HTTP, so
@@ -1186,22 +1190,32 @@ not failing); the OCC race surface drops by `batchSize`. The reconciler still ow
 fallback path: any item the bulk handler rejects (or the whole batch on a 5xx) is written
 to `ledger_inflight_outbox` and the slice 4p reconciler + compensator drive it from there.
 
-**Two-path topology — when to use which**:
+**Why the hypothesis was incomplete (Observed)**: the design held `OrderIngressService`
+on a synchronous `future.get(timeoutMs)` waiting on the bulk flush, with **one** flush
+thread per JVM. With concurrency 50 against 2 ingress replicas, that ceilings each JVM at
+"one bulk POST in flight at a time" while slice 4p's outbox path returns 201 the moment
+the outbox row is committed inside the accept tx (Ledger HTTP runs entirely off the
+ingress critical path, with no per-item future to wait on). Bulk POSTs of 6–7 items
+(observed `oms_ledger_inflight_coalescer_items_total` / `flush_seconds_count`) take ~100–
+135 ms server-side, so the steady-state ceiling is ~7 items × (1 s / 135 ms) ≈ 52 ord/s
+per JVM, ~104 ord/s across both — almost exactly what the bench measures (95 rps). The
+intra-batch OCC reduction landed as designed; the loss came from the new accept-side
+serialisation point, not from anything in the bulk dispatcher itself.
 
-| Profile | Flags | Critical-path Ledger HTTP per order | Durability gap | Server-side OCC contention |
+**Three-path topology — current state**:
+
+| Profile | Flags | Critical-path Ledger HTTP per order | Durability gap | Pop! 2026-05-14 rps / p50 |
 |---|---|---|---|---|
-| Sync hold (default safe) | `OMS_LEDGER_INFLIGHT_ASYNC_ENABLED=false`, `OMS_LEDGER_INFLIGHT_COALESCER_ENABLED=false` | 1 sync POST | None | 1× per order |
-| Outbox path (slice 4p) | `OMS_LEDGER_INFLIGHT_ASYNC_ENABLED=true`, `OMS_LEDGER_INFLIGHT_COALESCER_ENABLED=false` | 0 (HTTP after commit) | None — outbox row written in same tx as accept | 1× per order, off the critical path |
-| Coalescer path (slice 4q) | `OMS_LEDGER_INFLIGHT_ASYNC_ENABLED=false`, `OMS_LEDGER_INFLIGHT_COALESCER_ENABLED=true` | shared bulk POST per batch | Small — items in MPSC queue at JVM crash time are lost (the slice 4p compensator only graduates rows that exist in `ledger_inflight_outbox`) | 1× per `maxBatchSize` orders, sequential within one HTTP |
+| Sync hold | `OMS_LEDGER_INFLIGHT_ASYNC_ENABLED=false`, `OMS_LEDGER_INFLIGHT_COALESCER_ENABLED=false` | 1 sync POST | None | 279 rps / 167 ms (slice 4p Bench A) |
+| Outbox path (slice 4p) — **production default** | `OMS_LEDGER_INFLIGHT_ASYNC_ENABLED=true`, `OMS_LEDGER_INFLIGHT_COALESCER_ENABLED=false` | 0 (HTTP after commit) | None — outbox row written in same tx as accept | 768 rps / 17 ms |
+| Coalescer path (slice 4q) — **regression, off by default** | `OMS_LEDGER_INFLIGHT_ASYNC_ENABLED=false`, `OMS_LEDGER_INFLIGHT_COALESCER_ENABLED=true` | shared bulk POST per batch, but accept blocks on the per-item future | Small — items in MPSC queue at JVM crash time are lost (the slice 4p compensator only graduates rows that exist in `ledger_inflight_outbox`) | 95 rps / 431 ms |
 
-The coalescer also keeps the outbox path on as a fallback (priority order in
+The coalescer keeps the outbox path on as a fallback (priority order in
 `OrderIngressService.maybePlaceBuyLedgerInflightHold` is coalescer → outbox → sync).
 On any flush failure (whole-batch HTTP error or per-item Ledger error in a partial-success
 response) the failed items are written to `ledger_inflight_outbox` so the slice 4p
-reconciler + compensator still own correctness end-to-end. Operators who can't tolerate
-the queue-on-crash durability gap should leave the coalescer off and stay on the slice 4p
-outbox path (which is what production should default to until a bench on the production
-hardware confirms slice 4q's headroom is needed).
+reconciler + compensator still own correctness end-to-end. That much of the design held;
+the throughput regression is in the "happy path" only.
 
 ### Slice 4q setup — env to flip the coalescer flag
 
@@ -1242,12 +1256,70 @@ compensator cannot recover them because it only graduates rows that already exis
 outbox table. Operationally: prefer SIGTERM on the ingress replicas when the coalescer is
 on.
 
-### Slice 4q evidence — Pop! bench (TBD)
+### Slice 4q evidence — Pop! bench, 2026-05-14
 
-Run with the env block above; the first slice-4q Pop! bench fills in this block in-place
-with the same A/B shape as `## Slice 4p evidence` (rps, failure %, HTTP RTT p50/p99,
-`oms_pipeline_ingress_accept` p50/p99, `oms_cluster_client_commit_round_trip` p50/p99,
-`oms_ledger_inflight_coalescer_flush_seconds`, batch-size distribution).
+Same Pop! topology as slice 4p (5 OMS JVMs, 2× ingress replicas, port 6543 transaction-mode
+pool, same `~/.oms-bench.env` ledger backing endpoint, same `OMS_BURST_LEDGER_BALANCE_ID` /
+`OMS_BURST_LEDGER_IDENTITY_ID`). Burst load: `OMS_BURST_TOTAL=5000`, `OMS_BURST_CONCURRENCY=50`,
+`OMS_BURST_URLS` round-robin across both ingress replicas. Same Ledger / Postgres state
+between A and B (only the ingress replicas restart between runs to flip the flag pair).
+The ingress replicas' burst tool histograms are HdrHistograms over **client-side** HTTP
+RTT (the burst tool warmup is 0; the first 30 samples are not excluded — they sit in the
+slow tail).
+
+```
+== Bench A: OMS_LEDGER_INFLIGHT_ASYNC_ENABLED=true  (slice 4p outbox path) ==
+submitted=5000  success=4972 (created=4972, duplicate=0)  failed=28   elapsed=6.510 s   rps=768.1
+status breakdown:           201 = 4972       502 = 28
+HTTP RTT  p50=16.703 ms     p95=39.359 ms    p99=64.255 ms    p999=198.527 ms
+
+== Bench B: OMS_LEDGER_INFLIGHT_COALESCER_ENABLED=true (slice 4q coalescer) ==
+submitted=5000  success=4959 (created=4959, duplicate=0)  failed=41   elapsed=52.513 s  rps=95.2
+status breakdown:           201 = 4959       502 = 41
+HTTP RTT  p50=431.103 ms    p95=819.199 ms   p99=1000.959 ms  p999=1139.711 ms
+```
+
+Coalescer-side Prometheus snapshots after Bench B (sum across both ingress replicas):
+
+```
+oms_ledger_inflight_coalescer_flush_seconds_count{outcome=applied}        822
+oms_ledger_inflight_coalescer_flush_seconds_sum{outcome=applied}          93.5 s
+oms_ledger_inflight_coalescer_flush_seconds_max{outcome=applied}          1.032 s
+
+oms_ledger_inflight_coalescer_items_total{outcome=applied}                4959
+oms_ledger_inflight_coalescer_submit_seconds_count{outcome=applied}       4959
+oms_ledger_inflight_coalescer_submit_seconds_sum{outcome=applied}         1305.0 s
+oms_ledger_inflight_coalescer_submit_seconds_max{outcome=applied}         1.192 s
+```
+
+**Headline**: 8.1× **regression** (768 → 95 rps), 25.8× p50 inflation (17 → 431 ms),
+15.6× p99 inflation (64 → 1001 ms). The intra-batch OCC reduction landed as designed —
+no item-level fallback fired and the failure rate stays comparable to slice 4p (0.8 % vs
+0.6 %) — but the throughput collapsed because of the new design property described above.
+
+**Math sanity-check**: 822 flushes / 93.5 s = avg flush 113.7 ms; 4959 items / 822
+flushes = 6.0 items / batch (vs `maxBatchSize=50`). Average per-item submit-to-ack
+time = 1305 s / 4959 = 263 ms (≈ HTTP RTT mean of 437 ms minus the burst-tool / ingress
+accept hop). With one flush thread per JVM and 113.7 ms per flush, max throughput per
+JVM = (1000 ms / 113.7 ms) × 6 items = **53 items/s/JVM** = 106 items/s aggregate, almost
+exactly the 95 rps the bench measured. **Root cause of the regression**: synchronous
+accept→bulk-HTTP coupling + single flush thread per JVM, not the bulk endpoint itself.
+
+### Slice 4q verdict + roadmap
+
+- **Ship the code** (it is on `origin/main`), keep `inflightCoalescerEnabled=false` as
+  the default, and document the regression here so a future operator does not flip the
+  flag without seeing the numbers. The bulk dispatcher and outbox-fallback wiring compose
+  cleanly; only the dispatch loop's accept-side coupling needs to change.
+- **Production stays on slice 4p** (`OMS_LEDGER_INFLIGHT_ASYNC_ENABLED=true`,
+  coalescer off). Until slice 4r lands the coalescer flag is **not** to be turned on in
+  any environment past dev.
+- **Slice 4r (planned)** will redesign as fire-and-forget at accept, mirroring slice 4p:
+  the ingress accept tx writes to `ledger_inflight_outbox` (same row shape as 4p), and a
+  pool of coalescer flush threads drives the bulk HTTP **after** commit, draining the
+  outbox table directly instead of an in-memory MPSC queue. That removes both the accept
+  blocking property and the JVM-crash durability gap, and lets the bulk endpoint's OCC
+  reduction land on top of slice 4p's accept latency floor instead of replacing it.
 
 ## Caveats
 

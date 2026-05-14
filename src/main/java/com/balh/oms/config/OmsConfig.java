@@ -163,23 +163,40 @@ public class OmsConfig {
          * inflight holds are coalesced through {@link com.balh.oms.ledger.LedgerInflightCoalescer}
          * onto Ledger {@code POST /transactions/bulk?inflight=true&atomic=false} from a daemon
          * flush thread, instead of the per-order outbox path
-         * ({@link #inflightAsyncEnabled}). Off by default — operators opt in alongside
-         * {@link #inflightCompensatorEnabled} since the coalescer reuses the outbox as its
-         * fallback path (any flush failure writes pending items to {@code ledger_inflight_outbox},
-         * where the existing reconciler + compensator pick them up).
+         * ({@link #inflightAsyncEnabled}).
          *
-         * <p>Topology trade-off (see runbook "Slice 4q evidence" / systems/oms.md two-path
-         * topology table): the coalescer cuts the per-order critical-path Ledger HTTP cost from
-         * one synchronous round-trip to one shared bulk round-trip per {@code maxBatchSize}
-         * orders (or {@code flushIntervalMicros}, whichever fires first), and reduces the
-         * server-side {@code balances.version} OCC race surface by a factor of {@code batchSize}
-         * because the Ledger bulk handler iterates the batch sequentially within a single HTTP.
-         * The cost is a small in-memory durability gap: an item in the queue at JVM crash time
-         * is lost (the order is admitted at the cluster but the hold never reached either Ledger
-         * or the outbox). The slice 4p compensator does NOT recover this gap because it only
-         * graduates rows that crossed {@link #inflightCompensatorAttemptsThreshold} — a row that
-         * never existed cannot graduate. Operators who can't tolerate that gap stay on the
-         * outbox path ({@link #inflightAsyncEnabled} only).
+         * <p><b>Off by default and currently a regression vs slice 4p — do NOT enable in
+         * production until slice 4r lands.</b> Pop! 2026-05-14 A/B (5000 orders / concurrency 50,
+         * 2× ingress replicas, real Ledger HTTP, same Postgres state): outbox path =
+         * 768 rps / HTTP RTT p50 16.7 ms, coalescer path = 95 rps / p50 431 ms, i.e. 8.1× rps
+         * regression / 25.8× p50 inflation. Root cause (verified against
+         * {@code oms_ledger_inflight_coalescer_flush_seconds} and {@code _submit_seconds}): the
+         * accept thread blocks on {@link com.balh.oms.ledger.LedgerInflightCoalescer#submit}'s
+         * per-item future and only one daemon flush thread per JVM consumes the queue, so each
+         * JVM is ceiling-limited at "one bulk POST in flight at a time" while the slice 4p outbox
+         * path stays fire-and-forget at accept (the outbox row is committed in the same tx as the
+         * accept; Ledger HTTP is entirely off the ingress critical path). The intra-batch OCC
+         * reduction landed as designed; the loss came from the new accept-side serialisation
+         * point, not from the bulk dispatcher itself. Full numbers + math sanity-check + the
+         * slice 4r redesign roadmap (fire-and-forget at-accept dispatch reusing this slice's
+         * bulk dispatcher + outbox-fallback wiring) live in
+         * {@code oms/docs/runbooks/local-multi-jvm-bench.md} {@code ## Slice 4q evidence} /
+         * {@code ## Slice 4q verdict + roadmap}.
+         *
+         * <p><b>What this flag still costs even when correctness is fine</b>: the coalescer reuses
+         * {@code ledger_inflight_outbox} as its fallback path (any flush failure writes pending
+         * items to the outbox, where the existing reconciler + compensator pick them up). On
+         * the happy path, items in the in-memory queue at JVM crash time are lost (the order is
+         * admitted at the cluster but the hold never reached either Ledger or the outbox). The
+         * slice 4p compensator does NOT recover this gap because it only graduates rows that
+         * crossed {@link #inflightCompensatorAttemptsThreshold} — a row that never existed
+         * cannot graduate.
+         *
+         * <p>Until slice 4r the operator contract is: leave this flag {@code false} and run the
+         * slice 4p outbox path ({@link #inflightAsyncEnabled} {@code = true}, this flag
+         * {@code false}). The coalescer code is preserved on {@code main} so slice 4r can
+         * iterate on the dispatch loop (the bulk dispatcher and outbox-fallback wiring compose
+         * cleanly; only the accept-side coupling needs to change).
          */
         private boolean inflightCoalescerEnabled = false;
         /**

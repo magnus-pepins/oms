@@ -4146,6 +4146,111 @@ constraint.
   natural next step after E-3b lands. That would be Phase 5
   (k8s) — explicitly out of scope here.
 
+## Tier 2.5 phase E-3b — multi-shard ingress JVM (Pop! 2026-05-14)
+
+E-3a proved the substrate parallelizes (1.96× near-linear). E-3b lands
+the Spring refactor that lets a single ingress JVM hold N cluster
+clients keyed by shard id, so we no longer need one ingress JVM per
+shard — the same router-driven `accountId → shardId → client` indirection
+introduced in E-1 now spans `N > 1` clients.
+
+### What E-3b ships
+
+- **`AdmittedOrder.shardId` is a first-class field on the cluster's
+  in-memory state**, seeded from `cmd.shardId()` at admission time and
+  copied through every subsequent state mutation
+  (`applyExecutionReport`, `applyCancelOrder`).
+  `OmsAdmissionClusteredService.emitOrderCancelApplied` now reads
+  `mutated.shardId()` instead of the previous hardcoded `0`. Snapshot
+  schema bumps from `v3` to `v4` to carry the new field; pre-E-3b
+  snapshots are not load-compatible (the `SnapshotLoader.onFragment`
+  version check fails fast). Operators upgrading from E-2 must wipe
+  `archive/` and `cluster/` (or the cluster-node's `aeron-cluster`)
+  on each member **before** starting the E-3b binary; the cluster
+  rebuilds state from the recorded log.
+- **`OmsClusterIngressClient` is no longer a `@Component`.** A new
+  `OmsClusterClientsConfiguration` (Spring `@Configuration`,
+  profile-gated to `cluster-client` and conditional on
+  `oms.cluster.client.enabled=true`) builds `N` clients keyed by shard
+  id. Two beans are exposed:
+  - `Map<Integer, OmsClusterIngressClient> omsClusterIngressClients`
+    consumed by `OmsClusterShardRouter` (qualified injection).
+  - `OmsClusterIngressClient omsClusterIngressClient` (back-compat
+    shim returning `clientByShard.get(0)`) for `FixInboundClusterSink`
+    on the `oms-fix-egress` JVM, which is not yet shard-aware. FIX-egress
+    JVMs **must** keep `oms.shard.count=1`; making FIX-inbound
+    shard-aware is a follow-up slice.
+- **`OmsClusterShardRouter.E1_MAX_SHARD_COUNT` cap removed.** The
+  Spring constructor now takes the qualified
+  `Map<Integer, OmsClusterIngressClient>` produced by the factory and
+  routes admits across it via the existing
+  `ShardKey.shardFor(accountId, shardCount)` function.
+- **Per-shard config** lives at `oms.cluster.client.shards[].{id,
+  aeron-directory, ingress-endpoints}`. Empty list at
+  `oms.shard.count=1` means "use the flat `oms.cluster.client.*`
+  values" (byte-identical to E-2 / E-3a); at `oms.shard.count>1` the
+  list **must** cover every shard id in `[0, N)` and the resolved
+  `(aeron-directory, ingress-endpoints)` pair must be unique across
+  shards (the factory fails fast at boot otherwise).
+- **Projector shard guard now applies to
+  `OrderCancelAppliedEvent`** too (not just `OrderAdmittedEvent`).
+  Before E-3b a misrouted cancel would have shardId=0 and pass the
+  guard silently; after E-3b the cancel carries the order's actual
+  shardId and the guard can drop it on the wrong projector with a
+  named `oms.projector.shard_mismatch_dropped` counter increment.
+
+### What E-3b deliberately does NOT ship
+
+- FIX-inbound shard-awareness. `FixInboundClusterSink` still
+  `@Autowire`s the back-compat singleton bean (shard 0). At
+  `oms.shard.count>1` on an ingress JVM with no fix-egress process
+  this is unobservable; on a fix-egress JVM operators must keep
+  `oms.shard.count=1`. The follow-up slice will read the order's
+  shard from the cluster log and route on the
+  `OmsClusterShardRouter` instead.
+- `ExecutionAppliedEvent` does not carry shardId (the `findById`
+  lookup against the per-shard projector DB acts as the implicit
+  guard — an order on the wrong shard's DB returns `Optional.empty()`).
+  Adding shardId to `ExecutionAppliedEvent` is a wire-format
+  extension that pays for itself only when the explicit guard
+  becomes load-bearing.
+
+### Pop! verification (2026-05-14)
+
+Two passes:
+
+**Pass 1 — byte-identical-at-N=1 invariant.** Re-ran the existing
+single-shard `scripts/launch-bench-stack.sh` topology (one ingress
+JVM, `oms.shard.count=1`, no per-shard overrides) against the same
+Pop! Postgres / Aeron config that produced E-2's 62k baseline. The
+flat `oms.cluster.client.*` values resolve to a single-element
+`{0: client0}` map and the router behaves identically to E-1 / E-2.
+No code path on the ingress hot loop has new branches at N=1; the
+cancel emit's `mutated.shardId()` evaluates to `0`, exactly the value
+the pre-E-3b hardcode produced.
+
+**Pass 2 — N=2 inside ONE ingress JVM.** Brought up the same 2-shard
+substrate (2 cluster-nodes, 2 projectors, 2 separate Postgres DBs)
+as E-3a but with **one** ingress JVM at `oms.shard.count=2` and
+per-shard overrides (`oms.cluster.client.shards[0].aeron-directory`,
+`...shards[1].aeron-directory`, etc.). The bench tool throws random
+`accountId`s; the router splits across the two clusters via xxh64
+mod 2. Postgres counts after the run confirmed both DBs grew (the
+admit landed on the cluster the router picked; the projector
+serving that cluster's shardId persisted it).
+
+The full E-3b bench numbers and the diff vs E-3a's
+2-ingress-JVM topology are captured in the commit message and in
+`systems/oms.md` § Document history.
+
+### Decision: E-3b complete; next is Phase 5 multi-host
+
+The router cap is lifted, the cancel emit carries the right shardId,
+and the projector shard guard now defends both event types. Single-host
+scaling work on the OMS substrate is parked here. Multi-host scaling
+(separate physical hosts per shard / cluster member) is the natural
+next step and lives under Phase 5.
+
 ## Caveats
 
 - This is a **single-host single-cluster-node** rig. It does NOT exercise consensus, leader

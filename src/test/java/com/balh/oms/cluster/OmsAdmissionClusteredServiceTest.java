@@ -770,6 +770,56 @@ class OmsAdmissionClusteredServiceTest {
     }
 
     @Test
+    void snapshot_roundtripPreservesNonZeroShardId() {
+        // Phase 4 Tier 2.5 phase E-3b: AdmittedOrder gained a shardId field and the snapshot
+        // schema bumped 3 -> 4. Pin the on-wire byte layout so a future codec change that
+        // forgets shardId (or drops it on decode) is caught here rather than at first replay
+        // on a multi-shard cluster. The test admits at shardId=2, takes a snapshot, restores
+        // a fresh service from those bytes, and asserts the restored AdmittedOrder still
+        // reports shardId=2.
+        UUID orderId = UUID.fromString("00000000-0000-4000-8000-000000004301");
+        deliverCommand(
+                sampleAccept(11L, "acct-shard2", "idem-shard2", orderId, /* shardId = */ 2),
+                ANY_TIMESTAMP_MS);
+
+        byte[] snapshotBytes = takeSnapshotBytes(service);
+        OmsAdmissionClusteredService restored = newServiceFromSnapshot(snapshotBytes);
+
+        OmsAdmissionClusteredService.AdmittedOrder o = restored.lookupByOrderId(orderId);
+        assertThat(o).as("admitted order survives snapshot roundtrip").isNotNull();
+        assertThat(o.shardId())
+                .as("AdmittedOrder.shardId must round-trip through SNAPSHOT_SCHEMA_VERSION=4 unchanged")
+                .isEqualTo(2);
+    }
+
+    @Test
+    void applyCancelOrder_emitsEventWithOrderShardId_notHardcodedZero() {
+        // Phase 4 Tier 2.5 phase E-3b: the cluster service must propagate the order's owning
+        // shardId (seeded at admit time from cmd.shardId()) onto OrderCancelAppliedEvent so the
+        // E-2 projector shard guard accepts it on shard != 0. Pre-E-3b the emit hardcoded
+        // shardId=0 and a non-zero-shard projector would silently drop the cancel event.
+        UUID orderId = UUID.fromString("00000000-0000-4000-8000-000000004201");
+        deliverCommand(
+                sampleAccept(99L, "acct", "idem", orderId, /* shardId = */ 1),
+                ANY_TIMESTAMP_MS);
+        capturedAdmittedEvents.clear();
+
+        deliverCommand(
+                new CancelOrderCommand(101L, orderId, 1L, "ledger_inflight_hold_failed:test"),
+                ANY_TIMESTAMP_MS + 1);
+
+        assertThat(capturedAdmittedEvents).hasSize(1);
+        OrderCancelAppliedEvent ev = OrderCancelAppliedEvent.decode(
+                new UnsafeBuffer(capturedAdmittedEvents.get(0)),
+                0,
+                capturedAdmittedEvents.get(0).length);
+        assertThat(ev.shardId())
+                .as("OrderCancelAppliedEvent must carry the order's actual shardId from admission, not 0")
+                .isEqualTo(1);
+        assertThat(ev.orderId()).isEqualTo(orderId);
+    }
+
+    @Test
     void applyCancelOrder_replay_isIdempotent() {
         // Cluster log replay re-delivers the same CancelOrderCommand. The first apply mutates
         // working -> CANCELLED; the second sees the order is terminal and silent no-ops. State
@@ -847,13 +897,18 @@ class OmsAdmissionClusteredServiceTest {
     }
 
     private static AcceptOrderCommand sampleAccept(long correlationId, String accountId, String idemKey, UUID orderId) {
+        return sampleAccept(correlationId, accountId, idemKey, orderId, /* shardId = */ 0);
+    }
+
+    private static AcceptOrderCommand sampleAccept(
+            long correlationId, String accountId, String idemKey, UUID orderId, int shardId) {
         return new AcceptOrderCommand(
                 correlationId,
                 orderId,
                 /* clientTimestampNanos = */ 0L,
                 /* quantityScaled = */ 10_000_000_000L,
                 /* limitPriceScaledOrZero = */ 0L,
-                /* shardId = */ 0,
+                shardId,
                 AcceptOrderCommand.SIDE_BUY,
                 AcceptOrderCommand.TIF_DAY,
                 accountId,

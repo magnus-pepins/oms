@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Phase 4 Tier 2.5 phase E-3a: launch a single 2-shard OMS multi-JVM-bench role on Pop!.
+# Phase 4 Tier 2.5 phases E-3a / E-3b: launch a single 2-shard OMS multi-JVM-bench role on Pop!.
 #
-# E-3a is the cheap-experiment-first path: bring up TWO independent OMS Aeron Cluster
-# vertical stacks side-by-side on one host (each with its own aeronDirBase, port set, and
-# Postgres database) and bench them in parallel to falsify the multi-cluster-lift
-# hypothesis BEFORE the full E-3b Spring multi-bean refactor.
+# E-3a was the cheap-experiment-first path: TWO independent OMS Aeron Cluster vertical stacks
+# side-by-side on one host, each at oms.shard.count=1 with its own ingress JVM. E-3b extends
+# this script with an `ingress-multi` role: a SINGLE ingress JVM at oms.shard.count=2 holding
+# both shards' OmsClusterIngressClients via OmsClusterClientsConfiguration. Use roles
+# {cluster-node,projector}-{0,1} from E-3a (unchanged) plus `ingress-multi` from E-3b instead
+# of `ingress-0` + `ingress-1` to exercise the lifted E1_MAX_SHARD_COUNT cap.
 #
 # Both shards run at oms.shard.count=1 (router invariant unchanged) so no Spring code
 # changes ship with this slice — the only Java change is making
@@ -48,8 +50,11 @@
 #   ./scripts/launch-bench-stack-2shard.sh cluster-node-1
 #   ./scripts/launch-bench-stack-2shard.sh projector-0
 #   ./scripts/launch-bench-stack-2shard.sh projector-1
+#   # E-3a 2-ingress-JVM mode (one ingress per shard, byte-identical stacks):
 #   ./scripts/launch-bench-stack-2shard.sh ingress-0
 #   ./scripts/launch-bench-stack-2shard.sh ingress-1
+#   # E-3b 1-ingress-JVM mode (single ingress holding both clients via factory):
+#   ./scripts/launch-bench-stack-2shard.sh ingress-multi
 #
 # After: tail -f ~/oms/logs/<role>.log; pgrep -af 'com.balh.oms\.[A-Z]' to list JVMs.
 #
@@ -163,8 +168,28 @@ case "$ROLE" in
     shard_env_1
     launch bootRunIngressReplica ingress-1.log
     ;;
+  ingress-multi)
+    # E-3b: single ingress JVM with oms.shard.count=2 and per-shard cluster-client overrides.
+    # The flat OMS_CLUSTER_CLIENT_AERON_DIRECTORY / OMS_CLUSTER_CLIENT_INGRESS_ENDPOINTS env
+    # are unused at N>1 (the per-shard overrides supersede them) but we set them to the shard-0
+    # values so the back-compat singleton bean (OmsClusterIngressClient consumed by FIX-egress)
+    # has a defined fallback for any code path that still reads the flat config.
+    shard_env_0
+    export OMS_SHARD_COUNT=2
+    # Per-shard overrides for OmsClusterClientsConfiguration. Spring Boot's relaxed binding
+    # maps OMS_CLUSTER_CLIENT_SHARDS_<i>_<FIELD> onto the indexed list element. We hand-roll
+    # both shard 0 and shard 1 here because at N>1 the factory requires every shard to be
+    # listed (it fails fast otherwise — see OmsClusterClientsConfiguration#omsClusterIngressClients).
+    export OMS_CLUSTER_CLIENT_SHARDS_0_ID=0
+    export OMS_CLUSTER_CLIENT_SHARDS_0_AERON_DIRECTORY="$HOME/oms/build/aeron-cluster/media-driver"
+    export OMS_CLUSTER_CLIENT_SHARDS_0_INGRESS_ENDPOINTS="0=localhost:20110"
+    export OMS_CLUSTER_CLIENT_SHARDS_1_ID=1
+    export OMS_CLUSTER_CLIENT_SHARDS_1_AERON_DIRECTORY="$HOME/oms/build/aeron-cluster-1/media-driver"
+    export OMS_CLUSTER_CLIENT_SHARDS_1_INGRESS_ENDPOINTS="0=localhost:21110"
+    launch bootRunIngressReplica ingress-multi.log
+    ;;
   *)
-    echo "unknown role '$ROLE'; valid: cluster-node-{0,1}|projector-{0,1}|ingress-{0,1}" >&2
+    echo "unknown role '$ROLE'; valid: cluster-node-{0,1}|projector-{0,1}|ingress-{0,1}|ingress-multi" >&2
     exit 2
     ;;
 esac

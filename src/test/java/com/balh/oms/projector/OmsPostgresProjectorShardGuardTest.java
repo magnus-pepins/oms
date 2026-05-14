@@ -9,6 +9,7 @@ import static org.mockito.Mockito.when;
 import com.balh.oms.cluster.AcceptOrderCommand;
 import com.balh.oms.cluster.OmsClusterWireFormat;
 import com.balh.oms.cluster.OrderAdmittedEvent;
+import com.balh.oms.cluster.OrderCancelAppliedEvent;
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.events.DomainEventEnvelopeCodec;
 import com.balh.oms.marketdata.MarketdataPlatformHttpClient;
@@ -151,6 +152,38 @@ class OmsPostgresProjectorShardGuardTest {
         verify(ordersRepository, never()).insertFromAdmittedEvent(any());
         assertThat(meterRegistry.counter(OmsPostgresProjector.METRIC_SHARD_MISMATCH_DROPPED)
                 .count()).isEqualTo(3.0);
+    }
+
+    @Test
+    void applyOrderCancelAppliedEvent_mismatchedShard_dropsWithoutPostgresIO_advancesCursor_increments() {
+        // Phase 4 Tier 2.5 phase E-3b: the cluster service now propagates the order's actual
+        // shardId onto OrderCancelAppliedEvent (previously hardcoded to 0). The projector's
+        // shard guard now applies on the cancel branch too — same drop + counter + cursor
+        // advance contract as the admit branch.
+        config.getShard().setId(1);
+        OrderCancelAppliedEvent ev = sampleCancel(/* shardId = */ 0);
+
+        projector.applyOrderCancelAppliedEvent(ev, FRAGMENT_POSITION);
+
+        verify(ordersRepository, never()).findById(any());
+        verify(cursorRepository).advance(
+                OmsPostgresProjector.PROJECTOR_ID,
+                OmsClusterWireFormat.EVENTS_STREAM_ID,
+                FRAGMENT_POSITION);
+        assertThat(meterRegistry.counter(OmsPostgresProjector.METRIC_SHARD_MISMATCH_DROPPED)
+                .count()).isEqualTo(1.0);
+    }
+
+    private static OrderCancelAppliedEvent sampleCancel(int shardId) {
+        return new OrderCancelAppliedEvent(
+                UUID.randomUUID(),
+                /* cancelledAtMillis = */ ACCEPTED_AT_MS + 1L,
+                /* newVersion = */ 1,
+                shardId,
+                "acct",
+                "hash",
+                "AAPL",
+                "ledger_inflight_hold_failed:test");
     }
 
     private static OrderAdmittedEvent sampleAdmitted(int shardId) {

@@ -97,7 +97,17 @@ public class OmsAdmissionClusteredService implements ClusteredService {
      * are rejected — production is rebuilt from the cluster log on restart, no older prod snapshot
      * exists today.
      */
-    static final int SNAPSHOT_SCHEMA_VERSION = 3;
+    /**
+     * Phase 4 Tier 2.5 phase E-3b bumped this from {@code 3} to {@code 4} when {@link AdmittedOrder}
+     * gained {@code shardId} so the cluster log carries the order's owning shard for every emitted
+     * {@link OrderCancelAppliedEvent} (and any future shard-aware emissions). Because {@link
+     * SnapshotLoader#onFragment} fails fast on a version mismatch, pre-E-3b snapshots are not
+     * load-compatible with this build &mdash; operators upgrading from E-2 must wipe
+     * {@code archive/} and {@code cluster/} (or the cluster-node's {@code aeron-cluster}) on each
+     * member <em>before</em> starting the E-3b binary; the cluster will rebuild state from the
+     * recorded log.
+     */
+    static final int SNAPSHOT_SCHEMA_VERSION = 4;
 
     /** Initial buffer capacity for command processing. Grown on demand. */
     private static final int INITIAL_BUFFER_CAPACITY = 1024;
@@ -563,7 +573,8 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                 /* version = */ 0,
                 clusterTimestampMillis,
                 /* statusCode = */ STATUS_WORKING,
-                /* cumQtyScaled = */ 0L);
+                /* cumQtyScaled = */ 0L,
+                cmd.shardId());
         idempotencyIndex.put(key, admitted);
         orderIndex.put(admitted.orderId(), admitted);
 
@@ -682,7 +693,8 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                 newVersion,
                 order.acceptedAtMillis(),
                 newStatus,
-                newCumQty);
+                newCumQty,
+                order.shardId());
         orderIndex.put(mutated.orderId(), mutated);
         idempotencyIndex.put(
                 new IdempotencyKey(mutated.accountId(), mutated.clientIdempotencyKey()), mutated);
@@ -758,7 +770,8 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                 newVersion,
                 order.acceptedAtMillis(),
                 STATUS_CANCELLED,
-                order.cumQtyScaled());
+                order.cumQtyScaled(),
+                order.shardId());
         orderIndex.put(mutated.orderId(), mutated);
         idempotencyIndex.put(
                 new IdempotencyKey(mutated.accountId(), mutated.clientIdempotencyKey()), mutated);
@@ -770,16 +783,16 @@ public class OmsAdmissionClusteredService implements ClusteredService {
         if (eventsPublication == null) {
             return;
         }
-        // shardId is not carried on AdmittedOrder (the cluster's in-memory state ignores it; the
-        // projector reads shard from {@code orders.shard_id} which comes from OrderAdmittedEvent).
-        // We emit shardId=0 here and rely on the projector resolving shard via the
-        // already-projected order row. Operators reading the recording directly can still use
-        // accountIdHash for routing.
+        // Phase 4 Tier 2.5 phase E-3b: shardId is now a first-class field on AdmittedOrder, seeded
+        // from cmd.shardId() at admission time. We propagate it here so OrderCancelAppliedEvent
+        // carries the order's actual owning shard. This is what makes the projector's E-2 shard
+        // guard (OmsPostgresProjector#guardShardOrDrop) work for cancels too: at oms.shard.count>1
+        // a cancel emitted by shard 1 will not be silently dropped by shard 0's projector.
         OrderCancelAppliedEvent ev = new OrderCancelAppliedEvent(
                 mutated.orderId(),
                 cancelledAtMillis,
                 mutated.version(),
-                /* shardId = */ 0,
+                mutated.shardId(),
                 mutated.accountId(),
                 mutated.accountIdHash(),
                 mutated.instrumentSymbol(),
@@ -1050,7 +1063,8 @@ public class OmsAdmissionClusteredService implements ClusteredService {
             int version,
             long acceptedAtMillis,
             byte statusCode,
-            long cumQtyScaled) {
+            long cumQtyScaled,
+            int shardId) {
 
         int encode(MutableDirectBuffer buffer, int offset) {
             int p = offset;
@@ -1068,6 +1082,12 @@ public class OmsAdmissionClusteredService implements ClusteredService {
             p += Long.BYTES;
             buffer.putLong(p, cumQtyScaled);
             p += Long.BYTES;
+            // Phase 4 Tier 2.5 phase E-3b: shardId is preserved across replay/snapshot so the
+            // cluster's emit paths (cancel today, future shard-aware emissions) carry the order's
+            // owning shard without an out-of-band lookup. SNAPSHOT_SCHEMA_VERSION bumped to 4 in
+            // the same slice; older snapshots are detected at SnapshotLoader.onFragment.
+            buffer.putInt(p, shardId);
+            p += Integer.BYTES;
             buffer.putByte(p++, side);
             buffer.putByte(p++, timeInForceCode);
             buffer.putByte(p++, statusCode);
@@ -1098,6 +1118,8 @@ public class OmsAdmissionClusteredService implements ClusteredService {
             p += Long.BYTES;
             long cumQtyScaled = buffer.getLong(p);
             p += Long.BYTES;
+            int shardId = buffer.getInt(p);
+            p += Integer.BYTES;
             byte side = buffer.getByte(p++);
             byte timeInForceCode = buffer.getByte(p++);
             byte statusCode = buffer.getByte(p++);
@@ -1128,15 +1150,16 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                     version,
                     acceptedAtMillis,
                     statusCode,
-                    cumQtyScaled);
+                    cumQtyScaled,
+                    shardId);
         }
 
         int encodedLength() {
             int p = 0;
             // 6 longs (msb, lsb, acceptedAtMillis, quantityScaled, limitPriceScaledOrZero, cumQtyScaled).
             p += Long.BYTES * 6;
-            // 1 int (version).
-            p += Integer.BYTES;
+            // 2 ints (version, shardId).
+            p += Integer.BYTES * 2;
             // 4 bytes (side, tif, statusCode, hasLedgerBalanceId).
             p += 4;
             p += stringByteLen(accountId);

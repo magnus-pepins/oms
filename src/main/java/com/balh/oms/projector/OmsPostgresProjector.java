@@ -582,25 +582,38 @@ public class OmsPostgresProjector {
      * without a separate unique-index migration on {@code domain_event_outbox} (whose
      * {@code order_id} is intentionally not unique — multiple events per order are normal).
      */
-    void applyAdmittedEvent(OrderAdmittedEvent ev, long newPosition) {
-        // Phase 4 Tier 2.5 phase E-2: defensive shard guard. At shardCount=1 the cluster log
-        // only carries shardId=0 events and OmsConfig.Shard.id defaults to 0 — this guard is
-        // a no-op. At shardCount>1 (E-3+) each projector subscribes to its own cluster's
-        // events recording so it should naturally only see its shard's events; if a config
-        // bug wires the projector to the wrong cluster (e.g. OMS_SHARD_ID=1 but the Aeron
-        // events recording is shard 0's), this guard catches the mismatch BEFORE applying
-        // the event to Postgres. Drop + counter so the operator's existing alert on the
-        // failed-projection counter fires.
+    /**
+     * Phase 4 Tier 2.5 phase E-2 / phase E-3b — defensive shard guard. At shardCount=1 the cluster
+     * log only carries shardId=0 events and {@link OmsConfig.Shard#getId()} defaults to 0, so the
+     * guard is a no-op. At shardCount &gt; 1 each projector subscribes to its own cluster's events
+     * recording, so it should naturally only see its shard's events; if a config bug wires the
+     * projector to the wrong cluster (e.g. {@code OMS_SHARD_ID=1} but the Aeron events recording
+     * is shard 0's), this guard catches the mismatch BEFORE applying the event to Postgres.
+     *
+     * <p>Drop + counter so the operator's existing alert on the failed-projection counter fires.
+     * Cursor advances on the dropped event so the projector does not loop on the same misroute;
+     * replaying after fixing the wiring will re-emit the event from the recording.
+     *
+     * <p>E-3b extended this guard to {@link OrderCancelAppliedEvent}: the cluster service now
+     * propagates {@link OmsAdmissionClusteredService.AdmittedOrder#shardId()} into the cancel
+     * emit (previously hardcoded to 0) so the same misroute check works on the cancel branch
+     * without a special case for "shardId always 0 here".
+     */
+    private boolean isShardMisroute(java.util.UUID orderId, int eventShardId, long newPosition) {
         int expectedShardId = config.getShard().getId();
-        if (ev.shardId() != expectedShardId) {
-            shardMismatchCounter.increment();
-            log.warn(
-                    "projector shard mismatch: event orderId={} shardId={} but this projector serves shardId={}; dropping event without applying",
-                    ev.orderId(), ev.shardId(), expectedShardId);
-            // Cursor advance still happens so the projector does not loop on the same
-            // misrouted event. The event is dropped, not skipped — replaying after fixing
-            // the wiring will re-emit the event from the recording.
-            cursorRepository.advance(PROJECTOR_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, newPosition);
+        if (eventShardId == expectedShardId) {
+            return false;
+        }
+        shardMismatchCounter.increment();
+        log.warn(
+                "projector shard mismatch: event orderId={} shardId={} but this projector serves shardId={}; dropping event without applying",
+                orderId, eventShardId, expectedShardId);
+        cursorRepository.advance(PROJECTOR_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, newPosition);
+        return true;
+    }
+
+    void applyAdmittedEvent(OrderAdmittedEvent ev, long newPosition) {
+        if (isShardMisroute(ev.orderId(), ev.shardId(), newPosition)) {
             return;
         }
         boolean freshAdmission = ordersRepository.insertFromAdmittedEvent(ev);
@@ -864,6 +877,9 @@ public class OmsPostgresProjector {
      * loudly and advance the cursor.
      */
     void applyOrderCancelAppliedEvent(OrderCancelAppliedEvent ev, long newPosition) {
+        if (isShardMisroute(ev.orderId(), ev.shardId(), newPosition)) {
+            return;
+        }
         Optional<Order> opt = ordersRepository.findById(ev.orderId());
         if (opt.isEmpty()) {
             log.warn(

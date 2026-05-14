@@ -4,6 +4,7 @@ import com.balh.oms.config.OmsConfig;
 import com.balh.oms.config.OmsProfiles;
 import com.balh.oms.domain.ShardKey;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Profile;
 import org.springframework.stereotype.Component;
@@ -14,18 +15,18 @@ import java.util.UUID;
 
 /**
  * Picks the {@link OmsClusterIngressClient} that owns a given shard so call sites do not need to
- * know how the cluster topology is laid out. Phase 4 Tier 2.5 phase E-1 introduces this layer as
- * the byte-identical-at-{@code N=1} indirection that later slices replace internally without
- * touching call sites:
+ * know how the cluster topology is laid out. Phase 4 Tier 2.5 phase E-1 introduced the
+ * indirection at {@code shardCount=1}; phase E-3b lifted the cap so a single ingress JVM can
+ * route across {@code N} clusters via the per-shard client map produced by
+ * {@link OmsClusterClientsConfiguration}.
  *
  * <ul>
- *   <li><b>E-1 (this slice):</b> {@code shardCount} is pinned to {@code 1} and the router holds a
- *       single {@link OmsClusterIngressClient} bean — every call resolves to that one client.
- *       Behaviour is byte-identical to the pre-E-1 direct injection of
- *       {@code OmsClusterIngressClient}; the only observable change is the new indirection.</li>
- *   <li><b>E-3:</b> the Spring constructor evolves to inject {@code N} qualified
- *       {@code OmsClusterIngressClient} beans (one per shard) and populate
- *       {@link #clientByShard} with all of them.</li>
+ *   <li><b>E-1:</b> router holds a single {@link OmsClusterIngressClient} bean — byte-identical
+ *       to the pre-E-1 direct injection.</li>
+ *   <li><b>E-3b (this slice):</b> Spring constructor takes the
+ *       {@code Map<Integer, OmsClusterIngressClient>} produced by
+ *       {@link OmsClusterClientsConfiguration} and routes per shard. {@code oms.shard.count > 1}
+ *       is now supported inside one ingress JVM.</li>
  *   <li><b>Phase 5:</b> the per-shard client endpoints move from {@code localhost:20110/20120} to
  *       multi-host endpoints. <em>Zero</em> code change here — only operational config.</li>
  * </ul>
@@ -34,73 +35,53 @@ import java.util.UUID;
  *
  * <p>Routing matches {@code decisions.md} §4 (Sharding): the canonical mapping is
  * {@link ShardKey#shardFor(UUID, int)} (xxh64 of {@code accountId} mod {@code shardCount}). All
- * sharding-relevant call sites — the ingress admit path here, plus the future shard-aware FIX
- * inbound and inflight compensator paths in E-3 — must derive their shard via this function so
+ * sharding-relevant call sites — the ingress admit path here, plus the inflight compensator's
+ * cancel path (already on the router since E-2) — must derive their shard via this function so
  * that operations on the same {@code accountId} land on the same cluster.
  *
- * <h2>What does <em>not</em> live here</h2>
+ * <h2>What does <em>not</em> yet live here</h2>
  *
- * <p>E-1 deliberately leaves {@code submitApplyExecutionReport} (FIX inbound) and
- * {@code submitCancelOrder} (compensator) on the singleton client. At {@code N=1} the singleton is
- * <em>the same instance</em> the router would return anyway, so routing those paths is observably
- * a no-op. They move onto the router in E-3 once the cluster log carries an explicit
- * {@code shardId} and the corresponding {@code orderId} → shard lookup is wired through the
- * inflight outbox / FIX inbound queries.
+ * <p>{@code FixInboundClusterSink} on the {@code oms-fix-egress} JVM still injects the
+ * back-compat singleton {@link OmsClusterIngressClient} bean (shard-0). Making FIX-inbound
+ * shard-aware requires an {@code orderId → shardId} lookup that the cluster log does not yet
+ * expose to FIX-egress; this is a documented follow-up. {@code oms.shard.count > 1} is therefore
+ * supported on ingress JVMs only at E-3b; FIX-egress JVMs must keep {@code oms.shard.count=1}.
  *
  * <h2>Profile gating</h2>
  *
- * <p>Mirrors {@link OmsClusterIngressClient}: present on JVMs that submit cluster commands (HTTP /
- * gRPC ingress and the future {@code oms-fix-egress} shard-aware paths), absent on pure
- * cluster-internal roles ({@code oms-postgres-projector}, {@code oms-cluster-node}). The
- * {@code @ConditionalOnProperty} matches the underlying client so when the client bean is
- * disabled, the router is too — no orphan router referencing a missing client.
+ * <p>Mirrors {@link OmsClusterIngressClient} / {@link OmsClusterClientsConfiguration}: present on
+ * JVMs that submit cluster commands (HTTP / gRPC ingress and {@code oms-fix-egress}), absent on
+ * pure cluster-internal roles ({@code oms-postgres-projector}, {@code oms-cluster-node}). The
+ * {@code @ConditionalOnProperty} matches the underlying factory so when the client beans are
+ * disabled, the router is too — no orphan router referencing missing clients.
  */
 @Component
 @Profile(OmsProfiles.CLUSTER_CLIENT_PROFILE)
 @ConditionalOnProperty(prefix = "oms.cluster.client", name = "enabled", havingValue = "true")
 public final class OmsClusterShardRouter {
 
-    /**
-     * Slice E-1 invariant. Until E-3 wires multi-bean injection, the router can only host a
-     * single {@link OmsClusterIngressClient}, which means {@code oms.shard.count} must be
-     * {@code 1}. Setting it higher fails fast at construction with an explicit message that
-     * names the slice that lifts the constraint.
-     */
-    static final int E1_MAX_SHARD_COUNT = 1;
-
     private final int shardCount;
     private final Map<Integer, OmsClusterIngressClient> clientByShard;
 
     /**
-     * Spring constructor. At slice E-1 there is exactly one {@link OmsClusterIngressClient} bean
-     * in the context, which the router maps to shard {@code 0}. Later slices (E-3) replace this
-     * constructor body with multi-bean injection; the {@link #routeAdmit(UUID)} /
-     * {@link #forShard(int)} contract stays stable.
+     * Spring constructor. The {@code @Qualifier("omsClusterIngressClients")} matches the bean
+     * name produced by {@link OmsClusterClientsConfiguration#omsClusterIngressClients}; without
+     * the qualifier Spring would also see the back-compat singleton bean exposed by
+     * {@link OmsClusterClientsConfiguration#omsClusterIngressClient} and fail with a
+     * {@code NoUniqueBeanDefinitionException} on multi-shard configurations.
      *
-     * @throws IllegalStateException if {@link OmsConfig.Shard#getCount()} exceeds
-     *                               {@link #E1_MAX_SHARD_COUNT} (E-3 lifts this)
-     * @throws IllegalArgumentException if {@code oms.shard.count} is not strictly positive
+     * @throws IllegalArgumentException if {@code oms.shard.count} is not strictly positive or if
+     *                                  the injected map does not cover every shard id in
+     *                                  {@code [0, oms.shard.count)}
      */
     @Autowired
-    public OmsClusterShardRouter(OmsConfig config, OmsClusterIngressClient singleClient) {
-        // Validate the E-1 invariant <em>before</em> delegating to the direct constructor so a
-        // multi-shard config produces an operator-actionable error message naming the slice that
-        // lifts the constraint, instead of a generic size-mismatch from the delegate.
+    public OmsClusterShardRouter(
+            OmsConfig config,
+            @Qualifier("omsClusterIngressClients")
+                    Map<Integer, OmsClusterIngressClient> clientByShard) {
         this(
-                checkE1Invariant(Objects.requireNonNull(config, "config").getShard().getCount()),
-                Map.of(0, Objects.requireNonNull(singleClient, "singleClient")));
-    }
-
-    private static int checkE1Invariant(int requestedShardCount) {
-        if (requestedShardCount > E1_MAX_SHARD_COUNT) {
-            throw new IllegalStateException(
-                    "OmsClusterShardRouter: oms.shard.count="
-                            + requestedShardCount
-                            + " is not yet supported on this build (slice E-1 caps shardCount at "
-                            + E1_MAX_SHARD_COUNT
-                            + "; multi-shard client injection lands in slice E-3).");
-        }
-        return requestedShardCount;
+                Objects.requireNonNull(config, "config").getShard().getCount(),
+                Objects.requireNonNull(clientByShard, "clientByShard"));
     }
 
     /**

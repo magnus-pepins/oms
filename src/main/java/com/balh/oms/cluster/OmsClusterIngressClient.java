@@ -18,10 +18,6 @@ import org.agrona.ErrorHandler;
 import org.agrona.ExpandableArrayBuffer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
-import org.springframework.context.annotation.Profile;
-import org.springframework.stereotype.Component;
 
 import java.time.Duration;
 import java.util.ArrayList;
@@ -99,17 +95,14 @@ import java.util.concurrent.locks.ReentrantLock;
 /**
  * <h2>Profile gating</h2>
  *
- * <p>Slice 3d of the Aeron Cluster substrate plan extended the consumer set: the
- * {@code oms-fix-egress} JVM also offers commands now ({@link ApplyExecutionReportCommand} on
- * inbound venue ER). The {@code @Profile} therefore pins to
- * {@link OmsProfiles#CLUSTER_CLIENT_PROFILE} (ingress JVMs <em>and</em> {@code oms-fix-egress}),
- * and {@code @ConditionalOnProperty(oms.cluster.client.enabled=true)} provides the per-deployment
- * opt-in. Worker / projector profiles never load this bean even if their config flips the
- * property on, because they fall outside the profile expression.
+ * <p>Phase 4 Tier 2.5 phase E-3b demoted this class from a Spring {@code @Component} to a
+ * factory-built {@code @Bean}: a single ingress JVM can now host {@code N} instances (one per
+ * shard) when {@code oms.shard.count > 1}. The lifecycle annotations ({@link PostConstruct},
+ * {@link PreDestroy}) still drive the connect / close handshake because Spring honours them on
+ * any managed bean. Profile + property gating now live on
+ * {@link com.balh.oms.cluster.OmsClusterClientsConfiguration} (and the back-compat shim it
+ * exposes for FIX-egress at {@code oms.shard.count=1}).
  */
-@Component
-@Profile(OmsProfiles.CLUSTER_CLIENT_PROFILE)
-@ConditionalOnProperty(prefix = "oms.cluster.client", name = "enabled", havingValue = "true")
 public class OmsClusterIngressClient {
 
     private static final Logger log = LoggerFactory.getLogger(OmsClusterIngressClient.class);
@@ -307,16 +300,34 @@ public class OmsClusterIngressClient {
     /**
      * Back-compat overload used by ITs and other tests that don't care about meter assertions.
      * Meters register against {@link Metrics#globalRegistry}, which is a noop-safe composite when
-     * no actual registry is attached. Production wiring goes through the {@code @Autowired} ctor
-     * below so {@code /actuator/prometheus} on the cluster-client JVMs sees the real timers.
+     * no actual registry is attached. Production wiring goes through
+     * {@link com.balh.oms.cluster.OmsClusterClientsConfiguration} so
+     * {@code /actuator/prometheus} on the cluster-client JVMs sees the real timers.
      */
     public OmsClusterIngressClient(OmsConfig config) {
         this(config, Metrics.globalRegistry);
     }
 
-    @Autowired
+    /**
+     * Convenience constructor: takes the whole {@link OmsConfig} and reads the flat
+     * {@code oms.cluster.client} block. Used by tests and by the back-compat code path for
+     * {@code oms.shard.count=1}. For multi-shard ingress JVMs the factory builds each client
+     * with the per-shard {@link #OmsClusterIngressClient(OmsConfig.Cluster.Client, MeterRegistry)}
+     * constructor below.
+     */
     public OmsClusterIngressClient(OmsConfig config, MeterRegistry meterRegistry) {
-        this.config = Objects.requireNonNull(config, "config").getCluster().getClient();
+        this(Objects.requireNonNull(config, "config").getCluster().getClient(), meterRegistry);
+    }
+
+    /**
+     * Phase 4 Tier 2.5 phase E-3b primary constructor. Takes a resolved
+     * {@link OmsConfig.Cluster.Client} so {@link com.balh.oms.cluster.OmsClusterClientsConfiguration}
+     * can pass an already-merged per-shard config (template + shard override) without each
+     * shard's client having to know about {@code OmsConfig.Shard.id}.
+     */
+    public OmsClusterIngressClient(
+            OmsConfig.Cluster.Client clientConfig, MeterRegistry meterRegistry) {
+        this.config = Objects.requireNonNull(clientConfig, "clientConfig");
         this.meterRegistry = Objects.requireNonNull(meterRegistry, "meterRegistry");
         this.acceptOrderTimers = registerTimers(meterRegistry, COMMAND_ACCEPT_ORDER);
         this.applyExecutionReportTimers = registerTimers(meterRegistry, COMMAND_APPLY_EXECUTION_REPORT);

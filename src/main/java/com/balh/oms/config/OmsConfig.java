@@ -85,14 +85,16 @@ public class OmsConfig {
      *
      * <ul>
      *   <li>{@link #count} — number of shards in the OMS topology. Default {@code 1}. Phase 4
-     *       Tier 2.5 phase E-1 caps this at {@link com.balh.oms.cluster.OmsClusterShardRouter#E1_MAX_SHARD_COUNT}
-     *       on the ingress JVM until E-3 wires multi-bean injection of
-     *       {@link com.balh.oms.cluster.OmsClusterIngressClient}; setting it higher fails fast at
-     *       Spring context load with an explicit message naming the slice that lifts the cap.</li>
-     *   <li>{@link #id} — this JVM's shard id (only meaningful on per-shard JVM roles like
-     *       {@code oms-cluster-node} / {@code oms-postgres-projector} once those become
-     *       per-shard in E-3). Currently used as a {@code shard_id} tag on Micrometer meters
-     *       (see {@code MetricsConfig}). Default {@code 0}.</li>
+     *       Tier 2.5 phase E-3b lifted the previous E-1 single-shard cap; an ingress JVM now
+     *       hosts {@code count} {@link com.balh.oms.cluster.OmsClusterIngressClient}s wired by
+     *       {@link com.balh.oms.cluster.OmsClusterClientsConfiguration} and routed by
+     *       {@link com.balh.oms.cluster.OmsClusterShardRouter}. {@code count > 1} is supported
+     *       on ingress JVMs only; FIX-egress and projector JVMs still operate at
+     *       {@code count = 1} (a follow-up slice will lift this for FIX-inbound).</li>
+     *   <li>{@link #id} — this JVM's shard id (meaningful on per-shard JVM roles like
+     *       {@code oms-cluster-node} / {@code oms-postgres-projector}). Used as a
+     *       {@code shard_id} tag on Micrometer meters (see {@code MetricsConfig}) and as the
+     *       expected shard for the projector's E-2 shard guard. Default {@code 0}.</li>
      * </ul>
      */
     public static class Shard {
@@ -2004,6 +2006,70 @@ public class OmsConfig {
             private final AdmitBatch admitBatch = new AdmitBatch();
 
             public AdmitBatch getAdmitBatch() { return admitBatch; }
+
+            /**
+             * Phase 4 Tier 2.5 phase E-3b — per-shard overrides for the few cluster-client values
+             * that genuinely differ across the {@code N} clusters one ingress JVM can talk to:
+             * {@code aeronDirectory} (each cluster has its own Aeron media driver) and
+             * {@code ingressEndpoints} (each cluster's consensus members listen on different
+             * ports / hosts). All other knobs ({@code messageTimeoutMs}, {@code admitBatch}, …)
+             * are deployment-wide and reuse the flat values above.
+             *
+             * <p>At {@code oms.shard.count=1} this list is empty and the flat values define the
+             * single client &mdash; byte-identical to E-3a / E-2.
+             *
+             * <p>At {@code oms.shard.count>1} the list <em>must</em> contain {@code N} entries
+             * with ids {@code [0, N)} and each entry <em>must</em> set {@code aeronDirectory} and
+             * {@code ingressEndpoints} (otherwise two shards would point at the same cluster and
+             * silently double-route). {@code OmsClusterClientsConfiguration} validates this at
+             * factory build time.
+             */
+            private final java.util.List<ShardOverride> shards = new java.util.ArrayList<>();
+
+            public java.util.List<ShardOverride> getShards() { return shards; }
+            public void setShards(java.util.List<ShardOverride> shards) {
+                this.shards.clear();
+                if (shards != null) {
+                    this.shards.addAll(shards);
+                }
+            }
+
+            /**
+             * Per-shard override for the cluster-client. Only the fields that genuinely differ
+             * across clusters are settable; the remainder fall back to the flat
+             * {@link Client} values. {@link #id} is required so the factory can validate the
+             * full {@code [0, oms.shard.count)} coverage and so YAML order is irrelevant.
+             */
+            public static class ShardOverride {
+                /** Shard id. Required; the factory cross-checks against {@code oms.shard.count}. */
+                private int id = -1;
+                /**
+                 * Aeron media-driver directory for this shard's cluster client. Must be set when
+                 * {@code oms.shard.count > 1} so two shards' clients do not share a driver and
+                 * silently mix sessions.
+                 */
+                private String aeronDirectory = "";
+                /**
+                 * Cluster ingress endpoints for this shard. Must be set when
+                 * {@code oms.shard.count > 1}; format mirrors {@link Client#getIngressEndpoints()}
+                 * (e.g. {@code 0=host:port[,1=host:port,...]}).
+                 */
+                private String ingressEndpoints = "";
+
+                public int getId() { return id; }
+                public void setId(int id) { this.id = id; }
+
+                public String getAeronDirectory() { return aeronDirectory; }
+                public void setAeronDirectory(String aeronDirectory) {
+                    this.aeronDirectory = aeronDirectory == null ? "" : aeronDirectory.trim();
+                }
+
+                public String getIngressEndpoints() { return ingressEndpoints; }
+                public void setIngressEndpoints(String ingressEndpoints) {
+                    this.ingressEndpoints =
+                            ingressEndpoints == null ? "" : ingressEndpoints.trim();
+                }
+            }
 
             /**
              * Phase 4 Tier 2.5 phase D-6: configuration for the

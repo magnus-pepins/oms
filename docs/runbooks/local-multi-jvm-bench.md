@@ -3957,6 +3957,195 @@ first slice where that sharding has somewhere to land. The headroom
 probe predicted ~85–110k RPS lift on Pop! at N=2; E-3 is the bench
 that confirms or falsifies that prediction.
 
+## Tier 2.5 phase E-3a — falsifiable 2-shard scaling experiment (Pop! 2026-05-14)
+
+Cheap experiment first. The hypothesis under test is: **"running two
+independent OMS Aeron Cluster vertical stacks side-by-side on Pop!
+lifts aggregate ingress rps approximately linearly above the
+single-cluster ceiling."** If true, the cluster-substrate parallelizes
+on a single host and the **E-3b** Spring multi-bean refactor (lift
+`OmsClusterShardRouter.E1_MAX_SHARD_COUNT`, demote
+`OmsClusterIngressClient` from a `@Component` to a per-shard factory
+bean, and fix the hardcoded `shardId = 0` in
+`emitOrderCancelApplied`) is justified by data. If false, the
+substrate is the wall and we save the refactor.
+
+### What E-3a ships
+
+- **One Java change:**
+  `OmsClusterNodeBootstrap.buildArchiveContext()` now reads
+  `OMS_AERON_ARCHIVE_CONTROL_CHANNEL` (default
+  `aeron:udp?endpoint=localhost:8010` — pairs with
+  `DEFAULT_CLUSTER_MEMBERS_SINGLE_NODE`) instead of hardcoding the
+  literal endpoint. Without this the second cluster-node JVM on the
+  same host fails to bind. Default is unchanged so existing
+  single-node deploys are byte-identical.
+- **`scripts/launch-bench-stack-2shard.sh`** brings up two complete
+  vertical stacks (cluster-node + projector + ingress per shard) with
+  `oms.shard.count = 1` on **both** sides. The router invariant from
+  E-1 (`E1_MAX_SHARD_COUNT = 1`) is unchanged — the experiment runs
+  two independent N=1 stacks rather than a single N=2 stack. Each
+  stack has its own `aeronDirBase`
+  (`build/aeron-cluster` + `build/aeron-cluster-1`), port set, and
+  Postgres database (`oms` + `oms_1`).
+
+### What E-3a deliberately does NOT ship
+
+- FIX-egress is **not launched** for either shard (port collision
+  avoidance — `OMS_FIX_AUTO_START=false`,
+  `OMS_ROUTING_BACKEND=noop`). Removes one variable from the lift
+  measurement.
+- Ledger inflight reservation is **disabled** for both shards
+  (`OMS_LEDGER_INFLIGHT_RESERVATION_ENABLED=false`,
+  `OMS_LEDGER_INFLIGHT_ASYNC_ENABLED=false`). A single shared Ledger
+  Balance would otherwise cap aggregate rps at the per-Balance OCC
+  ceiling and confound the cluster-substrate measurement.
+- `OmsClusterIngressClient` is **not** demoted to a factory; the
+  router still has `E1_MAX_SHARD_COUNT = 1`. Each ingress JVM holds
+  exactly one client. Same Spring bean shape as today.
+- Postgres uses session-mode (port 5432) on both shards rather than
+  transaction-mode (6543). Required so Flyway can run `CREATE INDEX
+  CONCURRENTLY` against a fresh `oms_1` DB. Verified independently
+  that connection mode is not a confounder: a control run of shard 0
+  alone at port 6543 with the same E-3a config returned ~30k rps,
+  matching the 5432 measurement.
+
+### Pre-flight (one-time)
+
+```bash
+docker exec ledger-supabase-db psql -U postgres -c 'CREATE DATABASE oms_1;'
+```
+
+Then bring up the 6 JVMs in order (cluster-nodes first, projectors,
+ingresses):
+
+```bash
+cd ~/oms
+for r in cluster-node-0 cluster-node-1; do bash ./scripts/launch-bench-stack-2shard.sh "$r"; done
+sleep 25
+for r in projector-0 projector-1; do bash ./scripts/launch-bench-stack-2shard.sh "$r"; done
+sleep 30
+for r in ingress-0 ingress-1; do bash ./scripts/launch-bench-stack-2shard.sh "$r"; done
+sleep 30
+curl -fsS http://127.0.0.1:8087/actuator/health  # shard 0 ingress
+curl -fsS http://127.0.0.1:8187/actuator/health  # shard 1 ingress
+```
+
+### Bench
+
+Disjoint accountId pools per shard are not strictly required at
+`shardCount=1` because each shard's Postgres is independent and the
+bench tool's deterministic `accountPool=64` UUIDs do not need to
+diverge across shards (the orders simply land in different DBs). What
+matters is that both bench clients run **simultaneously** so the
+parallel-rps measurement reflects shared-host contention.
+
+The recipe used to produce the numbers below: c2400-style
+`burst-ingress-orders.sh` (slice 4k tool) with
+`OMS_BURST_TOTAL=24000`, `OMS_BURST_CONCURRENCY=200`,
+`OMS_BURST_ACCOUNT_POOL=64`, ledger fields unset (since
+`OMS_LEDGER_ENABLED=false` for the bench). Each shard's bench targets
+its own ingress port (`8088` / `8188`).
+
+### Evidence (Pop! 2026-05-14, three sequential warm passes per leg)
+
+**Single shard-0 baseline** (drop pass 1 = JVM warmup):
+
+| pass | rps    | bench elapsed |
+|------|--------|---------------|
+| 2    | 31,330 | 0.766 s       |
+| 3    | 29,744 | 0.807 s       |
+
+mean = **30.5k rps**
+
+**Single shard-1 baseline** (drop pass 1 = JVM warmup):
+
+| pass | rps    | bench elapsed |
+|------|--------|---------------|
+| 2    | 30,021 | 0.799 s       |
+| 3    | 30,068 | 0.798 s       |
+
+mean = **30.0k rps**
+
+**Parallel both shards (4 passes, both sides warm)**:
+
+| pass | shard-0 rps | shard-1 rps | aggregate |
+|------|-------------|-------------|-----------|
+| 1    | 27,956      | 30,695      | 58,651    |
+| 2    | 29,670      | 29,524      | 59,194    |
+| 3    | 28,180      | 31,103      | 59,283    |
+| 4    | 31,543      | 28,642      | 60,186    |
+
+mean aggregate = **59.3k rps**
+
+### Verdict
+
+**Aggregate / mean-single-shard = 59.3k / 30.3k = 1.96× ≈ 98%
+near-linear scaling.** Per-shard rps in the parallel run drops <5%
+versus the alone-shard baseline, so the host has the headroom to run
+two independent OMS clusters with negligible interference. The
+cluster substrate (consensus + Aeron media driver + projector + this
+host's Postgres + this host's CPU) parallelizes well at N=2 with
+disjoint state.
+
+End-to-end correctness check at the conclusion of the run:
+
+```sql
+-- shard 0 / oms (includes ~2.5M historical orders from prior benches)
+SELECT COUNT(*), COUNT(DISTINCT shard_id) FROM orders;
+--   2,559,842 |  1   (all shard_id=0)
+
+-- shard 1 / oms_1 (this E-3a session only — fresh DB)
+SELECT COUNT(*), COUNT(DISTINCT shard_id) FROM orders;
+--      113,339 |  1   (all shard_id=0)
+```
+
+Both projectors persist orders to their respective DBs without cross-shard
+contamination. (Projector lag is non-zero because the bench rate
+exceeds projection throughput, but the cluster recording is durable
+and the projector keeps catching up after the bench stops — same
+behaviour as the published single-shard baseline.)
+
+### Decision: proceed to E-3b
+
+The 1.96× lift on identical work is strong enough to justify the
+**E-3b** Spring refactor:
+
+1. Lift `OmsClusterShardRouter.E1_MAX_SHARD_COUNT = 1`.
+2. Demote `OmsClusterIngressClient` from `@Component` to a per-shard
+   factory bean (or a `Map<Integer, OmsClusterIngressClient>`
+   constructed during context init), so a single ingress JVM can hold
+   N clients keyed by shard id.
+3. Fix `emitOrderCancelApplied` (and any other clustered-service
+   emit path) to propagate `mutated.shardId()` instead of hardcoding
+   `0` — required so the E-2 projector shard guard accepts events
+   from non-zero shards.
+4. Default `oms.shard.count` stays at 1; multi-shard configurations
+   are opt-in via env, with the host-side topology (separate
+   `aeronDirBase`, separate Postgres DB per shard) remaining the
+   operator's responsibility.
+
+E-3b is a refactor, not a behaviour change at N=1. The E-1 router
+invariants and the E-2 projector shard guard already paid for the
+cross-shard correctness story; E-3b just removes the `N=1`
+constraint.
+
+### Open questions deferred past E-3b
+
+- The single-shard rps in E-3a (~30k) sits well below the
+  full-config baseline (~62k from slice 4p / D-9). The delta is **not**
+  Postgres connection mode (verified via the 6543 control run). Most
+  likely candidates: (a) the bench tool's HTTP client is the
+  bottleneck above some concurrency threshold (RTT p50 of 4 ms
+  against 200 concurrency caps theoretical at ~50k rps), or (b) the
+  no-fix / no-ledger path exercises a different cluster admit shape
+  than the full-config path. Either way the **single-vs-aggregate
+  ratio** is the result that matters for E-3a's hypothesis; the
+  absolute number is not.
+- Multi-host scaling beyond what one Pop! box can provide is the
+  natural next step after E-3b lands. That would be Phase 5
+  (k8s) — explicitly out of scope here.
+
 ## Caveats
 
 - This is a **single-host single-cluster-node** rig. It does NOT exercise consensus, leader

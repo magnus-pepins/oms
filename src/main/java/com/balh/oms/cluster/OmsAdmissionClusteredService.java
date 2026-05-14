@@ -171,6 +171,25 @@ public class OmsAdmissionClusteredService implements ClusteredService {
     private final DistributionSummary snapshotWriteBytes;
     private final DistributionSummary snapshotLoadBytes;
 
+    // ---- Phase 4 Tier 2.5 phase D-investigate: per-emit publish-timer + back-pressure counter ----
+    // Falsifier for the "per-admit egress publish is the wall" hypothesis from the post-D-6 runbook.
+    // emitAdmitted writes OrderAdmittedEvent to eventsPublication (projector consumes); emitAccepted
+    // writes OrderAcceptedEvent via session.offer (ingress client demuxes the egress reply). Each
+    // runs on the single cluster service thread and busy-waits via Thread.yield on Aeron back-pressure
+    // (offer return < 0). The timer records total per-call wall time (success + busy-wait combined);
+    // the counter increments per Thread.yield tick so a non-zero count signals BACK_PRESSURED.
+    //
+    // Determinism note: this uses Timer.start(meterRegistry) which reads System.nanoTime() under the
+    // hood — same pattern as the snapshot timers above (line 385). Allowed because the recorded
+    // duration is observability-only on a JVM-local registry; it does not influence emitted event
+    // payloads, in-memory state, or what gets written to the cluster log. Replay re-fires these
+    // meters identically modulo wall-clock noise; the per-replay deltas reset with the JVM, so
+    // production scrapes only see steady-state activity.
+    private final Timer eventsPublishTimerAdmitted;
+    private final Counter eventsBackPressureCounterAdmitted;
+    private final Timer sessionPublishTimerAccepted;
+    private final Counter sessionBackPressureCounterAccepted;
+
     /**
      * Phase 4 slice 4h — drives the {@code oms.cluster.snapshot.age_seconds} freshness gauge that
      * the snapshot-freshness alert in {@code oms/docs/cluster-slo.md} is wired against.
@@ -265,6 +284,26 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                                 + " onTakeSnapshot. Initial value = service-construct time (so a fresh boot"
                                 + " starts near zero); not reset by snapshot load.")
                 .baseUnit("seconds")
+                .register(meterRegistry);
+
+        // Phase 4 Tier 2.5 phase D-investigate — per-emit publish observability. Pre-registered so
+        // /metrics on the cluster-node JVM (port 8089 by default) exposes the names with zero counts
+        // on a freshly booted cluster, before the first admit fires.
+        this.eventsPublishTimerAdmitted = Timer.builder("oms.cluster.service.events_offer_seconds")
+                .description("Per-call wall time of eventsPublication.offer including back-pressure busy-wait.")
+                .tag("event_kind", "admitted")
+                .register(meterRegistry);
+        this.eventsBackPressureCounterAdmitted = Counter.builder("oms.cluster.service.events_offer_back_pressure_total")
+                .description("Aeron back-pressure ticks (Thread.yield iterations) per emit on eventsPublication.")
+                .tag("event_kind", "admitted")
+                .register(meterRegistry);
+        this.sessionPublishTimerAccepted = Timer.builder("oms.cluster.service.session_offer_seconds")
+                .description("Per-call wall time of session.offer (egress AcceptedEvent) including back-pressure busy-wait.")
+                .tag("event_kind", "accepted")
+                .register(meterRegistry);
+        this.sessionBackPressureCounterAccepted = Counter.builder("oms.cluster.service.session_offer_back_pressure_total")
+                .description("Aeron back-pressure ticks (Thread.yield iterations) per session.offer for AcceptedEvent.")
+                .tag("event_kind", "accepted")
                 .register(meterRegistry);
     }
 
@@ -793,14 +832,25 @@ public class OmsAdmissionClusteredService implements ClusteredService {
         }
         OrderAdmittedEvent ev = OrderAdmittedEvent.fromAdmittedCommand(cmd, acceptedAtMillis, version);
         int len = ev.encode(eventsBuffer, 0);
+        Timer.Sample sample = Timer.start(meterRegistry);
+        int backPressureTicks = 0;
         long pos;
         while ((pos = eventsPublication.offer(eventsBuffer, 0, len)) < 0L) {
             // BACK_PRESSURED / NOT_CONNECTED is normal during steady-state and during projector reconnect.
             // The Archive subscribes to this publication on the cluster member and is always present.
             if (pos == io.aeron.Publication.CLOSED || pos == io.aeron.Publication.MAX_POSITION_EXCEEDED) {
+                sample.stop(eventsPublishTimerAdmitted);
+                if (backPressureTicks > 0) {
+                    eventsBackPressureCounterAdmitted.increment(backPressureTicks);
+                }
                 throw new IllegalStateException("eventsPublication offer closed; pos=" + pos);
             }
+            backPressureTicks++;
             Thread.yield();
+        }
+        sample.stop(eventsPublishTimerAdmitted);
+        if (backPressureTicks > 0) {
+            eventsBackPressureCounterAdmitted.increment(backPressureTicks);
         }
     }
 
@@ -813,13 +863,24 @@ public class OmsAdmissionClusteredService implements ClusteredService {
         OrderAcceptedEvent ev = new OrderAcceptedEvent(
                 correlationId, admitted.orderId(), admitted.version(), duplicate, acceptedAtMillis);
         int len = ev.encode(egressBuffer, 0);
+        Timer.Sample sample = Timer.start(meterRegistry);
+        int backPressureTicks = 0;
         long pos;
         while ((pos = session.offer(egressBuffer, 0, len)) < 0L) {
             // BACK_PRESSURED is normal under load — retry. Closed/terminal positions throw.
             if (pos == io.aeron.Publication.CLOSED || pos == io.aeron.Publication.MAX_POSITION_EXCEEDED) {
+                sample.stop(sessionPublishTimerAccepted);
+                if (backPressureTicks > 0) {
+                    sessionBackPressureCounterAccepted.increment(backPressureTicks);
+                }
                 throw new IllegalStateException("session.offer closed; pos=" + pos);
             }
+            backPressureTicks++;
             Thread.yield();
+        }
+        sample.stop(sessionPublishTimerAccepted);
+        if (backPressureTicks > 0) {
+            sessionBackPressureCounterAccepted.increment(backPressureTicks);
         }
     }
 

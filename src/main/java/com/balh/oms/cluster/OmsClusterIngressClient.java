@@ -29,6 +29,8 @@ import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
@@ -244,6 +246,23 @@ public class OmsClusterIngressClient {
     private volatile Thread egressPollerThread;
     private volatile boolean closing;
 
+    // ---- Phase 4 Tier 2.5 phase D-6: admit-batcher state (only used when admit-batch enabled) ----
+
+    /** Queue entry for the admit-batcher: one in-flight {@link AcceptOrderCommand} awaiting batch flush. */
+    private record PendingBatchSubmit(
+            AcceptOrderCommand cmd,
+            long deadlineNanos,
+            CompletableFuture<AdmissionResult> future,
+            Timer.Sample sample) {}
+
+    /**
+     * Bounded MPSC queue that the admit-batcher daemon drains. Submit threads {@code offer()}
+     * with park-and-retry on full; the daemon {@code poll()}s up to {@code maxBatchSize} per
+     * pass. Null when admit-batching is disabled (slice 4n single-message path).
+     */
+    private final BlockingQueue<PendingBatchSubmit> admitBatchQueue;
+    private volatile Thread admitBatcherThread;
+
     // ---- Phase 4 slice 4c: commit-round-trip timer ----
     // Single timer name `oms.cluster.client.commit_round_trip` covers both submit methods so a
     // single SLO ("p99 of caller-side cluster wait") works across the OMS topology. The `command`
@@ -302,6 +321,10 @@ public class OmsClusterIngressClient {
         this.acceptOrderTimers = registerTimers(meterRegistry, COMMAND_ACCEPT_ORDER);
         this.applyExecutionReportTimers = registerTimers(meterRegistry, COMMAND_APPLY_EXECUTION_REPORT);
         this.cancelOrderTimers = registerTimers(meterRegistry, COMMAND_CANCEL_ORDER);
+        this.admitBatchQueue =
+                this.config.getAdmitBatch().isEnabled()
+                        ? new ArrayBlockingQueue<>(this.config.getAdmitBatch().getQueueCapacity())
+                        : null;
     }
 
     private static EnumMap<Outcome, Timer> registerTimers(MeterRegistry registry, String command) {
@@ -376,10 +399,16 @@ public class OmsClusterIngressClient {
                 try {
                     this.client = AeronCluster.connect(ctx.clone());
                     log.info(
-                            "OMS cluster client connected: aeronDir={} ingressEndpoints={}",
+                            "OMS cluster client connected: aeronDir={} ingressEndpoints={} admitBatch={}",
                             aeronDirectory,
-                            config.getIngressEndpoints());
+                            config.getIngressEndpoints(),
+                            config.getAdmitBatch().isEnabled()
+                                    ? "enabled(maxBatchSize=" + config.getAdmitBatch().getMaxBatchSize()
+                                            + ", flushNanos=" + config.getAdmitBatch().getFlushIntervalNanos()
+                                            + ", queueCap=" + config.getAdmitBatch().getQueueCapacity() + ")"
+                                    : "disabled");
                     startEgressPollerLocked();
+                    startAdmitBatcherLocked();
                     return;
                 } catch (RuntimeException e) {
                     lastFailure = e;
@@ -405,6 +434,16 @@ public class OmsClusterIngressClient {
             t.interrupt();
             try {
                 t.join(POLLER_JOIN_MS);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        Thread bt = admitBatcherThread;
+        admitBatcherThread = null;
+        if (bt != null) {
+            bt.interrupt();
+            try {
+                bt.join(POLLER_JOIN_MS);
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
             }
@@ -588,6 +627,13 @@ public class OmsClusterIngressClient {
         Objects.requireNonNull(cmd, "cmd");
         Objects.requireNonNull(timeout, "timeout");
 
+        // Phase 4 Tier 2.5 phase D-6: when admit-batching is enabled, the calling thread
+        // enqueues + parks on the future; the batcher daemon packs N admits into one Aeron
+        // cluster message. Egress demux is identical (per-correlationId completion).
+        if (admitBatchQueue != null) {
+            return submitAcceptOrderViaBatcher(cmd, timeout);
+        }
+
         ExpandableArrayBuffer buffer = new ExpandableArrayBuffer(OmsClusterWireFormat.MAX_COMMAND_BYTES);
         int written = cmd.encode(buffer, 0);
 
@@ -656,6 +702,252 @@ public class OmsClusterIngressClient {
             }
         } finally {
             sample.stop(acceptOrderTimers.get(outcome));
+        }
+    }
+
+    /**
+     * Phase 4 Tier 2.5 phase D-6 — admit-batched submit path. Calling thread:
+     * (1) registers its waiter in {@link #pending} (same demux contract as the unbatched path),
+     * (2) enqueues a {@link PendingBatchSubmit} into {@link #admitBatchQueue} with park-and-retry
+     *     on full, (3) waits on its future. The {@linkplain #admitBatcherLoop() batcher daemon}
+     *     drains up to {@code maxBatchSize} entries per pass, packs them into one
+     *     {@link BatchAcceptOrderCommand} frame, and offers via the existing client lock.
+     */
+    private AdmissionResult submitAcceptOrderViaBatcher(AcceptOrderCommand cmd, Duration timeout)
+            throws TimeoutException, InterruptedException {
+        long correlationId = cmd.correlationId();
+        long deadlineNanos = System.nanoTime() + timeout.toNanos();
+
+        CompletableFuture<AdmissionResult> waiter = new CompletableFuture<>();
+        if (pending.putIfAbsent(correlationId, waiter) != null) {
+            throw new IllegalStateException(
+                    "duplicate in-flight cluster correlationId=" + correlationId);
+        }
+
+        Timer.Sample sample = Timer.start(meterRegistry);
+        Outcome outcome = Outcome.ERROR;
+
+        PendingBatchSubmit submit = new PendingBatchSubmit(cmd, deadlineNanos, waiter, sample);
+        try {
+            // Park-and-retry enqueue. ArrayBlockingQueue.offer is wait-free on the fast path.
+            long parkNanos = config.getAdmitBatch().getEnqueueParkNanos();
+            while (true) {
+                if (closing) {
+                    pending.remove(correlationId, waiter);
+                    throw new IllegalStateException("OMS cluster client is closing");
+                }
+                if (admitBatchQueue.offer(submit)) {
+                    break;
+                }
+                if (System.nanoTime() > deadlineNanos) {
+                    pending.remove(correlationId, waiter);
+                    outcome = Outcome.TIMEOUT;
+                    sample.stop(acceptOrderTimers.get(outcome));
+                    throw new TimeoutException(
+                            "admit-batch queue full past deadline for correlationId=" + correlationId);
+                }
+                parkOrThrow(parkNanos);
+            }
+
+            long remainingNanos = deadlineNanos - System.nanoTime();
+            if (remainingNanos <= 0L) {
+                AdmissionResult salvaged = drainCompletedFuture(correlationId, waiter);
+                if (salvaged != null) {
+                    outcome = Outcome.COMMIT;
+                    sample.stop(acceptOrderTimers.get(outcome));
+                    return salvaged;
+                }
+                outcome = Outcome.TIMEOUT;
+                sample.stop(acceptOrderTimers.get(outcome));
+                throw new TimeoutException(
+                        "admit-batch egress wait timeout for correlationId=" + correlationId);
+            }
+            try {
+                AdmissionResult result = waiter.get(remainingNanos, TimeUnit.NANOSECONDS);
+                outcome = Outcome.COMMIT;
+                sample.stop(acceptOrderTimers.get(outcome));
+                return result;
+            } catch (java.util.concurrent.TimeoutException e) {
+                AdmissionResult salvaged = drainCompletedFuture(correlationId, waiter);
+                if (salvaged != null) {
+                    outcome = Outcome.COMMIT;
+                    sample.stop(acceptOrderTimers.get(outcome));
+                    return salvaged;
+                }
+                outcome = Outcome.TIMEOUT;
+                sample.stop(acceptOrderTimers.get(outcome));
+                throw new TimeoutException(
+                        "admit-batch egress wait timeout for correlationId=" + correlationId);
+            } catch (ExecutionException e) {
+                pending.remove(correlationId, waiter);
+                sample.stop(acceptOrderTimers.get(outcome));
+                Throwable cause = e.getCause();
+                if (cause instanceof RuntimeException re) {
+                    throw re;
+                }
+                throw new RuntimeException(
+                        "admit-batch egress unexpected failure for correlationId=" + correlationId,
+                        cause);
+            }
+        } catch (InterruptedException ie) {
+            pending.remove(correlationId, waiter);
+            sample.stop(acceptOrderTimers.get(outcome));
+            throw ie;
+        }
+    }
+
+    /**
+     * Caller must hold {@link #clientLock}. Starts the admit-batcher daemon when admit-batching
+     * is enabled. Idempotent.
+     */
+    private void startAdmitBatcherLocked() {
+        if (admitBatchQueue == null || admitBatcherThread != null) {
+            return;
+        }
+        Thread t = new Thread(this::admitBatcherLoop, "oms-cluster-client-admit-batcher");
+        t.setDaemon(true);
+        admitBatcherThread = t;
+        t.start();
+    }
+
+    /**
+     * Phase 4 Tier 2.5 phase D-6 daemon loop. Drains up to {@code maxBatchSize} pending submits
+     * per pass, packs them into one {@link BatchAcceptOrderCommand}, offers via {@link #clientLock}.
+     * On {@code BACK_PRESSURED}: parks {@link OmsConfig.Cluster.Client#getOfferBackpressureParkNanos()}
+     * and retries with the same batch. On {@code NOT_CONNECTED} / Aeron exception: completes all
+     * batched futures exceptionally and continues so subsequent batches can be tried.
+     *
+     * <p>Per-element deadline check before adding to the batch: a submit whose own per-call
+     * timeout has already expired is dropped from the batch (its waiter has already been notified
+     * by {@link #submitAcceptOrderViaBatcher}'s post-park check) — we don't waste a cluster log
+     * slot on a request whose caller has given up.
+     */
+    private void admitBatcherLoop() {
+        OmsConfig.Cluster.Client.AdmitBatch batchCfg = config.getAdmitBatch();
+        int maxBatchSize = batchCfg.getMaxBatchSize();
+        long flushIntervalNanos = batchCfg.getFlushIntervalNanos();
+        long offerBackpressureParkNanos = config.getOfferBackpressureParkNanos();
+
+        ExpandableArrayBuffer perCmdBuffer =
+                new ExpandableArrayBuffer(OmsClusterWireFormat.MAX_COMMAND_BYTES);
+        ExpandableArrayBuffer batchBuffer =
+                new ExpandableArrayBuffer(OmsClusterWireFormat.MAX_BATCH_COMMAND_BYTES);
+        List<PendingBatchSubmit> drained = new ArrayList<>(maxBatchSize);
+
+        while (!closing) {
+            try {
+                PendingBatchSubmit head = admitBatchQueue.poll(flushIntervalNanos, TimeUnit.NANOSECONDS);
+                if (head == null) {
+                    continue;
+                }
+                drained.clear();
+                drained.add(head);
+                while (drained.size() < maxBatchSize) {
+                    PendingBatchSubmit p = admitBatchQueue.poll();
+                    if (p == null) {
+                        break;
+                    }
+                    drained.add(p);
+                }
+
+                long now = System.nanoTime();
+                int dstOffset = BatchAcceptOrderCommand.firstInnerOffset(0);
+                int kept = 0;
+                for (PendingBatchSubmit s : drained) {
+                    if (now > s.deadlineNanos()) {
+                        continue;
+                    }
+                    int innerLen = s.cmd().encode(perCmdBuffer, 0);
+                    dstOffset = BatchAcceptOrderCommand.writeInner(
+                            batchBuffer, dstOffset, perCmdBuffer, 0, innerLen);
+                    kept++;
+                }
+                if (kept == 0) {
+                    continue;
+                }
+                BatchAcceptOrderCommand.writeHeader(batchBuffer, 0, kept);
+                int totalBytes = BatchAcceptOrderCommand.totalEncodedLength(dstOffset);
+
+                offerBatchWithBackpressure(
+                        batchBuffer, totalBytes, drained, offerBackpressureParkNanos);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                return;
+            } catch (RuntimeException e) {
+                log.warn("admit-batcher loop error", e);
+                // Fail any drained submits so callers don't hang on dead futures.
+                for (PendingBatchSubmit s : drained) {
+                    if (pending.remove(s.cmd().correlationId(), s.future())) {
+                        s.future().completeExceptionally(e);
+                    }
+                }
+            }
+        }
+        // Loop exit: closing == true. Drain remainder so callers parked on futures fail fast.
+        IllegalStateException reason = new IllegalStateException(
+                "OMS cluster client closed while admit-batch submit pending");
+        admitBatchQueue.drainTo(drained);
+        for (PendingBatchSubmit s : drained) {
+            if (pending.remove(s.cmd().correlationId(), s.future())) {
+                s.future().completeExceptionally(reason);
+            }
+        }
+    }
+
+    /**
+     * Offer one batch buffer with back-pressure retry. Each retry honours the
+     * <em>earliest</em> deadline among the batched submits — when that deadline passes, the
+     * whole batch is failed (we don't want to keep trying once any caller has given up; the
+     * cluster service would still apply the admit, but the projector / egress paths are
+     * idempotent so that's safe).
+     */
+    private void offerBatchWithBackpressure(
+            ExpandableArrayBuffer batchBuffer,
+            int totalBytes,
+            List<PendingBatchSubmit> batched,
+            long parkNanos) {
+        long earliestDeadline = Long.MAX_VALUE;
+        for (PendingBatchSubmit s : batched) {
+            if (s.deadlineNanos() < earliestDeadline) {
+                earliestDeadline = s.deadlineNanos();
+            }
+        }
+        while (!closing) {
+            long offerResult;
+            clientLock.lock();
+            try {
+                AeronCluster active = client;
+                if (active == null) {
+                    failBatchWith(batched, new IllegalStateException(
+                            "OMS cluster client is not connected"));
+                    return;
+                }
+                try {
+                    offerResult = active.offer(batchBuffer, 0, totalBytes);
+                } catch (RuntimeException e) {
+                    failBatchWith(batched, e);
+                    return;
+                }
+            } finally {
+                clientLock.unlock();
+            }
+            if (offerResult >= 0L) {
+                return;
+            }
+            if (System.nanoTime() > earliestDeadline) {
+                failBatchWith(batched, new TimeoutException(
+                        "admit-batch offer back-pressure timeout"));
+                return;
+            }
+            LockSupport.parkNanos(parkNanos);
+        }
+    }
+
+    private void failBatchWith(List<PendingBatchSubmit> batched, Throwable cause) {
+        for (PendingBatchSubmit s : batched) {
+            if (pending.remove(s.cmd().correlationId(), s.future())) {
+                s.future().completeExceptionally(cause);
+            }
         }
     }
 

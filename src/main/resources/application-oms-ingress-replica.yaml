@@ -25,6 +25,16 @@ oms:
       # knobs already exposed on oms-fix-egress.
       ingress-channel: ${OMS_CLUSTER_CLIENT_INGRESS_CHANNEL:aeron:udp?endpoint=localhost:0}
       egress-channel: ${OMS_CLUSTER_CLIENT_EGRESS_CHANNEL:aeron:udp?endpoint=localhost:0}
+      # Phase 4 Tier 2.5 phase D-6: opt-in admit-batcher. Disabled by default — slice 4n's
+      # single-message offer path is the safe baseline. Flip enabled=true on Pop! / single-host
+      # benches to amortise per-message cluster framing overhead across N admits per cluster log
+      # slot. See oms/docs/runbooks/local-multi-jvm-bench.md § Tier 2.5 phase D-6 for tuning.
+      admit-batch:
+        enabled: ${OMS_CLUSTER_CLIENT_ADMIT_BATCH_ENABLED:false}
+        max-batch-size: ${OMS_CLUSTER_CLIENT_ADMIT_BATCH_MAX_SIZE:16}
+        flush-interval-nanos: ${OMS_CLUSTER_CLIENT_ADMIT_BATCH_FLUSH_INTERVAL_NANOS:50000}
+        queue-capacity: ${OMS_CLUSTER_CLIENT_ADMIT_BATCH_QUEUE_CAPACITY:8192}
+        enqueue-park-nanos: ${OMS_CLUSTER_CLIENT_ADMIT_BATCH_ENQUEUE_PARK_NANOS:1000}
 
 management:
   server:

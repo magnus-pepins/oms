@@ -55,6 +55,16 @@ public final class OmsClusterWireFormat {
      */
     public static final int MAX_COMMAND_BYTES = 4096;
 
+    /**
+     * Maximum batched-command size on the wire. Larger than
+     * {@link #MAX_COMMAND_BYTES} because a {@link #TYPE_ID_BATCH_ACCEPT_ORDER}
+     * frame inlines many {@link AcceptOrderCommand} bodies (Phase 4 Tier 2.5
+     * phase D-6). Sized for {@code maxBatchSize=64 × ~360-byte per-cmd} plus
+     * a small header — well under Aeron's 16 KB term-buffer page so single-frame
+     * delivery is preserved (no MDS fragmentation).
+     */
+    public static final int MAX_BATCH_COMMAND_BYTES = 32_768;
+
     // ---- Command type IDs (1..999) ----
 
     /** {@link AcceptOrderCommand}. */
@@ -66,6 +76,19 @@ public final class OmsClusterWireFormat {
      * source of truth for execution-report state transitions (fill / partial / cancel / venue reject).
      */
     public static final int TYPE_ID_APPLY_EXECUTION_REPORT = 2;
+
+    /**
+     * {@link BatchAcceptOrderCommand}. Phase 4 Tier 2.5 phase D-6: client packs N
+     * {@link AcceptOrderCommand} bodies into one Aeron cluster message so the
+     * cluster's single-leader admit thread amortises per-message framing /
+     * consensus overhead across N admits. The cluster service decodes the batch
+     * and dispatches inner {@link AcceptOrderCommand}s through the same
+     * {@link OmsAdmissionClusteredService#applyAcceptOrder applyAcceptOrder} path
+     * — each inner command keeps its own {@code correlationId} so the
+     * {@link OmsClusterIngressClient} egress demux is identical to the unbatched
+     * path (replies arrive as N {@link OrderAcceptedEvent}s / {@link OrderRejectedEvent}s).
+     */
+    public static final int TYPE_ID_BATCH_ACCEPT_ORDER = 4;
 
     /**
      * {@link CancelOrderCommand}. Phase 4 slice 4p: OMS-initiated cancel issued by the

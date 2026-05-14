@@ -1982,6 +1982,89 @@ public class OmsConfig {
             public void setHeartbeatIntervalMs(long heartbeatIntervalMs) {
                 this.heartbeatIntervalMs = Math.max(50L, heartbeatIntervalMs);
             }
+
+            private final AdmitBatch admitBatch = new AdmitBatch();
+
+            public AdmitBatch getAdmitBatch() { return admitBatch; }
+
+            /**
+             * Phase 4 Tier 2.5 phase D-6: configuration for the
+             * {@link com.balh.oms.cluster.OmsClusterIngressClient}'s admit-batcher daemon. When
+             * enabled, calls to {@code submitAcceptOrder} enqueue into a bounded MPSC queue and a
+             * single daemon thread drains up to {@link #getMaxBatchSize()} entries per pass and
+             * offers them as one {@link com.balh.oms.cluster.BatchAcceptOrderCommand}. When
+             * disabled (default), {@code submitAcceptOrder} is the unchanged single-message offer
+             * path from slice 4n. Per-request {@code CompletableFuture} demux on the response side
+             * is identical in both paths — the only thing that changes is how the wire frame is
+             * shaped at the cluster ingress.
+             *
+             * <p>Why this exists: D-9 reduced ingress hot-path Postgres I/O to zero and lifted
+             * peak rps from 20 874 → 57 282; the residual wall is the single-leader cluster's
+             * {@code onSessionMessage} processing rate, which batching amortises. The D-7 Tomcat
+             * thread-bump experiment (see {@code oms/docs/runbooks/local-multi-jvm-bench.md}
+             * § Tier 2.5 phase D-7 falsification) confirmed the wall is on the cluster, not on
+             * Tomcat.
+             */
+            public static class AdmitBatch {
+
+                /** Default off — slice 4n single-message path is the safe fallback. */
+                private static final boolean DEFAULT_ENABLED = false;
+                /**
+                 * Default 16 admits per batch. Picks roughly the knee of the
+                 * "amortise framing overhead vs grow per-batch decode cost" trade-off based on
+                 * Pop! single-host bench shape (~360-byte AcceptOrderCommand bodies, 2.81 ms
+                 * cluster RTT). Tunable via env without code changes.
+                 */
+                private static final int DEFAULT_MAX_BATCH_SIZE = 16;
+                /**
+                 * Default 50 µs flush interval. Below the 17.5 µs per-admit cluster CPU cost
+                 * observed at 57 k rps (so the daemon's tick is fast enough to keep up with peak
+                 * arrival), but generous enough that under bursty traffic the daemon can let
+                 * batches accumulate to {@link #getMaxBatchSize()} before offering. Lower is more
+                 * aggressive (smaller batches, lower latency); higher is more amortising (larger
+                 * batches, higher latency).
+                 */
+                private static final long DEFAULT_FLUSH_INTERVAL_NANOS = 50_000L;
+                /**
+                 * Default queue capacity. Sized for ~2× the per-ingress in-flight admit count
+                 * (Tomcat 200 threads × 2 ingresses = 400 max in flight on Pop! D-9). Bounded so
+                 * a stalled daemon back-pressures rather than OOM-ing. The submit thread parks
+                 * on {@link #getEnqueueParkNanos()} ns retries when the queue is full.
+                 */
+                private static final int DEFAULT_QUEUE_CAPACITY = 8_192;
+                /** Park duration for the submit thread when the queue is full. */
+                private static final long DEFAULT_ENQUEUE_PARK_NANOS = 1_000L;
+
+                private boolean enabled = DEFAULT_ENABLED;
+                private int maxBatchSize = DEFAULT_MAX_BATCH_SIZE;
+                private long flushIntervalNanos = DEFAULT_FLUSH_INTERVAL_NANOS;
+                private int queueCapacity = DEFAULT_QUEUE_CAPACITY;
+                private long enqueueParkNanos = DEFAULT_ENQUEUE_PARK_NANOS;
+
+                public boolean isEnabled() { return enabled; }
+                public void setEnabled(boolean enabled) { this.enabled = enabled; }
+
+                public int getMaxBatchSize() { return maxBatchSize; }
+                public void setMaxBatchSize(int maxBatchSize) {
+                    this.maxBatchSize = Math.max(
+                            1, Math.min(com.balh.oms.cluster.BatchAcceptOrderCommand.MAX_COUNT, maxBatchSize));
+                }
+
+                public long getFlushIntervalNanos() { return flushIntervalNanos; }
+                public void setFlushIntervalNanos(long flushIntervalNanos) {
+                    this.flushIntervalNanos = Math.max(1_000L, flushIntervalNanos);
+                }
+
+                public int getQueueCapacity() { return queueCapacity; }
+                public void setQueueCapacity(int queueCapacity) {
+                    this.queueCapacity = Math.max(64, queueCapacity);
+                }
+
+                public long getEnqueueParkNanos() { return enqueueParkNanos; }
+                public void setEnqueueParkNanos(long enqueueParkNanos) {
+                    this.enqueueParkNanos = Math.max(100L, enqueueParkNanos);
+                }
+            }
         }
     }
 }

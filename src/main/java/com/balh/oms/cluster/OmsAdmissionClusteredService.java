@@ -328,6 +328,8 @@ public class OmsAdmissionClusteredService implements ClusteredService {
         switch (typeId) {
             case OmsClusterWireFormat.TYPE_ID_ACCEPT_ORDER ->
                     applyAcceptOrder(session, timestamp, buffer, offset, length);
+            case OmsClusterWireFormat.TYPE_ID_BATCH_ACCEPT_ORDER ->
+                    applyBatchAcceptOrder(session, timestamp, buffer, offset, length);
             case OmsClusterWireFormat.TYPE_ID_APPLY_EXECUTION_REPORT ->
                     applyExecutionReport(timestamp, buffer, offset, length);
             case OmsClusterWireFormat.TYPE_ID_CANCEL_ORDER ->
@@ -336,6 +338,40 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                 // Unknown command — silently ignored. A real reject would require an event;
                 // adding an UnknownCommandRejected event is a Phase 2 concern.
             }
+        }
+    }
+
+    /**
+     * Phase 4 Tier 2.5 phase D-6: dispatch each inner {@link AcceptOrderCommand} packed in a
+     * {@link BatchAcceptOrderCommand} frame through the existing
+     * {@link #applyAcceptOrder(io.aeron.cluster.service.ClientSession, long, DirectBuffer, int, int)}
+     * path. Inner commands are applied in batch arrival order (deterministic); each one emits its
+     * own {@link OrderAcceptedEvent} / {@link OrderRejectedEvent} keyed on its own {@code correlationId}
+     * so the {@link OmsClusterIngressClient} egress demux is identical to the unbatched path.
+     *
+     * <p>Determinism: this method does no time / random / external I/O — it is pure dispatch into
+     * existing deterministic logic. A malformed batch frame ({@link IllegalArgumentException} from
+     * {@link BatchAcceptOrderCommand#forEachInner}) is silently skipped to preserve the
+     * {@link #onSessionMessage} contract that bad frames must not break replay.
+     *
+     * <p>Idempotency: the batch frame is one cluster-log entry; on replay the same batch
+     * re-decodes the same N inner commands in the same order. Per-order
+     * {@code (accountId, clientIdempotencyKey)} dedupe in {@link #idempotencyIndex} short-circuits
+     * each inner command identically to the unbatched path.
+     */
+    private void applyBatchAcceptOrder(
+            io.aeron.cluster.service.ClientSession session,
+            long timestamp,
+            DirectBuffer buffer,
+            int offset,
+            int length) {
+        try {
+            BatchAcceptOrderCommand.forEachInner(buffer, offset, length,
+                    (innerBuf, innerOffset, innerLen) ->
+                            applyAcceptOrder(session, timestamp, innerBuf, innerOffset, innerLen));
+        } catch (IllegalArgumentException e) {
+            // Malformed batch — silent like onSessionMessage: log writes during apply must not
+            // throw on replay (file-system error during INFO would break determinism).
         }
     }
 

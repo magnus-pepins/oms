@@ -3472,6 +3472,215 @@ it strengthens it.
   the samples jar from Maven Central as a one-time bench-host setup
   step; do not add it as a runtime dependency.
 
+## Tier 2.5 phase D-headroom — Pop! CPU headroom probe + multi-cluster shard slice plan (2026-05-14)
+
+Continuation of D-investigate / D-aeron-stat. After both falsifiers ruled
+out OMS-code-level levers, the user explicitly deferred Phase 5 / k8s and
+asked: **"is multi-cluster sharding on a single host a credible single-host
+RPS lever, and how much can we get?"** This requires evidence on Pop!'s CPU
+budget at peak — specifically, how many of Pop!'s 48 logical cores are still
+idle at c2400, and which threads / processes are the CPU consumers — before
+committing to architecture work.
+
+### Methodology
+
+* **Hardware:** AMD Ryzen Threadripper PRO 9965WX, 24 physical cores / 48
+  logical (1 socket, 2 threads per core, max 5.49 GHz), 251 GiB RAM
+  (~87 GiB available at idle, the rest is buff/cache from other workloads
+  on the same box), `/dev/nvme0n1p4` 210 GB free on `/home`. `mpstat` /
+  `pidstat` not installed (no `sysstat` package), so used `top -bn1` and
+  `top -bH -n1 -p $cluster_pid` for system-wide and per-thread CPU samples.
+* **Driver:** Single c2400 burst (480 000 admits, no warmup, two-ingress
+  round-robin, identical knobs to D-aeron-stat). Snapshots at t = -1 s
+  (idle baseline), then every 1 s for 12 s during and after the burst,
+  then a final post-snapshot. Burst kicked at 18:20:03 and finished
+  18:20:11 (8.4 s, **57 094 rps** — same plateau as D-9 / D-investigate /
+  D-aeron-stat).
+* **Bench script:** `/tmp/bench-d-headroom.sh` (Pop!), output rooted at
+  `/tmp/bench-d-headroom-20260514-182003/` with `sys-{idle,t01..t12,post}.txt`
+  and `threads-{idle,t01..t12,post}.txt`.
+
+### System-wide CPU at peak
+
+| Sample | %us | %sy | %ni | **%id** | Load avg | Comment |
+|--------|-----|-----|-----|---------|----------|---------|
+| idle (t = -1 s) | 0.2 | 0.7 | 3.0 | **95.0** | 5.20 | baseline |
+| t01..t05 (mid-burst) | 0.0 | 9.5 | 61.2 | **26.3** | 19.5 | peak |
+| t06 (cluster drain) | — | 5–10 | 30–60 | 30–60 | 23.4 | varies |
+| post (drained) | 0.0 | 0.9 | 3.8 | **93.5** | 21.6 | back to idle |
+
+* JVMs run with `nice = 12` (inherited from launch context) so they show
+  under `%ni` not `%us`. The peak `61.2 % ni` is OMS / burst-tool work.
+* **At peak: ~26 % of 48 logical cores idle ≈ 12 logical cores free.**
+
+### Per-process CPU at peak (5 mid-burst samples averaged)
+
+| PID | identity | peak %CPU | logical cores at peak | constant across samples? |
+|-----|----------|-----------|------------------------|--------------------------|
+| 2873411 | **ingress-1** (`OmsIngressReplicaBootstrap`) | 946–1200 | **9.5–12.0** | yes |
+| 2873970 | **ingress-2** (`OmsIngressReplicaBootstrap`) | 930–1142 | **9.3–11.4** | yes |
+| 3240631 | **bootRunBurst** (load generator on Pop!) | 838–1269 | **8.4–12.7** | yes |
+| 2869907 | **cluster-node** (`OmsClusterNodeBootstrap`) | 123–158 | **1.2–1.6** | yes |
+| 2872115 | projector | 15.4 | 0.15 | yes |
+| 2871771 | fix-egress | ~10 | <0.10 | yes |
+
+**Key observations:**
+
+* **Cluster-node JVM uses only ~1.5 logical cores at peak.** The Aeron
+  cluster substrate is *not* CPU-bound on Pop!. The ~3.4 ms cluster RTT
+  is *latency-bound* (commit barrier propagation), not CPU-bound.
+* **Ingress JVMs are the dominant CPU consumer at ~22 cores combined** —
+  Tomcat thread orchestration + HTTP parse + JSON
+  serialise + cluster-client busy-wait. Per-request active CPU ≈ 0.4 ms,
+  which extrapolates to ~38 cores at 100 k rps.
+* **bootRunBurst (load generator) consumes 8–13 cores on Pop!.** In a
+  production / off-host topology this is moved off the bench host. For
+  the headroom calculation this is *not* a production cost.
+* **Total OMS-server-side CPU at 57 k rps: ~24 logical cores** of 48.
+  Production-relevant idle = 48 − 24 = **24 cores free**, of which the
+  load generator currently eats 9, leaving the observed 12.
+
+### Per-thread CPU on the cluster-node JVM (mid-burst, t05)
+
+| TID | thread name (truncated) | %CPU | logical cores |
+|-----|-------------------------|------|----------------|
+| 2869950 | `aeron-driver-conductor` (SHARED mode = also sender + receiver) | **63.6** | 0.64 |
+| 2869955 | `clustered-service-thread` | 27.3 | 0.27 |
+| 2869951 | `archive-recorder` / `archive-conductor` | 27.3 | 0.27 |
+| 2869952 | `consensus-module-thread` | 9.1 | 0.09 |
+| sum | | **127.3** | **1.27** |
+
+* **No single cluster-node thread is at 100 %.** The Aeron driver
+  agent (SHARED conductor + sender + receiver) is the highest at ~64 %
+  of one logical core. SHARED → DEDICATED (D-aeron-stat candidate) would
+  split this thread into three each at ~20 %, with no expected RPS lift
+  per the D-aeron-stat zero-back-pressure evidence — confirmed unattractive.
+* **The 3.4 ms cluster RTT is dominated by pipeline-stage hand-off
+  latency, not CPU saturation.** Each admit traverses
+  `consensus-module-thread → archive-recorder → clustered-service-thread`
+  via Aeron IPC ring buffers; each hand-off adds Archive-position
+  acknowledgement latency (microseconds) but each thread is only
+  ~10–30 % busy.
+
+### Verdict — Pop! single-host headroom
+
+Pop! has substantial CPU headroom for a 2nd cluster substrate, but
+**ingress JVM CPU caps single-host total RPS at ~110 k**:
+
+| Topology | Per-shard cluster-side cost | Ingress CPU (scales with admit rate) | Estimated RPS ceiling |
+|----------|------------------------------|---------------------------------------|------------------------|
+| 1 shard (today) | 1.7 cores | 22 cores @ 57 k | **57 k** (single-leader bound) |
+| 2 shards | 3.4 cores | 22 cores @ 57 k → ~38 cores @ 95 k | **~85–110 k** (1.5–1.9 × lift) |
+| 3 shards | 5.1 cores | ~46 cores @ 115 k | **~110 k** (Pop! aggregate CPU cap) |
+| ≥ 4 shards | 6.8+ cores | > 48 cores | **No further lift** — Pop! CPU saturated |
+
+`Hypothesis:` 2 shards on Pop! ≈ 1.5–1.9 × ingress RPS lift.
+`Hypothesis:` 3 shards ≈ same as 2; Pop! CPU is the cap.
+`Unknown:` exact scaling efficiency depends on cross-shard coordination
+overhead (projector multi-source consume, FIX egress fan-in, reconciler
+shard locality) — measure at slice E-3 below.
+
+**Crucially: the lift number is single-host only.** When the same shards
+are deployed on N hosts (Phase 5), each host's ingress JVM operates on
+its own 48-core budget, so multi-host scaling is approximately linear in
+the number of hosts (bound by external constraints — Postgres pooler,
+broker capacity, Ledger throughput — not by per-host CPU).
+
+### Recommended next slice plan — Phase 4 Tier 2.5 phase E (multi-cluster sharding)
+
+Topology-agnostic by design: every routing decision goes through a single
+`OmsClusterShardRouter` keyed on `accountId.hashCode() % shardCount`. The
+router is identical whether the N shards live on one host (E-1..E-3, today)
+or on N hosts (Phase 5 later — same code, different deploy).
+
+**Slice E-1 — Sharding configuration substrate (no behaviour change at N=1)**
+
+* New `OmsConfig.Cluster.Sharding` block: `enabled` (default `false`),
+  `shardCount` (default `1`, min `1`, max `32`), `shardingFunction`
+  (`ACCOUNT_ID_HASH`).
+* Aeron / cluster / archive directories prefixed with `shard-${index}/` so
+  `OmsClusterNodeBootstrap` can be launched once per shard with separate
+  `OMS_AERON_DIR_BASE` / `OMS_AERON_CLUSTER_DIR` / archive dirs.
+* `OmsClusterIngressClient` becomes per-shard; `OmsClusterShardRouter`
+  introduced as the new ingress-side routing layer (delegates to a
+  `Map<Integer, OmsClusterIngressClient>`).
+* New `scripts/launch-bench-stack-shards.sh N` orchestrates N cluster-node
+  + N projector + N fix-egress + 2 ingress JVMs.
+* **At `shardCount=1` the system is byte-identical to today** (the router
+  is a passthrough; same Aeron dirs).
+* New unit test `OmsClusterShardRouterTest` (hash distribution, deterministic
+  routing per accountId, single-shard fallthrough, invalid-shard
+  defensive paths).
+
+**Slice E-2 — Postgres shard column + projector locality**
+
+* Flyway `V30 — orders.shard_id` (smallint, nullable; backfilled from
+  `accountId.hashCode() % shardCount`). Index `idx_orders_shard_id` (partial
+  on the open-state subset already used by reconciler queries).
+* `OmsPostgresProjector` filters its log subscription to the shard it owns
+  (one projector JVM per shard); writes `orders.shard_id = ${shard}` on
+  every fresh insert. Replay paths do `INSERT ... ON CONFLICT DO NOTHING`
+  unchanged; the new column is always derivable from accountId so a
+  projector running on shard K never claims rows for shard K' ≠ K.
+* `LedgerInflightHoldFailureCompensator` adds shard awareness: enumerates
+  rows per shard, routes the resulting `submitCancelOrder` call through
+  the `OmsClusterShardRouter` (same accountId → same shard, by design).
+* New IT `OrdersRepositoryShardingTest` (verifies derive-on-insert + index
+  selectivity + replay idempotency).
+
+**Slice E-3 — N=2 multi-cluster bench on Pop!**
+
+* `scripts/launch-bench-stack-shards.sh 2` boots cluster-node-{0,1},
+  projector-{0,1}, fix-egress-{0,1}, ingress-{1,2} (each ingress now has
+  2 `OmsClusterIngressClient` instances pointing at the two cluster
+  members on `localhost:20110` and `localhost:20120`).
+* Verify shard locality (every admit's accountId hashes to its shard's
+  cluster, every cancel ditto, no cross-shard projector writes).
+* Bench at c1600 / c2400 / c3200 and compare to D-9 / D-investigate
+  baselines.
+* `Expected:` 1.5–1.9 × ingress RPS lift on Pop! (per the headroom
+  table above).
+* `Hypothesis to falsify:` cross-shard coordination overhead (router
+  hash + per-shard cluster-client back-pressure interaction at the
+  ingress JVM) eats more than 30 % of the theoretical lift. If so,
+  the router is the bottleneck — falsifier evidence: per-shard
+  cluster-client `submitAcceptOrder` p99 is similar to N=1, and ingress
+  Tomcat thread CPU per request is unchanged.
+
+**Slice E-4 — FIX-egress shard fan-in (or per-shard FIX session)**
+
+Two designs, choice deferred until E-3 numbers are in:
+
+* **Design A (per-shard FIX session):** N fix-egress JVMs, each holding
+  one QFJ `Initiator` per shard, each with its own SenderCompID suffix.
+  Broker accepts N FIX sessions. Simplest from OMS code perspective; but
+  some brokers require one session per institution.
+* **Design B (multi-shard FIX session):** 1 fix-egress JVM consumes from
+  all N cluster log streams, multiplexes onto a single FIX session.
+  Harder to write but operationally simpler.
+
+Default plan: A for the bench rig, B as a Phase 5 follow-up if broker
+session caps require it.
+
+**Slice E-5 — Phase 5 prelude: move shards to separate hosts**
+
+* No code change. The same `OmsClusterShardRouter` works whether shards
+  resolve to `localhost:20110 / localhost:20120` (one host) or
+  `host-0.svc:20110 / host-1.svc:20110` (multi-host).
+* Operationally: switch from `launch-bench-stack-shards.sh` to a
+  `kubectl apply -f shards.yaml` against a real cluster.
+* This slice is the **deferred** Phase 5; this runbook does not advance
+  it, but slices E-1..E-3 are designed to compose with it without
+  refactoring.
+
+### Sequencing
+
+E-1 first, in isolation (no behaviour change at N=1 — easy to verify).
+E-2 follows because the projector locality is a hard prerequisite for
+E-3's multi-shard bench. E-3 is the empirical lift measurement on Pop!.
+E-4 only after E-3 confirms the routing path is fast. E-5 is whenever
+Phase 5 is greenlit.
+
 ## Caveats
 
 - This is a **single-host single-cluster-node** rig. It does NOT exercise consensus, leader

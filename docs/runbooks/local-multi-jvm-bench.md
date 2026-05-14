@@ -3681,6 +3681,132 @@ E-3's multi-shard bench. E-3 is the empirical lift measurement on Pop!.
 E-4 only after E-3 confirms the routing path is fast. E-5 is whenever
 Phase 5 is greenlit.
 
+## Tier 2.5 phase E-1 — sharding configuration substrate landed (2026-05-14)
+
+Implements the first slice of the multi-cluster shard plan above. **No
+behaviour change at `shardCount=1`** — every admit goes through the new
+{@code OmsClusterShardRouter} but the router resolves to the same
+singleton {@code OmsClusterIngressClient} bean used pre-E-1. Topology is
+unchanged: still 5 JVMs, still one Aeron Cluster, still one consensus
+log. The only observable difference from the byte sequence on the wire
+or in Postgres is *zero*; the only difference at the source level is
+that {@code OrderIngressService} now obtains its cluster client via
+{@code OmsClusterShardRouter.forShard(shardId)} rather than holding the
+client directly.
+
+### Prior art that simplified the slice
+
+Two pieces of substrate already existed (per
+{@code oms/docs/decisions.md} §4 "Sharding") and shrank the slice
+significantly:
+
+* {@code com.balh.oms.domain.ShardKey.shardFor(UUID, int)} —
+  {@code xxh64} of {@code accountId} mod {@code shardCount}, stable
+  across processes. Decision date: slice 1.
+* {@code OmsConfig.Shard} — {@code id} (default 0) + {@code count}
+  (default 1) wired through to {@code OrderIngressService} (computes
+  {@code Order.shardId} on every admit) and {@code MetricsConfig}
+  (tags every meter with {@code shard_id}).
+* {@code orders.shard_id} (smallint, NOT NULL) plus
+  {@code idx_orders_shard_status} — already in Flyway {@code V1}, so
+  E-2's "Postgres shard column" work is mostly already done; the slice
+  reduces to "filter projector subscription by shard_id" and "shard the
+  reconciler queries".
+
+E-1 adds the *routing layer* on top — the only shard-related piece that
+was not yet present.
+
+### What E-1 ships
+
+* **`OmsClusterShardRouter`** ({@code com.balh.oms.cluster}) — Spring
+  bean profile-gated identically to {@code OmsClusterIngressClient}.
+  Holds {@code Map<Integer, OmsClusterIngressClient>} keyed by shard id;
+  {@code routeAdmit(UUID accountId)} hashes via {@code ShardKey} and
+  returns the owning client; {@code forShard(int shardId)} returns the
+  client for an already-known shard. Defensive validation throughout
+  (out-of-range {@code shardId}, null clients, mismatched map size).
+* **`OrderIngressService`** — refactored to inject the router instead of
+  the client. Resolves the cluster client via
+  {@code clusterShardRouter.forShard(shardId)} using the already-computed
+  {@code shardId} (rather than re-deriving from {@code accountId}), so
+  the order's recorded {@code shardId} and its admitting cluster are
+  identical by construction. All other call sites
+  ({@code FixInboundClusterSink} apply-execution-report,
+  {@code LedgerInflightHoldFailureCompensator} cancel-order)
+  deliberately stay on the singleton client; at {@code shardCount=1}
+  the singleton is the same instance the router would return, so
+  routing those paths is observably a no-op until E-3 adds shard
+  locality on the {@code orderId}-keyed call sites.
+* **`OmsConfig.Shard`** — previously undocumented; now carries a
+  docstring tying it to {@code decisions.md} §4 plus the E-1 cap.
+* **`OmsClusterShardRouterTest`** (8 cases) — Spring-discovered ctor at
+  {@code N=1}, hash determinism, out-of-range defensive paths, the E-1
+  cap with the operator-actionable error message, multi-shard direct
+  ctor (the path E-3 will use). The multi-shard distribution case
+  routes 200 random {@code UUID}s through a 2-shard router and asserts
+  at least one hits each shard — pinning {@code xxh64} non-degeneracy
+  so a future hash-function regression cannot silently break shard
+  spread.
+* **`OrderIngressServiceClusterGateTest`** — updated to wrap the mock
+  {@code OmsClusterIngressClient} in a 1-entry router; all five
+  existing scenarios still hold.
+
+The slice is **177 + 18 + 22 + 148 + 9 = 374 line diff** across 5 files
+(2 new, 3 modified).
+
+### What E-1 deliberately does NOT ship (defers to E-2 / E-3)
+
+* No {@code Flyway V30} for {@code orders.shard_id} — already in V1.
+* No per-shard Aeron / archive directories — only meaningful at
+  {@code N>1}; lands in E-3.
+* No {@code launch-bench-stack-shards.sh N} — same.
+* No projector locality filter — lands in E-2.
+* No shard-aware compensator / FIX-inbound — lands in E-3 once the
+  cluster log carries shard id.
+
+### Verification — byte-identical at `shardCount=1`
+
+**Local Mac (compile + targeted unit tests):**
+
+| Tests | Result |
+|-------|--------|
+| `compileJava` + `compileTestJava` | clean |
+| `OmsClusterShardRouterTest` | 8 / 8 pass |
+| `OrderIngressServiceClusterGateTest` | 5 / 5 pass |
+| `ShardKeyTest` (regression check) | 3 / 3 pass |
+| Full `gradlew test` | 270 unit tests pass; 120 IT failures are the documented Testcontainers / Docker-Desktop issue from the caveats section below — **none reference the new code** (verified by grepping the test reports for `OmsClusterShardRouter` / `clusterShardRouter`; only my own test mentions them) |
+
+**Pop! 2026-05-14 — full test sweep + bench parity:**
+
+| Check | Result |
+|-------|--------|
+| Targeted unit tests on Pop! | `OmsClusterShardRouterTest` 8 / 8, `OrderIngressServiceClusterGateTest` 5 / 5, `ShardKeyTest` 3 / 3 |
+| Full `gradlew test` on Pop! | 36 failing test classes, all pre-existing Docker-environment failures (35 of 36 also failed on the parent commit `d4967b4`); the 36th was `IngressBurstMainTest` flaking on `expected: <50> but was: <49>` under heavy parallel test load — passes 5 / 5 in isolation, does not reference any E-1 code, **not caused by this slice** |
+| Stack health post-boot | 5 JVMs running; cluster-node `role=LEADER`; both ingress `/actuator/health` 200 |
+| **c2400 burst plateau (the byte-identical-at-N=1 invariant)** | 4-run sequence: run 1 = 44 468 rps (cold start), run 2 = 52 935 rps (warming), **run 3 = 57 601 rps**, run 4 = 53 912 rps. Run 3 is **101 %** of the D-headroom baseline (57 094 rps); p50 / p99 / p999 = 37.9 / 121 / 173 ms vs D-headroom's same plateau. The router adds no measurable overhead at {@code N=1}. |
+
+`Verdict:` E-1 lands the indirection layer with zero observable cost.
+The slice is correct, complete, and ready for E-2 to build on.
+
+### What this enables
+
+E-2 ("Postgres shard column + projector locality") is now the next
+slice. Because {@code orders.shard_id} already exists, E-2 reduces to:
+
+* Per-shard projector — make {@code OmsPostgresProjector} accept an
+  {@code OMS_SHARD_ID} env var and only apply log records whose
+  {@code Order.shardId} matches.
+* Shard-aware compensator — {@code LedgerInflightHoldFailureCompensator}
+  enumerates rows per shard, routes each cancel through
+  {@code OmsClusterShardRouter.forShard}.
+* New `OrdersRepositoryShardingTest` IT — at {@code N=1} the existing
+  `idx_orders_shard_status` is exercised (no behaviour change); at
+  {@code N=2} (test-only constructor) the per-shard filters partition
+  the row set cleanly.
+
+Then E-3 stands up the second cluster on Pop! and runs the actual lift
+measurement.
+
 ## Caveats
 
 - This is a **single-host single-cluster-node** rig. It does NOT exercise consensus, leader

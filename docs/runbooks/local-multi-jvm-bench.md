@@ -3245,6 +3245,233 @@ context switches add up.
   pre-D-6 D-7 falsification (5-min env-flip beat hours of speculative
   Tomcat-thread-bump rationalisation).
 
+## Tier 2.5 phase D-aeron-stat — Aeron media-driver counter probe (Pop! 2026-05-14)
+
+Continuation of **D-investigate**, no code change. After D-investigate
+falsified "per-admit egress publish is the wall" and pinned the residual
+~3 400 µs of cluster RTT to **Aeron-internal transport**, the obvious next
+step is to actually *read* the Aeron media-driver counter file (`cnc.dat`)
+under load and see which Aeron-internal counter — driver back-pressure,
+NAK / retransmit, sender flow-control limit, conductor / sender / receiver
+work-cycle saturation — actually moves. That tells us whether the next
+lever is Aeron-side tuning (driver thread-pinning, channel mode flags) or
+purely topology (Phase 5 multi-host).
+
+### Methodology
+
+* **No code change.** The currently running Pop! stack is the D-9 baseline
+  (admit-batch off, D-investigate timers on). All five OMS JVMs (`cluster-node`,
+  `projector`, `fix-egress`, `ingress-1`, `ingress-2`) share **one** media-driver
+  directory: `~/oms/build/aeron-cluster/media-driver/cnc.dat`, owned by the
+  cluster-node JVM (PID 2 869 907) since the embedded `MediaDriver` lives there.
+  `OMS_POSTGRES_PROJECTOR_AERON_DIR` and `OMS_FIX_EGRESS_AERON_DIR` point
+  the projector and FIX-egress to the same dir; ingress JVMs default to
+  `${OMS_AERON_DIR_BASE:build/aeron-cluster}/media-driver`. So **one cnc.dat
+  observes the entire substrate.**
+* **Tooling.** `io.aeron.samples.AeronStat` ships in
+  `aeron-samples-1.48.0.jar` (Maven Central — *not* in the default
+  `io.aeron:aeron-{client,driver,archive,cluster}` dependency tree); fetched
+  to `~/aeron-tools/aeron-samples-1.48.0.jar` once on Pop! and reused.
+  Invoked with `watch=false` for one-shot snapshots and the same
+  `--add-opens` / `--add-exports` block the rest of the OMS JVMs use, since
+  Agrona's `UnsafeApi` reaches into `jdk.internal.misc`.
+* **Driver run.** Single c2400 burst (480 000 orders, no warmup, two-ingress
+  round-robin, `OMS_BURST_ACCOUNT_POOL=4800`, identical knobs to the
+  D-investigate c2400 leg). Snapshots at t = 0 s (idle baseline), then
+  every 5 s during and after the burst (t05 through t25), then a final
+  post-snapshot. Burst fired at 17:51:36 and finished 17:51:45 (8.6 s
+  total) — so t00 → t05 covers ~5 s of burst, t05 → t10 covers ~3.6 s of
+  burst plus ~1.4 s drain, t10 onward is post-burst drain. Throughput
+  observed: **480 000 admits / 8.633 s = 55 603 rps** (within noise of the
+  D-9 / D-investigate c2400 plateau of 55 909 / 57 023 / 57 282).
+* **Bench script:** `/tmp/bench-d-aeron-stat.sh` (Pop!), output rooted at
+  `/tmp/bench-d-aeron-stat-20260514-175136/` with `aeronstat-{t00_idle,
+  t05_load, t10_load, t15_load, t20_load, t25_load, t99_post}.txt` and
+  `cluster-{pre,post}.prom` / `ingress{1,2}-{pre,post}.prom`.
+
+### Counters that DID NOT move (the falsifier)
+
+Across every 5-second window, including the two windows that contained the
+load (t00 → t05 and t05 → t10), the following Aeron driver-aggregate
+counters all stayed at **delta = 0**:
+
+| Counter (cnc.dat row) | t00 → t05 Δ | t05 → t10 Δ | t10 → t15 Δ |
+|------------------------|-------------|-------------|-------------|
+| `2:  Failed offers to ReceiverProxy` | 0 | 0 | 0 |
+| `3:  Failed offers to SenderProxy` | 0 | 0 | 0 |
+| `4:  Failed offers to DriverConductorProxy` | 0 | 0 | 0 |
+| `5:  NAKs sent` | 0 | 0 | 0 |
+| `6:  NAKs received` | 0 | 0 | 0 |
+| `11: Retransmits sent` | 0 | 0 | 0 |
+| `12: Flow control under runs` | 0 | 0 | 0 |
+| `13: Flow control over runs` | 0 | 0 | 0 |
+| `18: Sender flow control limits, i.e. back-pressure events` | **0** | **0** | **0** |
+| `19: Unblocked Publications` | 0 | 0 | 0 |
+| `23: Loss gap fills` | 0 | 0 | 0 |
+| `24: Client liveness timeouts` | 0 | 0 | 0 |
+
+**Per-publication `snd-bpe` (sender back-pressure events) on every UDP
+publication** — the cluster ingress channel (`localhost:20110`), each
+ingress-side egress publication (the two `localhost:N` ephemerals chosen
+by Aeron), and the cluster log replication channel (`alias=log`) — also
+stayed at **0** through every window. The log entry for `snd-bpe` in
+`AeronStat` output emits one row per UDP publication; none of them changed.
+
+**Conductor / Sender / Receiver work-cycle exceeded counts** (rows 27 / 29 /
+31, threshold = 1 s) all stayed at 0 across every window. The driver never
+took longer than 1 s to complete one duty-cycle iteration even at peak
+load.
+
+**Bottom line:** there is **no Aeron-internal back-pressure** under
+single-host c2400 load. The driver is not saturating any of its internal
+queues, not retransmitting, not hitting flow-control limits, and not
+losing packets.
+
+### Counters that DID move (the actual flow)
+
+The counters that *did* show non-zero deltas tell us the substrate is
+*moving data through itself cleanly* — they are throughput meters, not
+saturation meters:
+
+| Counter | t00 → t05 Δ (5 s) | t05 → t10 Δ (5 s) | t10 → t15 Δ (5 s) | Interpretation |
+|---------|-------------------|-------------------|-------------------|----------------|
+| `0: Bytes sent` | 28.4 MB | **124.7 MB** | 46.9 MB | Driver-wide UDP egress; t05→t10 = peak window |
+| `1: Bytes received` | 28.5 MB | **124.7 MB** | 46.9 MB | Driver-wide UDP ingress (matches sent at ~25 MB/s peak) |
+| `64: Cluster commit-pos` | 20.06 MB | **86.09 MB** | 32.44 MB | Bytes appended to the consensus log; peak ~17.2 MB/s |
+| `99: Cluster container max cycle time` | unchanged | +81.16 ms | unchanged | Single outlier cycle of the `ClusteredServiceContainer` thread (high-water; no sustained stall) |
+| `26: Conductor max cycle time` | +3.16 ms | unchanged | +7.86 ms | Driver conductor max cycle (high-water; ~21–25 ms peak vs 17 ms idle baseline) |
+| `28: Sender max cycle time` | +3.32 ms | unchanged | +7.85 ms | Same shape (Sender duty cycle) |
+| `30: Receiver max cycle time` | +3.31 ms | unchanged | +7.84 ms | Same shape (Receiver duty cycle) |
+| `49: archive-recorder max write time` | **+17.44 ms** | unchanged | unchanged | Single outlier Archive write (~20.6 ms = idle 3.18 ms + 17.44 ms); likely a term-rotation fsync stall |
+| `50: archive-recorder total write bytes` | 37.7 MB | 170.8 MB | 64.8 MB | Archive recorder cumulative; peak rate ~34 MB/s |
+| `51: archive-recorder total write time (ns)` | 96.7 ms | 315.3 ms | 124.4 ms | Implies ~390 MB/s avg write throughput (NVMe is happy) |
+
+* **t00 → t05** captured the burst start; t00 was at 17:51:36.844, the
+  burst kicked at 17:51:36.844, and t05 was at 17:51:41.967 — so this
+  window is the burst's first ~5 s.
+* **t05 → t10** captured the burst's last ~3.6 s plus ~1.4 s of cluster
+  drain processing the in-flight backlog. This is the **peak throughput
+  window** (124.7 MB / 5 s = 24.9 MB/s driver-wide UDP, 86.1 MB cluster
+  log written = ~17.2 MB/s consensus log throughput).
+* **t10 → t15** is mostly post-burst drain — the cluster service still
+  applying the queued admits.
+* **t15 onward** is fully drained (sub-1 MB / 5 s on every counter).
+
+### What this tells us
+
+1. **The substrate is healthy under load.** Zero NAKs, zero retransmits,
+   zero sender flow-control limits, zero `snd-bpe` on any publication,
+   zero failed offers to any driver proxy, zero unblocked publications,
+   zero loss gap fills. The driver is moving 25 MB/s of UDP and 17 MB/s
+   of consensus log writes without flinching. Single-host loopback +
+   IPC SHM ring buffers handle this trivially.
+2. **There is no driver-side back-pressure to amortise.** Any tuning that
+   targets driver back-pressure (channel mode flags, dedicated
+   sender/receiver/conductor threads, `term-buffer-length` increases) has
+   nothing to optimise here — the back-pressure counters are already at
+   zero.
+3. **The Archive recorder is fine on average but takes ~20 ms outlier
+   stalls.** The single +17.44 ms spike on `archive-recorder max write
+   time` during t00 → t05 is consistent with a term-rotation fsync (the
+   default Aeron Archive fsyncs at term boundaries, not per record).
+   *Average* write rate is ~390 MB/s, so the stall is one-shot — but
+   under a sustained admit stream that single 20 ms stall propagates
+   into the cluster commit RTT for whichever admits happen to be in
+   flight during the rotation. This is the *one* observable outlier, but
+   it's a tail-latency contributor, not a peak-RPS contributor.
+4. **The cluster service container's worst cycle was 166 ms.** Row 99 went
+   high-water +81 ms during t05 → t10; baseline idle high-water is 85 ms.
+   Both numbers are way under the work-cycle-exceeded threshold (1 s),
+   so the work-cycle-exceeded count stays at 0 — but a 166 ms outlier
+   on the single cluster-service-thread loop *is* a tail-latency event,
+   most likely a JVM safepoint (GC) on the cluster-node JVM. Not enough
+   evidence to say which collector did it (G1 by default), and it
+   doesn't affect peak RPS — it would show up as a one-off
+   p99 / p999 spike.
+5. **Peak consensus log write rate of ~17.2 MB/s** matches ~57 k admits/s
+   times ~300 bytes per `OrderAdmittedEvent` plus per-admit framing, and
+   the IPC log → ClusteredServiceContainer drain is keeping up
+   (`pub-pos` ≈ `sub-pos` in every snapshot — the consumer of the
+   consensus log is never lagging the producer).
+
+### Where the cluster RTT actually goes — confirmed
+
+D-investigate already pinned the residual ~3 400 µs as **outside**
+`applyAcceptOrder`'s emit calls. D-aeron-stat now confirms it's **also
+outside the driver's back-pressure paths**. By elimination, the residual
+3.4 ms cluster RTT lives in:
+
+* **The single cluster-service-thread serialisation.** Every admit is
+  appended to the consensus log (IPC), then dispatched to
+  `applyAcceptOrder` on **one** thread (the
+  `ClusteredServiceContainer`'s service-thread). On a single-leader,
+  single-host topology there is no parallelism to extract here — adding
+  more cluster members (Phase 5) does **not** speed up a single admit's
+  RTT, but it does parallelise the Archive write fan-out (each member
+  has its own NVMe).
+* **The per-admit `applyAcceptOrder` body excluding emits.** Idempotency
+  HashMap lookup, validation, state mutation, OrderAdmitted /
+  OrderAccepted allocation — sub-microsecond on Pop!'s 32-core CPU but
+  the *ordering* across admits is sequential.
+* **Aeron Cluster's commit barrier.** The
+  `ClusteredServiceContainer` does not dispatch a new command until the
+  consensus module has acked the previous one as committed. On a
+  single-host single-node cluster, this means each admit waits for one
+  Archive position acknowledgement before the next one runs. That's
+  Archive position-update propagation, not fsync time — which is why the
+  ~20 ms fsync stall (rare) is not the dominant cost (frequent).
+
+### Implications for the next-slice plan
+
+D-aeron-stat **does not change** the post-D-investigate next-slice plan;
+it strengthens it.
+
+* **Aeron driver tuning (D-12 candidate)?** Falsified for peak-RPS
+  purposes. Driver back-pressure counters are at zero; there is nothing
+  to tune. **Drop from the list.** (Could still help tail latency by
+  reducing the term-rotation fsync stall and the 81 ms cluster-container
+  outlier — but those are p99/p999 levers, not RPS levers.)
+* **Phase 5 / multi-host.** Now the *only* remaining axis with
+  meaningful expected RPS gain. Each cluster member runs its own
+  `MediaDriver` + `Archive` on its own NVMe, so the Archive
+  position-acknowledgement that bounds single-admit RTT is parallelised
+  across members; a 3-node cluster can sustain ~3× the consensus log
+  fan-out (bound by the slowest member, not the sum). Per-admit RTT
+  also drops because the leader can ack the commit as soon as a
+  *quorum* of members has the log frame, not after its own Archive
+  fsync. **This is the next code/topology slice.**
+* **D-10 (projector decoupling).** Stays on the list **for production
+  stability**, not for RPS. The D-investigate per-admit data
+  (`events_BP_ticks/admit ≈ 0.16`) and the D-aeron-stat zero-flow-
+  control evidence both confirm the projector is not back-pressuring
+  the cluster's events publication. D-10 still matters because in
+  production, if the slice 4p reconciler's blocking Ledger calls back
+  up the projector's drain, **then** the events publication might
+  back-pressure — but that's a stability concern, not a peak-RPS one.
+
+### Lessons (D-aeron-stat specific)
+
+* **Reading the driver counter file before redesigning the substrate is
+  cheap.** This entire experiment is one shell script + AeronStat in
+  `watch=false` + `python3` to diff snapshots. Total time: ~30 minutes
+  end-to-end including pulling the samples jar from Maven Central. It
+  rules out an entire class of "tune the driver" work.
+* **Operate the AeronStat snapshot tool in `watch=false` and diff
+  snapshots manually** rather than running it in `watch=true` continuous
+  mode. Continuous mode uses ANSI clear-screen which is unfriendly for
+  log capture. Manual snapshot files diff cleanly with `diff` or a
+  small parser.
+* **The IPC log + cluster commit-pos counters are the highest-signal
+  meters here** — the per-publication position counters are noisy
+  (sampled, not exact), but `Cluster commit-pos` (row 64) and the
+  `archive-recorder total write bytes / write time` triple (rows 50 /
+  51) give exact throughput numbers per snapshot window.
+* **`aeron-samples` is *not* on the default Aeron classpath.** It's a
+  separate Maven artifact (`io.aeron:aeron-samples`). The driver,
+  client, archive and cluster jars do not contain `AeronStat`. Pull
+  the samples jar from Maven Central as a one-time bench-host setup
+  step; do not add it as a runtime dependency.
+
 ## Caveats
 
 - This is a **single-host single-cluster-node** rig. It does NOT exercise consensus, leader

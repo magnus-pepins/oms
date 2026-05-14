@@ -2,6 +2,7 @@ package com.balh.oms.reconciler;
 
 import com.balh.oms.cluster.CancelOrderCommand;
 import com.balh.oms.cluster.OmsClusterIngressClient;
+import com.balh.oms.cluster.OmsClusterShardRouter;
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.persistence.LedgerInflightOutboxRepository;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
@@ -16,6 +17,7 @@ import org.springframework.transaction.support.DefaultTransactionStatus;
 
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
@@ -51,7 +53,7 @@ class LedgerInflightHoldFailureCompensatorTest {
 
     private LedgerInflightOutboxRepository outbox;
     private OmsClusterIngressClient client;
-    private ObjectProvider<OmsClusterIngressClient> clusterClient;
+    private ObjectProvider<OmsClusterShardRouter> clusterShardRouter;
     private OmsConfig config;
     private SimpleMeterRegistry meterRegistry;
     private LedgerInflightHoldFailureCompensator compensator;
@@ -61,17 +63,21 @@ class LedgerInflightHoldFailureCompensatorTest {
     void setUp() {
         outbox = mock(LedgerInflightOutboxRepository.class);
         client = mock(OmsClusterIngressClient.class);
-        @SuppressWarnings("unchecked")
-        ObjectProvider<OmsClusterIngressClient> provider = mock(ObjectProvider.class);
-        when(provider.getIfAvailable()).thenReturn(client);
         when(client.isConnected()).thenReturn(true);
         correlationCounter = new AtomicLong(1000L);
         when(client.nextCorrelationId()).thenAnswer(inv -> correlationCounter.getAndIncrement());
-        clusterClient = provider;
+        // Phase 4 Tier 2.5 phase E-2: the compensator now routes via OmsClusterShardRouter
+        // (E-1 introduced it). At shardCount=1 the router wraps a single client — same instance
+        // every test method here exercises, so all pre-E-2 assertions on `client` still hold.
+        OmsClusterShardRouter router = new OmsClusterShardRouter(1, Map.of(0, client));
+        @SuppressWarnings("unchecked")
+        ObjectProvider<OmsClusterShardRouter> provider = mock(ObjectProvider.class);
+        when(provider.getIfAvailable()).thenReturn(router);
+        clusterShardRouter = provider;
         config = newEnabledConfig();
         meterRegistry = new SimpleMeterRegistry();
         compensator = new LedgerInflightHoldFailureCompensator(
-                outbox, clusterClient, config, meterRegistry, new NoopTransactionManager());
+                outbox, clusterShardRouter, config, meterRegistry, new NoopTransactionManager());
     }
 
     @Test
@@ -84,12 +90,23 @@ class LedgerInflightHoldFailureCompensatorTest {
     }
 
     @Test
-    void runOnce_clusterClientDisconnected_isNoOp() {
+    void runOnce_clusterClientDisconnected_skipsRowsAndCountsSubmitFailed() {
+        // Phase 4 Tier 2.5 phase E-2: connect-check moved per-row (the router can host clients
+        // for several shards; one shard's client being down should not block another shard's
+        // rows). For the single-shard test config that means: outbox is queried, but each row is
+        // skipped without a cluster offer, and each skip increments the submit_failed counter.
         when(client.isConnected()).thenReturn(false);
+        UUID orderId = UUID.fromString("00000000-0000-4000-8000-00000000B001");
+        var row = new LedgerInflightOutboxRepository.FailedInflightRow(
+                73L, orderId, /* attempts = */ 3, "x", /* shardId = */ 0);
+        when(outbox.fetchFailedUncompensated(anyInt(), anyInt())).thenReturn(List.of(row));
 
         compensator.runOnce();
 
-        verify(outbox, never()).fetchFailedUncompensated(anyInt(), anyInt());
+        verify(outbox).fetchFailedUncompensated(anyInt(), anyInt());
+        verify(outbox, never()).markCompensated(anyLong(), anyLong(), any());
+        assertThat(meterRegistry.counter("oms_ledger_inflight_hold_compensate_failed_total",
+                "outcome", "submit_failed").count()).isEqualTo(1.0);
     }
 
     @Test
@@ -105,7 +122,7 @@ class LedgerInflightHoldFailureCompensatorTest {
     void runOnce_successfulCancel_marksCompensatedWithSameCorrelationId() throws Exception {
         UUID orderId = UUID.fromString("00000000-0000-4000-8000-00000000A001");
         var row = new LedgerInflightOutboxRepository.FailedInflightRow(
-                42L, orderId, /* attempts = */ 3, "insufficient_balance");
+                42L, orderId, /* attempts = */ 3, "insufficient_balance", /* shardId = */ 0);
         when(outbox.fetchFailedUncompensated(anyInt(), anyInt())).thenReturn(List.of(row));
 
         compensator.runOnce();
@@ -125,8 +142,8 @@ class LedgerInflightHoldFailureCompensatorTest {
     void runOnce_clusterTimeout_abortsBatch() throws Exception {
         UUID first = UUID.fromString("00000000-0000-4000-8000-00000000A002");
         UUID second = UUID.fromString("00000000-0000-4000-8000-00000000A003");
-        var rowA = new LedgerInflightOutboxRepository.FailedInflightRow(101L, first, 3, "balance");
-        var rowB = new LedgerInflightOutboxRepository.FailedInflightRow(102L, second, 3, "balance");
+        var rowA = new LedgerInflightOutboxRepository.FailedInflightRow(101L, first, 3, "balance", 0);
+        var rowB = new LedgerInflightOutboxRepository.FailedInflightRow(102L, second, 3, "balance", 0);
         when(outbox.fetchFailedUncompensated(anyInt(), anyInt())).thenReturn(List.of(rowA, rowB));
         doThrow(new TimeoutException("cluster offer back-pressure"))
                 .when(client).submitCancelOrder(any(), any());
@@ -144,8 +161,8 @@ class LedgerInflightHoldFailureCompensatorTest {
     void runOnce_perRowRuntimeFailure_continuesToNextRow() throws Exception {
         UUID first = UUID.fromString("00000000-0000-4000-8000-00000000A004");
         UUID second = UUID.fromString("00000000-0000-4000-8000-00000000A005");
-        var rowA = new LedgerInflightOutboxRepository.FailedInflightRow(201L, first, 3, "x");
-        var rowB = new LedgerInflightOutboxRepository.FailedInflightRow(202L, second, 3, "y");
+        var rowA = new LedgerInflightOutboxRepository.FailedInflightRow(201L, first, 3, "x", 0);
+        var rowB = new LedgerInflightOutboxRepository.FailedInflightRow(202L, second, 3, "y", 0);
         when(outbox.fetchFailedUncompensated(anyInt(), anyInt())).thenReturn(List.of(rowA, rowB));
         // First call throws a runtime; second succeeds. The compensator must process row B.
         doThrow(new RuntimeException("aeron"))
@@ -157,6 +174,82 @@ class LedgerInflightHoldFailureCompensatorTest {
         verify(client, times(2)).submitCancelOrder(any(), any());
         verify(outbox, times(1)).markCompensated(eq(202L), anyLong(), any());
         verify(outbox, never()).markCompensated(eq(201L), anyLong(), any());
+    }
+
+    @Test
+    void runOnce_multiShard_dispatchesEachRowToItsOwningShard() throws Exception {
+        // Phase 4 Tier 2.5 phase E-2 — pin the routing contract: at shardCount=2 a batch with
+        // rows from both shards must dispatch each row's submitCancelOrder on the correct
+        // client, and one shard being unconnected must not block the other shard's rows.
+        OmsClusterIngressClient s0 = mock(OmsClusterIngressClient.class);
+        OmsClusterIngressClient s1 = mock(OmsClusterIngressClient.class);
+        when(s0.isConnected()).thenReturn(true);
+        when(s1.isConnected()).thenReturn(true);
+        AtomicLong corrSeq = new AtomicLong(2_000L);
+        when(s0.nextCorrelationId()).thenAnswer(inv -> corrSeq.getAndIncrement());
+        when(s1.nextCorrelationId()).thenAnswer(inv -> corrSeq.getAndIncrement());
+
+        OmsClusterShardRouter router = new OmsClusterShardRouter(2, Map.of(0, s0, 1, s1));
+        @SuppressWarnings("unchecked")
+        ObjectProvider<OmsClusterShardRouter> provider = mock(ObjectProvider.class);
+        when(provider.getIfAvailable()).thenReturn(router);
+
+        LedgerInflightHoldFailureCompensator multiShardCompensator =
+                new LedgerInflightHoldFailureCompensator(
+                        outbox, provider, config, meterRegistry, new NoopTransactionManager());
+
+        UUID orderS0 = UUID.fromString("00000000-0000-4000-8000-00000000C001");
+        UUID orderS1 = UUID.fromString("00000000-0000-4000-8000-00000000C002");
+        var rowS0 = new LedgerInflightOutboxRepository.FailedInflightRow(
+                301L, orderS0, 3, "balance", /* shardId = */ 0);
+        var rowS1 = new LedgerInflightOutboxRepository.FailedInflightRow(
+                302L, orderS1, 3, "balance", /* shardId = */ 1);
+        when(outbox.fetchFailedUncompensated(anyInt(), anyInt()))
+                .thenReturn(List.of(rowS0, rowS1));
+
+        multiShardCompensator.runOnce();
+
+        // Shard 0's row must hit s0; shard 1's must hit s1; never the other way.
+        verify(s0, times(1)).submitCancelOrder(any(), any());
+        verify(s1, times(1)).submitCancelOrder(any(), any());
+        verify(outbox, times(1)).markCompensated(eq(301L), anyLong(), any());
+        verify(outbox, times(1)).markCompensated(eq(302L), anyLong(), any());
+    }
+
+    @Test
+    void runOnce_multiShard_oneShardDownDoesNotBlockOtherShard() throws Exception {
+        OmsClusterIngressClient s0 = mock(OmsClusterIngressClient.class);
+        OmsClusterIngressClient s1 = mock(OmsClusterIngressClient.class);
+        when(s0.isConnected()).thenReturn(false); // shard 0 down
+        when(s1.isConnected()).thenReturn(true);
+        AtomicLong corrSeq = new AtomicLong(3_000L);
+        when(s1.nextCorrelationId()).thenAnswer(inv -> corrSeq.getAndIncrement());
+
+        OmsClusterShardRouter router = new OmsClusterShardRouter(2, Map.of(0, s0, 1, s1));
+        @SuppressWarnings("unchecked")
+        ObjectProvider<OmsClusterShardRouter> provider = mock(ObjectProvider.class);
+        when(provider.getIfAvailable()).thenReturn(router);
+
+        LedgerInflightHoldFailureCompensator multiShardCompensator =
+                new LedgerInflightHoldFailureCompensator(
+                        outbox, provider, config, meterRegistry, new NoopTransactionManager());
+
+        var rowS0 = new LedgerInflightOutboxRepository.FailedInflightRow(
+                401L, UUID.fromString("00000000-0000-4000-8000-00000000D001"), 3, "x", 0);
+        var rowS1 = new LedgerInflightOutboxRepository.FailedInflightRow(
+                402L, UUID.fromString("00000000-0000-4000-8000-00000000D002"), 3, "y", 1);
+        when(outbox.fetchFailedUncompensated(anyInt(), anyInt()))
+                .thenReturn(List.of(rowS0, rowS1));
+
+        multiShardCompensator.runOnce();
+
+        // Shard 0 row deferred (counted as submit_failed); shard 1 row succeeds.
+        verify(s0, never()).submitCancelOrder(any(), any());
+        verify(s1, times(1)).submitCancelOrder(any(), any());
+        verify(outbox, times(1)).markCompensated(eq(402L), anyLong(), any());
+        verify(outbox, never()).markCompensated(eq(401L), anyLong(), any());
+        assertThat(meterRegistry.counter("oms_ledger_inflight_hold_compensate_failed_total",
+                "outcome", "submit_failed").count()).isEqualTo(1.0);
     }
 
     @Test

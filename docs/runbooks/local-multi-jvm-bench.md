@@ -3807,6 +3807,156 @@ slice. Because {@code orders.shard_id} already exists, E-2 reduces to:
 Then E-3 stands up the second cluster on Pop! and runs the actual lift
 measurement.
 
+## Tier 2.5 phase E-2 — projector shard guard + compensator shard routing (2026-05-14)
+
+Lands the second slice in the multi-cluster sharding stack laid out in
+[Recommended next slice plan — Phase 4 Tier 2.5 phase E (multi-cluster sharding)](#tier-25-phase-d-headroom---pop-cpu-headroom-probe--multi-cluster-shard-slice-plan-2026-05-14).
+E-1 introduced `OmsClusterShardRouter` as the per-shard cluster-client
+indirection layer. E-2 makes the two off-hot-path consumers of that router
+shard-aware so the topology is correct end-to-end at `shardCount > 1`,
+without touching the on-hot-path admit code (which already shards via
+`OrderIngressService` → router → cluster client at E-1).
+
+### Scope
+
+Three behaviour-preserving changes at `shardCount = 1`, four-digit-RPS
+shape on Pop!:
+
+1. **Compensator shard routing** —
+   `LedgerInflightHoldFailureCompensator` now injects
+   `OmsClusterShardRouter` (was the singleton `OmsClusterIngressClient`)
+   and routes every `submitCancelOrder` through `router.forShard(row.shardId())`.
+   At N=1 the router resolves to the same single client; at N>1 each row's
+   cancel lands on the cluster that owns the order. Connect-check moved
+   per-row so one shard's outage does not block other shards' rows; the
+   timeout-aborts-batch invariant is preserved by checking that all
+   remaining rows in the same batch still target the same shard before
+   aborting.
+
+2. **`LedgerInflightOutboxRepository.fetchFailedUncompensated` JOINs
+   `orders.shard_id`** —
+   `FailedInflightRow` gains a `shardId` field sourced from the existing
+   FK `ledger_inflight_outbox.order_id REFERENCES orders(id)`. **No
+   migration**: `orders.shard_id` has been on the `orders` row since the
+   V1 init migration, and the projector's D-9 invariant (orders row +
+   inflight outbox row written in one tx) makes the JOIN total. The
+   `FOR UPDATE SKIP LOCKED` lock stays scoped to `lio` only —
+   compensator concurrency partitions on the inflight outbox row, not on
+   the `orders` row.
+
+3. **`OmsPostgresProjector.applyAdmittedEvent` defensive shard guard** —
+   if `ev.shardId() != config.getShard().getId()`, the projector
+   increments `oms_projector_shard_mismatch_dropped_total`, logs a warn
+   line, advances the cursor (so it does not loop on the misrouted
+   event), and returns without touching Postgres. At `shardCount=1` the
+   cluster log only carries `shardId=0` events and the projector's
+   `OmsConfig.Shard.id` defaults to `0` — the guard is a no-op. At
+   `shardCount>1` (E-3+) each projector subscribes to its own cluster's
+   events recording so it should naturally only see its shard's events;
+   this guard catches a config bug (projector wired to the wrong
+   cluster's events recording, or `OMS_SHARD_ID` not set on the
+   per-shard projector JVM) before applying the event to the shared
+   Postgres `orders` table — protecting projection correctness in the
+   exact failure mode the multi-shard topology introduces.
+
+### Deliberately not in this slice
+
+* **No Flyway migration on the inflight outbox tables.** A previous
+  iteration of the E-2 plan called for a `shard_id` column on
+  `ledger_inflight_outbox` and `domain_event_outbox`, populated by the
+  projector. The JOIN to `orders.shard_id` makes that redundant for the
+  one query (`fetchFailedUncompensated`) that needs it; adding columns
+  + a write-side change to the projector for zero behavioural value at
+  N=1 would have widened the slice without buying anything for E-3.
+  Defer to a future slice if hot-path compensator queries become a
+  measurable cost.
+
+* **No per-shard `WHERE lio.shard_id = :myShard` partition on the
+  compensator query.** At N>1 every ingress JVM still runs its own
+  compensator instance, all share the same `ledger_inflight_outbox`
+  table, and `FOR UPDATE SKIP LOCKED` already prevents double-cancel.
+  Shard-partitioning the query would buy isolation (one shard's row
+  flood does not delay another shard's compensator), but the cost is
+  another DB round-trip per tick + a subtle invariant (rows whose
+  `orders.shard_id` does not match any compensator's `myShard` would
+  silently stall). Defer until measured.
+
+* **No `OrdersRepositoryShardingTest` exercising
+  `idx_orders_shard_status`.** The index has been on `orders` since V1
+  but no production code path queries by `(shard_id, status)` today —
+  E-3 will add the first such query (per-shard projector backfill /
+  health probe). Adding a test now would test only the index's
+  existence, not its use.
+
+* **No fix on `OrderCancelAppliedEvent.shardId` hardcoded to 0 inside
+  `OmsAdmissionClusteredService.emitOrderCancelApplied`.** That field
+  is a wire-format placeholder because `AdmittedOrder` (the cluster
+  service's in-memory state) does not carry shardId. At N>1 each
+  cluster's events recording only emits cancels for orders that cluster
+  admitted, so the projector still applies them to the right
+  `orders.shard_id` row via the orderId lookup; the wire field is
+  cosmetic. E-3 will thread `shardId` through `AdmittedOrder` so the
+  field carries semantics, but E-2 does not need it for correctness.
+
+### Verification — Pop! 2026-05-14, 19:58 → 20:00
+
+Stack restart procedure: kill all 5 OMS JVMs, clean
+`build/aeron-cluster/{media-driver,archive,cluster-services,consensus-module}`,
+relaunch via `scripts/launch-bench-stack.sh` in dependency order, wait
+for `/actuator/health` on both ingress JVMs (8087, 8187). Three
+sequential c2400 bursts (`OMS_BURST_TOTAL=480000`,
+`OMS_BURST_CONCURRENCY=400`, `OMS_BURST_RPS_CAP=0`) — first is
+cold-start (fresh JIT, empty page cache), second + third are the
+real signal. Pattern matches E-1 verification.
+
+| burst | submitted | failed | elapsed | RPS | p50 | p95 | p99 | p999 |
+|:------|----------:|-------:|--------:|----:|----:|----:|----:|-----:|
+| cold   | 480 000 | 0 | 7.883 s | 60 888 | 5.4 ms | 9.1 ms | 23.7 ms | 77.4 ms |
+| warm   | 480 000 | 0 | 7.625 s | **62 953** | 5.3 ms | 8.4 ms | 17.0 ms | 67.1 ms |
+| steady | 480 000 | 0 | 7.740 s | 62 017 | 5.4 ms | 8.6 ms | 19.3 ms | 49.7 ms |
+
+Pre-E-2 baseline (E-1 third run, same Pop! stack): **57 601 RPS**,
+p50 5.6 ms, p99 21.2 ms.
+E-2 average across the three runs: **61 953 RPS** — within day-to-day
+RPS jitter band documented in earlier slices. Latency is at or
+below the E-1 baseline at every percentile, so E-2 is **byte-identical
+at `shardCount = 1`** (the slice's invariant).
+
+Runtime evidence the E-2 surface is exercised under load:
+
+* `oms_projector_shard_mismatch_dropped_total{shard_id="0"} = 0` —
+  pre-registered counter is visible on the projector's
+  `/actuator/prometheus` (port 8090), which proves the guard fires the
+  registry path; zero increments confirms the cluster log only carries
+  shardId=0 events at N=1 (the topological invariant the guard is
+  supposed to verify).
+* `oms_ledger_inflight_hold_compensated_total{outcome="cancelled",
+  shard_id="0"} = 4832` — the compensator's new
+  `router.forShard(row.shardId())` codepath drained the bench's
+  insufficient-funds backlog through 4 832 successful cluster cancels
+  during the 2-minute window. End-to-end proof that
+  `LedgerInflightOutboxRepository.fetchFailedUncompensated`'s JOIN to
+  `orders.shard_id` produced a correct shardId every time (the router
+  rejects out-of-range shardIds, so an incorrect JOIN row would have
+  surfaced as `oms_ledger_inflight_hold_compensate_failed_total`,
+  not as a clean cancel).
+* No SQL exceptions from the changed query in either ingress log.
+* No `submit_failed` storms — the per-row connect-check + per-shard
+  abort logic both behave identically to the pre-E-2 single-shard
+  branch when there is exactly one shard.
+
+### Next slice
+
+E-3 stands up a **second** cluster-node JVM on Pop! (with its own Aeron
+media-driver dir + cluster-dir), wires
+`scripts/launch-bench-stack.sh` to launch one cluster-node, projector,
+and fix-egress per shard, and bumps the ingress
+`OmsClusterShardRouter` injection to two clients (one per shard). The
+admit hot path already shards by `accountId` since E-1; E-3 is the
+first slice where that sharding has somewhere to land. The headroom
+probe predicted ~85–110k RPS lift on Pop! at N=2; E-3 is the bench
+that confirms or falsifies that prediction.
+
 ## Caveats
 
 - This is a **single-host single-cluster-node** rig. It does NOT exercise consensus, leader

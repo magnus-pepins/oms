@@ -139,6 +139,11 @@ class OmsPostgresProjectorD3OrderAcceptedTest {
         // Re-wire the projector with a real codec so we can capture and parse the JSON. We
         // keep the rest of the collaborators as mocks — only the codec needs real serialisation
         // logic to make the assertion meaningful.
+        // Phase 4 Tier 2.5 phase E-2: the event below carries shardId=7 so we can pin "the
+        // payload's shardId field is the event's shardId field, not a hard-coded 0". Move the
+        // projector's own shard id to 7 too so the new defensive shard guard does not drop
+        // the event before applyAdmittedEvent runs.
+        config.getShard().setId(7);
         DomainEventEnvelopeCodec realCodec = new DomainEventEnvelopeCodec(objectMapper);
         SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
         Clock pinned = Clock.fixed(Instant.ofEpochMilli(ACCEPTED_AT_MS + 1L), ZoneOffset.UTC);

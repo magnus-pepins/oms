@@ -30,8 +30,17 @@ public class LedgerInflightOutboxRepository {
      * Slice 4p row shape for {@link com.balh.oms.reconciler.LedgerInflightHoldFailureCompensator}:
      * carries enough metadata to log + emit a {@code CancelOrderCommand}, but not the full
      * payload (the compensator does not call Ledger).
+     *
+     * <p>Phase 4 Tier 2.5 phase E-2 added {@link #shardId}: the order's
+     * {@code orders.shard_id}, sourced via a JOIN in {@link #FETCH_FAILED_UNCOMPENSATED_SQL}
+     * (the existing {@code FK ledger_inflight_outbox.order_id REFERENCES orders(id)} guarantees
+     * the join is total). The compensator passes {@code shardId} to
+     * {@code OmsClusterShardRouter.forShard(int)} so the resulting
+     * {@code CancelOrderCommand} lands on the cluster that owns the order. At
+     * {@code shardCount=1} every row carries {@code shardId=0} and the router resolves to the
+     * single client — byte-identical to the pre-E-2 path.
      */
-    public record FailedInflightRow(long id, UUID orderId, int attempts, String lastError) {}
+    public record FailedInflightRow(long id, UUID orderId, int attempts, String lastError, int shardId) {}
 
     private static final String INSERT_SQL = """
             INSERT INTO ledger_inflight_outbox (order_id, payload_json, created_at)
@@ -78,16 +87,26 @@ public class LedgerInflightOutboxRepository {
      * keeps transient failures (one-off network blip during a single tick) on the reconciler
      * retry path; a row that has crossed the threshold is treated as a hold the Ledger will not
      * accept (e.g. insufficient balance) and graduates to compensation.
+     *
+     * <p>Phase 4 Tier 2.5 phase E-2: JOINs {@code orders} so the compensator can route the
+     * resulting {@link com.balh.oms.cluster.CancelOrderCommand} to the cluster that owns the
+     * order's shard. The FK {@code ledger_inflight_outbox.order_id REFERENCES orders(id)}
+     * (slice 4p {@code V4} migration) plus the projector's D-9 invariant
+     * (orders row inserted before the inflight outbox row, both inside one projector tx)
+     * make the join total. {@code FOR UPDATE SKIP LOCKED} stays on
+     * {@code ledger_inflight_outbox} only — taking the row lock here is sufficient because
+     * compensator concurrency is partitioned by the inflight outbox row, not by the order.
      */
     private static final String FETCH_FAILED_UNCOMPENSATED_SQL = """
-            SELECT id, order_id, attempts, last_error
-            FROM ledger_inflight_outbox
-            WHERE published_at IS NULL
-              AND compensated_at IS NULL
-              AND attempts >= :threshold
-            ORDER BY id
+            SELECT lio.id, lio.order_id, lio.attempts, lio.last_error, o.shard_id
+            FROM ledger_inflight_outbox lio
+            JOIN orders o ON o.id = lio.order_id
+            WHERE lio.published_at IS NULL
+              AND lio.compensated_at IS NULL
+              AND lio.attempts >= :threshold
+            ORDER BY lio.id
             LIMIT :batch_size
-            FOR UPDATE SKIP LOCKED
+            FOR UPDATE OF lio SKIP LOCKED
             """;
 
     private static final String MARK_PUBLISHED_SQL = """
@@ -198,6 +217,7 @@ public class LedgerInflightOutboxRepository {
             rs.getLong("id"),
             (UUID) rs.getObject("order_id"),
             rs.getInt("attempts"),
-            rs.getString("last_error")
+            rs.getString("last_error"),
+            rs.getInt("shard_id")
     );
 }

@@ -34,6 +34,7 @@ import io.aeron.Aeron;
 import io.aeron.Subscription;
 import io.aeron.archive.client.AeronArchive;
 import io.aeron.logbuffer.FragmentHandler;
+import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
@@ -140,6 +141,16 @@ public class OmsPostgresProjector {
     private static final String TIMER_TRADE_APPLY = "oms.trade.apply";
     private static final String TIMER_NBBO_FETCH = "oms.marketdata.nbbo.fetch";
 
+    /**
+     * Phase 4 Tier 2.5 phase E-2 — defensive shard guard. Increments when an
+     * {@link OrderAdmittedEvent} arrives whose {@link OrderAdmittedEvent#shardId()} does not
+     * match {@link OmsConfig.Shard#getId() this projector's shard id}. At {@code shardCount=1}
+     * always {@code 0} (cluster log only carries shard-0 events and the projector defaults to
+     * shard 0). Pre-registered so {@code /actuator/prometheus} shows the series with count 0
+     * on a freshly booted JVM and Prometheus alerts on {@code rate(...) > 0} match cleanly.
+     */
+    static final String METRIC_SHARD_MISMATCH_DROPPED = "oms_projector_shard_mismatch_dropped_total";
+
     private final OmsConfig config;
     private final AeronProjectorCursorRepository cursorRepository;
     private final OrdersRepository ordersRepository;
@@ -155,6 +166,11 @@ public class OmsPostgresProjector {
     private final ObjectMapper objectMapper;
     private final TransactionTemplate transactionTemplate;
     private final Clock wallClock;
+    /**
+     * Phase 4 Tier 2.5 phase E-2 — pre-registered counter for the defensive shard guard in
+     * {@link #applyAdmittedEvent}. See {@link #METRIC_SHARD_MISMATCH_DROPPED} for the contract.
+     */
+    private final Counter shardMismatchCounter;
 
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicReference<Long> lastAppliedPosition = new AtomicReference<>(0L);
@@ -229,6 +245,12 @@ public class OmsPostgresProjector {
         this.meterRegistry = meterRegistry;
         this.objectMapper = objectMapper;
         this.wallClock = wallClock;
+        this.shardMismatchCounter = Counter.builder(METRIC_SHARD_MISMATCH_DROPPED)
+                .description(
+                        "Cluster events whose shard id did not match this projector's "
+                                + "OmsConfig.Shard.id. Indicates a config bug (projector wired to the "
+                                + "wrong cluster's events recording) — should be 0 in steady state.")
+                .register(meterRegistry);
         // Programmatic boundary: the replay loop is a non-Spring thread, so AOP-proxied
         // @Transactional on this bean's own methods would not be intercepted. A
         // TransactionTemplate guarantees orders.insert + persistAdmission + cursor.advance
@@ -561,6 +583,26 @@ public class OmsPostgresProjector {
      * {@code order_id} is intentionally not unique — multiple events per order are normal).
      */
     void applyAdmittedEvent(OrderAdmittedEvent ev, long newPosition) {
+        // Phase 4 Tier 2.5 phase E-2: defensive shard guard. At shardCount=1 the cluster log
+        // only carries shardId=0 events and OmsConfig.Shard.id defaults to 0 — this guard is
+        // a no-op. At shardCount>1 (E-3+) each projector subscribes to its own cluster's
+        // events recording so it should naturally only see its shard's events; if a config
+        // bug wires the projector to the wrong cluster (e.g. OMS_SHARD_ID=1 but the Aeron
+        // events recording is shard 0's), this guard catches the mismatch BEFORE applying
+        // the event to Postgres. Drop + counter so the operator's existing alert on the
+        // failed-projection counter fires.
+        int expectedShardId = config.getShard().getId();
+        if (ev.shardId() != expectedShardId) {
+            shardMismatchCounter.increment();
+            log.warn(
+                    "projector shard mismatch: event orderId={} shardId={} but this projector serves shardId={}; dropping event without applying",
+                    ev.orderId(), ev.shardId(), expectedShardId);
+            // Cursor advance still happens so the projector does not loop on the same
+            // misrouted event. The event is dropped, not skipped — replaying after fixing
+            // the wiring will re-emit the event from the recording.
+            cursorRepository.advance(PROJECTOR_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, newPosition);
+            return;
+        }
         boolean freshAdmission = ordersRepository.insertFromAdmittedEvent(ev);
         if (freshAdmission) {
             // First time we project this admit: emit OrderAccepted into the fanout outbox so

@@ -2,6 +2,7 @@ package com.balh.oms.reconciler;
 
 import com.balh.oms.cluster.CancelOrderCommand;
 import com.balh.oms.cluster.OmsClusterIngressClient;
+import com.balh.oms.cluster.OmsClusterShardRouter;
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.config.OmsProfiles;
 import com.balh.oms.persistence.LedgerInflightOutboxRepository;
@@ -77,19 +78,26 @@ public class LedgerInflightHoldFailureCompensator {
     private static final String REASON_PREFIX = "ledger_inflight_hold_failed:";
 
     private final LedgerInflightOutboxRepository outbox;
-    private final ObjectProvider<OmsClusterIngressClient> clusterClient;
+    /**
+     * Phase 4 Tier 2.5 phase E-2 — replaces the pre-E-2
+     * {@code ObjectProvider<OmsClusterIngressClient>} so the compensator can route each cancel
+     * to the shard that owns the order. At {@code shardCount=1} the router resolves to the
+     * single cluster client (byte-identical to E-1); at {@code shardCount>1} (E-3+) each row's
+     * cancel lands on its owning cluster without changing this method.
+     */
+    private final ObjectProvider<OmsClusterShardRouter> clusterShardRouter;
     private final OmsConfig config;
     private final MeterRegistry meterRegistry;
     private final TransactionTemplate transactionTemplate;
 
     public LedgerInflightHoldFailureCompensator(
             LedgerInflightOutboxRepository outbox,
-            ObjectProvider<OmsClusterIngressClient> clusterClient,
+            ObjectProvider<OmsClusterShardRouter> clusterShardRouter,
             OmsConfig config,
             MeterRegistry meterRegistry,
             PlatformTransactionManager transactionManager) {
         this.outbox = outbox;
-        this.clusterClient = clusterClient;
+        this.clusterShardRouter = clusterShardRouter;
         this.config = config;
         this.meterRegistry = meterRegistry;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
@@ -103,8 +111,8 @@ public class LedgerInflightHoldFailureCompensator {
                 || !ledgerCfg.isInflightCompensatorEnabled()) {
             return;
         }
-        OmsClusterIngressClient client = clusterClient.getIfAvailable();
-        if (client == null || !client.isConnected()) {
+        OmsClusterShardRouter router = clusterShardRouter.getIfAvailable();
+        if (router == null) {
             return;
         }
 
@@ -120,6 +128,36 @@ public class LedgerInflightHoldFailureCompensator {
         }
 
         for (var row : rows) {
+            // Phase 4 Tier 2.5 phase E-2: pick the cluster client that owns this row's shard.
+            // At shardCount=1 every row carries shardId=0 and the router returns the singleton
+            // — same instance the pre-E-2 code held in clusterClient.
+            OmsClusterIngressClient client;
+            try {
+                client = router.forShard(row.shardId());
+            } catch (IllegalArgumentException e) {
+                // Defensive: a row whose shardId is out of range would indicate either a stale
+                // outbox row from a higher-shardCount deployment or a corrupt orders.shard_id.
+                // Don't compensate this row this tick; surface the count via the same
+                // submit_failed bucket so the operator's existing alert fires.
+                meterRegistry.counter(METRIC_COMPENSATE_FAILED,
+                        Tags.of(TAG_OUTCOME, OUTCOME_SUBMIT_FAILED)).increment();
+                log.warn(
+                        "Compensator: row shardId={} not in router (shardCount={}); skipping orderId={} id={}.",
+                        row.shardId(), router.shardCount(), row.orderId(), row.id(), e);
+                continue;
+            }
+            if (!client.isConnected()) {
+                // The owning shard's client is currently down. Skip without burning the submit
+                // timeout — the next tick will retry. Bookkeeping intentionally uses the same
+                // submit_failed counter the timeout / runtime-error paths use; the operator's
+                // existing alert fires regardless of which sub-cause kept the row alive.
+                meterRegistry.counter(METRIC_COMPENSATE_FAILED,
+                        Tags.of(TAG_OUTCOME, OUTCOME_SUBMIT_FAILED)).increment();
+                log.debug(
+                        "Compensator: shard {} client not connected; deferring orderId={} id={} to next tick.",
+                        row.shardId(), row.orderId(), row.id());
+                continue;
+            }
             try {
                 long correlationId = client.nextCorrelationId();
                 String reason = buildReason(row.lastError());
@@ -136,17 +174,24 @@ public class LedgerInflightHoldFailureCompensator {
                 meterRegistry.counter(METRIC_COMPENSATED,
                         Tags.of(TAG_OUTCOME, OUTCOME_CANCELLED)).increment();
                 log.info(
-                        "Compensated ledger_inflight_outbox id={} orderId={} (attempts={}) -> CancelOrderCommand correlationId={}",
-                        row.id(), row.orderId(), row.attempts(), correlationId);
+                        "Compensated ledger_inflight_outbox id={} orderId={} shardId={} (attempts={}) -> CancelOrderCommand correlationId={}",
+                        row.id(), row.orderId(), row.shardId(), row.attempts(), correlationId);
             } catch (TimeoutException e) {
                 meterRegistry.counter(METRIC_COMPENSATE_FAILED,
                         Tags.of(TAG_OUTCOME, OUTCOME_SUBMIT_FAILED)).increment();
                 log.warn(
-                        "Compensator: cluster submitCancelOrder timed out for orderId={} id={}; will retry next tick.",
-                        row.orderId(), row.id(), e);
-                // Stop the batch on first timeout: the cluster is back-pressured or unreachable;
-                // burning the rest of the batch on the same condition wastes a 2s budget per row.
-                return;
+                        "Compensator: cluster submitCancelOrder timed out for orderId={} id={} shardId={}; will retry next tick.",
+                        row.orderId(), row.id(), row.shardId(), e);
+                // E-2: stop the batch on first timeout only when the timeout came from the
+                // shard the *next* row also targets. Different shards have independent
+                // back-pressure budgets; making a shard-1 timeout also skip pending shard-0
+                // rows would over-couple them. At shardCount=1 this preserves the pre-E-2
+                // "abort batch" behaviour because every row's shardId is 0.
+                if (allRemainingRowsTargetShard(rows, row, row.shardId())) {
+                    return;
+                }
+                // Otherwise fall through to the next row; if THAT row's shard is also down its
+                // own isConnected() / submit failure will skip it on its own.
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 log.warn(
@@ -164,6 +209,31 @@ public class LedgerInflightHoldFailureCompensator {
                 // rest of the batch.
             }
         }
+    }
+
+    /**
+     * Returns {@code true} when every row in {@code rows} after {@code currentRow} targets the
+     * same {@code shardId}. Used to preserve the pre-E-2 "abort batch on first timeout" semantics
+     * at {@code shardCount=1} (every remaining row hits the same back-pressured cluster, so
+     * burning the rest is wasteful) without coupling shards in the multi-shard path.
+     */
+    private static boolean allRemainingRowsTargetShard(
+            List<LedgerInflightOutboxRepository.FailedInflightRow> rows,
+            LedgerInflightOutboxRepository.FailedInflightRow currentRow,
+            int shardId) {
+        boolean past = false;
+        for (var r : rows) {
+            if (!past) {
+                if (r == currentRow) {
+                    past = true;
+                }
+                continue;
+            }
+            if (r.shardId() != shardId) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**

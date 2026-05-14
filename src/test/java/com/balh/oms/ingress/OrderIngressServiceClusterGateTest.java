@@ -23,6 +23,9 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.http.HttpStatus;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.support.AbstractPlatformTransactionManager;
 
 import java.math.BigDecimal;
 import java.time.Duration;
@@ -92,6 +95,17 @@ class OrderIngressServiceClusterGateTest {
                 (ObjectProvider<LedgerBalanceClient>) mock(ObjectProvider.class);
         when(ledgerBalance.getIfAvailable()).thenReturn(null);
 
+        // Phase 4 Tier 2.5 phase C-2: OrderIngressService now takes a
+        // PlatformTransactionManager. Tests don't need a real Postgres tx — a no-op
+        // manager that hands out a synthetic TransactionStatus is enough to satisfy the
+        // contract. The unit test surface verifies the cluster gate, not the Postgres tx.
+        PlatformTransactionManager noopTxManager = new AbstractPlatformTransactionManager() {
+            @Override protected Object doGetTransaction() { return new Object(); }
+            @Override protected void doBegin(Object tx, TransactionDefinition def) {}
+            @Override protected void doCommit(org.springframework.transaction.support.DefaultTransactionStatus status) {}
+            @Override protected void doRollback(org.springframework.transaction.support.DefaultTransactionStatus status) {}
+        };
+
         service = new OrderIngressService(
                 orders,
                 domainEventOutbox,
@@ -105,7 +119,8 @@ class OrderIngressServiceClusterGateTest {
                 ledgerInflightOutbox,
                 new SimpleMeterRegistry(),
                 orderControlAdmission,
-                cluster);
+                cluster,
+                noopTxManager);
     }
 
     @Test

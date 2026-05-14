@@ -30,7 +30,8 @@ import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.context.annotation.Profile;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
 import java.time.Duration;
@@ -94,6 +95,7 @@ public class OrderIngressService {
     private final MeterRegistry meterRegistry;
     private final OrderControlAdmission orderControlAdmission;
     private final OmsClusterIngressClient clusterIngressClient;
+    private final TransactionTemplate transactionTemplate;
 
     public OrderIngressService(
             OrdersRepository orders,
@@ -108,7 +110,8 @@ public class OrderIngressService {
             LedgerInflightOutboxRepository ledgerInflightOutbox,
             MeterRegistry meterRegistry,
             OrderControlAdmission orderControlAdmission,
-            OmsClusterIngressClient clusterIngressClient) {
+            OmsClusterIngressClient clusterIngressClient,
+            PlatformTransactionManager transactionManager) {
         this.orders = orders;
         this.domainEventOutbox = domainEventOutbox;
         this.domainEventEnvelopeCodec = domainEventEnvelopeCodec;
@@ -122,6 +125,7 @@ public class OrderIngressService {
         this.meterRegistry = meterRegistry;
         this.orderControlAdmission = orderControlAdmission;
         this.clusterIngressClient = clusterIngressClient;
+        this.transactionTemplate = new TransactionTemplate(transactionManager);
     }
 
     /**
@@ -147,12 +151,32 @@ public class OrderIngressService {
      * {@code oms-postgres-projector} JVM owns it now, applying the cluster-emitted
      * {@code OrderAdmittedEvent} idempotently. Returning from this method means "cluster
      * committed"; the Postgres orders row materialises shortly after via the projector.
+     *
+     * <p>Phase 4 Tier 2.5 phase C-2: the Ledger {@code GET /balances/{id}} sync HTTP call
+     * for {@link #maybeVerifyLedgerBalanceBinding} now runs <strong>before</strong> the
+     * Postgres transaction opens. Pop! 2026-05-14 jstacks (post-V30+V31 indexes) showed
+     * 17 of ingress-2's 39 http-nio threads RUNNABLE inside
+     * {@code HttpClient.parseHTTPHeader} on this verify call, while still holding a Hikari
+     * connection acquired by the surrounding {@code @Transactional}. Pulling the verify
+     * out of the tx and using an explicit {@link TransactionTemplate} for the
+     * Postgres+cluster-commit work makes the conn-hold cover only Postgres time
+     * (microseconds) instead of Postgres+Ledger-RTT (10–20 ms).
+     *
+     * <p>Behaviour-preserving: error semantics for the verify path are unchanged
+     * ({@code ledger_identity_required} / {@code ledger_identity_mismatch} /
+     * {@code ledger_balance_not_found} / {@code ledger_identity_lookup_failed} still
+     * surface as the same HTTP status codes) and the
+     * {@code oms.pipeline.ingress.accept_seconds} timer still wraps the full method
+     * surface from a caller's perspective.
      */
-    @Transactional
     public IngressResult persistAccepted(CreateOrderRequest req) {
         Timer.Sample ingressSample = Timer.start(meterRegistry);
         try {
-            IngressResult result = persistAcceptedBody(req);
+            maybeVerifyLedgerBalanceBinding(req);
+            IngressResult result = transactionTemplate.execute(status -> persistAcceptedBody(req));
+            if (result == null) {
+                throw new IllegalStateException("transactionTemplate returned null IngressResult");
+            }
             OmsPipelineMetrics.finishIngressAccept(
                     meterRegistry, ingressSample, result.created() ? "created" : "duplicate");
             return result;
@@ -162,9 +186,12 @@ public class OrderIngressService {
         }
     }
 
+    /**
+     * The Postgres-transactional portion of {@link #persistAccepted}. Caller must have
+     * already run {@link #maybeVerifyLedgerBalanceBinding} (the only step that did Ledger
+     * sync HTTP — see Phase 4 Tier 2.5 phase C-2 note on {@link #persistAccepted}).
+     */
     private IngressResult persistAcceptedBody(CreateOrderRequest req) {
-        maybeVerifyLedgerBalanceBinding(req);
-
         UUID id = UUID.randomUUID();
         Instant now = Instant.now();
         int shardId = ShardKey.shardFor(req.accountId(), config.getShard().getCount());

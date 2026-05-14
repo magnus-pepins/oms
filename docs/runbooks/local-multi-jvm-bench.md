@@ -1073,6 +1073,102 @@ released on transaction-mode commit. The pattern would be: keep the default OMS
 DataSource on `6543`, register a separate `@Configuration` DataSource pointed at
 `5432` and inject it specifically into the leader-election bean.
 
+## Slice 4p evidence — ledger-bound bench, async outbox + compensator (Pop! 2026-05-14)
+
+Same Pop! topology as slice 4o (5 OMS JVMs, 2× ingress replicas, `MAX=20`, port 6543
+transaction-mode pool). The new dimension this bench measures: orders carry a real
+`ledgerBalanceId` / `ledgerIdentityId` so `OrderIngressService.maybePlaceBuyLedgerInflightHold`
+fires for every accept. The **only** difference between the two runs below is the slice 4p
+async flag.
+
+The burst tool was extended with `OMS_BURST_LEDGER_BALANCE_ID` /
+`OMS_BURST_LEDGER_IDENTITY_ID` (config-and-limits compliant; both required when set, fails
+fast at config build); see the doc-block in `IngressBurstMain`.
+
+```
+== Bench A: OMS_LEDGER_INFLIGHT_ASYNC_ENABLED=false (sync hold) ==
+submitted=5000  success=414 (created=414, duplicate=0)  failed=4586  elapsed=17.913 s  rps=279.1
+status breakdown:           201 = 414        500 = 4586
+HTTP RTT p50=166.911 ms     p99=952.319 ms
+oms_pipeline_ingress_accept p50=44.739 ms    p99=2147.484 ms
+oms_cluster_client_commit_round_trip p50=2.447 ms  p99=5.592 ms
+
+== Bench B: OMS_LEDGER_INFLIGHT_ASYNC_ENABLED=true  (slice 4p async outbox) ==
+submitted=5000  success=4971 (created=4971, duplicate=0)  failed=29   elapsed=6.542 s   rps=764.3
+status breakdown:           201 = 4971       502 = 29
+HTTP RTT p50=14.015 ms      p99=46.143 ms
+oms_pipeline_ingress_accept p50=5.592 ms     p99=15.379 ms
+oms_cluster_client_commit_round_trip p50=1.000 ms  p99=3.845 ms
+```
+
+**Headline**: 2.74× rps lift (279 → 764) and 12× HTTP-RTT p50 reduction (167 ms → 14 ms);
+the 92 % failure cliff in Bench A collapses to 0.6 %. The ingress-accept tx commit drops
+8× p50 / 140× p99.
+
+**Why Bench A fails**: the synchronous `RestLedgerInflightReservationClient.placeBuyNotionalHold`
+hits the ledger's `balances.version` optimistic-concurrency lock — every burst thread tries
+to mutate the same source balance. Server-side error: `Balance version conflict: source
+balance was modified by another transaction`. The 50-way burst loses ~92 % of those races.
+Slice 4p moves the hold off the ingress thread (insert into `ledger_inflight_outbox` in the
+same accept tx; reconciler publishes serially per JVM via `FOR UPDATE SKIP LOCKED`), so the
+collisions never reach the user.
+
+**Compensator wired and observed working**: post-bench reconciliation drained the queue in
+~1 minute; after drain the outbox was at:
+
+| total | published | compensated | pending |
+|---|---|---|---|
+| 4 971 | 3 271 (65.8 %) | 1 700 (34.2 %) | 0 |
+
+Each compensated row corresponded to an order whose hold lost the OCC race three times in a
+row (`OMS_LEDGER_INFLIGHT_COMPENSATOR_ATTEMPTS_THRESHOLD=3`). The compensator submitted
+`CancelOrderCommand` for each, the cluster admitted the cancel, the projector wrote
+`orders.status=CANCELLED`. Sample audit on 500 randomly-picked compensated rows: **all 500
+orders were `CANCELLED`** (no race-with-fill anomalies on this run; the slice-4q coalescer
+narrows that race window further). Per-replica metric:
+`oms_ledger_inflight_hold_compensated_total{outcome="cancelled"} = 948 (ingress-1) +
+814 (ingress-2)`.
+
+**Why Bench B is still well below slice 4o's 6 471 rps**: the synchronous
+`LedgerBalanceClient.fetchIdentityIdForBalance` HTTP (`maybeVerifyLedgerBalanceBinding`)
+runs once per accept when `ledgerBalanceId` is set — that ~25 ms ledger HTTP is on the
+ingress critical path and not addressed by slice 4p. Either an in-process binding cache
+(safe; balanceId→identityId is operator-rare-change) or the slice-4q coalescer would lift
+this. **Slice 4p does what it advertises** (async hold, compensating cancel) — the binding
+verify is a separate lever.
+
+### Slice 4p setup — env to flip the async flag
+
+Add these to `~/.oms-bench.env` (full ledger HTTP must be reachable; on Pop! the default
+ledger app on `127.0.0.1:5001` is the same backing the customer-frontend dev stack):
+
+```
+export OMS_LEDGER_ENABLED=true
+export OMS_LEDGER_BASE_URL='http://127.0.0.1:5001'
+export OMS_LEDGER_API_KEY='<LEDGER_SERVER_SECRET_KEY>'      # see ledger/.env
+export OMS_LEDGER_INFLIGHT_RESERVATION_ENABLED=true
+export OMS_LEDGER_INFLIGHT_ASYNC_ENABLED=true               # slice 4p — flip to false for Bench A
+export OMS_LEDGER_INFLIGHT_HOLD_DESTINATION_BALANCE_ID='<balance_id of @Nostro-EUR>'
+export OMS_LEDGER_INFLIGHT_RESERVATION_CURRENCY=EUR
+export OMS_LEDGER_INFLIGHT_COMPENSATOR_ENABLED=true
+export OMS_LEDGER_INFLIGHT_COMPENSATOR_ATTEMPTS_THRESHOLD=3
+export OMS_BURST_LEDGER_BALANCE_ID='<EUR customer balance with funds>'
+export OMS_BURST_LEDGER_IDENTITY_ID='<identity owning that balance>'
+```
+
+`scripts/launch-bench-stack.sh <role>` (added in slice 4p) is a thin convenience wrapper
+that sources `~/.oms-bench.env` then `nohup`s `./gradlew bootRun<Role>` to
+`~/oms/logs/<role>.log`. Roles: `cluster-node | projector | fix-egress | ingress-1 |
+ingress-2`. ingress-1 picks `OMS_HTTP_PORT=8088 OMS_INGRESS_REPLICA_MANAGEMENT_SERVER_PORT=8087`,
+ingress-2 picks `8188 / 8187`.
+
+### When to flip back (rollback)
+
+If you suspect the async path is masking a behaviour change, set
+`OMS_LEDGER_INFLIGHT_ASYNC_ENABLED=false` and restart the ingress replicas. Outbox rows
+already accepted on the async path keep being driven by the reconciler regardless of the
+flag flip; only newly-accepted orders take the sync path again.
+
 ## Caveats
 
 - This is a **single-host single-cluster-node** rig. It does NOT exercise consensus, leader

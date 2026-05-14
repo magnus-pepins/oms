@@ -1796,6 +1796,196 @@ from earlier benches; not new-order hot path, will drain.
   The right discipline is "run the bench, read the jstack, then tell me where
   the next ceiling is" — not "extrapolate from theory".
 
+## Tier 2.5 phase C-4 verification — Hikari pool size is **not** the lever (Pop! 2026-05-14)
+
+> Negative result. The C-3 runbook predicted "Phase-C-4 (raise Hikari pool size)
+> becomes the dominant remaining lever" — Pop! data falsified that prediction.
+> Documenting the disproof here so the next person doesn't repeat the experiment.
+
+### Hypothesis (going in)
+
+Post-C-3 mid-bench `jstack` showed ~78 % of ingress `http-nio-*` threads parked
+in `HikariPool.getConnection`. Naive read: pool too small (`OMS_PG_POOL_MAX_SIZE=20`),
+bumping to 40/80/120 should raise the ceiling.
+
+### Setup
+
+`scripts/launch-bench-stack.sh` sources `~/.oms-bench.env` **after** the calling
+shell's `export`, so passing `OMS_PG_POOL_MAX_SIZE=80` to the script is silently
+overridden by the file's own `export OMS_PG_POOL_MAX_SIZE=20`. The first sweep
+(`bench-results/c4-pool*-09[44-45]*`) was a wash — Hikari `connections_max` came
+back as `20.0` for all three target sizes. The real sweep
+(`bench-results/c4real-pool*`) `sed`-replaces the file in place and verifies via
+`/actuator/prometheus` (port 8087/8187, **not** 8088/8188 — those are app HTTP)
+that `hikaricp_connections_max{pool="oms-pg"}` matches the target before
+benching.
+
+### Measurement (60 000 orders, conc=400, two ingress JVMs, all 5 OMS JVMs alive)
+
+Pool sweep with verification:
+
+| Pool | RPS | p50 | p99 | Hikari `connections_max` |
+|---:|---:|---:|---:|---:|
+| 20 (canon)  | 6 894 | 52 ms | 152 ms | 20 (verified) |
+| 20 (canon)  | 7 623 | 52 ms | 123 ms | 20 (verified) |
+| 40          | 7 100 | 51 ms | 149 ms | 40 (verified) |
+| 50          | 7 126 | 49 ms | 134 ms | 50 (verified) |
+| 60          | 7 202 | 49 ms | 141 ms | 60 (verified) |
+| 80          | 7 063 | 49 ms | 155 ms | 80 (verified) |
+| 120         | 7 315 | 51 ms | 155 ms | 120 (verified) |
+
+The pool=20 reruns bracket the rest of the sweep (6 894 — 7 623 rps run-to-run).
+**Pool size between 20 and 120 does not move the ceiling.** Best single observation
+post-C-3 stays at the 7 762 rps reported in the C-3 section (one-off lucky run).
+Mean steady-state ceiling on Pop! is **~7 200-7 300 rps**.
+
+### Why pool size doesn't help — re-reading the jstack
+
+The C-3 jstack interpretation was wrong. The 176 ingress-1 / 171 ingress-2
+threads parked at `HikariPool.getConnection(HikariPool.java:162)` were not
+queueing because the pool was full — at pool=120 the post-bench scrape shows
+`hikaricp_connections_idle=47` (i.e. only 73 conns ever activated, with plenty
+of slack), and the mid-bench `RUNNABLE` count of threads in any DB or HTTP frame
+is just 24-37. Pool size 20 already covers the working set.
+
+Sampling stacks from the parked threads shows two real groups:
+
+1. **Tomcat idle workers** (most of the 116 raw `Unsafe.park` on ingress-2):
+
+   ```
+   ThreadPoolExecutor.getTask → TaskQueue.poll → LinkedBlockingQueue.poll
+   ```
+
+   Tomcat keeps spare worker threads beyond the steady-state in-flight count.
+   Not a bottleneck.
+
+2. **Threads inside an open transaction, parked on the cluster commit reply:**
+
+   ```
+   CompletableFuture.timedGet
+   OmsClusterIngressClient.submitAcceptOrder(:635)
+   OrderIngressService.submitToClusterOrThrow(:266)
+   OrderIngressService.persistAcceptedBody(:203)            ← inside tx
+   TransactionTemplate.execute(:140)
+   OrderIngressService.persistAccepted(:176)
+   ```
+
+   These threads **own a Hikari connection** (acquired by `doBegin`) and are
+   waiting on Aeron cluster commit before doing the two outbox `INSERT`s and
+   committing. Conn-hold time per request is dominated by `commit_round_trip`,
+   not by Postgres work. `oms.cluster.client.commit_round_trip_seconds` shows
+   mean 0.91 ms, p99 ~3.8 ms, p999 ~11 ms across 30 000 calls per ingress —
+   so each conn is held ~1-3 ms beyond the 0.05 ms of actual `INSERT` time.
+
+   The threads at `HikariPool.getConnection(:162)` are queued behind
+   conn-holders that are themselves queued on the cluster reply. Bumping the
+   pool just lengthens the ready-queue without speeding up the cycle.
+
+### Side-finding: Supavisor `POOLER_MAX_CLIENT_CONN` cap
+
+`docker inspect ledger-supabase-pooler` →
+`POOLER_DEFAULT_POOL_SIZE=50, POOLER_MAX_CLIENT_CONN=300`.
+
+When pool=80 was applied across both ingress (160 conns) plus cluster-node
+(20) plus the Ledger app's own pool plus pre-existing zombie conns from
+killed JVMs, host-side `ss -tn | grep -c :6543` topped out at exactly 300.
+**At that point projector and fix-egress could no longer start** — Flyway boot
+fails with `FATAL: Max client connections reached`. Restoring pool=20 and
+waiting for Supavisor to reap idle conns drops it to ~24/300, after which
+projector + fix-egress restart cleanly.
+
+Operational implication: do not raise `OMS_PG_POOL_MAX_SIZE` above ~50 per JVM
+on this rig without first raising `POOLER_MAX_CLIENT_CONN` on the Supavisor.
+Even though pool size doesn't help RPS, an accidental bump can lock you out of
+restarting any other JVM that talks to the same pooler.
+
+### Diagnostic: confirming the cluster-admit-in-tx hypothesis
+
+Ran a falsifiable test: kill projector + fix-egress (free their Supavisor
+backends and Hikari pool slack), bench again. Two outcomes possible:
+
+- **If Supavisor's 50-backend pool was the wall**, RPS rises (~1.5x).
+- **If cluster-admit-in-tx is the wall**, RPS stays flat or drops (cluster
+  egress backs up because nothing drains `OrderAdmittedEvent`).
+
+Result: **5 057 rps with cold-restart** (down from 7 200), then **8 230 rps
+with already-warm ingress and a degraded-but-stable topology**, with p50 dropping
+to 47 ms. The 5 057 number is the cold-cluster-egress-backup case; the 8 230 is
+the warm case. Either way, the absence of projector/fix-egress isn't a clean
+test because they share the cluster's egress recording. So: not Supavisor's pool
+that limits us — it's the conn-hold time inside the tx.
+
+`pg_stat_statements` at the pool=120 saturation run confirms Postgres is mostly
+idle on the hot path:
+
+```
+INSERT ledger_inflight_outbox (60 000 calls × 0.054 ms) = 3.24 s of pg time
+INSERT domain_event_outbox (60 000 calls × 0.027 ms) = 1.62 s
+UPDATE compensator (671 calls × 6.6 ms)             = 4.43 s   ← background
+SELECT reconciler (~20 calls × 90 ms)               = 1.80 s   ← background
+```
+
+Total Postgres time on the hot path ≈ 4.9 s over the 8.2 s bench window. That's
+0.6 connection-equivalents of pg work for ~7 200 rps. The bottleneck is
+**not Postgres**, **not Hikari**, **not Supavisor** — it's the ~3-8 ms of
+Aeron cluster commit RTT held inside the Postgres transaction.
+
+### Phase D-1 (recommended next slice) — pull cluster admit out of the Postgres tx
+
+Mirrors what C-2 did for the Ledger verify HTTP call: move
+`submitToClusterOrThrow` (lines 203 of `OrderIngressService`) **out of**
+`transactionTemplate.execute(...)`. New flow:
+
+1. `maybeVerifyLedgerBalanceBinding(req)` — already outside the tx (C-2).
+2. `submitToClusterOrThrow(...)` — **NEW: outside the tx**. Cluster admit /
+   commit happens before any DB connection is touched.
+3. If admission returned `Duplicate`, return early — no tx needed.
+4. Open a tx (`transactionTemplate.execute`):
+   - `maybePlaceBuyLedgerInflightHold(order)` (writes to ledger_inflight_outbox)
+   - `domainEventOutbox.insert(...)` (writes to domain_event_outbox)
+5. Commit, return.
+
+Conn-hold drops from ~5-10 ms (mostly Aeron) to ~0.5-1 ms (just the two
+`INSERT`s + `COMMIT`). Theoretical lift at conc=400, 50-backend Supavisor wall:
+~3-5x. Practical lift bounded by what becomes the next ceiling — likely Aeron
+cluster commit serial throughput on cluster-node, then Tomcat / Spring
+overhead.
+
+Risk to think through: with the tx opening **after** cluster admit, an ingress
+JVM crash between step 2 and step 5 leaves the cluster with an `OrderAccepted`
+event but no outbox rows. The projector would still write the `orders` row from
+the cluster event, but without `domain_event_outbox` there is no fanout, and
+without `ledger_inflight_outbox` no async hold. Recovery would need either
+(a) a reconciler that materialises missing outbox rows from cluster log on
+startup, or (b) idempotent re-emission so the projector itself produces the
+domain envelopes from the cluster event (the path it already takes for the
+`orders` row writeup). Worth a small slice on its own before doing D-1.
+
+### Phase D-2 (optional, only if D-1 still leaves slack) — bump Supavisor pool
+
+Set `POOLER_DEFAULT_POOL_SIZE=100` and `POOLER_MAX_CLIENT_CONN=500` on
+`ledger-supabase-pooler`. Requires raising Postgres `max_connections` from 100
+to 250+ in the supabase-db config. Brief outage for the Ledger app while
+pooler restarts. Only worth doing if D-1 lifts the cluster-admit-in-tx wall and
+Supavisor's 50-backend pool becomes the new ceiling — until then, the OMS-side
+Hikari pool isn't even fully utilised, so this is premature.
+
+### Lessons
+
+- **`hikaricp_connections_max` is the truth.** Always verify the env var
+  reached the JVM before drawing conclusions from a bench. The first C-4 sweep
+  was a wash because the pool was still 20 the entire time.
+- **`HikariPool.getConnection(:162)` in jstack ≠ "pool too small".** Threads
+  also park there briefly during HikariCP's internal handover when conns are
+  available. Always cross-check with `hikaricp_connections_idle`. If conns
+  are idle at scrape, the pool is sized fine.
+- **The actual conn-holders' stacks reveal the bottleneck.** Sampling 5-8
+  diverse parked stacks (not just counting first-frame buckets) was what
+  surfaced `submitToClusterOrThrow` inside the tx.
+- **Supavisor `POOLER_MAX_CLIENT_CONN` is invisible until you trip it.** When
+  pool size starts mattering, the next infra knob to know about is this one,
+  not `POOLER_DEFAULT_POOL_SIZE`.
+
 ## Caveats
 
 - This is a **single-host single-cluster-node** rig. It does NOT exercise consensus, leader

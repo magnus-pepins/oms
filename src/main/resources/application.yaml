@@ -83,6 +83,11 @@ oms:
     inflight-compensator-batch-size: ${OMS_LEDGER_INFLIGHT_COMPENSATOR_BATCH_SIZE:50}
     inflight-compensator-interval-ms: ${OMS_LEDGER_INFLIGHT_COMPENSATOR_INTERVAL_MS:1000}
     inflight-compensator-submit-timeout-ms: ${OMS_LEDGER_INFLIGHT_COMPENSATOR_SUBMIT_TIMEOUT_MS:2000}
+    inflight-coalescer-enabled: ${OMS_LEDGER_INFLIGHT_COALESCER_ENABLED:false}
+    inflight-coalescer-max-batch-size: ${OMS_LEDGER_INFLIGHT_COALESCER_MAX_BATCH_SIZE:50}
+    inflight-coalescer-flush-interval-micros: ${OMS_LEDGER_INFLIGHT_COALESCER_FLUSH_INTERVAL_MICROS:5000}
+    inflight-coalescer-queue-capacity: ${OMS_LEDGER_INFLIGHT_COALESCER_QUEUE_CAPACITY:1000}
+    inflight-coalescer-submit-timeout-ms: ${OMS_LEDGER_INFLIGHT_COALESCER_SUBMIT_TIMEOUT_MS:2000}
     inflight-hold-destination-balance-id: ${OMS_LEDGER_INFLIGHT_HOLD_DESTINATION_BALANCE_ID:}
     inflight-reservation-currency: ${OMS_LEDGER_INFLIGHT_RESERVATION_CURRENCY:EUR}
     inflight-reservation-precision: ${OMS_LEDGER_INFLIGHT_RESERVATION_PRECISION:100}

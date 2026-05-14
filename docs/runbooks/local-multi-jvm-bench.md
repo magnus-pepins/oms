@@ -1169,6 +1169,86 @@ If you suspect the async path is masking a behaviour change, set
 already accepted on the async path keep being driven by the reconciler regardless of the
 flag flip; only newly-accepted orders take the sync path again.
 
+## Slice 4q — `LedgerInflightCoalescer` topology + operator contract
+
+Slice 4q ships the in-process MPSC queue + daemon flush thread that coalesces BUY inflight
+holds onto Ledger's `POST /transactions/bulk?inflight=true&atomic=false`. The
+`### Slice 4q evidence` block below is filled in by the first Pop! run; this section
+documents the topology, the operator contract, and the rollback path so a fresh operator
+can flip the flag without reading the slice's commit history.
+
+**Why slice 4q lifts where 4p plateaus**: the slice 4p outbox path still posts one Ledger
+transaction per HTTP, so a 50-way ingress burst still hits a 50-way `balances.version` OCC
+race surface server-side — just driven by the reconciler tick instead of the ingress
+thread. Slice 4q's bulk endpoint iterates the batch sequentially within a single HTTP, so
+50 holds in one bulk POST contend with each other only via Postgres row-locks (waiting,
+not failing); the OCC race surface drops by `batchSize`. The reconciler still owns the
+fallback path: any item the bulk handler rejects (or the whole batch on a 5xx) is written
+to `ledger_inflight_outbox` and the slice 4p reconciler + compensator drive it from there.
+
+**Two-path topology — when to use which**:
+
+| Profile | Flags | Critical-path Ledger HTTP per order | Durability gap | Server-side OCC contention |
+|---|---|---|---|---|
+| Sync hold (default safe) | `OMS_LEDGER_INFLIGHT_ASYNC_ENABLED=false`, `OMS_LEDGER_INFLIGHT_COALESCER_ENABLED=false` | 1 sync POST | None | 1× per order |
+| Outbox path (slice 4p) | `OMS_LEDGER_INFLIGHT_ASYNC_ENABLED=true`, `OMS_LEDGER_INFLIGHT_COALESCER_ENABLED=false` | 0 (HTTP after commit) | None — outbox row written in same tx as accept | 1× per order, off the critical path |
+| Coalescer path (slice 4q) | `OMS_LEDGER_INFLIGHT_ASYNC_ENABLED=false`, `OMS_LEDGER_INFLIGHT_COALESCER_ENABLED=true` | shared bulk POST per batch | Small — items in MPSC queue at JVM crash time are lost (the slice 4p compensator only graduates rows that exist in `ledger_inflight_outbox`) | 1× per `maxBatchSize` orders, sequential within one HTTP |
+
+The coalescer also keeps the outbox path on as a fallback (priority order in
+`OrderIngressService.maybePlaceBuyLedgerInflightHold` is coalescer → outbox → sync).
+On any flush failure (whole-batch HTTP error or per-item Ledger error in a partial-success
+response) the failed items are written to `ledger_inflight_outbox` so the slice 4p
+reconciler + compensator still own correctness end-to-end. Operators who can't tolerate
+the queue-on-crash durability gap should leave the coalescer off and stay on the slice 4p
+outbox path (which is what production should default to until a bench on the production
+hardware confirms slice 4q's headroom is needed).
+
+### Slice 4q setup — env to flip the coalescer flag
+
+Append these to the `~/.oms-bench.env` from slice 4p (same ledger backing endpoint, same
+balance / identity envs, same compensator threshold for the fallback path):
+
+```
+export OMS_LEDGER_INFLIGHT_ASYNC_ENABLED=false           # coalescer takes priority anyway,
+                                                         # but flip async off so the
+                                                         # bench measures only the bulk path
+export OMS_LEDGER_INFLIGHT_COALESCER_ENABLED=true
+export OMS_LEDGER_INFLIGHT_COALESCER_MAX_BATCH_SIZE=50    # default
+export OMS_LEDGER_INFLIGHT_COALESCER_FLUSH_INTERVAL_MICROS=5000  # default 5 ms
+export OMS_LEDGER_INFLIGHT_COALESCER_QUEUE_CAPACITY=1000  # default
+export OMS_LEDGER_INFLIGHT_COALESCER_SUBMIT_TIMEOUT_MS=2000  # default
+```
+
+Restart the two ingress replicas (`./scripts/launch-bench-stack.sh ingress-1` /
+`ingress-2`) and re-run `scripts/benchmark/shoot-ingress-orders.sh`. The cluster-node /
+projector / fix-egress JVMs do not need to restart — the coalescer lives on the ingress
+replicas only.
+
+### When to flip back (rollback) — slice 4q
+
+If a slice 4q regression is suspected, the safe rollback is the slice 4p path:
+
+```
+export OMS_LEDGER_INFLIGHT_COALESCER_ENABLED=false
+export OMS_LEDGER_INFLIGHT_ASYNC_ENABLED=true
+```
+
+Items already in the coalescer queue at the time of restart are drained to
+`ledger_inflight_outbox` by `LedgerInflightCoalescer.stop()` (graceful Ctrl-C / SIGTERM);
+the slice 4p reconciler picks them up after the JVM comes back. A SIGKILL (kernel OOM,
+`kill -9`) loses any items currently in the in-memory queue — those orders are admitted
+at the cluster but the hold never reached Ledger or the outbox, and the slice 4p
+compensator cannot recover them because it only graduates rows that already exist in the
+outbox table. Operationally: prefer SIGTERM on the ingress replicas when the coalescer is
+on.
+
+### Slice 4q evidence — Pop! bench (TBD)
+
+Run with the env block above; the first slice-4q Pop! bench fills in this block in-place
+with the same A/B shape as `## Slice 4p evidence` (rps, failure %, HTTP RTT p50/p99,
+`oms_pipeline_ingress_accept` p50/p99, `oms_cluster_client_commit_round_trip` p50/p99,
+`oms_ledger_inflight_coalescer_flush_seconds`, batch-size distribution).
+
 ## Caveats
 
 - This is a **single-host single-cluster-node** rig. It does NOT exercise consensus, leader

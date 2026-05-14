@@ -10,6 +10,7 @@ import com.balh.oms.domain.Order;
 import com.balh.oms.domain.Side;
 import com.balh.oms.events.DomainEventEnvelopeCodec;
 import com.balh.oms.ledger.LedgerBalanceClient;
+import com.balh.oms.ledger.LedgerInflightCoalescer;
 import com.balh.oms.ledger.LedgerInflightReservationClient;
 import com.balh.oms.observability.PiiHash;
 import com.balh.oms.persistence.DomainEventOutboxRepository;
@@ -84,6 +85,9 @@ class OrderIngressServiceClusterGateTest {
         ObjectProvider<LedgerInflightReservationClient> ledgerInflight =
                 (ObjectProvider<LedgerInflightReservationClient>) mock(ObjectProvider.class);
         when(ledgerInflight.getIfAvailable()).thenReturn(null);
+        ObjectProvider<LedgerInflightCoalescer> ledgerInflightCoalescer =
+                (ObjectProvider<LedgerInflightCoalescer>) mock(ObjectProvider.class);
+        when(ledgerInflightCoalescer.getIfAvailable()).thenReturn(null);
         ObjectProvider<LedgerBalanceClient> ledgerBalance =
                 (ObjectProvider<LedgerBalanceClient>) mock(ObjectProvider.class);
         when(ledgerBalance.getIfAvailable()).thenReturn(null);
@@ -96,6 +100,7 @@ class OrderIngressServiceClusterGateTest {
                 objectMapper,
                 piiHash,
                 ledgerInflight,
+                ledgerInflightCoalescer,
                 ledgerBalance,
                 ledgerInflightOutbox,
                 new SimpleMeterRegistry(),

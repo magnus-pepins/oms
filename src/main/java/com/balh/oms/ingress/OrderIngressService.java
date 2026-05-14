@@ -17,6 +17,7 @@ import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.tailer.OrderControlAdmission;
 import com.balh.oms.domain.Side;
 import com.balh.oms.ledger.LedgerBalanceClient;
+import com.balh.oms.ledger.LedgerInflightCoalescer;
 import com.balh.oms.ledger.LedgerInflightReservationClient;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -35,6 +36,9 @@ import java.math.BigDecimal;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
 /**
@@ -84,6 +88,7 @@ public class OrderIngressService {
     private final ObjectMapper objectMapper;
     private final PiiHash piiHash;
     private final ObjectProvider<LedgerInflightReservationClient> ledgerInflightReservation;
+    private final ObjectProvider<LedgerInflightCoalescer> ledgerInflightCoalescer;
     private final ObjectProvider<LedgerBalanceClient> ledgerBalanceClient;
     private final LedgerInflightOutboxRepository ledgerInflightOutbox;
     private final MeterRegistry meterRegistry;
@@ -98,6 +103,7 @@ public class OrderIngressService {
             ObjectMapper objectMapper,
             PiiHash piiHash,
             ObjectProvider<LedgerInflightReservationClient> ledgerInflightReservation,
+            ObjectProvider<LedgerInflightCoalescer> ledgerInflightCoalescer,
             ObjectProvider<LedgerBalanceClient> ledgerBalanceClient,
             LedgerInflightOutboxRepository ledgerInflightOutbox,
             MeterRegistry meterRegistry,
@@ -110,6 +116,7 @@ public class OrderIngressService {
         this.objectMapper = objectMapper;
         this.piiHash = piiHash;
         this.ledgerInflightReservation = ledgerInflightReservation;
+        this.ledgerInflightCoalescer = ledgerInflightCoalescer;
         this.ledgerBalanceClient = ledgerBalanceClient;
         this.ledgerInflightOutbox = ledgerInflightOutbox;
         this.meterRegistry = meterRegistry;
@@ -365,6 +372,21 @@ public class OrderIngressService {
         if (order.limitPrice() == null) {
             return;
         }
+        // Slice 4q: coalescer takes priority when enabled — both async-outbox (4p) and
+        // sync-HTTP paths remain available so operators can flip back. Coalescer reuses the
+        // outbox as its fallback path on flush failure, so {@code inflightCompensatorEnabled}
+        // still backstops correctness end-to-end.
+        if (config.getLedger().isInflightCoalescerEnabled()) {
+            LedgerInflightCoalescer coalescer = ledgerInflightCoalescer.getIfAvailable();
+            if (coalescer != null) {
+                placeBuyLedgerInflightHoldThroughCoalescer(order, coalescer);
+                return;
+            }
+            // Coalescer flag on but bean missing (mis-wiring): fall through to async/sync paths
+            // rather than silently dropping the hold.
+            log.warn("inflight-coalescer-enabled=true but no LedgerInflightCoalescer bean; "
+                    + "falling back to async/sync path for orderId={}", order.id());
+        }
         if (config.getLedger().isInflightAsyncEnabled()) {
             enqueueBuyLedgerInflightHold(order);
             return;
@@ -388,6 +410,56 @@ public class OrderIngressService {
                     .tag("path", "sync")
                     .register(meterRegistry));
             throw new RuntimeException("ledger inflight reservation failed", e);
+        }
+    }
+
+    private void placeBuyLedgerInflightHoldThroughCoalescer(Order order, LedgerInflightCoalescer coalescer) {
+        Timer.Sample sample = Timer.start(meterRegistry);
+        long timeoutMs = config.getLedger().getInflightCoalescerSubmitTimeoutMs();
+        CompletableFuture<Void> ack;
+        try {
+            ack = coalescer.submit(order.id(), order.ledgerBalanceId(), order.quantity(), order.limitPrice());
+        } catch (IllegalStateException e) {
+            sample.stop(Timer.builder(METRIC_LEDGER_INFLIGHT_HOLD)
+                    .description("Ledger inflight coalescer hold at order accept")
+                    .tag("result", "failure")
+                    .tag("path", "coalescer")
+                    .register(meterRegistry));
+            throw new RuntimeException("ledger inflight coalescer rejected submit: " + e.getMessage(), e);
+        }
+        try {
+            ack.get(timeoutMs, TimeUnit.MILLISECONDS);
+            sample.stop(Timer.builder(METRIC_LEDGER_INFLIGHT_HOLD)
+                    .description("Ledger inflight coalescer hold at order accept")
+                    .tag("result", "success")
+                    .tag("path", "coalescer")
+                    .register(meterRegistry));
+        } catch (TimeoutException e) {
+            sample.stop(Timer.builder(METRIC_LEDGER_INFLIGHT_HOLD)
+                    .description("Ledger inflight coalescer hold at order accept")
+                    .tag("result", "timeout")
+                    .tag("path", "coalescer")
+                    .register(meterRegistry));
+            // The future is still pending — coalescer may still flush + outbox-fallback after we
+            // throw. The compensator path handles any orphaned admit since we roll back the
+            // ingress accept tx (no domain event emitted) and the cluster orderId stays admitted.
+            throw new RuntimeException(
+                    "ledger inflight coalescer ack timed out after " + timeoutMs + "ms", e);
+        } catch (ExecutionException e) {
+            sample.stop(Timer.builder(METRIC_LEDGER_INFLIGHT_HOLD)
+                    .description("Ledger inflight coalescer hold at order accept")
+                    .tag("result", "failure")
+                    .tag("path", "coalescer")
+                    .register(meterRegistry));
+            throw new RuntimeException("ledger inflight coalescer ack failed", e.getCause());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            sample.stop(Timer.builder(METRIC_LEDGER_INFLIGHT_HOLD)
+                    .description("Ledger inflight coalescer hold at order accept")
+                    .tag("result", "interrupted")
+                    .tag("path", "coalescer")
+                    .register(meterRegistry));
+            throw new RuntimeException("ledger inflight coalescer ack interrupted", e);
         }
     }
 

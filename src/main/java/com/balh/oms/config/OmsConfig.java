@@ -158,6 +158,58 @@ public class OmsConfig {
          * {@link #inflightAsyncEnabled} since the compensator is the correctness backstop for the
          * async path.
          */
+        /**
+         * Phase 4 slice 4q — when {@code true} with {@link #inflightReservationEnabled}, BUY
+         * inflight holds are coalesced through {@link com.balh.oms.ledger.LedgerInflightCoalescer}
+         * onto Ledger {@code POST /transactions/bulk?inflight=true&atomic=false} from a daemon
+         * flush thread, instead of the per-order outbox path
+         * ({@link #inflightAsyncEnabled}). Off by default — operators opt in alongside
+         * {@link #inflightCompensatorEnabled} since the coalescer reuses the outbox as its
+         * fallback path (any flush failure writes pending items to {@code ledger_inflight_outbox},
+         * where the existing reconciler + compensator pick them up).
+         *
+         * <p>Topology trade-off (see runbook "Slice 4q evidence" / systems/oms.md two-path
+         * topology table): the coalescer cuts the per-order critical-path Ledger HTTP cost from
+         * one synchronous round-trip to one shared bulk round-trip per {@code maxBatchSize}
+         * orders (or {@code flushIntervalMicros}, whichever fires first), and reduces the
+         * server-side {@code balances.version} OCC race surface by a factor of {@code batchSize}
+         * because the Ledger bulk handler iterates the batch sequentially within a single HTTP.
+         * The cost is a small in-memory durability gap: an item in the queue at JVM crash time
+         * is lost (the order is admitted at the cluster but the hold never reached either Ledger
+         * or the outbox). The slice 4p compensator does NOT recover this gap because it only
+         * graduates rows that crossed {@link #inflightCompensatorAttemptsThreshold} — a row that
+         * never existed cannot graduate. Operators who can't tolerate that gap stay on the
+         * outbox path ({@link #inflightAsyncEnabled} only).
+         */
+        private boolean inflightCoalescerEnabled = false;
+        /**
+         * Maximum items the coalescer will batch into a single Ledger bulk POST. Larger batches
+         * amortise HTTP round-trip cost across more orders but widen the worst-case shutdown
+         * drain (each in-flight batch must finish or be flushed to outbox before the JVM stops).
+         */
+        private int inflightCoalescerMaxBatchSize = 50;
+        /**
+         * Maximum time the daemon flush thread waits for the next item once the queue empties
+         * before flushing whatever it has. Tuning lever between latency (lower = closer to sync
+         * RTT for first item) and throughput (higher = larger batches when load is bursty).
+         * Default 5 ms balances both for the slice 4p bench shape (HTTP RTT ≈ 25 ms; 5 ms wait
+         * lets a 50-item batch fill in steady state without stalling first arrivals).
+         */
+        private long inflightCoalescerFlushIntervalMicros = 5_000L;
+        /**
+         * Bounded queue capacity. {@code submit} fails fast with {@code IllegalStateException}
+         * when full, which propagates as 503 to the ingress caller — same operator contract as
+         * cluster back-pressure.
+         */
+        private int inflightCoalescerQueueCapacity = 1_000;
+        /**
+         * Caller (ingress thread) wait budget for the per-item future to complete. Includes the
+         * worst-case flush wait + the bulk Ledger HTTP RTT. Sized at 2 s to absorb an entire
+         * Ledger {@code readTimeoutMs} (5 s) at the bulk endpoint while still failing the order
+         * fast on a stalled coalescer (operator should pair this with monitoring on the
+         * {@code oms_ledger_inflight_coalescer_submit_seconds} histogram).
+         */
+        private long inflightCoalescerSubmitTimeoutMs = 2_000L;
         private boolean inflightCompensatorEnabled = false;
         /**
          * Number of failed Ledger hold attempts before the compensator graduates a row to a
@@ -218,6 +270,25 @@ public class OmsConfig {
         public void setInflightOutboxReconcilerBatchSize(int v) { this.inflightOutboxReconcilerBatchSize = v; }
         public long getInflightOutboxReconcilerIntervalMs() { return inflightOutboxReconcilerIntervalMs; }
         public void setInflightOutboxReconcilerIntervalMs(long v) { this.inflightOutboxReconcilerIntervalMs = v; }
+
+        public boolean isInflightCoalescerEnabled() { return inflightCoalescerEnabled; }
+        public void setInflightCoalescerEnabled(boolean v) { this.inflightCoalescerEnabled = v; }
+        public int getInflightCoalescerMaxBatchSize() { return inflightCoalescerMaxBatchSize; }
+        public void setInflightCoalescerMaxBatchSize(int v) {
+            this.inflightCoalescerMaxBatchSize = Math.max(1, v);
+        }
+        public long getInflightCoalescerFlushIntervalMicros() { return inflightCoalescerFlushIntervalMicros; }
+        public void setInflightCoalescerFlushIntervalMicros(long v) {
+            this.inflightCoalescerFlushIntervalMicros = Math.max(100L, v);
+        }
+        public int getInflightCoalescerQueueCapacity() { return inflightCoalescerQueueCapacity; }
+        public void setInflightCoalescerQueueCapacity(int v) {
+            this.inflightCoalescerQueueCapacity = Math.max(100, v);
+        }
+        public long getInflightCoalescerSubmitTimeoutMs() { return inflightCoalescerSubmitTimeoutMs; }
+        public void setInflightCoalescerSubmitTimeoutMs(long v) {
+            this.inflightCoalescerSubmitTimeoutMs = Math.max(100L, v);
+        }
 
         public boolean isInflightCompensatorEnabled() { return inflightCompensatorEnabled; }
         public void setInflightCompensatorEnabled(boolean v) { this.inflightCompensatorEnabled = v; }

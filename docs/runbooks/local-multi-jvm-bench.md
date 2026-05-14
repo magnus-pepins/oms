@@ -3106,22 +3106,144 @@ configured batch size approaches the in-flight count, threads can park inside
 
 ### Recommended next slices (post-D-6)
 
-* **Phase D-11 (new) — egress event batching from the cluster service.** If the
-  per-admit `events.offer` is the actual wall (hypothesis above), batching the
-  cluster's *outbound* egress events into one Aeron frame per batch *would* amortise
-  the right cost. This requires changing the egress wire format and the
-  `OmsClusterIngressClient` egress polling loop to demux N events per frame —
-  meaningfully bigger lift than D-6 inbound. Verify the hypothesis by reading
-  `aeron_publication_back_pressure_ratio` on the events publication or adding a
-  micrometer timer around `events.offer` in `applyAcceptOrder` first.
-* **Phase D-10 — projector decoupling.** Still on the list. If projector-side back-up
-  is starving the cluster `events.offer`, splitting projector + reconciler onto
-  separate JVMs / scheduler pools would relieve that. Bench-only-relevant on Pop!,
-  but the structural concern remains for production.
-* **Phase D-7 — Tomcat thread bump.** Stays disproven. Don't revisit until cluster /
-  egress wall lifts.
+After the **D-investigate falsifier below**, the post-D-6 plan is rewritten:
+
+* **Phase D-11 (egress event batching from the cluster service) — DROPPED.**
+  Falsified by the D-investigate run below: per-admit `events.offer` and
+  `session.offer` together total **~2 µs**, ≪ 0.1 % of the 3.4 ms cluster RTT.
+  Batching the cluster's outbound egress would amortise a non-bottleneck.
+* **Phase D-10 — projector decoupling.** Still on the list, but **not motivated
+  for ingress RPS** — projector lag does not back-pressure the cluster's
+  `events.offer` (events_BP_ticks/admit ≈ 0.16 at c2400, sub-microsecond
+  total wait per admit). Keep D-10 for *production stability* (so the
+  reconciler's blocking Ledger calls can't starve the projector's drain),
+  but expect zero ingress-side rps lift.
+* **Phase D-7 — Tomcat thread bump.** Stays disproven.
 * **Phase D-5 — split projector + fix-egress onto a separate Supavisor tenant.**
   Stays deprioritised.
+* **Phase 5 — multi-host / k8s.** The remaining ~3.4 ms cluster RTT is in
+  Aeron transport (media-driver IPC + log append + driver round-trip). On a
+  single-host rig the media driver is a shared bottleneck across ingress +
+  cluster + projector + fix-egress JVMs. Further single-host RPS gains will
+  require either Aeron media-driver tuning (dedicated sender/receiver/conductor
+  threads, off-cpu pinning) or moving to a multi-host topology. **Defer
+  further OMS-code optimisation; the OMS side is at its single-host ceiling.**
+
+## Tier 2.5 phase D-investigate — falsifying "per-admit egress publish is the wall" (Pop! 2026-05-14)
+
+Code: commit `oms@3cc3cea` (`oms: instrument cluster-service per-emit publish path
+(D-investigate)`). Adds four meters on
+{@code OmsAdmissionClusteredService} exposed at the cluster-node JVM's
+`:8089/metrics`:
+
+* `oms.cluster.service.events_offer_seconds{event_kind=admitted}` — Timer,
+  per-call wall time of `eventsPublication.offer` including any
+  `Thread.yield` busy-wait on Aeron back-pressure.
+* `oms.cluster.service.events_offer_back_pressure_total{event_kind=admitted}`
+  — Counter, increments once per `Thread.yield` tick. Non-zero rate signals
+  the Archive / projector consume rate isn't keeping up with leader produce.
+* `oms.cluster.service.session_offer_seconds{event_kind=accepted}` — Timer,
+  same shape for the egress `OrderAcceptedEvent` reply via `session.offer`.
+* `oms.cluster.service.session_offer_back_pressure_total{event_kind=accepted}`
+  — Counter for the egress publication.
+
+Same instrumentation pattern as the existing `oms.cluster.snapshot.duration`
+timer (line ~385); meters are observability-only on a JVM-local registry, so
+they don't violate the cluster-service determinism rule (no impact on emitted
+event payloads / state / cluster log).
+
+### Bench shape
+
+Single leg, admit-batch off (the D-9 / leg-A baseline, just with the new
+meters running). c80/warmup → c1600 → c2400 → c3200, 5 k → 640 k requests
+per step, two-ingress round-robin. Peak rps = **57 023 at c2400** — within
+the noise band of the un-instrumented D-6 leg A (55 909) and the D-9 main
+commit (57 282), so the timer overhead is sub-1 % and not regressing
+throughput.
+
+### Per-emit publish times — falsifier
+
+| Concurrency | admits at ingress | cluster RTT mean (ms, ingress view) | events_offer mean (µs, cluster) | session_offer mean (µs, cluster) | events BP ticks / admit | session BP ticks / admit |
+|-------------|-------------------|--------------------------------------|---------------------------------|-----------------------------------|--------------------------|---------------------------|
+| c1600       | 160 281           | 3.384                                | 1.0                             | 1.0                               | 0.19                     | 0.00                      |
+| **c2400**   | **240 300**       | **3.420**                            | **1.0**                         | **1.0**                           | **0.16**                 | **0.00**                  |
+| c3200       | 320 402           | 3.383                                | 1.0                             | 1.0                               | 0.14                     | 0.00                      |
+
+At c2400: cluster-node-side counts confirm the meters fired correctly —
+`events_offer.count = 480 000` (one per admit on each accept), `session_offer.count =
+480 000` (one accepted-event egress per admit), `events_offer_back_pressure_total =
+78 341` (~0.16 ticks/admit on average; 16 % of admits saw at least one yield),
+`session_offer_back_pressure_total = 4` (essentially zero — egress to the
+ingress client never back-presses).
+
+**The result:** per-admit egress publish work — `events.offer` + `session.offer` —
+totals **~2 µs**, while ingress sees **~3 400 µs of cluster RTT**. Egress
+publish is **0.06 % of cluster RTT.** The "per-admit egress publish is the
+wall" hypothesis from the post-D-6 runbook is **decisively falsified.** D-11
+(egress event batching from the cluster service) would amortise a
+non-bottleneck; **D-11 is dropped from the next-slice list.**
+
+### Where the cluster RTT actually goes
+
+3 400 µs cluster RTT − 2 µs egress publish = **~3 398 µs unaccounted on the
+cluster service thread** at c2400. This time is *outside*
+`applyAcceptOrder`'s emit calls (the only OMS-cluster-code we measured), so it
+falls in the **Aeron-internal transport** path:
+
+1. Aeron client publication on the ingress JVM (offer to local media driver).
+2. Driver-to-driver transport — Pop! single-host = UDP loopback or IPC SHM
+   ring buffers between the ingress driver and the cluster-node driver.
+3. Cluster module receive on the leader (Aeron Cluster Service Container's
+   `pollImage` loop reading from the consensus stream).
+4. Consensus log append (single-host = no replication wait but still a
+   serialised append on one log buffer).
+5. `applyAcceptOrder` body — idempotency lookup (HashMap), state update,
+   emit calls (~2 µs total per the table above).
+6. Egress driver-to-driver transport back to the ingress JVM.
+7. Ingress driver-to-client receive + `pending`-map demux + future completion
+   + Tomcat exec-thread wakeup.
+
+Steps 1–4, 6–7 are **Aeron media-driver work, not OMS code.** On Pop!
+single-host all four JVMs (ingress×2, cluster-node, projector, fix-egress)
+share the same per-driver conductor thread for their respective drivers and
+the same kernel for the shared-memory rings. With ~57 k admits/s × multiple
+publications / subscriptions per admit, per-driver conductor work + kernel
+context switches add up.
+
+### Why this matters for the next-slice plan
+
+* **The OMS-side levers (D-1 → D-9) have been pulled.** Hot path opens zero
+  Postgres connections, zero blocking HTTP calls, zero `Spring @Transactional`
+  on accept — verified in D-9 jstack (174 / 214 ingress threads parked on
+  cluster reply, no I/O frames). The remaining 3.4 ms is Aeron-internal.
+* **Further single-host RPS gains will require Aeron-side work** (dedicated
+  sender / receiver / conductor threads, off-cpu pin, MDC flags for shared-mem
+  IPC instead of UDP loopback) or **moving to multi-host** (Phase 5 k8s).
+* **Don't chase D-10 / D-11 / D-12 single-host code optimisations** until
+  either of the above is available; the model says no OMS-code change can
+  meaningfully amortise the residual 3.4 ms.
+* **What we *should* do next on this rig:** read the **Aeron driver counter
+  file** (`aeron-stat -d $AERON_DIR/media-driver/cnc.dat`) during a c2400 step
+  and look for the publication-back-pressure-events / image-block-position-lag
+  counters on the cluster-input + events publications. That tells us *which*
+  Aeron internal path is the bound (driver conductor saturating? back-pressure
+  on the consensus log? receive-thread starved?). One short bench run, no code
+  change.
+
+### Lessons (D-investigate specific)
+
+* **Two days of "the cluster admit is the wall" was correct on shape but
+  misleading on cause.** D-6 / D-7 / "D-11 egress" all assumed the wall was
+  inside `applyAcceptOrder` (framing, dispatch, egress emit). The real wall
+  was *outside* it, in Aeron transport. A single hour of instrumentation
+  beats a slice of speculative implementation.
+* **Default-on observability for hot paths pays off.** The four meters added
+  here cost ~1 % overhead and now let any future bench answer "is publish the
+  wall?" without re-instrumenting. Keep them on.
+* **Falsifying expensive D-11 work was cheap.** ~1 hour of code + 5-min bench
+  vs days of egress-wire-format design. This is the same lesson as the
+  pre-D-6 D-7 falsification (5-min env-flip beat hours of speculative
+  Tomcat-thread-bump rationalisation).
 
 ## Caveats
 

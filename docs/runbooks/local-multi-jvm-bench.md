@@ -1321,6 +1321,177 @@ accept→bulk-HTTP coupling + single flush thread per JVM, not the bulk endpoint
   blocking property and the JVM-crash durability gap, and lets the bulk endpoint's OCC
   reduction land on top of slice 4p's accept latency floor instead of replacing it.
 
+## Profile-led pivot — where the ingress ceiling actually lives (Pop! 2026-05-14)
+
+Written **before** any slice 4r / Tier-2.5-phase-C work, after slice 4q walked itself
+back. The standing question after slice 4q was: "is the next 2× rps available, and where
+is it?" Not by guessing — by measuring at the slice 4p ceiling. The data below answers
+"yes, but not where slice 4q assumed".
+
+### Setup
+
+- Pop! `192.168.68.112`, slice 4p production-shaped config: `OMS_LEDGER_INFLIGHT_ASYNC_ENABLED=true`,
+  `OMS_LEDGER_INFLIGHT_COALESCER_ENABLED=false`, 2× ingress replicas + cluster-node + projector + fix-egress.
+- Bench: `bootRunBurst` with `OMS_BURST_TOTAL=30000` / `OMS_BURST_CONCURRENCY=50`,
+  round-robin across `:8088` and `:8188`, real Ledger HTTP, AAPL 1@150.
+- The 5 k bursts in slices 4o–4q are warmup-bound; **30 k is closer to true steady state**.
+
+### What the 30 k burst measured
+
+| Surface | Value | Notes |
+|---|---|---|
+| **Throughput** | **1 094 rps** | (vs 768 rps on the 5 k slice 4p bench — 5 k underestimated the ceiling) |
+| HTTP RTT p50 / p99 / p99.9 | 21.1 / 54.8 / 100.7 ms | client-side, n=29 840 successful |
+| Failures | 119 / 30 000 = 0.4 % | all `502` (Ledger transient), no OCC |
+| `oms_pipeline_ingress_accept_seconds` p50 / p99 (ingress-1) | **4.2 / 9.1 ms** | **server-side @Transactional** |
+| `oms_cluster_client_commit_round_trip_seconds` p50 / p99 (ingress-1) | 1.4 / 4.5 ms | inside the accept tx |
+| `pg_stat_statements` accept-tx INSERTs (per call) | 0.02–0.04 ms | three INSERTs total ≈ 0.10 ms / accept |
+
+The first observation is that the 5 k-burst headline of "768 rps" was a warmup-shaped
+underestimate; **the true slice 4p ceiling on this rig is ~1 094 rps**. Refit any "next
+slice will lift X" claim against 1 094 rps, not 768 rps.
+
+The second observation is that the **server-side accept tx is fast** (4 ms p50). The
+17 ms gap between server-tx p50 (4 ms) and HTTP-RTT p50 (21 ms) lives **outside**
+`@Transactional`: Tomcat acceptor queue, filter chain, JSON serialise, and — critically —
+**Hikari connection borrow-wait before the @Transactional opens**.
+
+### What the jstack mid-bench captured
+
+`jstack` of ingress-1 (PID 2 473 554) at 8 s into the burst (peak load) showed:
+
+| Counter | Value |
+|---|---|
+| `http-nio-8088-exec-*` threads total | 41 |
+| Threads stalled inside `HikariPool.getConnection` (parking on `SynchronousQueue$Transferer`) | **15** |
+| Threads in `RUNNABLE` (mostly `EPoll.wait` / `Net.poll` — connector-idle, not mid-request) | 18 |
+
+So at peak load, **~37 % of ingress-1's request threads are queued on Hikari**, not on
+SQL execution, not on the cluster commit, not on Ledger. The pool is sized 20
+(`OMS_PG_POOL_MAX_SIZE=20`); the queue is the consequence.
+
+### Why the pool is starved — `pg_stat_statements` after the run
+
+```text
+total_ms |  calls  | mean_ms | pct  | query
+---------+---------+---------+------+------------------------------------
+296579.9 |    397  | 747.053 | 97.6 | SELECT ... FROM domain_event_outbox
+                                       WHERE published_at IS NULL
+                                         AND created_at <= $1
+                                       ORDER BY id LIMIT $2 FOR UPDATE SKIP LOCKED
+  1192.5 | 29 881  |   0.040 |  0.4 | INSERT INTO ledger_inflight_outbox ...
+  1020.0 | 45 995  |   0.022 |  0.3 | SELECT t.precise_amount ... FROM transactions
+   779.4 | 46 097  |   0.017 |  0.3 | INSERT INTO domain_event_outbox ...
+   653.5 | 16 114  |   0.041 |  0.2 | INSERT INTO orders ...
+   535.4 | 16 114  |   0.033 |  0.2 | UPDATE orders ...
+```
+
+**One query is 97.6 %** of all Postgres execution time during the run: the
+`DomainFanoutReconciler` (`@Scheduled fixedDelay=500 ms`) draining
+`domain_event_outbox`. 397 calls × 747 ms each ≈ 296 s of accumulated tx time during a
+27 s wall-clock burst, i.e. multiple JVMs running it concurrently and each call holds a
+Hikari connection for ~3/4 of a second.
+
+The accept-tx writes — `INSERT orders`, `INSERT domain_event_outbox`, `INSERT
+ledger_inflight_outbox`, `UPDATE orders` — together account for **<1.2 % of Postgres
+exec time**. Postgres is not the ingress bottleneck; **Postgres is mostly idle when the
+reconciler isn't running, and saturated on one bad query when it is**.
+
+### Why that one query is 747 ms — `EXPLAIN ANALYZE`
+
+```text
+Limit  (cost=0.43..4822.36 rows=200 width=74) (actual time=662.221..662.275 rows=50 loops=1)
+  Buffers: shared hit=728 255 read=306 999 dirtied=9 written=180
+  ->  LockRows  (cost=0.43..2 400 188.73 rows=99 553 width=74) (actual time=662.221..662.271 rows=50 loops=1)
+        ->  Index Scan using domain_event_outbox_pkey on domain_event_outbox
+              (cost=0.43..2 399 193.20 rows=99 553 width=74)
+              (actual time=662.120..662.178 rows=72 loops=1)
+              Filter: ((published_at IS NULL) AND (created_at <= now()))
+              Rows Removed by Filter: 3 138 866
+Planning Time: 0.346 ms
+Execution Time: 662.314 ms
+```
+
+Postgres is using **`domain_event_outbox_pkey`** (the PK on `id`) — not the partial
+index `idx_domain_event_outbox_pending btree (created_at) WHERE published_at IS NULL` —
+because `ORDER BY id` matches pkey ordering and the planner avoids a Sort. With **3.14 M
+total rows** in the table (only ~100 unpublished at any moment, the rest are completed
+events that are never deleted), the pkey scan walks **3 138 866 rows** through the heap
+and `LockRows` on top to filter out the 99.997 % that are already published. That's the
+662 ms.
+
+The partial index on `created_at` is on the wrong column to satisfy `ORDER BY id`. The
+planner picks pkey, the pkey is ~99.997 % dead-for-this-predicate, and the scan ends up
+in an O(table-size) regime rather than O(unpublished).
+
+### What this means for the next slice
+
+The pre-conditions for a real lift are:
+
+1. The **DomainFanoutReconciler SELECT** is the dominant Postgres time and a
+   real source of Hikari contention on ingress JVMs.
+2. The **accept tx itself is already fast** (4 ms p50, 9 ms p99 server-side). Slice 4r as
+   originally pitched (re-shape the Ledger hold path) is **not on the critical path** at
+   1 094 rps — the accept tx isn't waiting on Ledger, it's waiting on a connection.
+3. The **17 ms HTTP-vs-server gap** is dominated by Hikari borrow-wait. Removing the
+   reconciler stall (or growing the pool, or running the reconciler off the ingress
+   pool) should compress that gap directly.
+
+Falsifiable hypothesis: an evidence-led "Tier 2.5 phase C" slice that adds a partial
+index `(id) WHERE published_at IS NULL` (or moves the reconciler off the ingress pool,
+or both) will:
+
+- drop `pg_stat_statements` mean for that query from 747 ms to <1 ms,
+- drop `http-nio-*-exec` parking-on-Hikari count below 5 at peak,
+- lift sustained 30 k-burst rps from 1 094 → at least 1 800 rps (i.e. the same
+  factor that the connection-conservation buys back),
+- have **no** correctness change — the reconciler's `FOR UPDATE SKIP LOCKED` semantics
+  are unchanged.
+
+Both ways to verify the hypothesis are cheap: scrape `pg_stat_statements` after the
+fix, and re-run the same 30 k burst.
+
+### Slices ruled IN by the data
+
+- **Phase-C-1** (cheap, surgical, evidence-led): add `CREATE INDEX CONCURRENTLY
+  idx_domain_event_outbox_pending_id ON domain_event_outbox (id) WHERE published_at IS
+  NULL;` so `ORDER BY id LIMIT N FOR UPDATE SKIP LOCKED` walks only unpublished rows.
+- **Phase-C-2** (housekeeping, correctness-neutral): periodic
+  `DELETE FROM domain_event_outbox WHERE published_at IS NOT NULL AND published_at < now() - interval '7 days'`,
+  or move published rows to a partitioned tail. Bounds the "even with the right index,
+  bloat will eventually catch us" risk.
+- **Phase-C-3** (decoupling): give the reconciler its **own** small Hikari pool
+  (`spring.datasource.reconciler.hikari.maximum-pool-size=4`) so even a slow query
+  cannot starve HTTP accepts. Optional if Phase-C-1 lands the lift cleanly.
+
+### Slices ruled OUT (or down-prioritised) by the data
+
+- **Slice 4r as originally framed** (rebuild the LedgerInflightCoalescer as
+  fire-and-forget at-accept). The accept tx is not Ledger-bound at 1 094 rps. Until
+  Phase-C lands, slice 4r risks the same shape of mistake as 4q: building before
+  measuring whether the bottleneck it addresses is even live.
+- **Cluster-node parallelism / projector parallelism**. `cluster_client_commit_round_trip
+  p99 = 4.5 ms` and projector-lag stays in single-digit seconds in the slice 4n
+  verification run; neither is the live ceiling at 1 094 rps.
+
+### Operator-side: how to confirm before / after Phase-C-1
+
+1. Reset stats: `docker exec ledger-supabase-db psql -U supabase_admin -d oms -c 'SELECT
+   pg_stat_statements_reset();'`
+2. Run the same 30 k burst (`OMS_BURST_TOTAL=30000 OMS_BURST_CONCURRENCY=50` against
+   both ingress URLs round-robin).
+3. Compare:
+   - **rps + HTTP RTT p50/p99** (HdrHistogram in burst summary).
+   - **pg_stat_statements top-by-time** — the reconciler row's `mean_ms` should drop
+     from ~700 ms to <1 ms; its `pct` should drop from 97.6 % to single digits.
+   - **`jstack` of one ingress JVM at peak** — count of `http-nio-*-exec` threads
+     parking inside `HikariPool.getConnection` should drop below 5 (target: 0).
+
+Logs from the 2026-05-14 baseline live in
+`~/oms/logs/bench-profile-2026-05-14/` on Pop! (`pre-/post-ingress-{1,2}.txt`,
+`mid1-{cluster,projector,fixegress,ingress1,ingress2}.jstack`,
+`pg-top-by-time.txt`, `burst.log`).
+
 ## Caveats
 
 - This is a **single-host single-cluster-node** rig. It does NOT exercise consensus, leader

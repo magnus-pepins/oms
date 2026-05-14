@@ -153,32 +153,85 @@ public class OrderIngressService {
      * committed"; the Postgres orders row materialises shortly after via the projector.
      *
      * <p>Phase 4 Tier 2.5 phase C-2: the Ledger {@code GET /balances/{id}} sync HTTP call
-     * for {@link #maybeVerifyLedgerBalanceBinding} now runs <strong>before</strong> the
-     * Postgres transaction opens. Pop! 2026-05-14 jstacks (post-V30+V31 indexes) showed
-     * 17 of ingress-2's 39 http-nio threads RUNNABLE inside
-     * {@code HttpClient.parseHTTPHeader} on this verify call, while still holding a Hikari
-     * connection acquired by the surrounding {@code @Transactional}. Pulling the verify
-     * out of the tx and using an explicit {@link TransactionTemplate} for the
-     * Postgres+cluster-commit work makes the conn-hold cover only Postgres time
-     * (microseconds) instead of Postgres+Ledger-RTT (10–20 ms).
+     * for {@link #maybeVerifyLedgerBalanceBinding} runs <strong>before</strong> any tx opens.
+     * Phase 4 Tier 2.5 phase D-1: {@link #submitToClusterOrThrow} also runs
+     * <strong>before</strong> the tx opens. Pop! 2026-05-14 C-4 sweep showed Hikari pool size
+     * was not the lever — at saturation, the conn-holders were threads parked on
+     * {@code OmsClusterIngressClient.submitAcceptOrder → CompletableFuture.get} (waiting on
+     * the Aeron cluster commit reply) <em>inside</em> {@code transactionTemplate.execute}.
+     * The Aeron cluster commit RTT (mean ~0.9 ms, p999 ~11 ms) was being charged against
+     * the Hikari connection-hold budget. Pulling the cluster admit out of the tx drops
+     * conn-hold from ~3-8 ms (admit + INSERTs + commit) to ~0.5-1 ms (INSERTs + commit).
      *
-     * <p>Behaviour-preserving: error semantics for the verify path are unchanged
+     * <p><strong>Durability gap closure (D-1).</strong> The cluster log is the source of
+     * truth for "this order was admitted"; it commits independently of the Postgres tx.
+     * If the ingress JVM crashes between {@link #submitToClusterOrThrow} returning and the
+     * tx committing, the order is in the cluster but the {@code domain_event_outbox} +
+     * {@code ledger_inflight_outbox} rows are missing. {@code OmsPostgresProjector} closes
+     * the financial-correctness half of that gap by idempotently backfilling the
+     * {@code ledger_inflight_outbox} row from {@link com.balh.oms.cluster.OrderAdmittedEvent}
+     * (D-1; uses {@code uq_ledger_inflight_outbox_order_id} → {@code ON CONFLICT DO NOTHING}
+     * so the happy-path INSERT here stays authoritative). The {@code domain_event_outbox}
+     * {@code OrderAccepted} envelope is best-effort: a crash here means downstream consumers
+     * see {@code OrderWorking} (emitted by the projector via
+     * {@link OrderControlAdmission#persistAdmission}) without the preceding
+     * {@code OrderAccepted}; this is acceptable today (status fanout is the contract, the
+     * "received" stage is informational).
+     *
+     * <p>Behaviour-preserving: error semantics for verify + cluster admit are unchanged
      * ({@code ledger_identity_required} / {@code ledger_identity_mismatch} /
-     * {@code ledger_balance_not_found} / {@code ledger_identity_lookup_failed} still
-     * surface as the same HTTP status codes) and the
+     * {@code ledger_balance_not_found} / {@code ledger_identity_lookup_failed} /
+     * {@code cluster_admission_timeout} / {@code cluster_unavailable} /
+     * {@code cluster_rejected} all surface as the same HTTP status codes) and the
      * {@code oms.pipeline.ingress.accept_seconds} timer still wraps the full method
      * surface from a caller's perspective.
      */
     public IngressResult persistAccepted(CreateOrderRequest req) {
         Timer.Sample ingressSample = Timer.start(meterRegistry);
         try {
+            // Pre-tx phase: HTTP / cluster work that must NOT hold a Hikari connection.
+            //   1. Ledger balance/identity verify (HTTP; pulled out of tx in C-2).
+            //   2. Aeron cluster admit (CompletableFuture wait; pulled out of tx in D-1).
+            // Both can fail and short-circuit before any Postgres conn is acquired.
             maybeVerifyLedgerBalanceBinding(req);
-            IngressResult result = transactionTemplate.execute(status -> persistAcceptedBody(req));
+
+            UUID id = UUID.randomUUID();
+            Instant now = Instant.now();
+            int shardId = ShardKey.shardFor(req.accountId(), config.getShard().getCount());
+            String accountIdHash = piiHash.hash(req.accountId());
+            String ledgerBalanceId = normalizeLedgerBalanceId(req.ledgerBalanceId());
+            Order order = buildOrder(id, req, shardId, accountIdHash, ledgerBalanceId, now);
+
+            AdmissionResult ar = submitToClusterOrThrow(clusterIngressClient, order, accountIdHash, now);
+            AdmissionResult.Accepted accepted = (AdmissionResult.Accepted) ar;
+            boolean created = !accepted.event().duplicate();
+            if (accepted.event().duplicate() && !accepted.event().orderId().equals(id)) {
+                // Cluster idempotency: an earlier submission for this (accountId, idempotencyKey) won.
+                // Echo the original orderId in the response body so the caller sees a single identity.
+                id = accepted.event().orderId();
+                order = buildOrder(id, req, shardId, accountIdHash, ledgerBalanceId, now);
+            }
+
+            if (!created) {
+                // Duplicate at the cluster: the orders row + outbox rows were already produced by
+                // the original submission. Return without opening a tx; the projector does NOT
+                // re-emit OrderAdmittedEvent on idempotent re-hits (see slice 2b-1), and re-inserting
+                // the side-tables would create spurious extra domain envelopes / ledger holds.
+                OmsPipelineMetrics.finishIngressAccept(meterRegistry, ingressSample, "duplicate");
+                return new IngressResult(order, false);
+            }
+
+            // Tx phase: Postgres outbox writes only. Capture in finals for the lambda capture.
+            // The Aeron commit has already happened, so the cluster log is durable independent
+            // of this tx; the projector backfills ledger_inflight_outbox from the cluster event
+            // if this tx never commits (D-1, see method-level Javadoc).
+            UUID finalId = id;
+            Order finalOrder = order;
+            IngressResult result = transactionTemplate.execute(status -> persistAcceptedBody(finalId, finalOrder));
             if (result == null) {
                 throw new IllegalStateException("transactionTemplate returned null IngressResult");
             }
-            OmsPipelineMetrics.finishIngressAccept(
-                    meterRegistry, ingressSample, result.created() ? "created" : "duplicate");
+            OmsPipelineMetrics.finishIngressAccept(meterRegistry, ingressSample, "created");
             return result;
         } catch (RuntimeException e) {
             OmsPipelineMetrics.finishIngressAccept(meterRegistry, ingressSample, "error");
@@ -188,38 +241,14 @@ public class OrderIngressService {
 
     /**
      * The Postgres-transactional portion of {@link #persistAccepted}. Caller must have
-     * already run {@link #maybeVerifyLedgerBalanceBinding} (the only step that did Ledger
-     * sync HTTP — see Phase 4 Tier 2.5 phase C-2 note on {@link #persistAccepted}).
+     * already run {@link #maybeVerifyLedgerBalanceBinding} (C-2 — Ledger HTTP) and
+     * {@link #submitToClusterOrThrow} (D-1 — Aeron cluster admit). This body only does
+     * the residual outbox-side INSERTs that benefit from being one tx (so a fanout row
+     * is never written without its matching ledger inflight hold for BUY orders, modulo
+     * the projector backfill described on {@link #persistAccepted}).
      */
-    private IngressResult persistAcceptedBody(CreateOrderRequest req) {
-        UUID id = UUID.randomUUID();
-        Instant now = Instant.now();
-        int shardId = ShardKey.shardFor(req.accountId(), config.getShard().getCount());
-        String accountIdHash = piiHash.hash(req.accountId());
-        String ledgerBalanceId = normalizeLedgerBalanceId(req.ledgerBalanceId());
-
-        Order order = buildOrder(id, req, shardId, accountIdHash, ledgerBalanceId, now);
-
-        AdmissionResult ar = submitToClusterOrThrow(clusterIngressClient, order, accountIdHash, now);
-        AdmissionResult.Accepted accepted = (AdmissionResult.Accepted) ar;
-        boolean created = !accepted.event().duplicate();
-        if (accepted.event().duplicate() && !accepted.event().orderId().equals(id)) {
-            // Cluster idempotency: an earlier submission for this (accountId, idempotencyKey) won.
-            // Echo the original orderId in the response body so the caller sees a single identity.
-            id = accepted.event().orderId();
-            order = buildOrder(id, req, shardId, accountIdHash, ledgerBalanceId, now);
-        }
-
-        if (!created) {
-            // Duplicate at the cluster: the orders row + domain fanout were already produced by
-            // the original submission. Return without re-writing them; the projector does NOT
-            // re-emit OrderAdmittedEvent on idempotent re-hits (see slice 2b-1), and re-inserting
-            // the side-tables would create spurious extra domain envelopes.
-            return new IngressResult(order, false);
-        }
-
+    private IngressResult persistAcceptedBody(UUID id, Order order) {
         maybePlaceBuyLedgerInflightHold(order);
-
         try {
             domainEventOutbox.insert(id, domainEventEnvelopeCodec.orderAccepted(order));
         } catch (JsonProcessingException e) {

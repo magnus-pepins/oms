@@ -39,6 +39,21 @@ public class LedgerInflightOutboxRepository {
             """;
 
     /**
+     * Phase 4 Tier 2.5 phase D-1: idempotent INSERT used by the projector to backfill the row
+     * if the ingress JVM crashed between cluster admit and its outbox-INSERT transaction commit.
+     *
+     * <p>Relies on the existing {@code uq_ledger_inflight_outbox_order_id} unique index from
+     * V4. {@code ON CONFLICT (order_id) DO NOTHING} makes happy-path (ingress already wrote the
+     * row) a no-op, and the crash-window path produces the same row the ingress would have
+     * produced — so the slice 4p reconciler/compensator pipeline picks it up without changes.
+     */
+    private static final String INSERT_IF_ABSENT_SQL = """
+            INSERT INTO ledger_inflight_outbox (order_id, payload_json, created_at)
+            VALUES (:order_id, CAST(:payload AS jsonb), :created_at)
+            ON CONFLICT (order_id) DO NOTHING
+            """;
+
+    /**
      * {@code FOR UPDATE SKIP LOCKED} — callers must run inside a Spring transaction that spans fetch +
      * {@link #markPublished}/{@link #markFailed} (see {@link com.balh.oms.reconciler.LedgerInflightOutboxReconciler}).
      *
@@ -102,6 +117,23 @@ public class LedgerInflightOutboxRepository {
                 .addValue("payload", payloadJson)
                 .addValue("created_at", Timestamp.from(Instant.now()));
         jdbc.update(INSERT_SQL, params);
+    }
+
+    /**
+     * Phase 4 Tier 2.5 phase D-1: idempotent variant of {@link #insert(UUID, String)} used by
+     * {@link com.balh.oms.projector.OmsPostgresProjector} to backfill the row if the ingress
+     * JVM crashed between cluster admit and outbox-INSERT commit. See {@link #INSERT_IF_ABSENT_SQL}.
+     *
+     * @return {@code true} when this call inserted the row (crash-backfill path), {@code false}
+     *     when the row already existed (happy path — ingress wrote it before crashing or
+     *     committed cleanly).
+     */
+    public boolean insertIfAbsent(UUID orderId, String payloadJson) {
+        var params = new MapSqlParameterSource()
+                .addValue("order_id", orderId)
+                .addValue("payload", payloadJson)
+                .addValue("created_at", Timestamp.from(Instant.now()));
+        return jdbc.update(INSERT_IF_ABSENT_SQL, params) == 1;
     }
 
     public List<InflightRow> fetchPendingOlderThan(Instant olderThan, int batchSize) {

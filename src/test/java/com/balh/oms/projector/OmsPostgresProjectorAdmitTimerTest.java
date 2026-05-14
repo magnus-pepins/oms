@@ -13,6 +13,7 @@ import com.balh.oms.events.DomainEventEnvelopeCodec;
 import com.balh.oms.marketdata.MarketdataPlatformHttpClient;
 import com.balh.oms.persistence.DomainEventOutboxRepository;
 import com.balh.oms.persistence.ExecutionsRepository;
+import com.balh.oms.persistence.LedgerInflightOutboxRepository;
 import com.balh.oms.persistence.MarketContextRepository;
 import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.persistence.PositionsRepository;
@@ -51,12 +52,17 @@ class OmsPostgresProjectorAdmitTimerTest {
     private static final long NOW_MS = ACCEPTED_AT_MS + 23L;
     private static final long FRAGMENT_POSITION = 8192L;
 
-    @Mock private OmsConfig config;
+    // Real OmsConfig (defaults: ledger inflight reservation/async/coalescer all false) so the
+    // D-1 backfill in applyAdmittedEvent early-returns and this test focuses on the timer
+    // contract. Mocking OmsConfig + stubbing every nested getter would only fight the Mockito
+    // strict-stubbing surface for no behavioural gain here.
+    private final OmsConfig config = new OmsConfig();
     @Mock private AeronProjectorCursorRepository cursorRepository;
     @Mock private OrdersRepository ordersRepository;
     @Mock private OrderControlAdmission controlAdmission;
     @Mock private ExecutionsRepository executionsRepository;
     @Mock private DomainEventOutboxRepository domainEventOutboxRepository;
+    @Mock private LedgerInflightOutboxRepository ledgerInflightOutboxRepository;
     @Mock private DomainEventEnvelopeCodec envelopeCodec;
     @Mock private MarketContextRepository marketContextRepository;
     @Mock private PositionsRepository positionsRepository;
@@ -77,6 +83,7 @@ class OmsPostgresProjectorAdmitTimerTest {
                 controlAdmission,
                 executionsRepository,
                 domainEventOutboxRepository,
+                ledgerInflightOutboxRepository,
                 envelopeCodec,
                 marketContextRepository,
                 positionsRepository,

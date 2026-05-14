@@ -20,6 +20,7 @@ import com.balh.oms.events.DomainEventEnvelopeCodec;
 import com.balh.oms.marketdata.MarketdataPlatformHttpClient;
 import com.balh.oms.persistence.DomainEventOutboxRepository;
 import com.balh.oms.persistence.ExecutionsRepository;
+import com.balh.oms.persistence.LedgerInflightOutboxRepository;
 import com.balh.oms.persistence.MarketContextRepository;
 import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.persistence.PositionsRepository;
@@ -61,12 +62,17 @@ class OmsPostgresProjectorOrderCancelAppliedTest {
     private static final long CANCELLED_AT_MS = 1_700_000_000_000L;
     private static final long FRAGMENT_POSITION = 8192L;
 
-    @Mock private OmsConfig config;
+    // Real OmsConfig (defaults: ledger inflight reservation/async/coalescer all false) — D-1
+    // backfill in applyAdmittedEvent is the only code path that needs config.getLedger(); the
+    // cancel-applied tests in this class don't go through admit, but using a real config makes
+    // the projector wiring uniform across both code paths and avoids Mockito stub drift.
+    private final OmsConfig config = new OmsConfig();
     @Mock private AeronProjectorCursorRepository cursorRepository;
     @Mock private OrdersRepository ordersRepository;
     @Mock private OrderControlAdmission controlAdmission;
     @Mock private ExecutionsRepository executionsRepository;
     @Mock private DomainEventOutboxRepository domainEventOutboxRepository;
+    @Mock private LedgerInflightOutboxRepository ledgerInflightOutboxRepository;
     @Mock private DomainEventEnvelopeCodec envelopeCodec;
     @Mock private MarketContextRepository marketContextRepository;
     @Mock private PositionsRepository positionsRepository;
@@ -87,6 +93,7 @@ class OmsPostgresProjectorOrderCancelAppliedTest {
                 controlAdmission,
                 executionsRepository,
                 domainEventOutboxRepository,
+                ledgerInflightOutboxRepository,
                 envelopeCodec,
                 marketContextRepository,
                 positionsRepository,

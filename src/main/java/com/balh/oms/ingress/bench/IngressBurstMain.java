@@ -64,6 +64,12 @@ import java.util.concurrent.locks.LockSupport;
  *   OMS_BURST_LIMIT_PRICE        150
  *   OMS_BURST_REQUEST_TIMEOUT_S  30
  *   OMS_BURST_WARMUP             0      number of warmup requests whose latencies are discarded
+ *   OMS_BURST_LEDGER_BALANCE_ID  (off)  slice 4p: when set, every burst order carries this
+ *                                       ledgerBalanceId so ingress exercises the inflight-hold
+ *                                       path (sync HTTP at MAX_SIZE=1, async outbox at
+ *                                       OMS_LEDGER_INFLIGHT_ASYNC_ENABLED=true). Requires
+ *                                       OMS_BURST_LEDGER_IDENTITY_ID to be set as well.
+ *   OMS_BURST_LEDGER_IDENTITY_ID (off)  slice 4p: companion to OMS_BURST_LEDGER_BALANCE_ID.
  * </pre>
  *
  * <p>Run via the {@code bootRunBurst} Gradle task or
@@ -96,6 +102,21 @@ public final class IngressBurstMain {
     public static final String ENV_LIMIT_PRICE = "OMS_BURST_LIMIT_PRICE";
     public static final String ENV_REQUEST_TIMEOUT_S = "OMS_BURST_REQUEST_TIMEOUT_S";
     public static final String ENV_WARMUP = "OMS_BURST_WARMUP";
+    /**
+     * Slice 4p: optional ledgerBalanceId injected into every burst order. When set, ingress
+     * exercises the buying-power inflight hold path ({@code OrderIngressService
+     * .maybePlaceBuyLedgerInflightHold}) — sync HTTP at MAX_SIZE=1, async outbox at
+     * {@code OMS_LEDGER_INFLIGHT_ASYNC_ENABLED=true}. Empty / unset preserves slice-4m behaviour
+     * (no hold path; orders skip the hold branch entirely on the {@code ledgerBalanceId == null}
+     * guard).
+     */
+    public static final String ENV_LEDGER_BALANCE_ID = "OMS_BURST_LEDGER_BALANCE_ID";
+    /**
+     * Slice 4p: optional ledgerIdentityId. Required by ingress when {@code ledgerBalanceId} is
+     * set ({@code OrderIngressService.maybeVerifyLedgerBalanceBinding} returns a 400 otherwise).
+     * Operators must pair this with {@link #ENV_LEDGER_BALANCE_ID}.
+     */
+    public static final String ENV_LEDGER_IDENTITY_ID = "OMS_BURST_LEDGER_IDENTITY_ID";
 
     public static final String DEFAULT_URL = "http://127.0.0.1:8088/internal/v1/orders";
     public static final int DEFAULT_TOTAL = 1_000;
@@ -107,6 +128,8 @@ public final class IngressBurstMain {
     public static final String DEFAULT_LIMIT_PRICE = "150";
     public static final int DEFAULT_REQUEST_TIMEOUT_S = 30;
     public static final int DEFAULT_WARMUP = 0;
+    public static final String DEFAULT_LEDGER_BALANCE_ID = "";
+    public static final String DEFAULT_LEDGER_IDENTITY_ID = "";
 
     /** Lossless histogram covers 100 µs .. 60 s with 3 sig digits — total memory ~1 MB. */
     private static final long HISTOGRAM_LOWEST_DISCERNIBLE_MICROS = 100L;
@@ -260,7 +283,7 @@ public final class IngressBurstMain {
         // CreateOrderRequest's serialization shape (Spring is permissive on order anyway).
         long uniqueSuffix = System.nanoTime();
         String clientIdempotencyKey = "burst-" + uniqueSuffix + "-" + requestIndex;
-        StringBuilder sb = new StringBuilder(256);
+        StringBuilder sb = new StringBuilder(320);
         sb.append('{')
                 .append("\"accountId\":\"").append(accountId).append("\",")
                 .append("\"clientIdempotencyKey\":\"").append(clientIdempotencyKey).append("\",")
@@ -268,8 +291,14 @@ public final class IngressBurstMain {
                 .append("\"instrumentSymbol\":\"").append(cfg.instrument).append("\",")
                 .append("\"quantity\":\"").append(cfg.quantity).append("\",")
                 .append("\"limitPrice\":\"").append(cfg.limitPrice).append("\",")
-                .append("\"timeInForce\":\"DAY\"")
-                .append('}');
+                .append("\"timeInForce\":\"DAY\"");
+        // Slice 4p: opt-in inflight-hold exercise. Both fields are required by ingress when set
+        // (Config validates the pairing); leaving them off preserves slice 4m/4n burst shape.
+        if (!cfg.ledgerBalanceId.isEmpty()) {
+            sb.append(",\"ledgerBalanceId\":\"").append(cfg.ledgerBalanceId).append('"')
+              .append(",\"ledgerIdentityId\":\"").append(cfg.ledgerIdentityId).append('"');
+        }
+        sb.append('}');
         return sb.toString();
     }
 
@@ -310,6 +339,13 @@ public final class IngressBurstMain {
         public final String limitPrice;
         public final int requestTimeoutSeconds;
         public final int warmup;
+        /**
+         * Slice 4p. Empty when no hold path should be exercised; otherwise injected verbatim into
+         * every burst body (a single hold target is fine for benchmarking — the hold path locks
+         * by {@code (ledgerBalanceId, side)}, but burst sends BUY only).
+         */
+        public final String ledgerBalanceId;
+        public final String ledgerIdentityId;
 
         public Config(
                 String apiKey,
@@ -333,7 +369,9 @@ public final class IngressBurstMain {
                     quantity,
                     limitPrice,
                     requestTimeoutSeconds,
-                    warmup);
+                    warmup,
+                    DEFAULT_LEDGER_BALANCE_ID,
+                    DEFAULT_LEDGER_IDENTITY_ID);
         }
 
         public Config(
@@ -348,6 +386,35 @@ public final class IngressBurstMain {
                 String limitPrice,
                 int requestTimeoutSeconds,
                 int warmup) {
+            this(apiKey,
+                    urls,
+                    total,
+                    concurrency,
+                    rpsCap,
+                    accountPoolSize,
+                    instrument,
+                    quantity,
+                    limitPrice,
+                    requestTimeoutSeconds,
+                    warmup,
+                    DEFAULT_LEDGER_BALANCE_ID,
+                    DEFAULT_LEDGER_IDENTITY_ID);
+        }
+
+        public Config(
+                String apiKey,
+                List<String> urls,
+                int total,
+                int concurrency,
+                int rpsCap,
+                int accountPoolSize,
+                String instrument,
+                String quantity,
+                String limitPrice,
+                int requestTimeoutSeconds,
+                int warmup,
+                String ledgerBalanceId,
+                String ledgerIdentityId) {
             if (apiKey == null || apiKey.isBlank()) {
                 throw new IllegalArgumentException("apiKey must be set (env " + ENV_API_KEY + ")");
             }
@@ -385,6 +452,18 @@ public final class IngressBurstMain {
             this.limitPrice = limitPrice;
             this.requestTimeoutSeconds = requestTimeoutSeconds;
             this.warmup = warmup;
+            // Slice 4p: a balanceId without an identityId would be rejected at admission with a
+            // 400 (ledger_identity_required); fail fast at config build instead of N times in
+            // flight.
+            String balance = ledgerBalanceId == null ? "" : ledgerBalanceId.trim();
+            String identity = ledgerIdentityId == null ? "" : ledgerIdentityId.trim();
+            if (!balance.isEmpty() && identity.isEmpty()) {
+                throw new IllegalArgumentException(
+                        ENV_LEDGER_BALANCE_ID + " was set but " + ENV_LEDGER_IDENTITY_ID
+                                + " is empty; ingress requires both when exercising the hold path");
+            }
+            this.ledgerBalanceId = balance;
+            this.ledgerIdentityId = identity;
         }
 
         public static Config fromEnv() {
@@ -401,7 +480,9 @@ public final class IngressBurstMain {
                     envOrDefault(ENV_QUANTITY, DEFAULT_QUANTITY),
                     envOrDefault(ENV_LIMIT_PRICE, DEFAULT_LIMIT_PRICE),
                     parseInt(ENV_REQUEST_TIMEOUT_S, DEFAULT_REQUEST_TIMEOUT_S),
-                    parseInt(ENV_WARMUP, DEFAULT_WARMUP));
+                    parseInt(ENV_WARMUP, DEFAULT_WARMUP),
+                    envOrDefault(ENV_LEDGER_BALANCE_ID, DEFAULT_LEDGER_BALANCE_ID),
+                    envOrDefault(ENV_LEDGER_IDENTITY_ID, DEFAULT_LEDGER_IDENTITY_ID));
         }
 
         @Override
@@ -413,6 +494,7 @@ public final class IngressBurstMain {
                     + ", accountPool=" + accountPoolSize
                     + ", instrument=" + instrument
                     + ", warmup=" + warmup
+                    + ", ledgerBalanceId=" + (ledgerBalanceId.isEmpty() ? "(unset)" : ledgerBalanceId)
                     + "}";
         }
     }

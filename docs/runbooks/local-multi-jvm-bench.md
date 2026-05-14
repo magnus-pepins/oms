@@ -1646,6 +1646,156 @@ the C-1+C-2 verification live on Pop! in:
   cluster-node JVM jstack shows 8 RUNNABLE / 5 TIMED_WAITING / 4 WAITING with no
   thread parked on contended state — far from saturated.
 
+## Tier 2.5 phase C-3 verification — verify path uses Ledger's existing Redis cache (Pop! 2026-05-14)
+
+### What changed
+
+C-2 left ~190 of 400 ingress http-nio threads at conc=400 stuck in
+`HttpClient.parseHTTPHeader` for the Ledger balance verify call
+(`OrderIngressService.maybeVerifyLedgerBalanceBinding` →
+`RestLedgerBalanceClient.fetchIdentityIdForBalance`). The runbook recommended
+"cache `(balanceId → identityId)` in OMS for a small TTL".
+
+Audit found a cheaper fix:
+[`ledger/src/services/balance.service.ts:84`](../../ledger/src/services/balance.service.ts)
+already implements a Redis `BalanceCache` (60 s TTL,
+[`ledger/src/cache/balance-cache.ts:14`](../../ledger/src/cache/balance-cache.ts))
+that **only activates when `withQueued === false`**:
+
+```ts
+if (include.length === 0 && !withQueued) {
+  const cached = await getCache().get(balanceId);
+  if (cached) return cached;
+}
+```
+
+But OMS's `RestLedgerBalanceClient.fetchBalanceRoot` was hard-coded to send
+`?with_queued=true`, even from the verify path which only reads the durable
+`identityId`. So the verify call was *deliberately* bypassing a cache that
+already existed and ran the `getQueuedAmounts` SELECT on `transactions` for
+every request.
+
+### Standalone Ledger HTTP timing on Pop!
+
+Measured against `http://127.0.0.1:5001/balances/{id}` with `X-Ledger-Key`,
+on `balance_c28737c2-70f5-45d2-84aa-7c6c0b1dbbc2`:
+
+| query | single call | 50 parallel calls (wall-clock) |
+| ---- | ---- | ---- |
+| `?with_queued=true` (current OMS) | 2 – 28 ms | 5 015 ms total → ~100 ms / call |
+| `?with_queued=false` (warm cache) | **0.8 – 1.1 ms** | **13.5 ms total → ~0.27 ms / call** |
+
+`EXPLAIN ANALYZE` of the `getQueuedAmounts` SELECT on the Ledger DB at idle:
+0.105 ms, hash anti join, 25 buffers shared hit. So the query itself is fine
+under low load; what blew up at conc=400 was Express + Prisma + Postgres pool
+serialisation when 50 concurrent verifies all bypassed the cache.
+
+### OMS-side fix (only)
+
+[`oms@ee761c6`](https://github.com/magnus-pepins/oms/commit/ee761c6) — parameterise
+`fetchBalanceRoot(balanceId, withQueued)`. `fetchAvailableBalance` and
+`fetchBalanceReadModel` keep `true` (they need queued amounts);
+`fetchIdentityIdForBalance` passes `false`. **No Ledger code change** — the
+existing cache is the correct fix; OMS just needed to stop opting out of it.
+
+### Bench result (conc 50 / 200 / 400; same hardware as C-1+C-2)
+
+| concurrency | C-2 baseline RPS | **C-3 RPS** | lift over C-2 | C-2 mean RTT | C-3 mean RTT | C-3 p50 | C-3 p99 |
+| ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- |
+| 50  | 1 179 | **6 896** | **5.85×** | 14.0 ms | 6.8 ms | 6.3 ms | 20.0 ms |
+| 200 | 2 689 | **7 521** | 2.80× | ?       | 26.0 ms | 24.3 ms | 74.5 ms |
+| 400 | 3 807 | **7 762** | 2.04× | 41.4 ms | 50.9 ms | 49.7 ms | 111.1 ms |
+
+Bench tool: `bootRunBurst` (`OMS_BURST_TOTAL=30 000` for conc≤200, `60 000` for
+conc=400). All 60 000 / 30 000 requests `201`, no failures. Re-run at conc=400
+60 000 reproduced 7 562 rps within run-to-run variance.
+
+**Headline**: Pop! ceiling moved from C-2's 3 807 rps → **7 762 rps** at conc=400
+(another **2.04×** on top of C-1 + C-2; **7.10×** over the morning's slice 4p
+async-hold baseline of 1 094 rps).
+
+The huge conc=50 jump (1 179 → 6 896 rps) is because the bench client at
+conc=50 was *server-bound* on the verify HTTP under C-2 (each request held one
+client thread for ~30 ms while the verify ran), and is now near-zero per call.
+At conc=200 and conc=400 the bench client itself is fine; the server is the
+governor.
+
+### Saturation profile at conc=400 (`jstack` on the actual app JVMs)
+
+http-nio thread state distribution per ingress (212 / 214 threads alive):
+
+```
+ingress-1: 165 / 212 (78 %) parked in com.zaxxer.hikari.pool.HikariPool.getConnection
+            16     RestClient/HttpClient frames (was ~190 in C-2)
+             8     RUNNABLE in LedgerInflightOutboxRepository.insert
+             8     RUNNABLE in OrderIngressService.persistAccepted
+             3     parked on OmsClusterIngressClient.submitAcceptOrder (Aeron offer back-pressure)
+
+ingress-2: 170 / 214 (79 %) parked on Hikari (150 raw Unsafe.park + 20 explicit)
+            18     RestClient/HttpClient frames
+             9     RUNNABLE in LedgerInflightOutboxRepository.insert
+             7     parked on OmsClusterIngressClient.submitAcceptOrder
+             6     RUNNABLE in RestClient.exchangeInternal
+```
+
+`pg_stat_statements` for the OMS DB during the bench:
+
+```
+3 607 ms / 614 calls / mean 5.876 ms / 36.0 % — UPDATE ledger_inflight_outbox SET compensated_at=$1 ...
+3 253 ms / 60 000 / 0.054 ms / 32.5 %       — INSERT INTO ledger_inflight_outbox
+1 635 ms / 62 010 / 0.026 ms / 16.3 %       — INSERT INTO domain_event_outbox
+  941 ms / 23     / 40.945 ms / 9.4 %        — SELECT ... FROM ledger_inflight_outbox WHERE published_at IS NULL ...
+```
+
+The `getQueuedAmounts` SELECT on the Ledger DB (was 16 % of pg time at C-2
+conc=400 before the partial-index work) is **gone from the top** — the verify
+path now hits Ledger's Redis cache. The 36 % UPDATE is the
+`LedgerInflightHoldFailureCompensator` working through pre-existing stuck rows
+from earlier benches; not new-order hot path, will drain.
+
+### Predictions vs outcome (scoreboard)
+
+| prediction | outcome | verdict |
+| ---- | ---- | ---- |
+| `RUNNABLE in HttpClient` count at conc=400 drops from ~190 to <10 | dropped to 16 / 18 per ingress (mostly in-flight, not waiting) | partial win — order of magnitude correct |
+| RPS ceiling moves further | 3 807 → 7 762 (+2.04×) | confirmed |
+| New ceiling will surface as cluster-node or projector lag | Actually surfaces as **Hikari pool over-subscription** (78 % parked) | partial — correct that something else takes over, wrong about which |
+| Ledger Redis cache is the right fix without OMS-side cache | confirmed (single OMS diff, zero Ledger change, 7× lift over baseline) | win |
+
+### What this changes for the roadmap
+
+- **Phase-C-3 lands.** No follow-up needed in this slice.
+- **Phase-C-4 (raise Hikari pool size or run reconciler off its own pool)
+  becomes the dominant remaining lever**, not just a "if we expect conc≥400 in
+  production". The math fits the wall: 20 conns × ~5 ms accept-tx = 4 000 rps
+  per ingress = 8 000 rps theoretical; we're at 7 562 rps = 95 % of theoretical.
+  Doubling the pool to 40 should move the ceiling to ~15–16 k rps if nothing
+  else gives first.
+- **Aeron-cluster offer back-pressure** (`OmsClusterIngressClient.submitAcceptOrder`)
+  showed 3–7 parked threads per ingress at conc=400. Not yet dominant, but it
+  is now visible in the profile for the first time. Once Hikari is sized up,
+  this is the most likely next ceiling — at which point the conversation is
+  about cluster-node single-thread admission throughput / pipelining, **not**
+  about the request-handling layer.
+- **Ledger code is fine for now.** The Redis cache is doing its job for the
+  verify path. The non-verify Ledger paths (`fetchAvailableBalance` on the SYNC
+  buying-power admission, `fetchBalanceReadModel` on the FX nostro snapshot)
+  still send `with_queued=true` because they actually need queued amounts.
+  Both paths are low-volume in the current async-hold profile (sync buying-power
+  admission is gated off by `OMS_LEDGER_INFLIGHT_ASYNC_ENABLED=true`), so
+  Ledger-side cache work would be premature optimisation. Revisit if/when those
+  paths come back online.
+
+### Lessons
+
+- **Read the upstream service's code before adding a cache in front of it.**
+  Ledger had the right cache; OMS was opting out of it. The fix was a one-line
+  diff in OMS, no new layer, no TTL bookkeeping.
+- **Predicting "the next bottleneck" is fragile.** The C-2 runbook said the
+  next ceiling would be cluster-node or projector. It turned out to be Hikari.
+  The right discipline is "run the bench, read the jstack, then tell me where
+  the next ceiling is" — not "extrapolate from theory".
+
 ## Caveats
 
 - This is a **single-host single-cluster-node** rig. It does NOT exercise consensus, leader

@@ -2377,6 +2377,196 @@ contention, not Hikari.
   would growing Hikari be safe (and it would be moot, since there's no tx
   to hold the conn for).
 
+## Tier 2.5 phase D-3 verification — empty the ingress tx; projector emits OrderAccepted (Pop! 2026-05-14)
+
+**TL;DR.** Moving the `domain_event_outbox.insert(OrderAccepted)` from
+`OrderIngressService` into `OmsPostgresProjector` (gated on the existing
+`orders` `ON CONFLICT DO NOTHING` boolean return) and dropping the Spring
+`TransactionTemplate` from the ingress hot path lifted multi-ingress RPS from
+the D-4 ceiling **10 561 → 11 629 rps (1.10× over D-4, 10.6× over slice 4p
+baseline)**, with **0 failures across 240 000 admits at 1 600 client
+concurrency**, and collapsed Hikari conn-hold time on the ingress JVMs from
+≈ 7.8 ms (D-4: 5.1 ms acquire + 2.7 ms usage) to ≈ 1.65 ms (D-3: 0.23 ms
+acquire + 1.42 ms usage). The remaining ceiling is on the Aeron cluster
+admit + Tomcat thread budget, not Postgres.
+
+### Setup
+
+| Knob | Value | Note |
+|---|---|---|
+| Code | `oms@2045cce` (D-3) | `oms: tier-2.5 phase D-3 — emit OrderAccepted from projector, drop ingress Spring tx` |
+| `OMS_PG_POOL_MAX_SIZE` | 20 (per ingress JVM) | unchanged from D-4 canonical |
+| Supavisor `default_pool_size` (backend) | 80 | unchanged from D-4 canonical |
+| Supavisor `default_max_clients` | 300 | unchanged from D-4 canonical |
+| OMS topology | 5 JVMs (cluster-node + projector + fix-egress + 2× ingress-replica) | D-4 stack, restarted onto D-3 code |
+| Bench tool | `bootRunBurst` two-target round-robin (`8088` + `8188`) | matches D-2 / D-4 multi-ingress harness |
+| State | `TRUNCATE … RESTART IDENTITY CASCADE` before launch + Aeron dirs cleared | clean slate |
+
+The D-3 commit also updates `AbstractPostgresIntegrationTest.TestPostgresProjectorSingleton`
+to mirror the production D-3 path (it now writes the `OrderAccepted` envelope
+itself when the orders row is freshly inserted), so
+`NatsDomainFanoutIntegrationTest` keeps passing without touching its
+assertions.
+
+### Smoke test before benching (D-3 specific)
+
+The new projector path needs to be observable, not just inferred from latency.
+After the stack is up, post a single SELL order to ingress-1 and check that
+the `OrderAccepted` envelope shows up in `domain_event_outbox` even though
+the ingress JVM never opened a Spring tx:
+
+```bash
+. ~/.oms-bench.env
+ACCT=$(cat /proc/sys/kernel/random/uuid)
+curl -sS -o /tmp/d3-smoke.json -w 'HTTP %{http_code}\n' \
+  -X POST http://127.0.0.1:8088/internal/v1/orders \
+  -H 'Content-Type: application/json' \
+  -H "X-OMS-Internal-Key: $OMS_INTERNAL_API_KEY" \
+  -d "{\"accountId\":\"$ACCT\",\"clientIdempotencyKey\":\"d3-smoke-$$\",\"side\":\"SELL\",\"instrumentSymbol\":\"AAPL\",\"quantity\":\"1\",\"limitPrice\":\"5.00\",\"timeInForce\":\"DAY\"}"
+docker exec ledger-supabase-db psql -U supabase_admin -d oms -c "
+  SELECT count(*) FILTER (WHERE envelope_json->>'type' = 'OrderAccepted') as accepted,
+         count(*) FILTER (WHERE envelope_json->>'type' = 'OrderWorking')  as working
+    FROM domain_event_outbox"
+```
+
+Expected: 1 accepted + 1 working envelope per POST. The accepted row was
+inserted by the projector (D-3 path); the working row was inserted by the
+projector's existing post-admission emission. Both go through one tx in the
+projector, so they always appear together.
+
+### Multi-ingress sweep results
+
+`/tmp/bench-d3-multi.sh` (copy of D-2's harness with the rename) runs
+`bootRunBurst` against both ingresses round-robin at four steady-state
+concurrencies plus a 5 000-request warmup. Hikari + accept-pipeline timer
+deltas come from per-phase pre/post `/actuator/prometheus` scrapes on each
+ingress's management port (8087 / 8187).
+
+| phase | concurrency | total | RPS | mean RTT (ms) | p50 | p99 | failures |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| warmup | 80 | 5 000 | 5 349 | 13.4 | 9.8 | 116.7 | 1 |
+| c400 | 400 | 60 000 | 10 983 | 35.8 | 7.7 | 116.0 | 0 |
+| c800 | 800 | 120 000 | 11 512 | 68.6 | 62.5 | 164.1 | 0 |
+| c1200 | 1 200 | 180 000 | 11 588 | 102.6 | 93.1 | 194.2 | 0 |
+| **c1600** | **1 600** | **240 000** | **11 629** | **136.4** | **137.5** | **245.5** | **0** |
+
+RPS plateaus around 11 500 – 11 629 rps from c800 upward; latency keeps
+rising linearly with concurrency, which is the textbook "in queue, not in
+service" signature — at this load the bottleneck has moved off Postgres /
+Hikari and onto the Tomcat thread pool waiting on the Aeron cluster admit.
+
+### Hikari conn-hold collapse
+
+The whole point of D-3 was to shrink the ingress hot path Postgres footprint
+to "at most one auto-committing INSERT" (the BUY-async
+`ledger_inflight_outbox` row, slice 4p / D-1) — and drop the
+`TransactionTemplate` entirely. With the bench using SELL orders without
+inflight reservation, the ingress hot path now opens **zero** Postgres conns
+on most requests; only the `maybeVerifyLedgerBalanceBinding` HTTP path is
+left, and that's not a Hikari path.
+
+Per-ingress Hikari + accept-pipeline mean times at c1600 (post − pre divided
+by count delta over the steady-state phase, in milliseconds):
+
+| metric | D-4 step 3 (10 561 rps) | **D-3 (11 629 rps)** | Δ |
+|---|---:|---:|---:|
+| `hikaricp_connections_acquire` (mean) | ~5.1 ms | **0.23 ms** | **22× faster** |
+| `hikaricp_connections_usage` (mean) | ~2.7 ms | **1.42 ms** | **1.9× faster** |
+| total per-acquire conn hold | ~7.8 ms | **~1.65 ms** | **4.7× shorter** |
+| `oms.pipeline.ingress.accept` (mean) | ≈ 2.5 ms | ≈ 33.8 ms | now dominated by cluster admit RTT, not Postgres |
+
+The "ingress accept" mean grew because the timer now wraps the cluster admit
+itself (D-1 moved cluster admit out of the tx but still inside the timer);
+under 1 600 concurrent clients the cluster's single-leader admit thread
+serialises into the queue and contributes the full RTT. **This is the next
+slice's wall**, and it is *not* a regression — the timer's *Postgres
+contribution* has shrunk by 5×; the remaining time is the Aeron cluster
+admit, which Postgres tuning cannot help with.
+
+### What "Postgres is no longer the wall" means concretely
+
+At c1600 each ingress JVM does ~5 800 admits/sec into a Hikari pool of 20.
+With 1.42 ms mean usage, the pool's *steady-state utilisation* is:
+
+```
+5 800 admits/sec × 0.00142 sec/admit ≈ 8.2 conns inflight on average
+```
+
+i.e. the pool is < 50 % saturated. Acquire wait is 0.23 ms (mostly thread-
+park / unpark cost, not "queue for a conn"). Bumping the pool further would
+not help — the limit is now ingress thread-count waiting on Aeron.
+
+### Durability gap closure (D-3 specifically)
+
+D-1 closed the ledger-inflight gap (projector reconstructs
+`ledger_inflight_outbox` from `OrderAdmittedEvent` if ingress crashed before
+its tx commit). D-3 closes the symmetric gap for `OrderAccepted`: the
+projector emits the `OrderAccepted` envelope on the same fresh-vs-replay
+boolean it already uses for the orders row. Crash window is now an
+ingress-JVM-only concern — the cluster log + the projector together produce
+**both** the orders row **and** the `OrderAccepted` envelope. Before D-3
+this gap was theoretical (the ingress tx was already very small post-D-1)
+but now there is no gap at all.
+
+### Lift summary across Tier 2.5
+
+| phase | RPS (multi-ingress, 2 JVMs) | lift over slice 4p (1 094 rps) | lift over previous |
+|---|---:|---:|---:|
+| slice 4p baseline | 1 094 | 1.00× | — |
+| C-1 + C-2 (Postgres + Ledger HTTP fixes) | ≈ 3 800 | 3.5× | 3.5× |
+| C-3 (Ledger Redis cache for verify path) | 7 762 | 7.1× | 2.04× |
+| D-1 (cluster admit out of Postgres tx) | 7 770 | 7.1× | 1.00× *(correctness fix)* |
+| D-4 (Supavisor backend pool 20 → 80) | 10 561 | 9.65× | 1.36× |
+| **D-3 (drop Spring tx; projector emits OrderAccepted)** | **11 629** | **10.63×** | **1.10×** |
+
+D-3 was an order-of-magnitude smaller lift than D-4 because the path it
+optimised (one INSERT per request) was already cheap on a healthy backend;
+D-4 had unblocked the *real* multiplex contention. D-3 still pays for itself
+as a correctness fix (durability) and unlocks D-5 (the Aeron / Tomcat wall
+becomes addressable now that Postgres is out of the picture).
+
+### Lessons (D-3 specific, in addition to D-1 / D-4 lists)
+
+- **`hikaricp_connections_usage_seconds` is the right metric to "kill the
+  Postgres lever".** When it stops responding to concurrency increases, the
+  bottleneck has moved off Postgres entirely; further pool / Supavisor
+  tuning is wasted ingenuity.
+- **Idempotent backfill from the cluster log is an architectural pattern,
+  not a one-shot.** D-1 (`ledger_inflight_outbox`) and D-3
+  (`domain_event_outbox.OrderAccepted`) use the same shape: a cluster event
+  is the source of truth, the projector's `ON CONFLICT DO NOTHING` is the
+  idempotency boundary, and the ingress JVM's tx becomes optional. Future
+  side-tables that today ride the ingress tx (none right now, but watch for
+  new ones) should follow the same pattern from day one.
+- **Hikari `autoCommit=true` (the Spring Boot default) is enough when each
+  request makes at most one INSERT.** A `TransactionTemplate` only matters
+  when ≥ 2 statements need to commit atomically; D-3's residual ingress
+  write (BUY-async inflight outbox row) is a single statement, so the
+  template adds latency without buying any consistency.
+
+### Recommended next slices (post-D-3)
+
+* **Phase D-5 — split projector + fix-egress onto a separate Supavisor
+  tenant.** Today they share the 80-conn backend pool with the 2 ingresses
+  (40 client conns); after D-3 the projector is doing two INSERTs per
+  admit (orders + OrderAccepted; OrderWorking + control_decisions on the
+  next pass) and is the new write-amplifier. Splitting tenants gives both
+  groups independent backend headroom. Theoretical: removes
+  cross-tenant multiplex contention; expected lift modest (single-digit %).
+* **Phase D-6 — admit batching at the cluster client.** The plateau at
+  ~11 600 rps comes from a single Aeron cluster leader thread serialising
+  per-admit. Batching N requests per `submitAcceptOrder` round-trip (with
+  per-request future fan-out on the response side) would N× the admit
+  ceiling at the cost of N× admit latency. Expected lift: 2–3× when
+  batchSize is around 8–16; needs careful interplay with the existing
+  D-1 idempotency guarantees.
+* **Phase D-7 — Tomcat thread bump + ingress concurrency cap.** Today
+  Tomcat's default `max-threads=200` × 2 ingresses = 400 inflight requests
+  matches the c400 → c800 sweet spot; bumping to 400 per ingress would let
+  the bench push past c1600 without queueing on Tomcat first. Probably the
+  smallest-effort win remaining; the limit becomes the Aeron leader
+  immediately.
+
 ## Caveats
 
 - This is a **single-host single-cluster-node** rig. It does NOT exercise consensus, leader

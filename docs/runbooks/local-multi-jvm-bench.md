@@ -2567,6 +2567,171 @@ becomes addressable now that Postgres is out of the picture).
   smallest-effort win remaining; the limit becomes the Aeron leader
   immediately.
 
+> **D-7 disproved by jstack** (Pop! 2026-05-14, before D-8 lands): at
+> c1600 / 11 629 rps, only 14 / 200 ingress-1 exec threads were parked in
+> `TaskQueue.take` (idle), and **187 / 200 were parked in
+> `RestLedgerBalanceClient.fetchBalanceRoot →
+> SimpleClientHttpRequest.executeInternal`**. The wall was not Tomcat
+> thread budget; it was the synchronous Ledger balance/identity verify
+> HTTP call holding 93.5 % of the thread pool. D-7 would have only lifted
+> the Tomcat queue depth without removing the Ledger HTTP wait. D-8
+> (below) addresses the actual root cause.
+
+## Tier 2.5 phase D-8 verification — cache (balanceId → identityId) in OMS (Pop! 2026-05-14)
+
+### TL;DR
+
+| Concurrency | RPS         | Mean RTT  | p50 RTT   | p99 RTT   | Failures |
+|-------------|-------------|-----------|-----------|-----------|----------|
+| warmup (c80) |  7 290     |  10.0 ms  |   5.9 ms  | 104.9 ms  | 0        |
+| c400        | 19 675      |  19.8 ms  |  17.7 ms  |  59.3 ms  | 0        |
+| c800        | 20 452      |  38.4 ms  |  38.0 ms  |  75.8 ms  | 0        |
+| **c1200**   | **20 874**  |  56.6 ms  |  57.3 ms  | 102.8 ms  | 0        |
+| c1600       | 20 659      |  76.6 ms  |  77.2 ms  | 144.9 ms  | 0        |
+| c2400       | 20 753      | 114.6 ms  | 112.7 ms  | 180.7 ms  | 0        |
+| c3200       | 20 157      | 157.2 ms  | 161.5 ms  | 270.3 ms  | 0        |
+
+* Best run **20 874 rps** at c1200, **1.795× over D-3** (11 629 rps),
+  **18.7× over slice 4p baseline** (1 094 rps).
+* Plateau confirmed: RPS is essentially flat from c1200 → c3200 while p50
+  scales linearly with concurrency — the system is queue-bound, not
+  capacity-bound.
+* **0 failures across 1.32 M requests** in the sweep.
+
+### Setup
+
+* Code: `oms@1ce87de` (`oms: tier-2.5 phase D-8 — cache (balanceId →
+  identityId) in OMS`).
+* Flags on Pop! `~/.oms-bench.env`:
+  `OMS_LEDGER_BALANCE_IDENTITY_CACHE_ENABLED=true`,
+  `OMS_LEDGER_BALANCE_IDENTITY_CACHE_TTL_SECONDS=300`,
+  `OMS_LEDGER_BALANCE_IDENTITY_CACHE_MAX_SIZE=100000`.
+* All other flags unchanged from D-4: `OMS_PG_POOL_MAX_SIZE=20`,
+  `inflight-async-enabled=true`, `inflight-coalescer-enabled=false`,
+  Supavisor `default_pool_size=80`, `default_max_clients=300`.
+* Same 5 OMS JVMs (cluster-node + projector + fix-egress + 2 ×
+  ingress-replica), Postgres truncated before run.
+
+### Smoke test (4 sequential POSTs, 1 conn, same balanceId)
+
+* HTTP: 4 / 4 → 201, p50 = 7.1 ms (vs ~30 ms in D-3 / pre-cache).
+* Cache counters on ingress-1 prom scrape:
+
+```
+oms_ledger_balance_identity_cache_requests_total{result="hit"}  4.0
+oms_ledger_balance_identity_cache_requests_total{result="miss"} 1.0
+```
+
+* The single miss was the warmup curl right before the burst; the
+  bench's 4 POSTs all hit the warm cache. Single-flighting +
+  cache-hit-fast-path are wired correctly.
+
+### Where the time went, vs D-3 (per-ingress, c1600 row)
+
+| Timer                                | D-3 (Pop! 2026-05-14) | D-8 (Pop! 2026-05-14) | Δ        |
+|--------------------------------------|-----------------------|-----------------------|----------|
+| `oms.pipeline.ingress.accept`        | 33.8 ms               | **18.7 ms**           | −44 %    |
+| `hikaricp_connections_acquire`       |  5.1 ms               | **16.2 ms**           | +217 %   |
+| `hikaricp_connections_usage`         |  1.65 ms              |  1.35 ms              | −18 %    |
+| `oms_ledger_balance_identity_cache_requests_total{result="hit"}`  | n/a (no cache) | 160 000 / 160 000 | 100 % hit-rate at steady state |
+| `oms_ledger_balance_identity_cache_requests_total{result="miss"}` | n/a            | ~1 / ingress (warmup) | — |
+
+**Acquire time tripled even though usage dropped.** That is the
+signature of pool starvation: the cache removed ~15 ms of HTTP wait per
+request, so accept compresses, threads finish faster, and the next
+request immediately hits the Hikari queue for the BUY-async
+`ledger_inflight_outbox` INSERT. The connection itself runs in 1.35 ms,
+but 16 ms is spent waiting in line for one.
+
+### Where the threads went (jstack at c1600, ingress-1, 200 exec threads)
+
+| Frame                                                                    | Threads | % of pool |
+|--------------------------------------------------------------------------|---------|-----------|
+| `LedgerInflightOutboxRepository.insert → Hikari ConcurrentBag.borrow`    | 186     |  93 %     |
+| `OmsClusterIngressClient.submitAcceptOrder` (cluster admit reply)        |  13     |   6.5 %   |
+| `LedgerInflightHoldFailureCompensator.runOnce`                           |   1     |   0.5 %   |
+| `ApiKeyFilter.doFilterInternal`                                          |   1     |   0.5 %   |
+
+Compare to D-3 jstack at c1600: 187 / 200 in
+`RestLedgerBalanceClient.fetchBalanceRoot`. D-8 cleanly removed that
+wait — the remaining wait is now Postgres connection-pool starvation,
+not HTTP I/O.
+
+### Theoretical ceiling math
+
+* Per ingress: Hikari pool = 20 connections, each holding 1.35 ms per
+  request → 20 / 0.00135 ≈ **14 800 inserts/sec/ingress**.
+* Two ingresses → **29 600 inserts/sec theoretical**.
+* Observed: 20 874 rps (best) ≈ 70 % of theoretical, the gap is the usual
+  contention overhead (lock acquire, thread parking, JVM safepoints,
+  Tomcat NIO accept-queue handoff).
+
+### Lift summary across Tier 2.5 (slice 4p baseline → D-8)
+
+| Phase | RPS    | Lift over baseline | Lift over previous |
+|-------|--------|--------------------|--------------------|
+| 4p    |  1 094 | 1.00 ×             | —                  |
+| C-1+2 |  3 800 | 3.47 ×             | 3.47 ×             |
+| C-3   |  7 762 | 7.10 ×             | 2.04 ×             |
+| C-4   |  7 770 | 7.10 ×             | 1.00 ×             |
+| D-1   |  7 900 | 7.22 ×             | 1.02 ×             |
+| D-2   |  4 700 (regression) | 4.30 ×    | 0.59 × (Supavisor backend = 20 surfaced) |
+| D-4   | 10 561 | 9.65 ×             | 2.25 × (after Supavisor backend = 80 fix) |
+| D-3   | 11 629 | 10.63 ×            | 1.10 ×             |
+| **D-8** | **20 874** | **19.08 ×**     | **1.795 ×**         |
+
+### Lessons (D-8 specific)
+
+* **The Tomcat-thread hypothesis was wrong.** The simple math
+  (200 threads × 33.8 ms ≈ 11 832 rps) matched the observed D-3 ceiling
+  almost exactly, which made D-7 (bump max-threads) look like the
+  smallest-effort next win. Jstack showed 93.5 % of those "saturated"
+  threads were not doing CPU work — they were parked on a synchronous
+  Ledger HTTP call. Always confirm the saturation cause before sizing
+  the cure. (Same lesson as C-1 → C-2: the queue depth didn't tell us
+  *what* the queue was waiting on.)
+* **Caching a durable mapping is a root-cause fix, not a workaround.**
+  The `(balanceId → identityId)` binding only changes on operator
+  reassignment. Caching it locally with a 5 min TTL is a textbook
+  application of "stop fetching what doesn't change". The accept-side
+  invariant is preserved: a stale cache during operator reassignment can
+  let through up to 5 min of orders claiming the old identity, which is
+  the same staleness window the operator already tolerates between the
+  reassignment and the OMS replicas restarting.
+* **Caffeine's `Cache.get(K, Function)` gives you per-key
+  single-flighting for free.** The unit test that proved this had 64
+  threads stampeding the same cold key; exactly one delegate call ran.
+  This matters at burst-start when 1 600 client connections all ask
+  about the same balanceId before the first verify completes — without
+  single-flighting, the cache populates 1 600 times. With it, once.
+
+### Recommended next slices (post-D-8)
+
+* **Phase D-9 — move the BUY-async inflight-outbox INSERT off the
+  ingress hot path.** Mirrors D-3's `OrderAccepted` move: the projector
+  already idempotently backfills `ledger_inflight_outbox` from
+  `OrderAdmittedEvent` (D-1's `insertIfAbsent`); flipping the projector
+  from a "safety net" to the **only** writer removes the last Postgres
+  INSERT from ingress. Expected: ingress accept drops from 18.7 ms →
+  ~3 ms (cluster admit + Tomcat NIO only), throughput jumps to whatever
+  cluster admit can sustain (Aeron benches show 50–80 k rps for
+  single-leader IPC on this hardware), at which point D-6 (admit
+  batching) becomes the next obvious lever. **This is the largest
+  remaining single lever; skip D-5 / D-6 / D-7 and go here.**
+* **Phase D-6 — admit batching at the cluster client.** Becomes the
+  ceiling once D-9 lands. Single Aeron cluster leader thread serialises
+  per-admit; batching 8–16 requests per `submitAcceptOrder` round-trip
+  with per-request future fan-out on the response side gives N× the
+  admit ceiling for N× admit latency. The D-1 idempotency guarantees
+  (cluster log is the source of truth, projector is idempotent) compose
+  cleanly with batching.
+* **Phase D-5 — split projector + fix-egress onto a separate Supavisor
+  tenant.** Modest single-digit-% lift; deprioritised vs D-9.
+* **Phase D-7 — Tomcat thread bump.** Now properly motivated only after
+  D-9: with no Postgres I/O on the ingress hot path, Tomcat's 200-thread
+  ceiling × per-request CPU cost becomes the wall, and a 400-thread
+  bump becomes useful. Before D-9 it would only deepen the Hikari queue.
+
 ## Caveats
 
 - This is a **single-host single-cluster-node** rig. It does NOT exercise consensus, leader

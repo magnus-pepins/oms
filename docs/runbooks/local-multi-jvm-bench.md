@@ -2167,6 +2167,216 @@ not at the ingress-2 connection-hold wall.
   bench-client RTT and `concurrency > tomcat.max-threads`, that residual is
   the queue.
 
+## Tier 2.5 phase D-2 + D-4 verification — Hikari pool isn't the wall, Supavisor backend pool was lying about its size (Pop! 2026-05-14)
+
+**Headline:** D-1 left us at a multi-ingress ceiling of ~7 770 rps. D-2 (bumping
+the Hikari pool 20→40) is a **negative result** that *regresses* throughput by
+~40 %. D-4 (bumping the Supavisor *backend* pool from its actual value of 20 to
+80) lifts the multi-ingress ceiling to **10 561 rps** — a 1.36× win — with no
+code change and no failures. The investigation also surfaced a hard-to-spot
+operational footgun: Supavisor's tenant DB row had drifted away from the
+`POOLER_DEFAULT_POOL_SIZE=50` env var.
+
+### What changed
+
+* Code: nothing. Both knobs are runtime config.
+* Config (D-2 attempt): `~/.oms-bench.env` `OMS_PG_POOL_MAX_SIZE=20 → 40`.
+* Config (D-4 fix): in the Supavisor metadata DB (`_supabase._supavisor`),
+  `update _supavisor.tenants set default_pool_size=80, default_max_clients=300;`
+  `update _supavisor.users set pool_size=80;`, then `docker restart
+  ledger-supabase-pooler` and a clean restart of all 5 OMS JVMs.
+
+### D-2 attempt (pool=40 OMS, Supavisor backend still 20)
+
+Same multi-ingress sweep as D-1 (`/tmp/bench-d2-multi.sh`). Result: **collapse**.
+
+| concurrency | aggregate rps | mean RTT | p99 RTT |
+|---:|---:|---:|---:|
+| 400 (multi) | 4 587 | 86 ms | 158 ms |
+| 800 (multi) | 4 721 | 168 ms | 246 ms |
+| 1 200 (multi) | 4 652 | 256 ms | 421 ms |
+| 1 600 (multi) | 4 685 | 340 ms | 465 ms |
+
+Single-ingress at the same pool=40 was less catastrophic but still regressive
+(c=600 peaked at 7 698 rps, c=800 collapsed to 4 651 rps).
+
+`hikaricp_connections_usage_seconds_sum` / `_count` per ingress jumped from
+~2.75 ms (D-1 baseline) to **8.0 ms** (D-2 c=800). That's the smoking gun:
+queries themselves got slower under more in-flight clients. With 4 JVMs × 40 =
+160 client conns multiplexing through Supavisor, the actual backend pool was
+already saturated at every cycle and every Postgres operation queued for a
+backend slot.
+
+`jstack` mid-bench at c=800 (200 http-nio threads):
+* **155 TIMED_WAITING in `LinkedTransferQueue$DualNode.await`** — Hikari's
+  internal queue, threads waiting for any of the 40 in-pool connections.
+* **40 RUNNABLE in `Socket$SocketInputStream.read`** — exactly the 40 holding
+  connections, all stuck reading replies from Postgres (i.e. Supavisor).
+
+Reverted to pool=20 → multi-ingress sanity bench at c=800 returned **7 626 rps**
+(D-1 baseline restored). D-2 is rejected.
+
+### D-4 setup discovery — the Supavisor tenant row is the source of truth, not the env var
+
+`docker inspect ledger-supabase-pooler` showed `POOLER_DEFAULT_POOL_SIZE=50`
+and `POOLER_MAX_CLIENT_CONN=300` — those are the env vars supplied to the
+container. But Supavisor's `pooler.exs` only reads them at *initial tenant
+creation*; after that the active values live in
+`_supabase._supavisor.tenants` / `_supabase._supavisor.users`. On Pop!:
+
+```sql
+select default_pool_size, default_max_clients from _supavisor.tenants;
+-- 20 | 100
+select pool_size from _supavisor.users;
+-- 20
+```
+
+So the **actual enforced backend pool was 20**, not 50; the
+`POOLER_DEFAULT_POOL_SIZE=50` env was inert. This finding retroactively
+explains C-4 ("Supavisor `POOLER_MAX_CLIENT_CONN` is invisible until you trip
+it"): the tenant row's `default_max_clients=100` was the wall, not the env's
+300. Update the rows, restart the Supavisor container, then restart any client
+applications (their existing TCP sessions are severed).
+
+### D-4 step 1 — pool=20 OMS, Supavisor backend=80
+
+Multi-ingress sweep, all green:
+
+| concurrency | aggregate rps | mean RTT | p99 RTT |
+|---:|---:|---:|---:|
+| 400 (multi) | 10 055 | 51 ms | 107 ms |
+| 800 (multi) | 10 405 | 76 ms | 171 ms |
+| 1 200 (multi) | **10 602** | 112 ms | 234 ms |
+| 1 600 (multi) | 10 488 | 151 ms | 234 ms |
+
+`hikaricp_connections_acquire_seconds` per-request mean **dropped from D-1's
+44 ms (sanity revert measurement) to 2.81 ms**, and usage time held at 2.48 ms
+— the Supavisor queue is gone, ingress is now strictly Hikari-pool-bound.
+
+### D-4 step 2 — try also bumping OMS pool=40 (with backend=80)
+
+Theory: backend=80 should now accommodate 4 × 40 = 160 client conns at peak.
+Result: throughput is **flat or worse** (c=400 9 824 / c=800 10 313 / c=1 200
+10 340 / c=1 600 10 419 rps) **and** introduces 0.3 % HTTP 500s (`SQLException:
+Connection is closed` from `OrderIngressService.persistAccepted` rollback
+path):
+
+```
+java.sql.SQLException: Connection is closed
+    at com.zaxxer.hikari.pool.ProxyConnection$ClosedConnection.lambda$getClosedConnection$0(ProxyConnection.java:503)
+    at com.zaxxer.hikari.pool.ProxyConnection.rollback(ProxyConnection.java:386)
+    at com.balh.oms.ingress.OrderIngressService.persistAccepted(OrderIngressService.java:230)
+```
+
+Cause: pool=40 × 4 JVMs = 160 client conns multiplexed onto 80 backend conns,
+plus burst peaks where both ingresses simultaneously want >40 backend slots.
+Supavisor evicts idle client conns mid-tx; Hikari's proxy connection then
+fails the rollback. Pool=40 is **not viable** even with backend=80 at this
+JVM count.
+
+### D-4 step 3 — final canonical config: pool=20 OMS, backend=80 Supavisor
+
+Re-ran the sweep cleanly:
+
+| concurrency | aggregate rps | failures | p50 RTT | p99 RTT |
+|---:|---:|---:|---:|---:|
+| 400 (multi) | 10 086 | 0 | — | — |
+| 800 (multi) | 10 469 | 0 | 67 ms | 166 ms |
+| 1 200 (multi) | 10 481 | 7 (0.004 %, 502s) | 110 ms | 239 ms |
+| 1 600 (multi) | **10 561** | 0 | 150 ms | 260 ms |
+
+Hikari per-ingress at c=1 200: acquire wait 5.1 ms, usage 2.70 ms. Postgres
+work is back at the D-1 baseline (no Supavisor queue), and acquire wait is a
+manageable 1.9 × usage — within the regime where doubling pool would
+*linearly* scale RPS *if* there was Postgres headroom (pool=40 showed there
+isn't, given Supavisor multiplex / connection-eviction behaviour).
+
+### Lift summary so far
+
+| phase | per-ingress hot path | OMS pool | Supavisor backend | aggregate rps | vs D-1 |
+|---|---|---:|---:|---:|---:|
+| D-1 (cluster admit out of tx) | 2 INSERTs | 20 | 20 | 7 770 | 1.00× |
+| D-2 (pool 20 → 40 only) | 2 INSERTs | 40 | 20 | 4 720 | 0.61× |
+| **D-4 step 3** (backend 20 → 80) | 2 INSERTs | 20 | 80 | **10 561** | **1.36×** |
+
+End-to-end since slice 4p baseline (1 094 rps): **9.65× lift** over the original
+async-outbox ceiling.
+
+### Why D-2 was a regression and D-4 step 2 capped out
+
+The Hikari pool acts like a rate-limiter onto a downstream finite resource.
+With Supavisor backend=20:
+
+* pool=20 × 2 ingresses = 40 client conns peak demand → Supavisor multiplexes
+  each backend conn ~2:1, queries average 2.75 ms (1 ms pure Postgres + 1.75 ms
+  multiplex queue).
+* pool=40 × 2 ingresses = 80 client conns peak demand → Supavisor multiplex
+  ratio ~4:1, queries average 8 ms. RPS ceiling = pool / mean_usage =
+  40 / 0.008 = 5 000 rps per ingress (not 14 500 as the naive theoretical
+  formula suggested). Lower than pool=20 case (20 / 0.00275 = 7 273).
+
+With Supavisor backend=80, the multiplex ratio drops to <1:1 and the formula
+is dominated by *Postgres real time*, which is ~1–2 ms. pool=20 / 0.0027 ≈
+7 407 rps per ingress; 2 × ≈ 14 800 theoretical, achieving 10 561 means
+~71 % of theoretical — the gap is now real Tomcat / cluster-side / write
+contention, not Hikari.
+
+### Operational notes — touching Supavisor pool size
+
+1. **Stop client apps first.** OMS JVMs hold long-lived Hikari → Supavisor TCP
+   sessions; if the pooler restarts under them, every in-flight tx fails with
+   `Connection is closed`. Order is: stop OMS JVMs → update tenant row →
+   restart Supavisor → restart OMS.
+2. **Update the tenant row, not just the env var.** The env var is only read
+   on first tenant creation. The `_supabase._supavisor.tenants` and
+   `.users` rows are the runtime authority.
+3. **Watch Postgres `max_connections`.** With backend=80 and Supabase's
+   default `max_connections=100`, you have ~16 conns of headroom for
+   Realtime / PostgREST / pg_cron / admin shells. Check
+   `pg_stat_activity` after the bump to confirm the steady-state count.
+4. **Keep OMS pool low.** With backend=80 and 4 JVMs, the safe ceiling is
+   pool=20 each (= 80 client conns peak, matches backend exactly). pool=40
+   triggers Supavisor's client-conn eviction under burst and produces user-
+   visible 500s. This is the inverse of the C-4 / D-1 expectation that "more
+   Hikari is always better".
+
+### Recommended next slices
+
+* **Phase D-3 (highest expected lift) — empty the ingress tx.** Move the
+  `domain_event_outbox.insert` for `OrderAccepted` into the projector, driven
+  off `OrderAdmittedEvent` (mirrors the existing `OrderWorking` projector
+  path). With both outbox writes on the projector, ingress no longer opens a
+  Postgres tx at all; conn-hold drops to 0 ms; Hikari pool size becomes
+  irrelevant for the ingress hot path. Tomcat / cluster commit / bench tool
+  become the only walls. Theoretical lift: cap on ingress goes from
+  ~10 561 rps to whatever the cluster + Tomcat can sustain.
+* **Phase D-5 (only after D-3 lifts the ingress wall) — bump Supavisor
+  backend further (80 → 120) and/or split projector + fix-egress onto a
+  separate Supavisor tenant.** Today the projector / fix-egress conn budget
+  is small but their `max_connections=100` headroom is shrinking; if
+  D-3 succeeds, the projector will be doing 2× the writes per admit and
+  may need its own pool.
+
+### Lessons (D-2 + D-4 specific, in addition to D-1's list)
+
+- **`docker inspect $container | grep ENV` is not the source of truth for
+  Supavisor.** The active config lives in `_supabase._supavisor.tenants` /
+  `.users`. Always check the DB row, not the env, before reasoning about
+  pool capacity.
+- **Bigger Hikari is not always better — it can shorten tx but lengthen each
+  query under a saturated downstream.** If `hikaricp_connections_usage_seconds`
+  rises with concurrency, the bottleneck is downstream of Hikari, not in it,
+  and bumping pool will multiply contention.
+- **Supavisor in transaction mode evicts client conns under multiplex
+  pressure.** The `Connection is closed` rollback path is the symptom; the
+  cause is `client_conns_active > backend_pool`. Keep ingress pool ≤ backend
+  pool / (number of ingress JVMs).
+- **The cleanest tuning ladder for this stack is "shrink ingress tx → grow
+  Supavisor backend → grow OMS Hikari", in that order.** D-1 narrowed the tx,
+  D-4 grew Supavisor backend; only after D-3 fully empties the ingress tx
+  would growing Hikari be safe (and it would be moot, since there's no tx
+  to hold the conn for).
+
 ## Caveats
 
 - This is a **single-host single-cluster-node** rig. It does NOT exercise consensus, leader

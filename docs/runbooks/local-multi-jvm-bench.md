@@ -1986,6 +1986,187 @@ Hikari pool isn't even fully utilised, so this is premature.
   pool size starts mattering, the next infra knob to know about is this one,
   not `POOLER_DEFAULT_POOL_SIZE`.
 
+## Tier 2.5 phase D-1 verification — pull cluster admit out of the Postgres tx (Pop! 2026-05-14)
+
+Lands the "Phase D-1 (recommended next slice)" proposed by the C-4 verification
+above, plus the durability-gap closure that section flagged as a prerequisite
+("Worth a small slice on its own before doing D-1"). Both ship in commit `6bea82e`.
+
+### What changed
+
+* `OrderIngressService.persistAccepted`: `submitToClusterOrThrow` and the
+  duplicate-short-circuit branch run **before** `transactionTemplate.execute`
+  opens any Hikari connection. The tx body is now strictly the two outbox
+  `INSERT`s (`maybePlaceBuyLedgerInflightHold` for BUY/async + `domainEventOutbox.insert`).
+* `OmsPostgresProjector.applyAdmittedEvent`: idempotent backfill of
+  `ledger_inflight_outbox` from the cluster `OrderAdmittedEvent` itself. Uses
+  the existing `uq_ledger_inflight_outbox_order_id` UNIQUE INDEX (V4) →
+  `INSERT ... ON CONFLICT (order_id) DO NOTHING`. Happy path = no-op (one
+  index probe); crash path = projector materialises the row so the slice 4p
+  reconciler/compensator pipeline drives the BUY hold (or compensating cancel)
+  unchanged.
+* `LedgerInflightOutboxRepository.insertIfAbsent(orderId, payload)` added to
+  back the projector backfill.
+
+`OrderAccepted` domain envelopes (the customer-facing "we received your order"
+stage) are **not** backfilled by the projector: a crash in the admit-tx window
+means downstream consumers see `OrderWorking` (emitted by the projector via
+`OrderControlAdmission.persistAdmission`) without the preceding `OrderAccepted`.
+This is acceptable today — status fanout is the contract; the "received" stage
+is informational.
+
+### Bench setup (matches the C-4 baseline rig exactly)
+
+* Five JVMs running clean (cluster-node + projector + fix-egress + 2× ingress-replicas).
+* Postgres tables truncated + Aeron lock dirs cleaned + cluster log fresh — eliminates
+  the 1.4M-row inflight-outbox backlog from the C-4 sweep that would otherwise
+  have skewed the comparison.
+* `OMS_PG_POOL_MAX_SIZE=20` per ingress (canonical baseline; verified via
+  `hikaricp_connections_max=20.0` post-bench).
+* `OMS_LEDGER_INFLIGHT_RESERVATION_ENABLED=true`, `OMS_LEDGER_INFLIGHT_ASYNC_ENABLED=true`,
+  `OMS_LEDGER_INFLIGHT_COALESCER_ENABLED=false` — slice 4p outbox path, identical
+  to C-2 / C-3 / C-4 runs.
+
+### Bench result — single ingress concurrency sweep
+
+`/tmp/bench-d1-conc-20260514-110016/`
+
+| concurrency | total | rps | p50 (ms) | p95 (ms) | p99 (ms) |
+| ----------- | ----- | --- | -------- | -------- | -------- |
+| 80          | 5 000 | 5 902 | 11.8   | 18.0     | 63.4     |
+| 400         | 60 000 | **7 744** | 50.2 | 69.7  | 85.1     |
+| 600         | 90 000 | 7 802 | 74.9   | 95.6     | 116.9    |
+| 800         | 120 000 | **7 946** | 98.6 | 120.7 | 132.9    |
+| 1 200       | 180 000 | 7 818 | 150.3 | 177.7   | 193.5    |
+
+Single-ingress ceiling: **~7 950 rps**.
+
+### Bench result — both ingresses, round-robin
+
+`/tmp/bench-d1-multi-20260514-110226/` (`OMS_BURST_URLS=...:8088,...:8188`)
+
+| concurrency | total | rps | p50 (ms) |
+| ----------- | ----- | --- | -------- |
+| 400         | 60 000 | 7 717 | 49.7   |
+| 800         | 120 000 | 7 770 | 103.3 |
+| 1 200       | 180 000 | 7 721 | 152.1 |
+| 1 600       | 240 000 | 7 775 | 203.1 |
+
+Two-ingress ceiling: **~7 770 rps** — i.e. **the same** as one ingress. The
+bench machine is past the per-ingress ceiling but the cluster-side serial
+admit and bench-tool/CPU side of the run cap aggregate throughput.
+
+### Latency decomposition (per request mean, ingress-1, conc=400 run, 60 k)
+
+| stage                                                        | mean (ms) | source                                                   |
+| ------------------------------------------------------------ | --------- | -------------------------------------------------------- |
+| HTTP RTT (bench-client side)                                 | 51.0      | `IngressBurstMain` HdrHistogram                          |
+| Spring controller end-to-end                                 | 24.9      | `http_server_requests_seconds`                           |
+| `oms_pipeline_ingress_accept` (entire `persistAccepted`)     | 24.5      | `oms_pipeline_ingress_accept_seconds`                    |
+| Hikari conn-usage (the tx body)                              | **2.75**  | `hikaricp_connections_usage_seconds`                     |
+| Aeron cluster commit RTT (now outside the tx)                | **0.51**  | `oms_cluster_client_commit_round_trip_seconds[accept_order/commit]` |
+| Δ unaccounted (Ledger verify HTTP + Spring/JSON / scheduling) | ~21       | residual                                                 |
+
+The **bench client RTT − Tomcat-handled time = 51.0 − 24.9 = 26.1 ms** sits in the
+Tomcat NIO accept queue: with bench `concurrency=400` and Tomcat
+`max-threads=200` (Spring Boot default), about half the in-flight requests are
+queued before they are assigned a worker. Visible to the bench client as latency,
+invisible to `http_server_requests_seconds`.
+
+### Why the lift was modest, not 3-5x
+
+The C-4 plan estimated "theoretical lift ~3-5x" on the assumption the Aeron
+cluster commit RTT was ~3-8 ms. The actual cluster commit mean was already
+**~0.5 ms** (single-host, single-node consensus): pulling it out of the tx
+saves ~0.5 ms, not ~5 ms. The conn-hold time fell from where it was to **2.75 ms**
+mean (only ~2 inserts + commit + Supavisor RTT) — that is at or below the
+single-ingress Hikari pool ceiling at the configured pool=20:
+
+```
+pool=20 / 2.75 ms = 7 273 rps theoretical at full saturation
+```
+
+We measured 7 744 rps at conc=400 single-ingress (modest 6 % over theoretical
+because some requests are duplicate-short-circuit and never acquire a Hikari
+conn at all). The bench is now firmly **Hikari-pool-bound**, not
+cluster-RTT-bound.
+
+Concretely the right framing is: **D-1 was a correctness fix more than a
+throughput one in this rig.** It removes the Aeron commit RTT from the
+connection-hold critical path, so any future cluster slowdown (3-node consensus
+in Phase 5, slow follower replay, higher-latency disk archive) **does not
+quadratically tax Hikari conn-equivalents**. The +6-9 % single-ingress lift
+(7 100–7 300 → 7 744 rps) is the bonus on the single-host bench rig today.
+
+### Durability-gap closure verification
+
+`grep -c 'Projector D-1 backfill' ~/oms/logs/projector.log` after the full
+sweep (5 k smoke + 60 k + 90 k + 120 k + 180 k = 455 k orders): **0 hits**.
+
+Happy-path means ingress always wrote the `ledger_inflight_outbox` row before
+its tx returned to the projector's view of the cluster log. The
+`insertIfAbsent` is silently swallowed by `ON CONFLICT DO NOTHING` in steady
+state. The crash-window path is exercised by `OmsPostgresProjectorD1BackfillTest`
+which pins the gating + payload shape end-to-end (BUY-async / SELL skip /
+no-balance skip / market skip / disabled skip / happy path).
+
+### Side-finding: ingress-1 vs ingress-2 conn-hold asymmetry
+
+`hikaricp_connections_usage_seconds` over the entire bench window (cumulative
+since OMS startup):
+
+* ingress-1: 2.4–3.1 ms mean
+* ingress-2: 4.9–7.0 ms mean
+
+ingress-2 consistently held connections ~2× longer per request. Both ingresses
+share Supavisor (50-backend pool, 300 client conn cap), and the per-bench delta
+counts confirm round-robin load balancing was working. Most likely cause is
+warm-vs-cold Hikari pool history (ingress-1 was the warmup target in the
+single-ingress sweep before this run); not investigated further here because
+the aggregate ceiling (~7 770 rps) is already at the Tomcat / cluster-side wall,
+not at the ingress-2 connection-hold wall.
+
+### Recommended next slices
+
+* **Phase D-2 (next obvious lever) — bump per-ingress Hikari pool to 30-40.**
+  Budget: 2 ingresses × 40 = 80 client conns + projector + fix-egress
+  (~10 each) + Ledger app baseline (~50–80) ≈ 200, well under Supavisor's
+  `POOLER_MAX_CLIENT_CONN=300`. Theoretical lift: pool=40 / 2.75 ms ≈ 14 500 rps
+  ceiling per ingress, so ~2× single-ingress and possibly more aggregate. Will
+  validate the multi-ingress ceiling we hit in this run is genuinely
+  cluster-side / bench-tool-side and not a Hikari ceiling.
+* **Phase D-3 (alternative) — empty the ingress tx entirely.** Move
+  `domain_event_outbox.insert` for the `OrderAccepted` envelope into the
+  projector (driven from `OrderAdmittedEvent`, mirroring the existing
+  `OrderWorking` envelope path). With both outbox writes on the projector,
+  ingress no longer opens a Postgres tx at all; conn-hold drops to 0 ms;
+  Hikari pool size becomes irrelevant for the ingress hot path. Tomcat /
+  bench tool / cluster commit then become the only walls.
+* **Phase D-4 (optional infra) — bump Supavisor `POOLER_DEFAULT_POOL_SIZE`** —
+  same as the C-4 "Phase D-2 (optional)" proposal above. Only worthwhile after
+  D-2 or D-3 lifts the OMS-side wall and Supavisor's 50-backend pool actually
+  becomes the bottleneck (today it isn't).
+
+### Lessons (D-1 specific, in addition to C-4's list)
+
+- **"Theoretical 3-5x lift" assumes the bottleneck cost is what you guessed
+  it was.** C-4's jstack made the cluster commit look big because it was the
+  most-visible parked stack; the actual mean RTT was 0.5 ms. Always pair
+  jstack with `_seconds_count` + `_seconds_sum` Prometheus pairs to compute
+  real per-stage cost before estimating lift.
+- **Removing work from the tx is a correctness lever first, throughput lever
+  second.** The Phase 5 / 3-node consensus path will likely make Aeron commit
+  10–50 ms p99; D-1 ensures that increase doesn't multiply through Hikari.
+- **Idempotent backfill via `ON CONFLICT DO NOTHING` on a UNIQUE INDEX is
+  a clean closure for these "dual-write across logs" durability gaps.**
+  No new schema, no new columns, no compensator changes — projector writes
+  the row the ingress would have written, reconciler picks up either row
+  identically.
+- **Tomcat NIO accept queue is invisible to `http_server_requests_seconds`.**
+  When per-stage decomposition has a large unaccounted residual against
+  bench-client RTT and `concurrency > tomcat.max-threads`, that residual is
+  the queue.
+
 ## Caveats
 
 - This is a **single-host single-cluster-node** rig. It does NOT exercise consensus, leader

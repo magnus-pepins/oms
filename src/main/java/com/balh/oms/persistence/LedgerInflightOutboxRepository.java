@@ -26,6 +26,13 @@ public class LedgerInflightOutboxRepository {
 
     public record InflightRow(long id, UUID orderId, String payloadJson, Instant createdAt, int attempts) {}
 
+    /**
+     * Slice 4p row shape for {@link com.balh.oms.reconciler.LedgerInflightHoldFailureCompensator}:
+     * carries enough metadata to log + emit a {@code CancelOrderCommand}, but not the full
+     * payload (the compensator does not call Ledger).
+     */
+    public record FailedInflightRow(long id, UUID orderId, int attempts, String lastError) {}
+
     private static final String INSERT_SQL = """
             INSERT INTO ledger_inflight_outbox (order_id, payload_json, created_at)
             VALUES (:order_id, CAST(:payload AS jsonb), :created_at)
@@ -34,12 +41,35 @@ public class LedgerInflightOutboxRepository {
     /**
      * {@code FOR UPDATE SKIP LOCKED} — callers must run inside a Spring transaction that spans fetch +
      * {@link #markPublished}/{@link #markFailed} (see {@link com.balh.oms.reconciler.LedgerInflightOutboxReconciler}).
+     *
+     * <p>Slice 4p — adds {@code AND compensated_at IS NULL}: a row picked up by
+     * {@link com.balh.oms.reconciler.LedgerInflightHoldFailureCompensator} for
+     * {@link #markCompensated} is no longer eligible for reconciler retries (the order has been
+     * cancelled in the cluster, so re-driving the Ledger hold would be incorrect).
      */
     private static final String FETCH_PENDING_SQL = """
             SELECT id, order_id, payload_json::text AS payload_json, created_at, attempts
             FROM ledger_inflight_outbox
             WHERE published_at IS NULL
+              AND compensated_at IS NULL
               AND created_at <= :older_than
+            ORDER BY id
+            LIMIT :batch_size
+            FOR UPDATE SKIP LOCKED
+            """;
+
+    /**
+     * Slice 4p — failed rows that the compensator should cancel. {@code attempts >= :threshold}
+     * keeps transient failures (one-off network blip during a single tick) on the reconciler
+     * retry path; a row that has crossed the threshold is treated as a hold the Ledger will not
+     * accept (e.g. insufficient balance) and graduates to compensation.
+     */
+    private static final String FETCH_FAILED_UNCOMPENSATED_SQL = """
+            SELECT id, order_id, attempts, last_error
+            FROM ledger_inflight_outbox
+            WHERE published_at IS NULL
+              AND compensated_at IS NULL
+              AND attempts >= :threshold
             ORDER BY id
             LIMIT :batch_size
             FOR UPDATE SKIP LOCKED
@@ -56,6 +86,13 @@ public class LedgerInflightOutboxRepository {
                SET attempts = attempts + 1,
                    last_attempt_at = :now,
                    last_error = :error
+             WHERE id = :id
+            """;
+
+    private static final String MARK_COMPENSATED_SQL = """
+            UPDATE ledger_inflight_outbox
+               SET compensated_at = :compensated_at,
+                   cancel_correlation_id = :cancel_correlation_id
              WHERE id = :id
             """;
 
@@ -87,6 +124,27 @@ public class LedgerInflightOutboxRepository {
                 .addValue("now", Timestamp.from(now)));
     }
 
+    /**
+     * Slice 4p — fetch failed rows whose {@code attempts >= threshold} that have not yet been
+     * compensated. Caller is the {@link com.balh.oms.reconciler.LedgerInflightHoldFailureCompensator},
+     * which submits a {@code CancelOrderCommand} for each row and then calls
+     * {@link #markCompensated}. {@code FOR UPDATE SKIP LOCKED} so multiple compensator JVMs in a
+     * future shard topology cannot double-cancel the same order.
+     */
+    public List<FailedInflightRow> fetchFailedUncompensated(int threshold, int batchSize) {
+        var params = new MapSqlParameterSource()
+                .addValue("threshold", threshold)
+                .addValue("batch_size", batchSize);
+        return jdbc.query(FETCH_FAILED_UNCOMPENSATED_SQL, params, FAILED_ROW_MAPPER);
+    }
+
+    public void markCompensated(long id, long cancelCorrelationId, Instant compensatedAt) {
+        jdbc.update(MARK_COMPENSATED_SQL, new MapSqlParameterSource()
+                .addValue("id", id)
+                .addValue("cancel_correlation_id", cancelCorrelationId)
+                .addValue("compensated_at", Timestamp.from(compensatedAt)));
+    }
+
     private static String truncateError(String error) {
         if (error == null) {
             return null;
@@ -102,5 +160,12 @@ public class LedgerInflightOutboxRepository {
             rs.getString("payload_json"),
             rs.getTimestamp("created_at").toInstant(),
             rs.getInt("attempts")
+    );
+
+    private static final RowMapper<FailedInflightRow> FAILED_ROW_MAPPER = (rs, rowNum) -> new FailedInflightRow(
+            rs.getLong("id"),
+            (UUID) rs.getObject("order_id"),
+            rs.getInt("attempts"),
+            rs.getString("last_error")
     );
 }

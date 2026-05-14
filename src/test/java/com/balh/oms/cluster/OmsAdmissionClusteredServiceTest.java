@@ -698,6 +698,99 @@ class OmsAdmissionClusteredServiceTest {
         service.onSessionMessage(session, clusterTimestampMillis, buffer, 0, written, /* header = */ null);
     }
 
+    private void deliverCommand(CancelOrderCommand cmd, long clusterTimestampMillis) {
+        ExpandableArrayBuffer buffer = new ExpandableArrayBuffer(COMMAND_BUFFER_BYTES);
+        int written = cmd.encode(buffer, 0);
+        service.onSessionMessage(session, clusterTimestampMillis, buffer, 0, written, /* header = */ null);
+    }
+
+    // ------------------------------------------------------------------------
+    // Slice 4p: CancelOrderCommand (OMS-initiated cancel)
+    // ------------------------------------------------------------------------
+
+    @Test
+    void applyCancelOrder_workingOrder_emitsOrderCancelAppliedAndMutatesState() {
+        UUID orderId = UUID.fromString("00000000-0000-4000-8000-000000004001");
+        deliverCommand(sampleAccept(1L, "acct", "idem", orderId), ANY_TIMESTAMP_MS);
+        capturedAdmittedEvents.clear();
+
+        deliverCommand(
+                new CancelOrderCommand(7L, orderId, /* requestedAtNanos = */ 12345L,
+                        "ledger_inflight_hold_failed:insufficient_funds"),
+                ANY_TIMESTAMP_MS + 1);
+
+        assertThat(capturedAdmittedEvents).hasSize(1);
+        OrderCancelAppliedEvent ev = OrderCancelAppliedEvent.decode(
+                new UnsafeBuffer(capturedAdmittedEvents.get(0)),
+                0,
+                capturedAdmittedEvents.get(0).length);
+        assertThat(ev.orderId()).isEqualTo(orderId);
+        assertThat(ev.cancelledAtMillis()).isEqualTo(ANY_TIMESTAMP_MS + 1);
+        assertThat(ev.newVersion()).isEqualTo(1);
+        assertThat(ev.accountId()).isEqualTo("acct");
+        assertThat(ev.reason()).isEqualTo("ledger_inflight_hold_failed:insufficient_funds");
+
+        OmsAdmissionClusteredService.AdmittedOrder mutated = service.lookupByOrderId(orderId);
+        assertThat(mutated.statusCode()).isEqualTo(OmsAdmissionClusteredService.STATUS_CANCELLED);
+        assertThat(mutated.version()).isEqualTo(1);
+    }
+
+    @Test
+    void applyCancelOrder_unknownOrder_silentNoOp() {
+        UUID neverAdmitted = UUID.fromString("00000000-0000-4000-8000-000000004099");
+
+        deliverCommand(
+                new CancelOrderCommand(1L, neverAdmitted, 1L, "compensator"),
+                ANY_TIMESTAMP_MS);
+
+        assertThat(capturedAdmittedEvents).isEmpty();
+        assertThat(capturedEgress).isEmpty();
+        assertThat(service.admittedOrderCount()).isZero();
+    }
+
+    @Test
+    void applyCancelOrder_alreadyFilled_silentNoOpAndKeepsTerminalState() {
+        // Documented race: a venue fill lands between the inflight-hold failure and the
+        // compensator's cancel. Cluster sees the order is terminal and silent no-ops; the
+        // compensator's job is to "try to cancel, do not retry", which it has done.
+        UUID orderId = UUID.fromString("00000000-0000-4000-8000-000000004102");
+        deliverCommand(sampleAccept(1L, "acct", "idem", orderId), ANY_TIMESTAMP_MS);
+        deliverCommand(
+                sampleTrade(orderId, /* lastQtyScaled = */ 10_000_000_000L, 100_000_000L, "EXEC-FILL"),
+                ANY_TIMESTAMP_MS + 1);
+        capturedAdmittedEvents.clear();
+
+        deliverCommand(
+                new CancelOrderCommand(2L, orderId, 1L, "compensator"),
+                ANY_TIMESTAMP_MS + 2);
+
+        assertThat(capturedAdmittedEvents).isEmpty();
+        OmsAdmissionClusteredService.AdmittedOrder o = service.lookupByOrderId(orderId);
+        assertThat(o.statusCode()).isEqualTo(OmsAdmissionClusteredService.STATUS_FILLED);
+    }
+
+    @Test
+    void applyCancelOrder_replay_isIdempotent() {
+        // Cluster log replay re-delivers the same CancelOrderCommand. The first apply mutates
+        // working -> CANCELLED; the second sees the order is terminal and silent no-ops. State
+        // is byte-equal across the second attempt.
+        UUID orderId = UUID.fromString("00000000-0000-4000-8000-000000004110");
+        deliverCommand(sampleAccept(1L, "acct", "idem", orderId), ANY_TIMESTAMP_MS);
+        deliverCommand(
+                new CancelOrderCommand(2L, orderId, 1L, "first"),
+                ANY_TIMESTAMP_MS + 1);
+        OmsAdmissionClusteredService.AdmittedOrder afterFirst = service.lookupByOrderId(orderId);
+        int eventsAfterFirst = capturedAdmittedEvents.size();
+
+        deliverCommand(
+                new CancelOrderCommand(2L, orderId, 1L, "first"),
+                ANY_TIMESTAMP_MS + 2);
+
+        OmsAdmissionClusteredService.AdmittedOrder afterSecond = service.lookupByOrderId(orderId);
+        assertThat(afterSecond).isEqualTo(afterFirst);
+        assertThat(capturedAdmittedEvents).hasSize(eventsAfterFirst);
+    }
+
     /**
      * A second standalone service instance for replay-equivalence assertions. Built fresh so it has
      * no leftover state from {@link #service}. Captures every events-publication offer into

@@ -6,6 +6,7 @@ import com.balh.oms.cluster.ExecutionAppliedEvent;
 import com.balh.oms.cluster.OmsAdmissionClusteredService;
 import com.balh.oms.cluster.OmsClusterWireFormat;
 import com.balh.oms.cluster.OrderAdmittedEvent;
+import com.balh.oms.cluster.OrderCancelAppliedEvent;
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.config.OmsProfiles;
 import com.balh.oms.domain.Order;
@@ -519,6 +520,11 @@ public class OmsPostgresProjector {
                     transactionTemplate.executeWithoutResult(status -> applyExecutionAppliedEvent(ev, newPosition));
                     lastAppliedPosition.set(newPosition);
                 }
+                case OmsClusterWireFormat.TYPE_ID_ORDER_CANCEL_APPLIED -> {
+                    OrderCancelAppliedEvent ev = OrderCancelAppliedEvent.decode(buffer, offset, length);
+                    transactionTemplate.executeWithoutResult(status -> applyOrderCancelAppliedEvent(ev, newPosition));
+                    lastAppliedPosition.set(newPosition);
+                }
                 default -> {
                     // Unknown event types must still advance the cursor so the projector does not stall
                     // on a recording from a future schema. The cluster's snapshot bump procedure already
@@ -669,6 +675,94 @@ public class OmsPostgresProjector {
                             + " advancing cursor only.",
                     ev.orderId(),
                     ev.venueExecRef());
+        }
+        cursorRepository.advance(PROJECTOR_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, newPosition);
+    }
+
+    /**
+     * Slice 4p — single-transaction body for one {@link OrderCancelAppliedEvent} (OMS-initiated
+     * cancel from {@code LedgerInflightHoldFailureCompensator}). Distinct from
+     * {@link #applyExecutionAppliedEvent}'s {@code EXEC_TYPE_CANCEL} branch in two ways:
+     *
+     * <ol>
+     *   <li>No {@code executions} row insert. The cancel never touched a venue, so there is no
+     *       venue execution to record. {@code positions} / {@code market_context} are also
+     *       untouched: this cancel can only fire on a working / partially-filled order whose
+     *       cumulative qty is unchanged by the cancel itself; any prior trade ER already wrote
+     *       the trade-side rows.</li>
+     *   <li>Different domain envelope shape. {@link DomainEventEnvelopeCodec#orderCancelled} is
+     *       called with empty {@code venueId} / {@code venueExecRef} (the existing envelope tolerates
+     *       these — see {@code orderCancelled} signature: both are plain {@code String} fields).
+     *       Downstream BFF consumers can branch on empty venue fields if they want to surface
+     *       OMS-initiated cancels distinctly.</li>
+     * </ol>
+     *
+     * <p>Idempotency: re-delivery on cluster log replay sees {@code orders.status=CANCELLED}
+     * already; the CAS using the projector's read-then-CAS pattern misses (expected version no
+     * longer matches), the method logs at debug, and the cursor advances. The original
+     * {@code domain_event_outbox} row from the first apply stands.
+     *
+     * <p>Unknown order on this branch is the same anomaly described on
+     * {@link #applyExecutionAppliedEvent}: the cluster orders {@link OrderAdmittedEvent} strictly
+     * before any {@link OrderCancelAppliedEvent} for the same order, so seeing the cancel without
+     * the orders row implies a recording recreation that truncated admit but kept cancel — log
+     * loudly and advance the cursor.
+     */
+    void applyOrderCancelAppliedEvent(OrderCancelAppliedEvent ev, long newPosition) {
+        Optional<Order> opt = ordersRepository.findById(ev.orderId());
+        if (opt.isEmpty()) {
+            log.warn(
+                    "Projector: OrderCancelAppliedEvent for unknown order {} (reason={}); skipping.",
+                    ev.orderId(),
+                    ev.reason());
+            cursorRepository.advance(PROJECTOR_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, newPosition);
+            return;
+        }
+        Order order = opt.get();
+        if (order.status() == OrderStatus.CANCELLED) {
+            // Duplicate replay path. The first apply committed orders.status=CANCELLED and the
+            // domain_event_outbox row together; re-emitting the envelope here would write a second
+            // outbox row for the same logical cancel, which downstream fanout would deliver twice.
+            log.debug(
+                    "Projector: OrderCancelAppliedEvent already projected for order {}; advancing cursor only.",
+                    ev.orderId());
+            cursorRepository.advance(PROJECTOR_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, newPosition);
+            return;
+        }
+        int pgExpectedVersion = order.version();
+        boolean cas = ordersRepository.updateFillOrCancelWithCas(
+                order.id(),
+                pgExpectedVersion,
+                order.cumFilledQuantity(),
+                OrderStatus.CANCELLED,
+                /* terminalReason = */ null,
+                Instant.ofEpochMilli(ev.cancelledAtMillis()));
+        if (!cas) {
+            // CAS missed — somebody beat us to a terminal status. The most common race is a venue
+            // fill landing between the inflight-hold failure and this compensator cancel; the
+            // projector saw EXEC_TYPE_TRADE/FILLED first, this cancel is now stale. We log and
+            // advance the cursor — the order's terminal state stands and we do NOT emit an
+            // OrderCancelled envelope for an order that filled.
+            log.warn(
+                    "Projector: orders CAS missed on OrderCancelApplied projection for order {} (pgExpectedVersion={}, current status={}); cursor advances without envelope.",
+                    order.id(),
+                    pgExpectedVersion,
+                    order.status());
+            cursorRepository.advance(PROJECTOR_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, newPosition);
+            return;
+        }
+        int newSeq = pgExpectedVersion + 1;
+        Order refreshed = ordersRepository.findById(order.id()).orElse(order);
+        try {
+            // OMS-initiated cancel: empty venueId / venueExecRef. The domain event envelope shape
+            // already accepts plain Strings (see DomainEventEnvelopeCodec#orderCancelled); empty
+            // strings are a downstream sentinel for "no venue interaction recorded".
+            domainEventOutboxRepository.insert(
+                    refreshed.id(),
+                    envelopeCodec.orderCancelled(refreshed, newSeq, /* venueId = */ "", /* venueExecRef = */ ""));
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException(
+                    "domain event serialisation failed for OMS-cancel of order " + refreshed.id(), e);
         }
         cursorRepository.advance(PROJECTOR_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, newPosition);
     }

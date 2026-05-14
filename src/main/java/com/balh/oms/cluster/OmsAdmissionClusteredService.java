@@ -330,6 +330,8 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                     applyAcceptOrder(session, timestamp, buffer, offset, length);
             case OmsClusterWireFormat.TYPE_ID_APPLY_EXECUTION_REPORT ->
                     applyExecutionReport(timestamp, buffer, offset, length);
+            case OmsClusterWireFormat.TYPE_ID_CANCEL_ORDER ->
+                    applyCancelOrder(timestamp, buffer, offset, length);
             default -> {
                 // Unknown command — silently ignored. A real reject would require an event;
                 // adding an UnknownCommandRejected event is a Phase 2 concern.
@@ -627,6 +629,94 @@ public class OmsAdmissionClusteredService implements ClusteredService {
         }
 
         emitExecutionApplied(cmd, mutated, clusterTimestampMillis);
+    }
+
+    /**
+     * Slice 4p — apply path for OMS-initiated {@link CancelOrderCommand}s. Mirrors the discipline
+     * of {@link #applyExecutionReport}: idempotent on unknown / terminal orders, single state
+     * mutation on a live order, single {@link OrderCancelAppliedEvent} emission on the side
+     * publication.
+     *
+     * <p><strong>Idempotency:</strong>
+     * <ul>
+     *   <li>Unknown {@code orderId}: silent no-op. Compensator may race a never-admitted order
+     *       (e.g. caller cancelled the inflight outbox row before admission committed).</li>
+     *   <li>Already-terminal order ({@code FILLED} / {@code CANCELLED} / {@code REJECTED}): silent
+     *       no-op. Crucially this is the documented race window: a venue fill that lands between
+     *       the inflight-hold failure and the cancel command leaves the user with an unfunded
+     *       position. Slice 4q's coalescer is the synchronous fix; slice 4p's compensator is the
+     *       eventually-consistent backstop.</li>
+     *   <li>Working / partially-filled: mutate {@link AdmittedOrder#statusCode()} to
+     *       {@link #STATUS_CANCELLED}, bump {@link AdmittedOrder#version()}, emit one event.</li>
+     * </ul>
+     *
+     * <p>No new dedupe set is introduced: a re-delivered {@link CancelOrderCommand} for the same
+     * {@code orderId} sees the order is terminal and falls through the second bullet above. This
+     * is the same pattern as {@link #applyExecutionReport}'s "already-terminal order" guard.
+     */
+    private void applyCancelOrder(
+            long clusterTimestampMillis, DirectBuffer buffer, int offset, int length) {
+        CancelOrderCommand cmd = CancelOrderCommand.decode(buffer, offset, length);
+
+        AdmittedOrder order = orderIndex.get(cmd.orderId());
+        if (order == null) {
+            // Unknown order — silently ignored. See javadoc.
+            return;
+        }
+        if (isTerminal(order.statusCode())) {
+            // Already-terminal — silent no-op. Crucially includes the fill-before-cancel race.
+            return;
+        }
+
+        int newVersion = order.version() + 1;
+        AdmittedOrder mutated = new AdmittedOrder(
+                order.orderId(),
+                order.accountId(),
+                order.clientIdempotencyKey(),
+                order.accountIdHash(),
+                order.instrumentSymbol(),
+                order.side(),
+                order.quantityScaled(),
+                order.limitPriceScaledOrZero(),
+                order.timeInForceCode(),
+                order.ledgerBalanceIdOrNull(),
+                newVersion,
+                order.acceptedAtMillis(),
+                STATUS_CANCELLED,
+                order.cumQtyScaled());
+        orderIndex.put(mutated.orderId(), mutated);
+        idempotencyIndex.put(
+                new IdempotencyKey(mutated.accountId(), mutated.clientIdempotencyKey()), mutated);
+
+        emitOrderCancelApplied(mutated, clusterTimestampMillis, cmd.reason());
+    }
+
+    private void emitOrderCancelApplied(AdmittedOrder mutated, long cancelledAtMillis, String reason) {
+        if (eventsPublication == null) {
+            return;
+        }
+        // shardId is not carried on AdmittedOrder (the cluster's in-memory state ignores it; the
+        // projector reads shard from {@code orders.shard_id} which comes from OrderAdmittedEvent).
+        // We emit shardId=0 here and rely on the projector resolving shard via the
+        // already-projected order row. Operators reading the recording directly can still use
+        // accountIdHash for routing.
+        OrderCancelAppliedEvent ev = new OrderCancelAppliedEvent(
+                mutated.orderId(),
+                cancelledAtMillis,
+                mutated.version(),
+                /* shardId = */ 0,
+                mutated.accountId(),
+                mutated.accountIdHash(),
+                mutated.instrumentSymbol(),
+                reason);
+        int len = ev.encode(eventsBuffer, 0);
+        long pos;
+        while ((pos = eventsPublication.offer(eventsBuffer, 0, len)) < 0L) {
+            if (pos == io.aeron.Publication.CLOSED || pos == io.aeron.Publication.MAX_POSITION_EXCEEDED) {
+                throw new IllegalStateException("eventsPublication offer closed; pos=" + pos);
+            }
+            Thread.yield();
+        }
     }
 
     private void emitExecutionApplied(

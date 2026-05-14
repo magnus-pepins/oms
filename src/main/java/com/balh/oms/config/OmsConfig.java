@@ -150,6 +150,29 @@ public class OmsConfig {
         private int inflightOutboxReconcilerBatchSize = 50;
         private long inflightOutboxReconcilerIntervalMs = 500L;
         /**
+         * Phase 4 slice 4p — controls for {@link com.balh.oms.reconciler.LedgerInflightHoldFailureCompensator}.
+         * When enabled, rows on {@code ledger_inflight_outbox} that have failed past
+         * {@link #inflightCompensatorAttemptsThreshold} are cancelled in the cluster (idempotent
+         * {@code CancelOrderCommand}) and stamped {@code compensated_at} so the reconciler stops
+         * retrying them. Disabled by default — operator opts in alongside
+         * {@link #inflightAsyncEnabled} since the compensator is the correctness backstop for the
+         * async path.
+         */
+        private boolean inflightCompensatorEnabled = false;
+        /**
+         * Number of failed Ledger hold attempts before the compensator graduates a row to a
+         * {@code CancelOrderCommand}. Below this, transient blips stay on the reconciler retry
+         * path; at-or-above, the row is treated as a hold the Ledger will not accept (e.g.
+         * insufficient balance) and the order is cancelled. Operator should size this against
+         * Ledger's transient-failure SLO so a brief Ledger outage does not turn into spurious
+         * cancels.
+         */
+        private int inflightCompensatorAttemptsThreshold = 3;
+        private int inflightCompensatorBatchSize = 50;
+        private long inflightCompensatorIntervalMs = 1000L;
+        /** Time budget for {@link com.balh.oms.cluster.OmsClusterIngressClient#submitCancelOrder}. */
+        private long inflightCompensatorSubmitTimeoutMs = 2000L;
+        /**
          * When {@code true}, a row is written to {@code ledger_settlement_outbox} in the same transaction as OMS
          * transition to {@code settled} on {@code TRADE} executions; {@link com.balh.oms.reconciler.LedgerSettlementOutboxReconciler}
          * delivers when {@link #settlementOutboxReconcilerEnabled} is {@code true}.
@@ -195,6 +218,25 @@ public class OmsConfig {
         public void setInflightOutboxReconcilerBatchSize(int v) { this.inflightOutboxReconcilerBatchSize = v; }
         public long getInflightOutboxReconcilerIntervalMs() { return inflightOutboxReconcilerIntervalMs; }
         public void setInflightOutboxReconcilerIntervalMs(long v) { this.inflightOutboxReconcilerIntervalMs = v; }
+
+        public boolean isInflightCompensatorEnabled() { return inflightCompensatorEnabled; }
+        public void setInflightCompensatorEnabled(boolean v) { this.inflightCompensatorEnabled = v; }
+        public int getInflightCompensatorAttemptsThreshold() { return inflightCompensatorAttemptsThreshold; }
+        public void setInflightCompensatorAttemptsThreshold(int v) {
+            this.inflightCompensatorAttemptsThreshold = Math.max(1, v);
+        }
+        public int getInflightCompensatorBatchSize() { return inflightCompensatorBatchSize; }
+        public void setInflightCompensatorBatchSize(int v) {
+            this.inflightCompensatorBatchSize = Math.max(1, v);
+        }
+        public long getInflightCompensatorIntervalMs() { return inflightCompensatorIntervalMs; }
+        public void setInflightCompensatorIntervalMs(long v) {
+            this.inflightCompensatorIntervalMs = Math.max(50L, v);
+        }
+        public long getInflightCompensatorSubmitTimeoutMs() { return inflightCompensatorSubmitTimeoutMs; }
+        public void setInflightCompensatorSubmitTimeoutMs(long v) {
+            this.inflightCompensatorSubmitTimeoutMs = Math.max(100L, v);
+        }
 
         public boolean isSettlementOutboxEnabled() {
             return settlementOutboxEnabled;

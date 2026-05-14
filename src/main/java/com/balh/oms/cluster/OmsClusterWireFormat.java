@@ -67,6 +67,18 @@ public final class OmsClusterWireFormat {
      */
     public static final int TYPE_ID_APPLY_EXECUTION_REPORT = 2;
 
+    /**
+     * {@link CancelOrderCommand}. Phase 4 slice 4p: OMS-initiated cancel issued by the
+     * {@code LedgerInflightHoldFailureCompensator} when a buying-power hold fails on the async
+     * outbox path (Tier 2.5). Distinct from {@link #TYPE_ID_APPLY_EXECUTION_REPORT} with
+     * {@code execTypeCode=EXEC_TYPE_CANCEL}, which represents a venue-side cancel: this command
+     * never touched a venue, so the cluster service does not insert an {@code executions} row
+     * (downstream projector branch on {@link #TYPE_ID_ORDER_CANCEL_APPLIED}). The command is
+     * idempotent in the cluster: replay or a second compensator hit on the same {@code orderId}
+     * sees the order is terminal and silently no-ops.
+     */
+    public static final int TYPE_ID_CANCEL_ORDER = 3;
+
     // ---- Event type IDs (1000..1999) ----
 
     /** {@link OrderAcceptedEvent}. */
@@ -85,6 +97,15 @@ public final class OmsClusterWireFormat {
      * projector by consuming this event.
      */
     public static final int TYPE_ID_EXECUTION_APPLIED = 1003;
+
+    /**
+     * {@link OrderCancelAppliedEvent}. Phase 4 slice 4p projection event emitted to the side publication
+     * after the cluster's deterministic state machine applies a {@link #TYPE_ID_CANCEL_ORDER}. Distinct
+     * from {@link #TYPE_ID_EXECUTION_APPLIED} with {@code execTypeCode=EXEC_TYPE_CANCEL} so the projector
+     * can apply the OMS-initiated path with no {@code executions} row insert (the cancel never touched a
+     * venue) and a different domain event envelope shape (no {@code venueId} / {@code venueExecRef}).
+     */
+    public static final int TYPE_ID_ORDER_CANCEL_APPLIED = 1004;
 
     // ---- Cluster→projector event stream (Phase 2) ----
 

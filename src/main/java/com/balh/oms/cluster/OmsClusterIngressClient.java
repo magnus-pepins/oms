@@ -261,6 +261,7 @@ public class OmsClusterIngressClient {
     static final String TAG_OUTCOME = "outcome";
     static final String COMMAND_ACCEPT_ORDER = "accept_order";
     static final String COMMAND_APPLY_EXECUTION_REPORT = "apply_execution_report";
+    static final String COMMAND_CANCEL_ORDER = "cancel_order";
 
     /**
      * Per-submit terminal state. Maps to the {@code outcome} tag on
@@ -282,6 +283,7 @@ public class OmsClusterIngressClient {
     private final MeterRegistry meterRegistry;
     private final EnumMap<Outcome, Timer> acceptOrderTimers;
     private final EnumMap<Outcome, Timer> applyExecutionReportTimers;
+    private final EnumMap<Outcome, Timer> cancelOrderTimers;
 
     /**
      * Back-compat overload used by ITs and other tests that don't care about meter assertions.
@@ -299,6 +301,7 @@ public class OmsClusterIngressClient {
         this.meterRegistry = Objects.requireNonNull(meterRegistry, "meterRegistry");
         this.acceptOrderTimers = registerTimers(meterRegistry, COMMAND_ACCEPT_ORDER);
         this.applyExecutionReportTimers = registerTimers(meterRegistry, COMMAND_APPLY_EXECUTION_REPORT);
+        this.cancelOrderTimers = registerTimers(meterRegistry, COMMAND_CANCEL_ORDER);
     }
 
     private static EnumMap<Outcome, Timer> registerTimers(MeterRegistry registry, String command) {
@@ -498,6 +501,70 @@ public class OmsClusterIngressClient {
             }
         } finally {
             sample.stop(applyExecutionReportTimers.get(outcome));
+        }
+    }
+
+    /**
+     * Submits a {@link CancelOrderCommand} to the cluster as a fire-and-forget offer, mirroring
+     * {@link #submitApplyExecutionReport}. Used by {@code LedgerInflightHoldFailureCompensator}
+     * (slice 4p of {@code system-documentation/plans/oms-aeron-cluster-substrate.md}) to cancel
+     * an order whose buying-power hold failed on the async outbox path (Tier 2.5).
+     *
+     * <p>The cluster service applies the cancel deterministically and emits one
+     * {@link OrderCancelAppliedEvent} on the side publication for the projector. The compensator
+     * marks {@code ledger_inflight_outbox.compensated_at} once this method returns successfully
+     * — the cluster log commit is the durability boundary; replay will re-apply the cancel
+     * idempotently if the compensator crashes between offer-success and Postgres update.
+     *
+     * <h3>Back-pressure handling</h3>
+     *
+     * <p>Identical to {@link #submitApplyExecutionReport}: {@link AeronCluster#offer offer} can
+     * return negative on {@code BACK_PRESSURED} / {@code NOT_CONNECTED} / {@code ADMIN_ACTION};
+     * we park {@link OmsConfig.Cluster.Client#getOfferBackpressureParkNanos()} ns and retry until
+     * the deadline. No egress wait — the projector reads from the recording.
+     *
+     * @throws IllegalStateException if not connected (see {@link #connect()}).
+     * @throws TimeoutException if back-pressure persists past {@code timeout}.
+     * @throws InterruptedException if the calling thread is interrupted while parked.
+     */
+    public void submitCancelOrder(CancelOrderCommand cmd, Duration timeout)
+            throws TimeoutException, InterruptedException {
+        Objects.requireNonNull(cmd, "cmd");
+        Objects.requireNonNull(timeout, "timeout");
+
+        ExpandableArrayBuffer buffer = new ExpandableArrayBuffer(OmsClusterWireFormat.MAX_COMMAND_BYTES);
+        int written = cmd.encode(buffer, 0);
+
+        long deadlineNanos = System.nanoTime() + timeout.toNanos();
+
+        Timer.Sample sample = Timer.start(meterRegistry);
+        Outcome outcome = Outcome.ERROR;
+        try {
+            clientLock.lockInterruptibly();
+            try {
+                AeronCluster active = client;
+                if (active == null) {
+                    throw new IllegalStateException("OMS cluster client is not connected");
+                }
+                long offerResult;
+                do {
+                    offerResult = active.offer(buffer, 0, written);
+                    if (offerResult < 0L) {
+                        if (System.nanoTime() > deadlineNanos) {
+                            outcome = Outcome.TIMEOUT;
+                            throw new TimeoutException(
+                                    "cluster offer back-pressure timeout for CancelOrderCommand orderId="
+                                            + cmd.orderId() + " correlationId=" + cmd.correlationId());
+                        }
+                        parkOrThrow(config.getOfferBackpressureParkNanos());
+                    }
+                } while (offerResult < 0L);
+                outcome = Outcome.COMMIT;
+            } finally {
+                clientLock.unlock();
+            }
+        } finally {
+            sample.stop(cancelOrderTimers.get(outcome));
         }
     }
 

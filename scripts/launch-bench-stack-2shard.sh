@@ -95,7 +95,11 @@ shard_env_0() {
   export OMS_INGRESS_REPLICA_MANAGEMENT_SERVER_PORT=8087
   export OMS_CLUSTER_CLIENT_AERON_DIRECTORY="$OMS_AERON_DIR_BASE/media-driver"
   export OMS_CLUSTER_CLIENT_INGRESS_ENDPOINTS="0=localhost:20110"
-  export OMS_PG_URL='jdbc:postgresql://127.0.0.1:6543/oms?prepareThreshold=0&socketTimeout=10'
+  # Port 5432 = Supabase session-mode pool (transaction-mode 6543 can't run Flyway's
+  # CREATE INDEX CONCURRENTLY against a fresh shard 1 DB; using session-mode on both
+  # shards keeps the comparison apples-to-apples). Both shards use the same connection
+  # mode to avoid introducing a Postgres-side variable into the lift measurement.
+  export OMS_PG_URL='jdbc:postgresql://127.0.0.1:5432/oms?prepareThreshold=0&socketTimeout=30'
   if [[ -f "$HOME/.oms-bench-2shard-shard0.env" ]]; then
     # shellcheck disable=SC1091
     . "$HOME/.oms-bench-2shard-shard0.env"
@@ -114,7 +118,8 @@ shard_env_1() {
   export OMS_INGRESS_REPLICA_MANAGEMENT_SERVER_PORT=8187
   export OMS_CLUSTER_CLIENT_AERON_DIRECTORY="$OMS_AERON_DIR_BASE/media-driver"
   export OMS_CLUSTER_CLIENT_INGRESS_ENDPOINTS="0=localhost:21110"
-  export OMS_PG_URL='jdbc:postgresql://127.0.0.1:6543/oms_1?prepareThreshold=0&socketTimeout=10'
+  # See shard_env_0 for the rationale on port 5432 vs 6543.
+  export OMS_PG_URL='jdbc:postgresql://127.0.0.1:5432/oms_1?prepareThreshold=0&socketTimeout=30'
   if [[ -f "$HOME/.oms-bench-2shard-shard1.env" ]]; then
     # shellcheck disable=SC1091
     . "$HOME/.oms-bench-2shard-shard1.env"

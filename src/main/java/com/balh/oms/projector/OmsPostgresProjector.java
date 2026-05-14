@@ -577,13 +577,17 @@ public class OmsPostgresProjector {
         }
         PendingControlEvent pending = toPendingControlEvent(ev);
         controlAdmission.persistAdmission(pending);
-        // Phase 4 Tier 2.5 phase D-1: idempotently backfill ledger_inflight_outbox if the
-        // ingress JVM crashed between cluster admit and its own outbox-INSERT tx commit. See
-        // OrderIngressService#persistAccepted Javadoc for the full reasoning. Happy path is a
-        // no-op (ON CONFLICT DO NOTHING on uq_ledger_inflight_outbox_order_id); crash path
-        // produces the same row ingress would have, so the slice 4p reconciler/compensator
-        // pipeline drives the BUY hold (or compensating cancel) without any extra wiring.
-        backfillLedgerInflightOutboxIfNeeded(ev);
+        // Phase 4 Tier 2.5 phase D-9: project the BUY-async ledger_inflight_outbox row from
+        // the cluster's authoritative OrderAdmittedEvent. D-1 introduced this as a crash-window
+        // backfill (ingress wrote the row in the happy path, projector filled the gap if the
+        // ingress JVM crashed between cluster admit and its outbox-INSERT tx commit). D-9
+        // promotes the projector to the only writer, removing the last residual Postgres
+        // INSERT from the ingress hot path (Pop! D-8 jstack at c1600/20.8 k rps showed
+        // 186/200 ingress exec threads parked in this exact INSERT waiting for a Hikari
+        // connection — see OrderIngressService class-level Javadoc). insertIfAbsent stays
+        // idempotent on replay because the V4 uq_ledger_inflight_outbox_order_id unique
+        // index + ON CONFLICT DO NOTHING make this a safe no-op when the row already exists.
+        recordLedgerInflightOutboxIfNeeded(ev);
         cursorRepository.advance(PROJECTOR_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, newPosition);
         // Phase 4j per-event histogram: cluster-admit -> projector-applied. Recorded after the last
         // SQL operation in this fragment's transaction; the actual COMMIT happens when the wrapping
@@ -596,8 +600,15 @@ public class OmsPostgresProjector {
     }
 
     /**
-     * Phase 4 Tier 2.5 phase D-1 — idempotent backfill of {@code ledger_inflight_outbox} for the
+     * Phase 4 Tier 2.5 phase D-9 — primary writer of {@code ledger_inflight_outbox} for the
      * BUY-with-async-hold case, driven from {@link OrderAdmittedEvent} on the projector.
+     *
+     * <p>Originally introduced as D-1's crash-window backfill (when ingress was the primary
+     * writer and the projector covered the gap if ingress crashed between cluster admit and
+     * its own outbox-INSERT tx commit). D-9 promoted the projector to the <strong>only</strong>
+     * writer, removing the last residual Postgres INSERT from the ingress hot path (Pop! D-8
+     * jstack showed 186/200 ingress exec threads parked in this exact INSERT waiting for a
+     * Hikari connection at c1600 / 20.8 k rps).
      *
      * <p>Gating mirrors {@link com.balh.oms.ingress.OrderIngressService#maybePlaceBuyLedgerInflightHold}
      * for the async path: requires {@code oms.ledger.inflight-reservation-enabled=true},
@@ -605,20 +616,25 @@ public class OmsPostgresProjector {
      * a non-null {@code ledgerBalanceId}, and a non-zero limit price (the hold notional is
      * {@code quantity * limitPrice}, so market orders are skipped here as well).
      *
-     * <p>Payload shape mirrors {@link com.balh.oms.ingress.OrderIngressService#enqueueBuyLedgerInflightHold}:
-     * a small JSON object with {@code ledgerBalanceId} / {@code quantity} / {@code limitPrice}.
-     * The decode of {@code quantityScaled} / {@code limitPriceScaledOrZero} uses the same
-     * {@code BigDecimal.valueOf(scaled).divide(SCALE, 10, UNNECESSARY)} pattern as
+     * <p>Payload shape: small JSON object with {@code ledgerBalanceId} / {@code quantity} /
+     * {@code limitPrice}, matching the slice 4p contract that {@code LedgerInflightOutboxReconciler}
+     * already consumes. Decode of {@code quantityScaled} / {@code limitPriceScaledOrZero} uses
+     * the same {@code BigDecimal.valueOf(scaled).divide(SCALE, 10, UNNECESSARY)} pattern as
      * {@link OrdersRepository#insertFromAdmittedEvent(OrderAdmittedEvent)}, so the round-trip
      * preserves exact value (no scientific-notation / trailing-zero drift).
      *
-     * <p>Sync HTTP and {@code LedgerInflightCoalescer} (slice 4q) paths are not backfilled here:
-     * those paths fail the order synchronously on hold rejection, so a crash between cluster
-     * admit and ingress tx commit is already visible to the operator (compensator picks up via
-     * {@code attempts >= threshold} on the row when it eventually appears via reconciler retry,
-     * or the ingress's own try/catch path issues the cancel before HTTP returns).
+     * <p>Idempotent on replay (cursor rewind, recording rebuild) via
+     * {@code uq_ledger_inflight_outbox_order_id} + {@code ON CONFLICT DO NOTHING}: a row that
+     * was already projected stays as-is; reconciler/compensator state ({@code attempts},
+     * {@code published_at}, {@code compensated_at}) is preserved untouched.
+     *
+     * <p>Sync HTTP and {@code LedgerInflightCoalescer} (slice 4q) paths are <strong>not</strong>
+     * driven from here: those paths still call Ledger / the coalescer synchronously inside
+     * {@link com.balh.oms.ingress.OrderIngressService#maybePlaceBuyLedgerInflightHold} so the
+     * customer sees the hold result on the response. D-9 only changes the BUY-async branch
+     * (the production default).
      */
-    private void backfillLedgerInflightOutboxIfNeeded(OrderAdmittedEvent ev) {
+    private void recordLedgerInflightOutboxIfNeeded(OrderAdmittedEvent ev) {
         if (!config.getLedger().isInflightReservationEnabled()) {
             return;
         }
@@ -652,17 +668,9 @@ public class OmsPostgresProjector {
             // correctness issue, and we cannot serialize a small fixed-shape JSON object means
             // something is very wrong. Better to halt the projector than silently advance.
             throw new IllegalStateException(
-                    "ledger inflight outbox backfill payload serialisation failed for orderId=" + ev.orderId(), e);
+                    "ledger inflight outbox payload serialisation failed for orderId=" + ev.orderId(), e);
         }
-        boolean inserted = ledgerInflightOutboxRepository.insertIfAbsent(ev.orderId(), payload);
-        if (inserted) {
-            // Crash-window backfill actually fired. Log at INFO so operators correlate this with
-            // ingress crashes; no metric yet (D-1 lands silently — add a counter if this turns
-            // out to fire frequently in production).
-            log.info(
-                    "Projector D-1 backfill inserted ledger_inflight_outbox row for orderId={} (ingress crash window — happy path would have inserted before cluster admit returned)",
-                    ev.orderId());
-        }
+        ledgerInflightOutboxRepository.insertIfAbsent(ev.orderId(), payload);
     }
 
     /**

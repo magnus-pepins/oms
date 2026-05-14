@@ -4,6 +4,7 @@ import com.balh.oms.AbstractPostgresIntegrationTest;
 import com.balh.oms.reconciler.LedgerInflightOutboxReconciler;
 import com.github.tomakehurst.wiremock.WireMockServer;
 import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
+import org.awaitility.Awaitility;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -21,6 +22,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
+import java.time.Duration;
 import java.util.Map;
 import java.util.UUID;
 
@@ -35,8 +37,16 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * When {@code oms.ledger.inflight-async-enabled=true}, BUY inflight hold is written to
- * {@code ledger_inflight_outbox} in the accept transaction and {@link LedgerInflightOutboxReconciler}
- * POSTs to Ledger after commit.
+ * {@code ledger_inflight_outbox} and {@link LedgerInflightOutboxReconciler} POSTs to Ledger
+ * shortly after.
+ *
+ * <p>Phase 4 Tier 2.5 phase D-9: the row is now written by the projector (asynchronously,
+ * from the cluster's authoritative {@code OrderAdmittedEvent}) rather than inline by the
+ * ingress accept tx — see {@code OmsPostgresProjector#recordLedgerInflightOutboxIfNeeded}.
+ * The test daemon ({@code TestPostgresProjectorSingleton}) mirrors that path so this test
+ * still runs without the production projector JVM, but the row appears after a small
+ * (sub-ms typical, bounded by Awaitility timeout) projector lag instead of being visible
+ * the instant the HTTP response returns.
  */
 class LedgerInflightOutboxIntegrationTest extends AbstractPostgresIntegrationTest {
 
@@ -105,11 +115,17 @@ class LedgerInflightOutboxIntegrationTest extends AbstractPostgresIntegrationTes
         ledgerWireMock.verify(0, postRequestedFor(urlPathEqualTo("/transactions")));
         ledgerWireMock.verify(1, getRequestedFor(urlPathEqualTo("/balances/cust_balance_async")));
 
-        assertThat(jdbc.queryForObject(
-                "SELECT COUNT(*) FROM ledger_inflight_outbox WHERE order_id = ? AND published_at IS NULL",
-                Long.class,
-                orderId))
-                .isEqualTo(1L);
+        // D-9: the row is projected from OrderAdmittedEvent (async, sub-ms typical). Wait
+        // until the test projector daemon has caught up before we hand off to the reconciler.
+        Awaitility.await()
+                .atMost(Duration.ofSeconds(5))
+                .pollDelay(Duration.ZERO)
+                .pollInterval(Duration.ofMillis(20))
+                .untilAsserted(() -> assertThat(jdbc.queryForObject(
+                        "SELECT COUNT(*) FROM ledger_inflight_outbox WHERE order_id = ? AND published_at IS NULL",
+                        Long.class,
+                        orderId))
+                        .isEqualTo(1L));
 
         ledgerInflightOutboxReconciler.runOnce();
 

@@ -9,7 +9,6 @@ import com.balh.oms.domain.Order;
 import com.balh.oms.domain.OrderStatus;
 import com.balh.oms.domain.ShardKey;
 import com.balh.oms.observability.PiiHash;
-import com.balh.oms.persistence.LedgerInflightOutboxRepository;
 import com.balh.oms.observability.metrics.OmsPipelineMetrics;
 import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.tailer.OrderControlAdmission;
@@ -17,9 +16,6 @@ import com.balh.oms.domain.Side;
 import com.balh.oms.ledger.LedgerBalanceClient;
 import com.balh.oms.ledger.LedgerInflightCoalescer;
 import com.balh.oms.ledger.LedgerInflightReservationClient;
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
 import org.slf4j.Logger;
@@ -66,16 +62,27 @@ import java.util.concurrent.TimeoutException;
  * from this method too: the projector emits the {@code OrderAccepted} envelope from the
  * cluster's {@link com.balh.oms.cluster.OrderAdmittedEvent} (gated on the
  * {@code orders} ON-CONFLICT-DO-NOTHING insert returning a fresh row, mirroring the existing
- * idempotency for {@code OrderWorking}). The only Postgres write that may still happen on
- * the ingress hot path is the optional BUY-async {@code ledger_inflight_outbox} insert
- * (slice 4p / D-1), which a single auto-committing JDBC statement can do without a Spring
- * transaction — Hikari's default {@code autoCommit=true} commits per-statement.
+ * idempotency for {@code OrderWorking}).
  *
- * <p>Net effect: SELL and BUY-without-inflight orders open <strong>zero</strong> Postgres
- * connections on the hot path; BUY-with-inflight-async opens one connection just long
- * enough for the single INSERT (sub-millisecond). The {@link
- * org.springframework.transaction.support.TransactionTemplate} that D-1 left in place is
- * gone — there is nothing to demarcate.
+ * <p>Phase 4 Tier 2.5 phase D-8 cached the synchronous Ledger {@code GET /balances/{id}}
+ * verify in {@link com.balh.oms.ledger.CachingLedgerBalanceClient} (Caffeine, JVM-local).
+ *
+ * <p>Phase 4 Tier 2.5 phase D-9 retires the last residual ingress-side Postgres write: the
+ * BUY-async {@code ledger_inflight_outbox} INSERT moves to the projector. The projector's
+ * idempotent {@code insertIfAbsent} (D-1) was already wired as a crash-window backfill;
+ * D-9 promotes it to <strong>the only writer</strong> on the BUY-async path. Pop! D-8 jstack
+ * at c1600 / 20 800 rps showed 186/200 ingress exec threads parked in
+ * {@code LedgerInflightOutboxRepository.insert → ConcurrentBag.borrow} (Hikari pool
+ * starvation), so removing the write is the largest remaining single lever — the projector
+ * already did the same insert idempotently a few ms later, this just lets the customer-facing
+ * 201 not wait on a Hikari connection at all.
+ *
+ * <p>Net effect after D-9: <strong>every</strong> path through this method opens
+ * <strong>zero</strong> Postgres connections on the hot path. Synchronous-hold and
+ * coalescer paths still call Ledger / the coalescer respectively (no Postgres there);
+ * BUY-async simply returns once the cluster has admitted, and the projector handles the
+ * outbox row. SELL / BUY-without-balance / BUY-without-limit-price already short-circuited
+ * before any I/O.
  */
 @Service
 @Profile(OmsProfiles.ORDER_ACCEPT_PROFILE)
@@ -88,12 +95,10 @@ public class OrderIngressService {
 
     private final OrdersRepository orders;
     private final OmsConfig config;
-    private final ObjectMapper objectMapper;
     private final PiiHash piiHash;
     private final ObjectProvider<LedgerInflightReservationClient> ledgerInflightReservation;
     private final ObjectProvider<LedgerInflightCoalescer> ledgerInflightCoalescer;
     private final ObjectProvider<LedgerBalanceClient> ledgerBalanceClient;
-    private final LedgerInflightOutboxRepository ledgerInflightOutbox;
     private final MeterRegistry meterRegistry;
     private final OrderControlAdmission orderControlAdmission;
     private final OmsClusterIngressClient clusterIngressClient;
@@ -101,23 +106,19 @@ public class OrderIngressService {
     public OrderIngressService(
             OrdersRepository orders,
             OmsConfig config,
-            ObjectMapper objectMapper,
             PiiHash piiHash,
             ObjectProvider<LedgerInflightReservationClient> ledgerInflightReservation,
             ObjectProvider<LedgerInflightCoalescer> ledgerInflightCoalescer,
             ObjectProvider<LedgerBalanceClient> ledgerBalanceClient,
-            LedgerInflightOutboxRepository ledgerInflightOutbox,
             MeterRegistry meterRegistry,
             OrderControlAdmission orderControlAdmission,
             OmsClusterIngressClient clusterIngressClient) {
         this.orders = orders;
         this.config = config;
-        this.objectMapper = objectMapper;
         this.piiHash = piiHash;
         this.ledgerInflightReservation = ledgerInflightReservation;
         this.ledgerInflightCoalescer = ledgerInflightCoalescer;
         this.ledgerBalanceClient = ledgerBalanceClient;
-        this.ledgerInflightOutbox = ledgerInflightOutbox;
         this.meterRegistry = meterRegistry;
         this.orderControlAdmission = orderControlAdmission;
         this.clusterIngressClient = clusterIngressClient;
@@ -159,25 +160,33 @@ public class OrderIngressService {
      *
      * <p>Phase 4 Tier 2.5 phase D-3 retired the Spring tx entirely: the projector emits the
      * {@code OrderAccepted} envelope from {@link com.balh.oms.cluster.OrderAdmittedEvent}
-     * (gated on {@link OrdersRepository#insertFromAdmittedEvent} returning a fresh insert),
-     * so the only Postgres write that may still happen here is the optional BUY-async
-     * {@code ledger_inflight_outbox} INSERT inside {@link #maybePlaceBuyLedgerInflightHold}.
-     * That single statement auto-commits via Hikari's default {@code autoCommit=true};
-     * a {@code TransactionTemplate} would only widen the conn-hold window without buying
-     * any consistency.
+     * (gated on {@link OrdersRepository#insertFromAdmittedEvent} returning a fresh insert).
      *
-     * <p><strong>Durability gap closure (D-1 + D-3).</strong> The cluster log is the source
-     * of truth for "this order was admitted"; it commits independently of any Postgres
-     * write here. If the ingress JVM crashes after {@link #submitToClusterOrThrow} returns,
-     * the projector idempotently backfills both
+     * <p>Phase 4 Tier 2.5 phase D-9 retires the BUY-async {@code ledger_inflight_outbox}
+     * INSERT too: the projector's {@code insertIfAbsent} (originally D-1's crash-window
+     * safety net) is now the only writer on the BUY-async path. Ingress no longer touches
+     * Postgres at all on this branch.
+     *
+     * <p><strong>Durability via cluster log (D-1 + D-3 + D-9).</strong> The cluster log is
+     * the source of truth for "this order was admitted"; it commits independently of any
+     * Postgres write. After D-9, every Postgres row downstream of the cluster log
+     * (orders, OrderAccepted envelope, ledger_inflight_outbox) is materialised by the
+     * projector from the authoritative {@link com.balh.oms.cluster.OrderAdmittedEvent}:
      * <ul>
-     *   <li>the {@code ledger_inflight_outbox} row (D-1, via
-     *       {@code uq_ledger_inflight_outbox_order_id} ON CONFLICT DO NOTHING), and</li>
-     *   <li>the {@code OrderAccepted} envelope (D-3, gated on the projector's own
-     *       {@code orders} ON CONFLICT DO NOTHING returning a fresh insert).</li>
+     *   <li>the {@code orders} row (slice 2c — projector's
+     *       {@link OrdersRepository#insertFromAdmittedEvent} ON CONFLICT DO NOTHING)</li>
+     *   <li>the {@code OrderAccepted} envelope in {@code domain_event_outbox} (D-3, gated
+     *       on the {@code orders} insert returning fresh)</li>
+     *   <li>the {@code ledger_inflight_outbox} row for BUY-async (D-9, idempotent via the
+     *       {@code uq_ledger_inflight_outbox_order_id} unique index)</li>
      * </ul>
-     * The whole "ingress crashed mid-write" state therefore no longer leaves missing rows
-     * downstream; the projector reconstructs both from the cluster's authoritative event.
+     * The trade-off: the {@code ledger_inflight_outbox} row now appears after the projector
+     * applies the admit instead of inside the ingress accept. The slice 4p reconciler
+     * already polls on a configured interval — the per-order delay between cluster admit
+     * and Ledger hold POST grows by the projector's per-event latency (sub-ms in steady
+     * state, see {@code oms.pipeline.cluster_admit_to_projector_seconds}). Customer-facing
+     * 201 happens at cluster admit; the actual hold settles a tick later, which is the
+     * same eventual-consistency contract slice 4p already established.
      *
      * <p>Behaviour-preserving: error semantics for verify + cluster admit are unchanged
      * ({@code ledger_identity_required} / {@code ledger_identity_mismatch} /
@@ -222,10 +231,11 @@ public class OrderIngressService {
                 return new IngressResult(order, false);
             }
 
-            // D-3 post-cluster phase: at most one auto-committing JDBC INSERT
-            // (ledger_inflight_outbox, BUY-async path only). No Spring tx — Hikari's default
-            // autoCommit=true commits per statement, and the projector backfills this row from
-            // the cluster event if we crash before this method returns (see Javadoc above).
+            // D-9 post-cluster phase: only sync-HTTP and coalescer paths still have work
+            // here; BUY-async (the production default) returns immediately because the
+            // projector's recordLedgerInflightOutboxIfNeeded materialises the outbox row
+            // from the cluster's authoritative OrderAdmittedEvent. No Postgres I/O on the
+            // hot path for the BUY-async branch.
             maybePlaceBuyLedgerInflightHold(order);
 
             OmsPipelineMetrics.finishIngressAccept(meterRegistry, ingressSample, "created");
@@ -422,7 +432,12 @@ public class OrderIngressService {
                     + "falling back to async/sync path for orderId={}", order.id());
         }
         if (config.getLedger().isInflightAsyncEnabled()) {
-            enqueueBuyLedgerInflightHold(order);
+            // Phase 4 Tier 2.5 phase D-9: ingress no longer writes ledger_inflight_outbox.
+            // The projector's recordLedgerInflightOutboxIfNeeded(OrderAdmittedEvent) is the
+            // only writer; it idempotently inserts the row (ON CONFLICT DO NOTHING on
+            // uq_ledger_inflight_outbox_order_id) from the cluster's authoritative admit
+            // event, so the slice 4p reconciler/compensator pipeline picks the row up
+            // without any change. See class-level Javadoc for the consistency contract.
             return;
         }
         LedgerInflightReservationClient client = ledgerInflightReservation.getIfAvailable();
@@ -494,19 +509,6 @@ public class OrderIngressService {
                     .tag("path", "coalescer")
                     .register(meterRegistry));
             throw new RuntimeException("ledger inflight coalescer ack interrupted", e);
-        }
-    }
-
-    private void enqueueBuyLedgerInflightHold(Order order) {
-        try {
-            ObjectNode node = objectMapper.createObjectNode();
-            node.put("ledgerBalanceId", order.ledgerBalanceId());
-            node.put("quantity", order.quantity().toPlainString());
-            node.put("limitPrice", order.limitPrice().toPlainString());
-            ledgerInflightOutbox.insert(order.id(), objectMapper.writeValueAsString(node));
-        } catch (JsonProcessingException e) {
-            log.error("Failed to serialise ledger inflight outbox payload for orderId={}", order.id(), e);
-            throw new RuntimeException("ledger inflight outbox payload serialisation failed", e);
         }
     }
 

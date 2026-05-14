@@ -40,18 +40,22 @@ import java.time.ZoneOffset;
 import java.util.UUID;
 
 /**
- * Phase 4 Tier 2.5 phase D-1 — covers
- * {@link OmsPostgresProjector#backfillLedgerInflightOutboxIfNeeded(OrderAdmittedEvent)} which
- * idempotently writes a {@code ledger_inflight_outbox} row from the cluster's
- * {@link OrderAdmittedEvent} so the slice 4p reconciler/compensator pipeline still drives the
- * BUY hold (or compensating cancel) when the ingress JVM crashes between cluster admit and its
- * outbox-INSERT tx commit.
+ * Phase 4 Tier 2.5 phase D-1 (introduced) / phase D-9 (promoted to primary) — covers
+ * {@link OmsPostgresProjector}'s ledger inflight outbox projection: idempotently writes a
+ * {@code ledger_inflight_outbox} row from the cluster's {@link OrderAdmittedEvent} so the
+ * slice 4p reconciler/compensator pipeline drives the BUY hold (or compensating cancel).
+ *
+ * <p>D-1 added this as a crash-window backfill (ingress was the primary writer, projector
+ * filled in if the ingress JVM crashed between cluster admit and its INSERT tx commit). D-9
+ * removed the ingress-side INSERT entirely, so the projector is now the only writer on the
+ * BUY-async path. The gating + payload contract this test pins down is unchanged across both
+ * phases — the slice 4p reconciler keeps consuming the same row shape it always has, and
+ * {@code insertIfAbsent} stays idempotent on cursor-rewind / recording-replay.
  *
  * <p>Scope: gating on {@code oms.ledger.inflight-reservation-enabled},
  * {@code oms.ledger.inflight-async-enabled}, {@code side=BUY}, non-null {@code ledgerBalanceId}
- * and non-zero limit price; plus the payload shape that mirrors
- * {@link com.balh.oms.ingress.OrderIngressService#enqueueBuyLedgerInflightHold} so the reconciler
- * can read either ingress's row or the projector's backfilled row uniformly.
+ * and non-zero limit price; plus the payload shape ({@code ledgerBalanceId} /
+ * {@code quantity} / {@code limitPrice} as plain-string decimals) that the reconciler parses.
  */
 @ExtendWith(MockitoExtension.class)
 class OmsPostgresProjectorD1BackfillTest {
@@ -99,7 +103,7 @@ class OmsPostgresProjectorD1BackfillTest {
     }
 
     @Test
-    void inflightReservationDisabled_skipsBackfill() {
+    void inflightReservationDisabled_skipsProjection() {
         config.getLedger().setInflightReservationEnabled(false);
         config.getLedger().setInflightAsyncEnabled(true);
 
@@ -109,7 +113,7 @@ class OmsPostgresProjectorD1BackfillTest {
     }
 
     @Test
-    void inflightAsyncDisabled_skipsBackfill() {
+    void inflightAsyncDisabled_skipsProjection() {
         config.getLedger().setInflightReservationEnabled(true);
         config.getLedger().setInflightAsyncEnabled(false);
 
@@ -119,7 +123,7 @@ class OmsPostgresProjectorD1BackfillTest {
     }
 
     @Test
-    void sellSide_skipsBackfill() {
+    void sellSide_skipsProjection() {
         config.getLedger().setInflightReservationEnabled(true);
         config.getLedger().setInflightAsyncEnabled(true);
 
@@ -135,7 +139,7 @@ class OmsPostgresProjectorD1BackfillTest {
     }
 
     @Test
-    void noLedgerBalanceId_skipsBackfill() {
+    void noLedgerBalanceId_skipsProjection() {
         config.getLedger().setInflightReservationEnabled(true);
         config.getLedger().setInflightAsyncEnabled(true);
 
@@ -151,7 +155,7 @@ class OmsPostgresProjectorD1BackfillTest {
     }
 
     @Test
-    void marketOrder_zeroLimitPrice_skipsBackfill() {
+    void marketOrder_zeroLimitPrice_skipsProjection() {
         config.getLedger().setInflightReservationEnabled(true);
         config.getLedger().setInflightAsyncEnabled(true);
 
@@ -167,7 +171,7 @@ class OmsPostgresProjectorD1BackfillTest {
     }
 
     @Test
-    void buyAsyncWithLedgerAndLimit_writesIdempotentBackfillRowWithExpectedPayload() throws Exception {
+    void buyAsyncWithLedgerAndLimit_writesIdempotentRowWithExpectedPayload() throws Exception {
         config.getLedger().setInflightReservationEnabled(true);
         config.getLedger().setInflightAsyncEnabled(true);
 
@@ -200,9 +204,13 @@ class OmsPostgresProjectorD1BackfillTest {
     }
 
     @Test
-    void happyPath_insertIfAbsentReturnsFalse_isStillTreatedAsSuccess() {
-        // The "ingress already wrote the row" no-op case: insertIfAbsent returns false and the
-        // projector advances the cursor without throwing. Mockito stub returns false by default.
+    void replayPath_insertIfAbsentReturnsFalse_isStillTreatedAsSuccess() {
+        // Idempotency on cursor-rewind / recording-replay: insertIfAbsent returns false (the
+        // row from the original projection of this orderId still exists, ON CONFLICT DO NOTHING)
+        // and the projector advances the cursor without throwing. Pre-D-9 this also covered the
+        // "ingress already wrote the row" branch; D-9 removed that ingress-side INSERT, so this
+        // path now only fires on operator-driven cluster cursor rewinds. Mockito stub returns
+        // false by default.
         config.getLedger().setInflightReservationEnabled(true);
         config.getLedger().setInflightAsyncEnabled(true);
 

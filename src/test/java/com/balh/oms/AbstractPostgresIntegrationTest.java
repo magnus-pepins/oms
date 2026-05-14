@@ -1,9 +1,11 @@
 package com.balh.oms;
 
+import com.balh.oms.cluster.AcceptOrderCommand;
 import com.balh.oms.cluster.OmsClusterWireFormat;
 import com.balh.oms.cluster.OrderAdmittedEvent;
 import com.balh.oms.events.DomainEventEnvelopeCodec;
 import com.balh.oms.persistence.DomainEventOutboxRepository;
+import com.balh.oms.persistence.LedgerInflightOutboxRepository;
 import com.balh.oms.persistence.OrdersRepository;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -444,6 +446,12 @@ public abstract class AbstractPostgresIntegrationTest {
      *       identity / cursor, so this daemon does not interfere with it.</li>
      * </ul>
      *
+     * <p>Phase 4 Tier 2.5 phase D-9: the production projector is also the only writer of
+     * the BUY-async {@code ledger_inflight_outbox} row (see
+     * {@code OmsPostgresProjector#recordLedgerInflightOutboxIfNeeded}). The test daemon
+     * mirrors that path here so {@code LedgerInflightOutboxIntegrationTest} sees the row
+     * appear after the HTTP response without depending on the Spring-managed projector.
+     *
      * <p>Phase 4 Tier 2.5 phase D-3: the production projector now also writes the
      * {@code OrderAccepted} envelope into {@code domain_event_outbox} on a fresh admission
      * (because ingress stopped doing it to drop the per-request Postgres tx). This daemon
@@ -467,6 +475,7 @@ public abstract class AbstractPostgresIntegrationTest {
         private final OrdersRepository ordersRepository;
         private final DomainEventOutboxRepository domainEventOutboxRepository;
         private final DomainEventEnvelopeCodec domainEventEnvelopeCodec;
+        private final LedgerInflightOutboxRepository ledgerInflightOutboxRepository;
         private final Aeron aeron;
         private final AeronArchive archive;
         private final Subscription replay;
@@ -478,6 +487,7 @@ public abstract class AbstractPostgresIntegrationTest {
                 OrdersRepository ordersRepository,
                 DomainEventOutboxRepository domainEventOutboxRepository,
                 DomainEventEnvelopeCodec domainEventEnvelopeCodec,
+                LedgerInflightOutboxRepository ledgerInflightOutboxRepository,
                 Aeron aeron,
                 AeronArchive archive,
                 Subscription replay,
@@ -487,6 +497,7 @@ public abstract class AbstractPostgresIntegrationTest {
             this.ordersRepository = ordersRepository;
             this.domainEventOutboxRepository = domainEventOutboxRepository;
             this.domainEventEnvelopeCodec = domainEventEnvelopeCodec;
+            this.ledgerInflightOutboxRepository = ledgerInflightOutboxRepository;
             this.aeron = aeron;
             this.archive = archive;
             this.replay = replay;
@@ -527,6 +538,8 @@ public abstract class AbstractPostgresIntegrationTest {
             OrdersRepository orders = new OrdersRepository(jdbc);
             DomainEventOutboxRepository domainEventOutbox = new DomainEventOutboxRepository(jdbc);
             DomainEventEnvelopeCodec domainEventCodec = new DomainEventEnvelopeCodec(new ObjectMapper());
+            LedgerInflightOutboxRepository ledgerInflightOutbox = new LedgerInflightOutboxRepository(jdbc);
+            ObjectMapper inflightObjectMapper = new ObjectMapper();
 
             Aeron aeron = Aeron.connect(new Aeron.Context().aeronDirectoryName(aeronDir));
             AeronArchive archive = AeronArchive.connect(new AeronArchive.Context()
@@ -545,11 +558,27 @@ public abstract class AbstractPostgresIntegrationTest {
 
             AtomicBoolean running = new AtomicBoolean(true);
             Thread thread = new Thread(
-                    () -> replayLoop(replay, orders, domainEventOutbox, domainEventCodec, running),
+                    () -> replayLoop(
+                            replay,
+                            orders,
+                            domainEventOutbox,
+                            domainEventCodec,
+                            ledgerInflightOutbox,
+                            inflightObjectMapper,
+                            running),
                     "oms-test-projector-daemon");
             thread.setDaemon(true);
             TestPostgresProjectorSingleton instance = new TestPostgresProjectorSingleton(
-                    ds, orders, domainEventOutbox, domainEventCodec, aeron, archive, replay, thread, running);
+                    ds,
+                    orders,
+                    domainEventOutbox,
+                    domainEventCodec,
+                    ledgerInflightOutbox,
+                    aeron,
+                    archive,
+                    replay,
+                    thread,
+                    running);
             thread.start();
             return instance;
         }
@@ -601,6 +630,8 @@ public abstract class AbstractPostgresIntegrationTest {
                 OrdersRepository orders,
                 DomainEventOutboxRepository domainEventOutbox,
                 DomainEventEnvelopeCodec domainEventCodec,
+                LedgerInflightOutboxRepository ledgerInflightOutbox,
+                ObjectMapper inflightObjectMapper,
                 AtomicBoolean running) {
             FragmentHandler handler = (buffer, offset, length, header) -> {
                 int typeId = buffer.getInt(offset + OmsClusterWireFormat.HEADER_TYPE_ID_OFFSET);
@@ -621,6 +652,37 @@ public abstract class AbstractPostgresIntegrationTest {
                                     "OrderAccepted envelope serialisation failed for orderId="
                                             + ev.orderId(),
                                     e);
+                        }
+                    }
+                    // Mirror production OmsPostgresProjector D-9: project the BUY-async
+                    // ledger_inflight_outbox row from the cluster's authoritative
+                    // OrderAdmittedEvent. Gating mirrors the production gating: BUY only,
+                    // non-null ledgerBalanceId, non-zero limit price. We don't gate on the
+                    // OmsConfig.Ledger flags here because the integration test that exercises
+                    // this path explicitly enables them via DynamicPropertySource; tests that
+                    // disable inflight-async still POST orders without ledgerBalanceId, which
+                    // short-circuits below.
+                    if (ev.side() == AcceptOrderCommand.SIDE_BUY
+                            && ev.ledgerBalanceIdOrNull() != null
+                            && !ev.ledgerBalanceIdOrNull().isBlank()
+                            && ev.limitPriceScaledOrZero() != 0L) {
+                        java.math.BigDecimal quantity = java.math.BigDecimal.valueOf(ev.quantityScaled())
+                                .divide(java.math.BigDecimal.valueOf(AcceptOrderCommand.QUANTITY_SCALE),
+                                        10, java.math.RoundingMode.UNNECESSARY);
+                        java.math.BigDecimal limitPrice = java.math.BigDecimal.valueOf(ev.limitPriceScaledOrZero())
+                                .divide(java.math.BigDecimal.valueOf(AcceptOrderCommand.PRICE_SCALE),
+                                        10, java.math.RoundingMode.UNNECESSARY);
+                        var node = inflightObjectMapper.createObjectNode();
+                        node.put("ledgerBalanceId", ev.ledgerBalanceIdOrNull());
+                        node.put("quantity", quantity.toPlainString());
+                        node.put("limitPrice", limitPrice.toPlainString());
+                        try {
+                            ledgerInflightOutbox.insertIfAbsent(
+                                    ev.orderId(), inflightObjectMapper.writeValueAsString(node));
+                        } catch (JsonProcessingException e) {
+                            throw new IllegalStateException(
+                                    "ledger inflight outbox payload serialisation failed for orderId="
+                                            + ev.orderId(), e);
                         }
                     }
                 } catch (RuntimeException e) {

@@ -12,10 +12,8 @@ import com.balh.oms.ledger.LedgerBalanceClient;
 import com.balh.oms.ledger.LedgerInflightCoalescer;
 import com.balh.oms.ledger.LedgerInflightReservationClient;
 import com.balh.oms.observability.PiiHash;
-import com.balh.oms.persistence.LedgerInflightOutboxRepository;
 import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.tailer.OrderControlAdmission;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -36,23 +34,23 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * Phase 1c slice B / Phase 2 slice 2c / Phase 3 slice 3f / Phase 4 Tier 2.5 phase D-3 unit
- * test: verifies {@link OrderIngressService} routes admission through the (now mandatory)
+ * Phase 1c slice B / Phase 2 slice 2c / Phase 3 slice 3f / Phase 4 Tier 2.5 phase D-3 / D-9
+ * unit test: verifies {@link OrderIngressService} routes admission through the (now mandatory)
  * {@link OmsClusterIngressClient}, surfaces cluster failures as the right
  * {@link ClusterAdmissionException} HTTP status, does NOT write an {@code orders} row from
  * the ingress (slice 2c — projector owns it), does NOT write a {@code control_outbox} row
- * (slice 3f — table is gone), and (slice D-3) does NOT write a {@code domain_event_outbox}
- * row either — the projector now emits {@code OrderAccepted} from the cluster's
- * {@link com.balh.oms.cluster.OrderAdmittedEvent}, gated on a fresh {@code orders} insert.
+ * (slice 3f — table is gone), does NOT write a {@code domain_event_outbox} row (slice D-3 —
+ * projector emits {@code OrderAccepted} from the cluster log), and (slice D-9) does NOT write
+ * a {@code ledger_inflight_outbox} row from the ingress either — the projector promotes the
+ * D-1 idempotent backfill to the only writer of that table for the BUY-async path. Net: zero
+ * Postgres I/O on the ingress hot path on every branch through this method.
  *
  * <p>Plan: {@code system-documentation/plans/oms-aeron-cluster-substrate.md}.
  */
 class OrderIngressServiceClusterGateTest {
 
     private OrdersRepository orders;
-    private ObjectMapper objectMapper;
     private PiiHash piiHash;
-    private LedgerInflightOutboxRepository ledgerInflightOutbox;
     private OrderControlAdmission orderControlAdmission;
     private OmsClusterIngressClient cluster;
 
@@ -63,9 +61,7 @@ class OrderIngressServiceClusterGateTest {
     @SuppressWarnings("unchecked")
     void setUp() {
         orders = mock(OrdersRepository.class);
-        objectMapper = mock(ObjectMapper.class);
         piiHash = mock(PiiHash.class);
-        ledgerInflightOutbox = mock(LedgerInflightOutboxRepository.class);
         orderControlAdmission = mock(OrderControlAdmission.class);
         cluster = mock(OmsClusterIngressClient.class);
 
@@ -86,20 +82,18 @@ class OrderIngressServiceClusterGateTest {
                 (ObjectProvider<LedgerBalanceClient>) mock(ObjectProvider.class);
         when(ledgerBalance.getIfAvailable()).thenReturn(null);
 
-        // Phase 4 Tier 2.5 phase D-3: OrderIngressService no longer takes a
-        // PlatformTransactionManager — the only Postgres write that may still happen on
-        // the ingress hot path is the optional BUY-async ledger_inflight_outbox INSERT,
-        // which auto-commits via Hikari's default autoCommit=true. The DomainEventOutbox
-        // and DomainEventEnvelopeCodec dependencies are gone for the same reason.
+        // Phase 4 Tier 2.5 phase D-9: OrderIngressService no longer depends on
+        // LedgerInflightOutboxRepository or ObjectMapper — the BUY-async ledger_inflight_outbox
+        // INSERT moved to the projector (which materialises the row from the cluster's
+        // OrderAdmittedEvent via insertIfAbsent). The class now opens zero Postgres
+        // connections on the hot path on every branch.
         service = new OrderIngressService(
                 orders,
                 config,
-                objectMapper,
                 piiHash,
                 ledgerInflight,
                 ledgerInflightCoalescer,
                 ledgerBalance,
-                ledgerInflightOutbox,
                 new SimpleMeterRegistry(),
                 orderControlAdmission,
                 cluster);
@@ -126,10 +120,9 @@ class OrderIngressServiceClusterGateTest {
                 .isTrue();
         verify(cluster).submitAcceptOrder(any(AcceptOrderCommand.class), any(Duration.class));
         verify(orders, never()).insert(any(Order.class));
-        // D-3: ingress no longer writes the OrderAccepted envelope here. The buyRequest()
-        // also has limitPrice=null and ledgerBalanceId=null, so maybePlaceBuyLedgerInflightHold
-        // is a no-op and no Postgres conn is acquired at all on this path.
-        verify(ledgerInflightOutbox, never()).insert(any(), any());
+        // D-3 + D-9: ingress no longer writes either the OrderAccepted envelope or the
+        // ledger_inflight_outbox row — both materialise on the projector from the cluster's
+        // OrderAdmittedEvent. The class no longer holds either repository reference.
     }
 
     @Test
@@ -157,7 +150,6 @@ class OrderIngressServiceClusterGateTest {
                 .as("response must echo the cluster's original orderId so callers see a single identity")
                 .isEqualTo(clusterOriginalOrderId);
         verify(orders, never()).insert(any(Order.class));
-        verify(ledgerInflightOutbox, never()).insert(any(), any());
     }
 
     @Test
@@ -180,7 +172,6 @@ class OrderIngressServiceClusterGateTest {
                     assertThat(e.getErrorCode()).isEqualTo("cluster_rejected");
                 });
         verify(orders, never()).insert(any());
-        verify(ledgerInflightOutbox, never()).insert(any(), any());
     }
 
     @Test
@@ -194,7 +185,6 @@ class OrderIngressServiceClusterGateTest {
                     assertThat(e.getErrorCode()).isEqualTo("cluster_admission_timeout");
                 });
         verify(orders, never()).insert(any());
-        verify(ledgerInflightOutbox, never()).insert(any(), any());
     }
 
     @Test
@@ -208,7 +198,6 @@ class OrderIngressServiceClusterGateTest {
                     assertThat(e.getErrorCode()).isEqualTo("cluster_unavailable");
                 });
         verify(orders, never()).insert(any());
-        verify(ledgerInflightOutbox, never()).insert(any(), any());
     }
 
     private static CreateOrderRequest buyRequest() {

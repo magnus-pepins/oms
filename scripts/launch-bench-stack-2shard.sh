@@ -85,9 +85,18 @@ export OMS_LEDGER_INFLIGHT_RESERVATION_ENABLED=false
 export OMS_LEDGER_INFLIGHT_ASYNC_ENABLED=false
 
 # Per-shard env: shard 0 keeps existing single-host defaults; shard 1 lives on a
-# port-offset namespace and a separate Postgres DB. shardId on each side is 0 (router
-# invariant); shardCount=1 (no multi-bean injection yet).
+# port-offset namespace and a separate Postgres DB. The shard.id env var per shard
+# matters because of the E-2 projector shard guard (OmsPostgresProjector#guardShardOrDrop):
+# at E-3b the ingress-multi router stamps cmd.shardId via xxh64(accountId, count=2) — so a
+# command routed to shard 1's cluster carries shardId=1, the cluster admits with shardId=1,
+# and the OrderAdmittedEvent on the shard-1 events recording carries shardId=1. If shard 1's
+# projector is configured shard.id=0 (default), the guard will silently drop every event,
+# which is exactly the bug E-3b's first 2-shard end-to-end attempt hit. Setting OMS_SHARD_ID
+# per shard makes both projectors accept their own shard's events. The cluster-node itself
+# does not consult shard.id today (it admits with cmd.shardId()), but we still set it so the
+# JVM's identity is consistent in metrics and any future shard-aware paths.
 shard_env_0() {
+  export OMS_SHARD_ID=0
   export OMS_AERON_DIR_BASE="$HOME/oms/build/aeron-cluster"
   export OMS_AERON_CLUSTER_MEMBERS="0,localhost:20110,localhost:20220,localhost:20330,localhost:20440,localhost:8010"
   # Default OMS_AERON_ARCHIVE_CONTROL_CHANNEL ("aeron:udp?endpoint=localhost:8010") is
@@ -113,6 +122,7 @@ shard_env_0() {
 }
 
 shard_env_1() {
+  export OMS_SHARD_ID=1
   export OMS_AERON_DIR_BASE="$HOME/oms/build/aeron-cluster-1"
   export OMS_AERON_CLUSTER_MEMBERS="0,localhost:21110,localhost:21220,localhost:21330,localhost:21440,localhost:9010"
   export OMS_AERON_ARCHIVE_CONTROL_CHANNEL="aeron:udp?endpoint=localhost:9010"

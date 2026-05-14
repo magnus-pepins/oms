@@ -4235,13 +4235,79 @@ as E-3a but with **one** ingress JVM at `oms.shard.count=2` and
 per-shard overrides (`oms.cluster.client.shards[0].aeron-directory`,
 `...shards[1].aeron-directory`, etc.). The bench tool throws random
 `accountId`s; the router splits across the two clusters via xxh64
-mod 2. Postgres counts after the run confirmed both DBs grew (the
-admit landed on the cluster the router picked; the projector
-serving that cluster's shardId persisted it).
+mod 2.
 
-The full E-3b bench numbers and the diff vs E-3a's
-2-ingress-JVM topology are captured in the commit message and in
-`systems/oms.md` § Document history.
+End-to-end smoke (4 000 orders @ 50 conc, account-pool 16):
+- 4 000/4 000 success, 0 failures, ~8.8 k RPS.
+- Postgres counts after the run: both DBs grew. xxh64 distribution
+  on 4 000 random `accountId`s landed ~1 910 on shard 0 and ~2 090
+  on shard 1.
+- `oms_projector_shard_mismatch_dropped_total` = `0` on **both**
+  projectors — the cancel-applied guard is exercised on the happy
+  path without false drops.
+
+Saturation bench (single ingress JVM, `oms.shard.count=2`, account
+pool 32, 5 000-order warmup excluded from the HdrHistogram):
+
+| burst        | conc | orders   | failed | RPS     | p50 RTT | p99 RTT |
+|--------------|-----:|---------:|-------:|--------:|--------:|--------:|
+| 80 k         | 100  | 80 000   | 0      | 42 322  | 1.79 ms | 4.35 ms |
+| 120 k        | 200  | 120 000  | 0      | 52 305  | 3.20 ms | 9.34 ms |
+| 200 k        | 300  | 200 000  | 0      | 58 699  | 3.90 ms | 12.80 ms|
+| **300 k**    | 400  | 300 000  | 0      | **64 580** | 5.12 ms | 14.72 ms |
+
+Diff vs E-3a's 2-ingress-JVM topology: E-3a reached ~59 k RPS
+**aggregated across two ingress JVMs at conc 50 each** (≈ 100
+in-flight). E-3b reaches ~64.6 k from a **single** ingress JVM at
+conc 400, so the Spring refactor neither costs throughput nor
+forces operators to run a JVM per shard on a single host. The
+substrate parallelises through one process boundary just as well
+as through two.
+
+Process-boundary correctness (post-bench, after projectors drained):
+- Postgres `orders` row counts: `oms` ≈ 91 k, `oms_1` ≈ 90 k after
+  the saturation sweep — a ~50/50 split through the router that
+  matches the xxh64 expectation.
+- `oms_projector_shard_mismatch_dropped_total` = `0` on **both**
+  projectors after every burst, including the 300 k @ 400 conc run.
+- Both projectors' Postgres pools held during the bench (no
+  `socketTimeout` exceptions during steady state). The projector is
+  the next visible bottleneck under E-3b — it lags the ingress
+  burst, drains in seconds-to-minutes after the burst ends, and is
+  the natural target for a Phase-5 sharded-projector scaling pass.
+
+Two regressions found and fixed during this validation, both in
+the new factory's lifecycle (a generic `@Bean`-method-creates-
+non-managed-objects pitfall, not specific to Aeron):
+- `OmsClusterClientsConfiguration` originally relied on Spring's
+  `@PostConstruct` on `OmsClusterIngressClient` to call `connect()`.
+  That hook only fires for shard 0 (the back-compat singleton bean
+  exposed via the second `@Bean` method); shards `1..N-1` were
+  built with `new` inside the factory and stayed unconnected. The
+  first 2-shard burst surfaced this as 2 130 / 4 000 HTTP 503
+  ("OMS cluster client is not connected") for shard-1 traffic. The
+  factory now calls `client.connect()` explicitly after each
+  `createClient(...)`. `connect()` is idempotent, so re-invoking it
+  on shard 0 (where Spring's `@PostConstruct` does run) is a no-op.
+  A unit test in `OmsClusterClientsConfigurationTest`
+  (`omsClusterIngressClients_callsConnectOnEveryShard_notJustShardZero`)
+  uses a `createClient(...)` test seam to assert `connect()` is
+  invoked on every shard's client.
+- `OmsClusterClientsConfiguration#close()` (the `@PreDestroy`
+  symmetry) had the same issue going the other way: only shard 0's
+  client was being closed by Spring (via the same back-compat
+  singleton). The factory now explicitly closes shards `1..N-1` on
+  shutdown; shard 0 is left to Spring (skip in the loop) since
+  `OmsClusterIngressClient.close()` is idempotent and double-close
+  would be safe but loud in logs.
+
+A third issue surfaced was a launcher-script bug in
+`scripts/launch-bench-stack-2shard.sh`: `OMS_SHARD_ID` was not
+exported in either `shard_env_*` helper, so `cluster-node-1` and
+`projector-1` defaulted to `shard_id=0` and the projector dropped
+every event from `cluster-node-1` via the (correctly-working)
+shard guard. Fixed by `export OMS_SHARD_ID={0,1}` in the right
+helpers.
 
 ### Decision: E-3b complete; next is Phase 5 multi-host
 

@@ -151,11 +151,34 @@ public class OmsClusterClientsConfiguration {
                     shardCount,
                     e.getValue().getAeronDirectory(),
                     e.getValue().getIngressEndpoints());
-            clients.put(e.getKey(), new OmsClusterIngressClient(e.getValue(), meterRegistry));
+            OmsClusterIngressClient client = createClient(e.getValue(), meterRegistry);
+            // Phase 4 Tier 2.5 phase E-3b: when this factory builds clients via {@code new}, Spring
+            // does not run the {@link OmsClusterIngressClient#connect() @PostConstruct} on the
+            // returned objects (only the back-compat singleton bean exposed below has its lifecycle
+            // managed). Without an explicit {@code connect()} here, every shard except shard 0
+            // would silently stay unconnected and {@code submit*} would throw
+            // {@code IllegalStateException("OMS cluster client is not connected")} at runtime —
+            // exactly the failure mode the first 2-shard end-to-end smoke hit (2130/4000 commands
+            // routed to shard 1 returned HTTP 503). {@code connect()} is idempotent so re-invoking
+            // it on shard 0 (which Spring does call via the singleton bean's @PostConstruct) is a
+            // no-op.
+            client.connect();
+            clients.put(e.getKey(), client);
         }
         Map<Integer, OmsClusterIngressClient> immutable = Collections.unmodifiableMap(clients);
         this.built = immutable;
         return immutable;
+    }
+
+    /**
+     * Test seam for {@link #omsClusterIngressClients}. Production wiring constructs a real
+     * {@link OmsClusterIngressClient}; tests override this to return a spy/mock so they can
+     * assert e.g. that {@code connect()} is called on <em>every</em> shard's client (not just
+     * shard 0 — the bug Phase 4 Tier 2.5 phase E-3b's first Pop! 2-shard e2e attempt hit).
+     */
+    OmsClusterIngressClient createClient(
+            OmsConfig.Cluster.Client clientConfig, MeterRegistry meterRegistry) {
+        return new OmsClusterIngressClient(clientConfig, meterRegistry);
     }
 
     /**
@@ -188,10 +211,25 @@ public class OmsClusterClientsConfiguration {
         if (snapshot.isEmpty()) {
             return;
         }
-        // Spring's bean factory will already invoke the per-client @PreDestroy. We don't double-
-        // close here; this hook is a structured logging point so operators see the multi-shard
-        // shutdown order in the same log line shape as startup.
         log.info("OMS cluster client factory shutting down: shardCount={}", snapshot.size());
+        // Phase 4 Tier 2.5 phase E-3b: same Spring-lifecycle nuance as the {@code connect()} bug
+        // fixed in {@link #omsClusterIngressClients}: only shard 0's client is a Spring-managed
+        // bean (via the back-compat {@link #omsClusterIngressClient} method) and so only its
+        // {@link OmsClusterIngressClient#close() @PreDestroy} runs automatically. Shards 1..N-1
+        // were created with {@code new} inside the factory, so we must close them explicitly here
+        // or operators see leaked Aeron media-driver subscriptions / publications past JVM
+        // shutdown. {@link OmsClusterIngressClient#close()} is idempotent (guards on null
+        // {@code client}), so double-closing shard 0 if Spring does call it later is safe.
+        for (Map.Entry<Integer, OmsClusterIngressClient> e : snapshot.entrySet()) {
+            if (e.getKey() == 0) {
+                continue;
+            }
+            try {
+                e.getValue().close();
+            } catch (RuntimeException ex) {
+                log.warn("Error closing OmsClusterIngressClient for shard {}: {}", e.getKey(), ex.toString(), ex);
+            }
+        }
     }
 
     /**

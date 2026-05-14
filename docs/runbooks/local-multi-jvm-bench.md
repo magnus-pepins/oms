@@ -2732,6 +2732,186 @@ not HTTP I/O.
   ceiling × per-request CPU cost becomes the wall, and a 400-thread
   bump becomes useful. Before D-9 it would only deepen the Hikari queue.
 
+## Tier 2.5 phase D-9 verification — projector is sole writer of `ledger_inflight_outbox` (Pop! 2026-05-14)
+
+### TL;DR
+
+| Concurrency | RPS | Mean RTT | p50 RTT | p99 RTT | Failures |
+|-------------|-------------|-----------|-----------|-----------|----------|
+| warmup (c80) | 10 643 | 5.95 ms | 2.56 ms | 109.25 ms | 0 |
+| c400 | 46 505 | 7.32 ms | 5.95 ms | 24.06 ms | 0 |
+| c800 | 51 348 | 13.48 ms | 11.84 ms | 58.82 ms | 0 |
+| c1200 | 49 275 | 21.38 ms | 19.71 ms | 59.33 ms | 0 |
+| c1600 | 53 929 | 28.04 ms | 25.60 ms | 94.21 ms | 0 |
+| **c2400** | **57 282** | 40.43 ms | 37.89 ms | 123.07 ms | 0 |
+| c3200 | 53 130 | 58.92 ms | 55.74 ms | 190.46 ms | 0 |
+
+* Best run **57 282 rps** at c2400, **2.74× over D-8** (20 874 rps),
+  **52.4× over slice 4p baseline** (1 094 rps).
+* RPS plateau between c1600 and c3200 sits at **53–57 k**: the system is
+  no longer queue-bound on Postgres or Hikari (those acquired sub-µs); the
+  remaining wait is in the Aeron cluster commit RTT.
+* **0 failures across 1.92 M requests** in the sweep.
+
+### Setup
+
+* Code: `oms@272042a` (`oms: tier-2.5 phase D-9 — projector is sole writer
+  of ledger_inflight_outbox`).
+* Flags on Pop! `~/.oms-bench.env`: unchanged from D-8 (no new env knobs in
+  D-9 — the change is a pure code refactor of where the
+  `ledger_inflight_outbox` row is written). Specifically
+  `OMS_PG_POOL_MAX_SIZE=20`, `inflight-async-enabled=true`,
+  `inflight-coalescer-enabled=false`, balance-identity cache on
+  (`enabled=true ttl=300 max=100000`), Supavisor `default_pool_size=80`.
+* Same 5 OMS JVMs (cluster-node + projector + fix-egress + 2 ×
+  ingress-replica), Postgres truncated before run, Aeron cluster dir wiped.
+
+### Smoke test (5 sequential POSTs, 1 conn, same balanceId)
+
+* HTTP: 5 / 5 → 201, first POST 38 ms (cold cluster + cold cache),
+  subsequent POSTs ~5 ms.
+* After 2 s: `orders=5`, `ledger_inflight_outbox=5`,
+  `domain_event_outbox=10` (5 × `OrderAccepted` + 5 × `OrderWorking`).
+  Critically: **all 5 inflight rows came from the projector**, not from
+  the ingress JVM (the ingress no longer holds a
+  `LedgerInflightOutboxRepository` reference at all).
+* Cache: 4 hits / 1 miss — single-flighting + warmup behaving as in D-8.
+
+### Where the time went, vs D-8 (per-ingress, c1600 row)
+
+| Timer | D-8 | D-9 | Δ |
+|--------------------------------------|---------|---------|---------|
+| `oms.pipeline.ingress.accept` | 18.7 ms | **2.86 ms** | **−85 %** |
+| `hikaricp_connections_acquire` (per-acquire mean) | 16.2 ms | **0.67 µs** | **≈ 0** |
+| `hikaricp_connections_usage` (per-acquire count) | 160 000 | **291** | **−99.8 %** |
+| `oms_ledger_balance_identity_cache_requests_total{result="hit"}` | 160 000 | 160 000 | unchanged (100 % hit-rate) |
+| `oms_ledger_balance_identity_cache_requests_total{result="miss"}` | ~1 / ingress | ~1 / ingress | unchanged |
+
+The Hikari count dropping from 160 000 to 291 is the headline: **almost
+no ingress request opens a Postgres connection any more**. The 291
+acquires that remain are background work (actuator endpoints, the
+fixed-rate `LedgerBalanceClient.fetchAvailableBalance` health probe in
+the slice 4p reconciler — none of them on the order-accept hot path).
+Per-acquire usage time stayed around 16 ms (similar to D-8) but the
+acquire count is so small that it doesn't show up as a wait at the
+Tomcat-thread level any more.
+
+### Where the threads went (jstack at c1600, ingress-1, 214 exec threads)
+
+| Frame | Threads | % of pool |
+|-----------------------------------------------------------------------------|---------|-----------|
+| `OmsClusterIngressClient.submitAcceptOrder` (Aeron cluster admit reply wait) | 174 | 81 % |
+| Other parkNanos (Tomcat scheduler) | 13 | 6 % |
+| `TaskQueue.take` (idle) | 10 | 5 % |
+| Tomcat NIO selector + misc Tomcat internals | 8 | 4 % |
+| `LedgerInflightOutboxRepository.insert → ConcurrentBag.borrow` | **0** | **0 %** |
+| `RestLedgerBalanceClient.fetchBalanceRoot` | **0** | **0 %** |
+
+Compare to D-8 jstack at c1600: 186 / 200 in
+`LedgerInflightOutboxRepository.insert → ConcurrentBag.borrow`. D-9
+cleanly removed that wait — the wall is now the Aeron cluster's
+**single-leader commit serialisation**, not Postgres connection-pool
+starvation. This is exactly the next-lever signal the post-D-8 plan
+predicted.
+
+At c2400 (the peak step) the cluster-wait fraction drops to 111 / 214
+(52 %) and "other parkNanos" rises to 87 (41 %): the Tomcat scheduler
+is starting to absorb queue depth into request-thread wait. Beyond
+c3200 the system would benefit from D-7 (Tomcat thread bump) — now
+properly motivated because no I/O is still on the hot path, only CPU
++ scheduler.
+
+### Theoretical ceiling math
+
+* Per ingress: a single Aeron cluster commit RTT ≈ 1.5–2 ms in steady
+  state on Pop! (single leader, single-host IPC). 200 Tomcat exec
+  threads × ~3 ms accept time = ~67 k accepts/sec/ingress; with two
+  ingresses sharing one cluster leader, the *sum* hits the leader's
+  serialisation ceiling first.
+* Observed: 57 282 rps best ≈ 30 k / ingress. The leader is still the
+  wall — admit batching (D-6) is the next obvious lever to multiply
+  this by N (the cluster commits N admits per round-trip with N×
+  per-request future fan-out on the response side).
+
+### Lift summary across Tier 2.5 (slice 4p baseline → D-9)
+
+| Phase | RPS | Lift over baseline | Lift over previous |
+|-------|--------|--------------------|--------------------|
+| 4p | 1 094 | 1.00 × | — |
+| C-1+2 | 3 800 | 3.47 × | 3.47 × |
+| C-3 | 7 762 | 7.10 × | 2.04 × |
+| C-4 | 7 770 | 7.10 × | 1.00 × |
+| D-1 | 7 900 | 7.22 × | 1.02 × |
+| D-2 | 4 700 (regression) | 4.30 × | 0.59 × (Supavisor backend = 20 surfaced) |
+| D-4 | 10 561 | 9.65 × | 2.25 × (after Supavisor backend = 80 fix) |
+| D-3 | 11 629 | 10.63 × | 1.10 × |
+| D-8 | 20 874 | 19.08 × | 1.795 × |
+| **D-9** | **57 282** | **52.36 ×** | **2.74 ×** |
+
+### Lessons (D-9 specific)
+
+* **The largest remaining I/O sink was the simplest to remove.** The
+  ingress-side `ledger_inflight_outbox` INSERT was already mirrored
+  by the projector's idempotent backfill (D-1 made it crash-safe
+  back in May 2026). Promoting the projector to the only writer was
+  a **5-line behavioural change** in `OrderIngressService` (drop the
+  `enqueueBuyLedgerInflightHold` body) plus a Javadoc rename in
+  `OmsPostgresProjector`. The lift was 2.74×.
+  Prior art is the right starting point for the highest-leverage
+  refactors — the scaffolding (idempotency, projector cursor,
+  reconciler) was already in place; D-9 is just operator-flippable
+  re-routing.
+* **D-7 is now properly motivated.** With Postgres + Hikari + Ledger
+  HTTP all off the ingress hot path, the c3200 jstack starts to show
+  Tomcat scheduler queueing as a real source of wait (87 / 214
+  threads in "other parkNanos"). A 400-thread Tomcat bump would
+  delay the queue-up wall; before D-9 the same bump only deepened
+  the Hikari queue.
+* **Synthetic-test noise from the slice 4p reconciler is expected.**
+  At 1.92 M admits in ~36 s, the reconciler ran out of test-Ledger
+  funds (test balance: 100 EUR; per-order hold: 1.50 EUR) and logged
+  ~82 k "Insufficient funds" warnings. The compensator cancelled the
+  affected admits in turn (11 017 `compensated_at` rows). This does
+  not affect the customer-facing 201 RPS — those came back the moment
+  the cluster admitted, before any Ledger interaction. It does
+  demonstrate that the slice 4p reconciler / compensator pipeline
+  consumes the projector-written rows identically to ingress-written
+  rows, which is the durability-equivalent property D-9 needed to
+  preserve.
+
+### Recommended next slices (post-D-9)
+
+* **Phase D-6 — admit batching at the cluster client.** Now the
+  unambiguous next lever. The 174 / 214 jstack signal at c1600 is
+  exactly what an unbatched single-leader admit looks like at
+  saturation. Batching N requests per `submitAcceptOrder` round-trip
+  with per-request future fan-out on the response side multiplies
+  the ceiling by N at the cost of N× admit latency. Expected
+  2–3× lift with `batchSize ≈ 8–16` (cluster commits one log slot
+  per batch, Aeron+Postgres commit are the same per-batch).
+* **Phase D-7 — Tomcat thread bump (now meaningful).** With the
+  scheduler-side wait visible in the c2400/c3200 jstacks, lifting
+  `server.tomcat.max-threads` per ingress from 200 → 400 or 600
+  would absorb more of the bench's c2400+ concurrency without
+  back-pressuring the burst tool. Probably small additional lift
+  (10–20 %) but trivial to flip.
+* **Phase D-10 (new) — projector throughput tuning.** D-9 surfaced
+  a downstream limit: at 57 k rps on ingress, the projector +
+  reconciler (running in the same JVM) drained admit events to
+  Postgres at ~360 events/s once the slice-4p reconciler started
+  hammering Ledger with insufficient-funds errors. In production the
+  reconciler will not be receiving steady-state errors, so this is a
+  bench-specific symptom, but the structural concern remains: the
+  projector / reconciler share a Spring scheduler thread pool, and
+  the reconciler's blocking Ledger HTTP call can starve the
+  projector's admit-event drain. Splitting them onto separate
+  schedulers (or moving reconciler to its own JVM) would decouple
+  the two so projector lag stays bounded under reconciler back-up.
+  Not a customer-facing 201 issue — only an "orders row appears in
+  Postgres" lag issue.
+* **Phase D-5 — split projector + fix-egress onto a separate
+  Supavisor tenant.** Stays deprioritised vs D-6 / D-7 / D-10.
+
 ## Caveats
 
 - This is a **single-host single-cluster-node** rig. It does NOT exercise consensus, leader

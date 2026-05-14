@@ -116,6 +116,11 @@ dependencies {
     // LMAX Disruptor — in-process pipelining (used post-PG-commit only)
     implementation("com.lmax:disruptor:4.0.0")
 
+    // Caffeine — JVM-local cache for the (balanceId -> identityId) binding (Phase 4 Tier 2.5
+    // phase D-8). Version managed by the Spring Boot 3.3 BOM (3.1.8 at the time of writing);
+    // pin via the BOM rather than explicitly so future Boot upgrades carry it forward.
+    implementation("com.github.ben-manes.caffeine:caffeine")
+
     // HdrHistogram — Phase 4 slice 4e cluster bench harness records commit-round-trip
     // latencies into a lossless high-dynamic-range histogram so p50/p95/p99/p99.9 are
     // accurate to the underlying recording resolution (no Micrometer-style summary

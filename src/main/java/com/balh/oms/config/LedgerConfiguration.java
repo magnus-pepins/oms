@@ -1,5 +1,6 @@
 package com.balh.oms.config;
 
+import com.balh.oms.ledger.CachingLedgerBalanceClient;
 import com.balh.oms.ledger.LedgerBalanceClient;
 import com.balh.oms.ledger.LedgerInflightBulkDispatcher;
 import com.balh.oms.ledger.LedgerInflightCoalescer;
@@ -43,13 +44,35 @@ public class LedgerConfiguration {
                 .build();
     }
 
+    /**
+     * Phase 4 Tier 2.5 phase D-8: when
+     * {@code oms.ledger.balance-identity-cache.enabled=true}, the {@link RestLedgerBalanceClient}
+     * is wrapped in {@link CachingLedgerBalanceClient}. The cache is JVM-local (each ingress
+     * has its own) and only caches the durable {@code (balanceId -> identityId)} binding;
+     * the volatile {@code availableBalance} / {@code balance} reads pass through unchanged.
+     * See {@code OmsConfig.Ledger.BalanceIdentityCache} Javadoc for the operator contract
+     * around bounded staleness.
+     */
     @Bean
-    LedgerBalanceClient ledgerBalanceClient(RestClient omsLedgerRestClient, OmsConfig config, ObjectMapper objectMapper) {
+    LedgerBalanceClient ledgerBalanceClient(
+            RestClient omsLedgerRestClient,
+            OmsConfig config,
+            ObjectMapper objectMapper,
+            MeterRegistry meterRegistry) {
         String key = config.getLedger().getApiKey();
         if (key == null || key.isBlank()) {
             throw new IllegalStateException("oms.ledger.api-key is required when oms.ledger.enabled=true");
         }
-        return new RestLedgerBalanceClient(omsLedgerRestClient, key, objectMapper);
+        LedgerBalanceClient delegate = new RestLedgerBalanceClient(omsLedgerRestClient, key, objectMapper);
+        var cacheConfig = config.getLedger().getBalanceIdentityCache();
+        if (!cacheConfig.isEnabled()) {
+            return delegate;
+        }
+        return new CachingLedgerBalanceClient(
+                delegate,
+                cacheConfig.getTtlSeconds(),
+                cacheConfig.getMaxSize(),
+                meterRegistry);
     }
 
     @Bean

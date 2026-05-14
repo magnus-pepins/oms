@@ -261,6 +261,67 @@ public class OmsConfig {
          */
         private String settlementPostingHttpPath = "/internal/v0/settlement-outbox";
 
+        private final BalanceIdentityCache balanceIdentityCache = new BalanceIdentityCache();
+
+        public BalanceIdentityCache getBalanceIdentityCache() { return balanceIdentityCache; }
+
+        /**
+         * Phase 4 Tier 2.5 phase D-8 — JVM-local cache for the
+         * {@code (balanceId -> identityId)} binding read by
+         * {@link com.balh.oms.ingress.OrderIngressService#maybeVerifyLedgerBalanceBinding}.
+         *
+         * <p>The binding is durable in Ledger (it only changes when an operator reassigns a
+         * balance to a different identity, which is a manual action and rare in steady state).
+         * Caching it locally removes a synchronous {@code GET /balances/{id}} round-trip from
+         * the order accept hot path. Pop! 2026-05-14 D-3 jstack at c1600 / 11 629 rps showed
+         * 187 / 200 ingress Tomcat threads parked in
+         * {@code RestLedgerBalanceClient.fetchBalanceRoot} — i.e. the verify HTTP call was the
+         * primary throughput wall after Postgres + Aeron came off the hot path.
+         *
+         * <p>Negative responses ({@code ledger_balance_not_found}, network errors) are
+         * <strong>not</strong> cached: those should remain fast-retryable so transient blips
+         * don't pin a 4xx/5xx for the whole TTL window. Mismatch (claimed identity != cached
+         * identity) is also surfaced from the cached value, because the durable identity is
+         * the cached value — a mismatch means the caller's claim is wrong, not the cache.
+         *
+         * <p>Disabled by default. When enabled, callers must accept up to {@link #ttlSeconds}
+         * of staleness on the (balanceId -> identityId) mapping. Operators flipping
+         * a balance reassignment that needs to be effective sooner can shrink {@link #ttlSeconds}
+         * temporarily, or trigger a JVM restart on the affected ingresses.
+         */
+        public static class BalanceIdentityCache {
+
+            /** Default 5 min — short enough to limit operator-reassignment staleness, long enough to absorb burst load. */
+            private static final long DEFAULT_TTL_SECONDS = 300L;
+            /**
+             * Default 100k entries. Each entry is a small fixed-size pair of UUID-ish strings
+             * (~80 B + Caffeine overhead, well under 200 B), so 100k * 200 B = 20 MB worst
+             * case — comfortable on every ingress JVM. Operators with much larger balance
+             * domains can raise this; the eviction policy is Caffeine's default Window-TinyLFU.
+             */
+            private static final long DEFAULT_MAX_SIZE = 100_000L;
+
+            private boolean enabled = false;
+            private long ttlSeconds = DEFAULT_TTL_SECONDS;
+            private long maxSize = DEFAULT_MAX_SIZE;
+
+            public boolean isEnabled() { return enabled; }
+            public void setEnabled(boolean v) { this.enabled = v; }
+
+            public long getTtlSeconds() { return ttlSeconds; }
+            public void setTtlSeconds(long v) {
+                // Floor at 1s — anything smaller is cheaper to just call Ledger every time.
+                this.ttlSeconds = Math.max(1L, v);
+            }
+
+            public long getMaxSize() { return maxSize; }
+            public void setMaxSize(long v) {
+                // Floor at 1 — Caffeine rejects 0/negative; "0" means "off", which is what
+                // BalanceIdentityCache.enabled=false expresses.
+                this.maxSize = Math.max(1L, v);
+            }
+        }
+
         public boolean isEnabled() { return enabled; }
         public void setEnabled(boolean v) { this.enabled = v; }
         public boolean isInflightReservationEnabled() { return inflightReservationEnabled; }

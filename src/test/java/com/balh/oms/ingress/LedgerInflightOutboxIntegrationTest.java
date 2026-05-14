@@ -79,8 +79,9 @@ class LedgerInflightOutboxIntegrationTest extends AbstractPostgresIntegrationTes
 
     @Test
     void asyncInflightDefersLedgerPostUntilReconcilerRuns() {
+        // Verify path sends with_queued=false (Tier 2.5 phase C-3, see RestLedgerBalanceClient).
         ledgerWireMock.stubFor(get(urlPathEqualTo("/balances/cust_balance_async"))
-                .withQueryParam("with_queued", equalTo("true"))
+                .withQueryParam("with_queued", equalTo("false"))
                 .willReturn(aResponse()
                         .withHeader("Content-Type", "application/json")
                         .withBody("{\"availableBalance\":\"999\",\"identityId\":\"ident-async-it\"}")));

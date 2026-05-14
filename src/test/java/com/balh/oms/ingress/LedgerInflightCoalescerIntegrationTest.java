@@ -97,8 +97,10 @@ class LedgerInflightCoalescerIntegrationTest extends AbstractPostgresIntegration
 
     @Test
     void coalescerPath_routesBuyHoldThroughBulkEndpoint_noOutboxRow() {
+        // Verify path sends with_queued=false so it hits Ledger's Redis cache (Tier 2.5 phase C-3,
+        // see RestLedgerBalanceClient Javadoc).
         ledgerWireMock.stubFor(get(urlPathEqualTo("/balances/cust_balance_coalescer"))
-                .withQueryParam("with_queued", equalTo("true"))
+                .withQueryParam("with_queued", equalTo("false"))
                 .willReturn(aResponse()
                         .withHeader("Content-Type", "application/json")
                         .withBody("{\"availableBalance\":\"999\",\"identityId\":\"ident-coalescer-it\"}")));
@@ -138,7 +140,7 @@ class LedgerInflightCoalescerIntegrationTest extends AbstractPostgresIntegration
     @Test
     void coalescerBulkFailure_fallsBackToOutbox_andReconcilerDrivesLedger() {
         ledgerWireMock.stubFor(get(urlPathEqualTo("/balances/cust_balance_fallback"))
-                .withQueryParam("with_queued", equalTo("true"))
+                .withQueryParam("with_queued", equalTo("false"))
                 .willReturn(aResponse()
                         .withHeader("Content-Type", "application/json")
                         .withBody("{\"availableBalance\":\"999\",\"identityId\":\"ident-fallback-it\"}")));

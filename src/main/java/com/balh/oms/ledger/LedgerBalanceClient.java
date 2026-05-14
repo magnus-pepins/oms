@@ -24,6 +24,10 @@ public interface LedgerBalanceClient {
      * Ledger {@code identity_id} owning the balance (from GET body {@code identityId} or nested
      * {@code identity.identityId}).
      *
+     * <p>Implementations should request the GET <strong>without</strong> {@code with_queued=true}
+     * so the call hits Ledger's Redis balance cache (60 s TTL). See
+     * {@link RestLedgerBalanceClient} class-level Javadoc for the measured impact.
+     *
      * @throws LedgerServiceException when the balance is missing, the response is invalid, or HTTP fails
      */
     String fetchIdentityIdForBalance(String balanceId) throws LedgerServiceException;

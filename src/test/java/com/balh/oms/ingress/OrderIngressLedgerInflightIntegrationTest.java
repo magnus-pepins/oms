@@ -71,8 +71,9 @@ class OrderIngressLedgerInflightIntegrationTest extends AbstractPostgresIntegrat
 
     @Test
     void rejectsBuyWhenLedgerIdentityDoesNotMatchClaim() {
+        // Verify path sends with_queued=false (Tier 2.5 phase C-3, see RestLedgerBalanceClient).
         ledgerWireMock.stubFor(get(urlPathEqualTo("/balances/cust_balance_1"))
-                .withQueryParam("with_queued", equalTo("true"))
+                .withQueryParam("with_queued", equalTo("false"))
                 .willReturn(aResponse()
                         .withHeader("Content-Type", "application/json")
                         .withBody("{\"availableBalance\":\"999\",\"identityId\":\"ledger-actual-owner\"}")));
@@ -92,7 +93,7 @@ class OrderIngressLedgerInflightIntegrationTest extends AbstractPostgresIntegrat
     @Test
     void buyOrderWithInflightPostsLedgerSyncTransaction() {
         ledgerWireMock.stubFor(get(urlPathEqualTo("/balances/cust_balance_1"))
-                .withQueryParam("with_queued", equalTo("true"))
+                .withQueryParam("with_queued", equalTo("false"))
                 .willReturn(aResponse()
                         .withHeader("Content-Type", "application/json")
                         .withBody("{\"availableBalance\":\"999\",\"identityId\":\"ident-inflight-it\"}")));

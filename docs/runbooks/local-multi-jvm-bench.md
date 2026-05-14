@@ -2889,12 +2889,15 @@ properly motivated because no I/O is still on the hot path, only CPU
   the ceiling by N at the cost of N× admit latency. Expected
   2–3× lift with `batchSize ≈ 8–16` (cluster commits one log slot
   per batch, Aeron+Postgres commit are the same per-batch).
-* **Phase D-7 — Tomcat thread bump (now meaningful).** With the
-  scheduler-side wait visible in the c2400/c3200 jstacks, lifting
-  `server.tomcat.max-threads` per ingress from 200 → 400 or 600
-  would absorb more of the bench's c2400+ concurrency without
-  back-pressuring the burst tool. Probably small additional lift
-  (10–20 %) but trivial to flip.
+* **Phase D-7 — Tomcat thread bump.** Pre-D-9 plan said this was
+  "now properly motivated"; the **D-7 falsification experiment**
+  below (immediately after D-9) tested that hypothesis with a 1-flag
+  change and found it **regressed peak rps by −7.5 %** (57 282 →
+  52 967). The 87 / 214 "other parkNanos" frames seen in the D-9
+  c2400 jstack were idle-pool overhead, not queue-wait — doubling
+  the pool just doubled the idle frames. Keep `threads.max=200`
+  until D-6 lifts the cluster ceiling; D-7 may matter again at a
+  much higher RPS regime.
 * **Phase D-10 (new) — projector throughput tuning.** D-9 surfaced
   a downstream limit: at 57 k rps on ingress, the projector +
   reconciler (running in the same JVM) drained admit events to
@@ -2911,6 +2914,89 @@ properly motivated because no I/O is still on the hot path, only CPU
   Postgres" lag issue.
 * **Phase D-5 — split projector + fix-egress onto a separate
   Supavisor tenant.** Stays deprioritised vs D-6 / D-7 / D-10.
+
+## Tier 2.5 phase D-7 falsification — Tomcat thread bump alone (Pop! 2026-05-14)
+
+Run between D-9 and D-6 to test the D-9 plan claim that "D-7 is now
+properly motivated." **Pure env flip — no code change** —
+`SERVER_TOMCAT_THREADS_MAX=400` on both ingress JVMs, all other
+config / DB state identical to the D-9 sweep. Same Postgres / Aeron
+wipe + same launch order + same bench script.
+
+### TL;DR
+
+| Concurrency | D-9 (`threads.max=200`) | D-7 (`threads.max=400`) | Δ rps |
+|-------------|-------------------------|-------------------------|-------|
+| warmup (c80) | 10 643 | 10 371 | −2.6 % |
+| c400 | 46 505 | 44 749 | −3.8 % |
+| c800 | 51 348 | 44 589 | **−13.2 %** |
+| c1200 | 49 275 | 53 147 | +7.9 % |
+| c1600 | 53 929 | 54 073 | +0.3 % |
+| **c2400 (peak)** | **57 282** | **52 967** | **−7.5 %** |
+| c3200 | 53 130 | 50 257 | −5.4 % |
+
+* **Peak rps regressed**, the c800 leg regressed by 13 %, and no leg
+  showed a meaningful gain. **D-7 alone is a no-op-or-worse, not a
+  win** — falsifies the D-9 runbook claim that the c2400 / c3200
+  scheduler-side parkNanos was queue-wait.
+
+### Where the threads went (jstack at c1600, ingress-1, threads.max=400)
+
+| Frame | D-9 (414 caps the pool) | D-7 (414 actual) | Δ |
+|-----------------------------------------------------------------------------|-------------------------|------------------|---|
+| `OmsClusterIngressClient.submitAcceptOrder` (cluster admit reply wait) | 174 / 214 (81 %) | **86 / 414 (20 %)** | absolute count went down |
+| `LockSupport.park` (other) | 13 / 214 (6 %) | **299 / 414 (72 %)** | absolute count exploded |
+| `TaskQueue.take` (idle exec thread) | 10 / 214 (5 %) | 10 / 414 (2 %) | unchanged |
+| Tomcat NIO selector / epoll | 8 / 214 (4 %) | 2 / 414 (0 %) | unchanged |
+
+The "active in-flight admit count" — threads actually parked in
+`submitAcceptOrder` — **stayed roughly the same** (174 → 86;
+across two ingresses it sums to similar effective work). The extra
+200 threads on each ingress are just **idle exec workers parked
+on `Tomcat$ContainerThreadMarker$BlockingQueue.poll`**, contributing
+context-switch overhead to no useful end. The wall is genuinely the
+**Aeron cluster's single-leader admit serialisation** (`onSessionMessage`
+processes one admit at a time, and a single-host cluster has a fixed
+per-admit CPU cost ≈ 17.5 µs at 57 k rps), **not Tomcat thread
+budget**. More Tomcat threads just queue more work at the same
+single cluster ingress.
+
+### Cluster commit RTT trend (per-leg mean, ingress-1)
+
+| Leg | D-9 mean RTT | D-7 mean RTT |
+|-----|--------------|--------------|
+| c400 | ~1 ms | ~1 ms |
+| c800 | ~2 ms | ~2 ms |
+| c1200 | ~2 ms | ~2 ms |
+| c1600 | ~3 ms | ~3 ms |
+| c2400 | ~3 ms | ~3 ms |
+| c3200 | ~3 ms | ~4 ms |
+| post-c3200 (cumulative) | ~3 ms | ~4 ms |
+
+Cluster RTT is identical-to-slightly-worse with `threads.max=400`,
+consistent with the throughput regression: more Tomcat threads
+**did not** reduce per-admit cluster wait, they just added scheduler
+overhead.
+
+### Lessons (D-7 specific)
+
+* **Falsifying first is cheaper than coding speculatively.** The
+  pre-D-9 plan claimed D-7 was "now properly motivated"; a 5-min
+  env-only experiment disproved it. Worth doing **before** the
+  ~hours of D-6 implementation, because if D-7 had paid off, D-6
+  scope would have shrunk.
+* **The `LockSupport.park (other)` frames in the D-9 c2400 jstack
+  were idle-pool overhead, not queue-wait.** Frame count alone is
+  not enough to tell those apart; the falsifier was running the
+  bigger pool and seeing the absolute submitAcceptOrder count
+  *not* increase.
+* **Hardware ceiling check held.** Pop! is at ~9 % CPU during the
+  bench (load avg 8 / 48 cores). The 57 k rps wall is **software
+  architectural**, not hardware. D-6 (admit batching) is the only
+  lever that changes the per-admit work model the cluster runs.
+* **Reverted.** `SERVER_TOMCAT_THREADS_MAX` is not committed to
+  `~/.oms-bench.env`; the post-D-7-experiment baseline is the same
+  D-9 stack, threads.max=200 default, ready for D-6.
 
 ## Caveats
 

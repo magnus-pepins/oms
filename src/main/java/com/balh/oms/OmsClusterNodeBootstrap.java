@@ -127,6 +127,25 @@ public final class OmsClusterNodeBootstrap {
      */
     private static final String ENV_AERON_DIRECTORY = "OMS_AERON_MEDIA_DRIVER_DIR";
 
+    /**
+     * Env var: Archive {@link Archive.Context#controlChannel control channel} for the cluster's
+     * local Archive. Must match field 6 (the archive endpoint) of the corresponding member entry
+     * in {@link #ENV_CLUSTER_MEMBERS}. Defaults to {@link #DEFAULT_ARCHIVE_CONTROL_CHANNEL}, which
+     * is the single-host {@code localhost:8010} that pairs with
+     * {@link #DEFAULT_CLUSTER_MEMBERS_SINGLE_NODE}.
+     *
+     * <p>Phase 4 Tier 2.5 phase E-3a: required to be overridable so two cluster-node JVMs can run
+     * side-by-side on one host (each with its own archive listen port). Production/multi-host
+     * deployments override this together with {@link #ENV_CLUSTER_MEMBERS}.
+     */
+    static final String ENV_ARCHIVE_CONTROL_CHANNEL = "OMS_AERON_ARCHIVE_CONTROL_CHANNEL";
+
+    /**
+     * Default Archive control channel for the local single-node cluster. Pairs with the archive
+     * endpoint ({@code localhost:8010}) in {@link #DEFAULT_CLUSTER_MEMBERS_SINGLE_NODE}.
+     */
+    static final String DEFAULT_ARCHIVE_CONTROL_CHANNEL = "aeron:udp?endpoint=localhost:8010";
+
     private OmsClusterNodeBootstrap() {}
 
     public static void main(String[] args) {
@@ -269,10 +288,14 @@ public final class OmsClusterNodeBootstrap {
     }
 
     public static Archive.Context buildArchiveContext(ClusterNodePaths paths) {
+        // Phase 4 Tier 2.5 phase E-3a: control channel resolves from ENV_ARCHIVE_CONTROL_CHANNEL
+        // so two cluster-node JVMs can co-exist on one host (e.g. Pop! 2-shard bench with shard 0
+        // archive on localhost:8010 and shard 1 archive on localhost:9010). Default is unchanged
+        // (DEFAULT_ARCHIVE_CONTROL_CHANNEL) so existing single-node deploys are byte-identical.
         return new Archive.Context()
                 .aeronDirectoryName(paths.aeronDirectory())
                 .archiveDir(new File(paths.archiveDir()))
-                .controlChannel("aeron:udp?endpoint=localhost:8010")
+                .controlChannel(envOrDefault(ENV_ARCHIVE_CONTROL_CHANNEL, DEFAULT_ARCHIVE_CONTROL_CHANNEL))
                 .localControlChannel("aeron:ipc?term-length=64k")
                 .recordingEventsEnabled(false)
                 .replicationChannel("aeron:udp?endpoint=localhost:0")

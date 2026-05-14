@@ -1492,6 +1492,160 @@ Logs from the 2026-05-14 baseline live in
 `mid1-{cluster,projector,fixegress,ingress1,ingress2}.jstack`,
 `pg-top-by-time.txt`, `burst.log`).
 
+## Tier 2.5 phase C-1 + C-2 verification (Pop! 2026-05-14, same day)
+
+Falsifiable predictions from "Profile-led pivot" above were verified by running the
+same 30 k burst against the same Pop! rig, after applying the changes
+incrementally. Headline:
+
+| Stage | rps (30 k @ conc 50) | HTTP p50 / p99 / p999 | What changed |
+|---|---|---|---|
+| Pre-V30 | 1 094 | 21.1 / 54.8 / 100.7 ms | baseline (Profile-led pivot section) |
+| V30 only (`domain_event_outbox` partial idx on `id`) | 1 130 | 15.9 / 60.4 / 85.6 ms | reconciler SELECT 662 ms → 0.083 ms |
+| V30 + V31 (`ledger_inflight_outbox` partial idx on `id`) | 970 | 13.9 / 55.2 / 74.5 ms | second reconciler SELECT 15 ms → 0.32 ms; rps **regressed** because Hikari freed by indexes was re-consumed by Ledger HTTP verify still inside `@Transactional` (next stage fixes that) |
+| V30 + V31 + C-2 (Ledger verify out of `@Transactional`) | **1 179** | **7.4 / 12.3 / 14.9 ms** | Hikari starvation completely gone (0 / 0 stalled) |
+| Same code, conc=50 | 1 179 | 7.4 / 12.3 / 14.9 ms | bench-client-bound |
+| Same code, conc=200 | **2 689** | 9.0 / 17.3 / 28.0 ms | server scaling well |
+| Same code, conc=400, 60 k burst | **3 807** | 39.7 / 92.6 / 150.5 ms | server saturating, but new bottleneck is Ledger HTTP |
+
+**Ceiling on this Pop! rig moved from 1 094 rps → ~3 800 rps (3.5 ×)** with three
+small changes:
+
+1. **V30** (Flyway, no app code) — `CREATE INDEX CONCURRENTLY IF NOT EXISTS
+   idx_domain_event_outbox_pending_id ON domain_event_outbox (id) WHERE published_at IS NULL;`
+2. **V31** (Flyway, no app code) — same shape on `ledger_inflight_outbox`, predicate
+   `WHERE published_at IS NULL AND compensated_at IS NULL`.
+3. **C-2** (one Java file: `OrderIngressService`) — drop `@Transactional` from
+   `persistAccepted`, run `maybeVerifyLedgerBalanceBinding` first (no Hikari conn
+   held during the Ledger `GET /balances/{id}` HTTP RTT), then open the Postgres
+   tx via `TransactionTemplate.execute` for the cluster admit + outbox INSERTs.
+
+### EXPLAIN ANALYZE before / after, both indexes
+
+`domain_event_outbox` (V30, query `WHERE published_at IS NULL AND created_at <= now()
+ORDER BY id LIMIT 200 FOR UPDATE SKIP LOCKED`):
+
+```text
+pre-V30: Index Scan using domain_event_outbox_pkey
+         Buffers: shared hit=728 255 read=306 999
+         Rows Removed by Filter: 3 138 866
+         Execution Time: 662.314 ms
+
+post-V30: Index Scan using idx_domain_event_outbox_pending_id
+          Buffers: shared hit=15
+          Execution Time: 0.083 ms             (≈8 000 × speedup)
+```
+
+`ledger_inflight_outbox` (V31, query `WHERE published_at IS NULL AND
+compensated_at IS NULL AND created_at <= now() ORDER BY id LIMIT 200 FOR UPDATE
+SKIP LOCKED`):
+
+```text
+pre-V31: Index Scan using ledger_inflight_outbox_pkey
+         Buffers: shared hit=26 934
+         Rows Removed by Filter: 42 972
+         Execution Time: 15.014 ms
+
+post-V31: Index Scan using idx_ledger_inflight_outbox_pending_id
+          Buffers: shared hit=406
+          Execution Time: 0.320 ms             (≈47 × speedup, 66 × fewer pages)
+```
+
+Both indexes use the `-- flyway:executeInTransaction=false` directive so the
+build runs with `CREATE INDEX CONCURRENTLY` (no AccessExclusiveLock on a hot
+table). Watch out for a Flyway 10 quirk: `executeInTransaction=false` migrations
+**cannot mix** non-transactional `CREATE INDEX CONCURRENTLY` with a
+transactional `COMMENT ON INDEX` in the same file. The migrations carry the
+rationale in their own header comments instead.
+
+### `pg_stat_statements` top-by-time, before / after
+
+```text
+pre-V30 (one row dominates 97.6 %):
+  total_ms=296 580  calls=397  mean_ms=747.05  pct=97.6  SELECT FROM domain_event_outbox ...
+  total_ms=  1 192  calls=29 881  mean_ms=0.04  pct=0.4  INSERT INTO ledger_inflight_outbox ...
+
+post-V30+V31+C-2 (no single dominant query — work is now Postgres-bound on accept-tx writes):
+  total_ms=  3 754  calls=59 482  mean_ms=0.063  pct=35.4  INSERT INTO ledger_inflight_outbox ...
+  total_ms=  1 867  calls=64 607  mean_ms=0.029  pct=17.6  INSERT INTO domain_event_outbox ...
+  total_ms=  1 707  calls=64 456  mean_ms=0.026  pct=16.1  SELECT FROM transactions (Ledger DB)
+  (DomainFanoutReconciler SELECT no longer in the top 25)
+```
+
+### `jstack` mid-bench thread-state, before / after
+
+| Counter (sum across both ingress JVMs at peak) | Pre-V30 | V30+V31+C-2 conc=50 | V30+V31+C-2 conc=400 |
+|---|---|---|---|
+| `http-nio-*-exec` total | 41+25=66 | 34+39=73 | 200+200=400 |
+| Stalled inside `HikariPool.getConnection` | 15+0=15 | 0+0=**0** | 62+88=150 |
+| `RUNNABLE` inside `HttpClient.parseHTTPHeader` (Ledger verify HTTP) | not measured | 23+19=42 | 97+93=**190** |
+
+Two important interpretations of the conc=400 column:
+
+- The **Ledger verify HTTP call** is now the dominant per-request cost. With a
+  single balance ID being repeatedly checked across ~30 k orders, ~190 ingress
+  threads are simultaneously RUNNABLE inside `HttpClient.parseHTTPHeader` waiting
+  for the same `GET /balances/{id}` to come back. **C-3 candidate**: cache the
+  `(balanceId, identityId)` mapping in `OrderIngressService` for a small TTL
+  (60–300 s); first request per balance pays the HTTP cost, the rest hit the
+  cache.
+- Hikari starvation **comes back at conc=400** (150 of 400 threads parking) —
+  but this is now expected: 400 threads × Hikari pool of 20 = 20 × ratio. At
+  conc=200 the ratio is 10× and the rig sustains 2 689 rps with p50 9 ms; at
+  conc=400 the ratio is 20× and p50 inflates to 39 ms. **Realistic
+  sustained-load ceiling with reasonable p50 (<10 ms) is ~2 700 rps** on this
+  rig; the 3 807 rps headline at conc=400 trades ~5 × p50 inflation for
+  marginal extra throughput.
+
+### What this verifies / falsifies relative to the Profile-led pivot predictions
+
+| Prediction | Outcome |
+|---|---|
+| `pg_stat_statements` mean for the `domain_event_outbox` SELECT drops from 747 ms to <1 ms | **TRUE** (0.083 ms in EXPLAIN; query no longer in `pg_stat_statements` top 25) |
+| Hikari starvation count drops below 5 at peak | **TRUE** at conc=50/200 (= 0); **FALSE** at conc=400 (resurfaces but for a different reason — request ratio not slow query) |
+| 30 k-burst rps lifts from 1 094 → ≥ 1 800 | **FALSE at conc=50** (only 1 179, bench-client-bound). **TRUE at conc≥200** (2 689–3 807) |
+| 17 ms HTTP-vs-server gap closes | **TRUE** — `oms.pipeline.ingress.accept_seconds` p50 stayed ~4 ms (server tx never was the bottleneck) but **HTTP RTT** p50 collapsed from 21 ms to 7.4 ms |
+
+The "FALSE at conc=50" line is the only diagnostic miss in the morning's memo:
+the bench tool's HTTP client at conc=50 was already the cap, hiding the actual
+server ceiling. Future bench runs against the rig should sweep concurrency at
+50/100/200/400 and report each, not assume conc=50 is steady-state. Logs from
+the C-1+C-2 verification live on Pop! in:
+
+- `~/oms/logs/bench-profile-2026-05-14-v30/` (V30 only)
+- `~/oms/logs/bench-profile-2026-05-14-v31/` (V30+V31, verify still inside tx — regression)
+- `~/oms/logs/bench-profile-2026-05-14-c2/` (V30+V31+C-2 at conc=50)
+- `~/oms/logs/bench-profile-2026-05-14-c2-scale/` (conc 100/200/400 sweep)
+- `~/oms/logs/bench-profile-2026-05-14-c2-saturate/` (conc=400, 60 k burst, full instrumentation)
+
+### Slices ruled IN by the C-2 saturation profile (next-up)
+
+- **Phase-C-3** — cache `(balanceId → identityId)` mapping in `OrderIngressService` for
+  a small TTL (60–300 s, configurable). 99 %+ of `RestLedgerBalanceClient.fetchIdentityIdForBalance`
+  calls in steady state come back with the same answer, and the TTL bounds the
+  staleness risk if a balance is reassigned. Falsifiable: `RUNNABLE inside
+  HttpClient.parseHTTPHeader` count at conc=400 should drop from ~190 to <10
+  on subsequent requests after a cache warm-up. rps ceiling should move further;
+  the new ceiling will likely surface as either cluster-node single-thread state
+  machine or projector lag (next bottleneck).
+- **Phase-C-4** (only if C-3 lands and rps still has headroom) — bump
+  `OMS_PG_POOL_MAX_SIZE` from 20 → 40 per ingress JVM, or run the reconciler off
+  its own Hikari pool. The data shows Hikari is fine at conc≤200 with the current
+  pool size **once** the slow reconciler query is gone; over-provisioning the
+  pool is only useful if we expect conc≥400 in production-shape clients.
+
+### Slices ruled OUT (or further down-prioritised) by the data
+
+- **Slice 4r as originally framed** (rebuild `LedgerInflightCoalescer` as
+  fire-and-forget at-accept). Stays out — the accept tx still doesn't wait on
+  Ledger after C-2; the verify HTTP is now its own thing, not on the
+  Postgres-tx critical path. C-3 (cache verify) addresses the same per-request
+  Ledger cost more cheaply than C-4-style coalescing, and without the
+  durability gap.
+- **Cluster-node parallelism / pipelined commit work**. At 3 800 rps the
+  cluster-node JVM jstack shows 8 RUNNABLE / 5 TIMED_WAITING / 4 WAITING with no
+  thread parked on contended state — far from saturated.
+
 ## Caveats
 
 - This is a **single-host single-cluster-node** rig. It does NOT exercise consensus, leader

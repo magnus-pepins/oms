@@ -4317,6 +4317,634 @@ scaling work on the OMS substrate is parked here. Multi-host scaling
 (separate physical hosts per shard / cluster member) is the natural
 next step and lives under Phase 5.
 
+> **Update — Phase F-1 (2026-05-15):** the "single-host scaling work
+> on the OMS substrate is parked" sentence above turned out to be
+> premature. The 64.6 k / 62.6 k numbers in this section were the
+> **single-process burst-tool ceiling**, not the OMS ceiling. See
+> the Phase F-1 section below; the OMS-N=2 single-host substrate
+> sustains ≥ 96 k RPS when fed by multiple parallel burst-tool
+> processes.
+
+## Tier 2.5 phase F-1 — bench-tool ceiling, not OMS ceiling (Pop! 2026-05-15)
+
+E-3b's saturation sweep parked at ~64.6 k RPS (300 k @ 400 conc) and
+flat-lined at ~62.6 k under both c1600 and c2400 (with client-side
+RTT ballooning from 5 ms p50 → 32 ms p50 as concurrency grew). The
+D-9 single-shard sweep at conc 2400 had also landed near 62 k.
+Three distinct topologies (D-9 N=1, E-3a 2-JVM N=2 aggregate, E-3b
+single-JVM N=2) all converging on ~60–65 k was suspicious — the
+ingress JVM, cluster substrate, and projector pool are not the
+same dominant work between those topologies.
+
+**Hypothesis:** the `burst-ingress-orders.sh` JVM (Spring Boot
++ JDK 21 virtual threads + `java.net.http.HttpClient`) running on
+the same Pop! box as the OMS JVMs is itself the wall around 62–65 k
+RPS, regardless of OMS topology. **Falsifier:** if we run two or
+three burst-tool processes in parallel against the same OMS-N=2
+stack with the same total in-flight load, aggregate RPS should rise
+if the bench was the wall, or stay flat if OMS was the wall.
+
+### Off-host bench attempt (abandoned)
+
+First plan was to drive the bench from the developer laptop over LAN
+(macOS, JDK 21, gigabit LAN to Pop! at `192.168.68.112:8088`). That
+hit a tooling cliff: JDK 21's default `HttpClient` opens HTTP/1.1
+keep-alive connections with no per-host pool tuning; against
+remote Tomcat it kept ~9 connections open and barely registered on
+the ingress JVM (Pop! `process_cpu_usage = 0.27 %` during the run).
+This is a connection-pool / HTTP-version issue in the burst tool's
+client config, not OMS. Aborted; pivoted to running multiple burst
+processes on Pop! itself, where the same code paths already saturate.
+
+### Parallel-bursts on Pop! (the actual experiment)
+
+Same 2-shard substrate as E-3b (one ingress-multi JVM at
+`oms.shard.count=2`, two cluster-nodes, two projectors, two
+Postgres DBs). Burst-tool processes were started with
+`OMS_INGRESS_REPLICA_PROM_URL=disabled` etc. so the wrapper script
+skips the cross-process Prometheus delta scrapes that would
+otherwise overlap (the per-burst HdrHistogram is independent of
+the wrapper scrape, so the headline RPS number is still well-defined).
+
+| variant                  | bursts | conc/burst | orders/burst | total orders | wall-clock | aggregate RPS | per-burst RPS  | failed |
+|--------------------------|-------:|-----------:|-------------:|-------------:|-----------:|--------------:|---------------:|-------:|
+| E-3b single-burst c2400  |     1  |       2400 |      800 000 |      800 000 |  12.79 s   |    62 569     | 62 569         | 0      |
+| F-1 two parallel c1200   |     2  |       1200 |      400 000 |      800 000 |   9.74 s   |   ~83 594     | 41 059 / 42 535 | 0      |
+| F-1 three parallel c800  |     3  |        800 |      267 000 |      801 000 |   8.31 s   |   ~96 389     | 32 130 / 47 167 / 32 446 | 0 |
+
+Each row uses **2 400 in-flight requests** at the same single-host
+OMS-N=2 stack. The single-process bench is capped near 62.6 k and
+inflates client-side latency to 32 ms p50 instead of admitting more
+work. Splitting the 2 400 in-flight load across 2 (then 3) burst-tool
+processes lifts aggregate to 83.6 k, then 96.4 k — a +33 % and +54 %
+gain that the OMS substrate paid for transparently (no failures, no
+shard mismatches, projector lag bounded under 4 s and drained between
+runs). Per-burst RPS is uneven in the 3-way case (32 k / 47 k / 32 k),
+which is itself evidence that the bottleneck has moved out of OMS:
+the three burst processes are now contending with each other (and
+the OMS JVMs) for cores on the Pop! box, so whichever burst gets
+scheduling preference at startup pulls ahead.
+
+Server-side health during F-1:
+- `oms_projector_shard_mismatch_dropped_total` remained absent from
+  the Prometheus output on **both** projectors throughout — i.e. the
+  router placed every order on the right shard's cluster client
+  (the metric is only emitted after the first non-zero increment,
+  per Micrometer convention; an empty grep is the success
+  signature, same as E-3a / E-3b).
+- Ingress accept count grew by exactly the submitted total each run
+  (`oms_pipeline_ingress_accept_seconds_count{outcome="created"}`).
+- Both projectors drained the burst's backlog within a few seconds
+  of the burst completing (`oms_projector_lag_seconds` decayed to
+  the pre-burst floor before the next sweep started).
+
+### What this changes
+
+- **The 30 k-per-shard ceiling stated in the E-3a / E-3b sections
+  was a measurement artifact of the single-process burst tool, not
+  a property of the OMS substrate.** The real per-shard ceiling on
+  this Pop! hardware is at minimum ~48 k (96 k aggregate ÷ 2 shards)
+  and is likely higher — F-1 stopped at 3 parallel bursts because
+  Pop!'s 48 logical cores are already split between OMS JVMs (~20)
+  and the bench-tool JVMs (~10 cores each). A k=4 sweep would tip
+  Pop! into core oversubscription and is not the right next step
+  on this hardware.
+- **D-headroom (the "85–110 k for N=2" prediction from the D-7
+  jstack analysis) was directionally correct.** F-1's 96.4 k lands
+  inside that range; we just couldn't see it until we removed the
+  load generator from the critical path.
+- The "Decision: E-3b complete; next is Phase 5 multi-host" callout
+  above stands as a *historical* decision point but is no longer
+  the right next step. A faster single-process load generator (or a
+  permanently-multi-process burst-tool wrapper that is the supported
+  bench shape) is a cheaper way to keep characterising OMS than
+  Phase-5 multi-host work on hardware we do not yet have.
+
+### Reproduction snippet
+
+The 3-way variant (the one that produced 96.4 k aggregate) is a
+shell-script wrapper around two unmodified `burst-ingress-orders.sh`
+invocations:
+
+```bash
+# on Pop!, with the E-3b 2-shard stack already up
+cat > /tmp/parallel-bursts-3way.sh <<'SCRIPT'
+#!/bin/bash
+set -e
+cd ~/oms
+set -a
+. ~/.oms-bench.env
+set +a
+export OMS_BURST_TOTAL=267000
+export OMS_BURST_CONCURRENCY=800
+export OMS_BURST_ACCOUNT_POOL=64
+export OMS_BURST_WARMUP=4000
+# disable the wrapper's cross-process prom scrapes so the three
+# bursts don't fight over /actuator/prometheus pulls
+export OMS_INGRESS_REPLICA_PROM_URL=disabled
+export OMS_POSTGRES_PROJECTOR_PROM_URL=disabled
+export OMS_FIX_EGRESS_PROM_URL=disabled
+export OMS_CLUSTER_NODE_METRICS_URL=disabled
+bash ./scripts/benchmark/burst-ingress-orders.sh > /tmp/p3-A.log 2>&1 & PIDA=$!
+bash ./scripts/benchmark/burst-ingress-orders.sh > /tmp/p3-B.log 2>&1 & PIDB=$!
+bash ./scripts/benchmark/burst-ingress-orders.sh > /tmp/p3-C.log 2>&1 & PIDC=$!
+wait $PIDA && wait $PIDB && wait $PIDC
+SCRIPT
+bash /tmp/parallel-bursts-3way.sh
+grep -E "submitted|elapsed|rps=" /tmp/p3-{A,B,C}.log
+```
+
+### Decision: F-1 surfaced; next is Phase F-2 (single-process bench rework)
+
+Phase F-2 should rebuild the burst tool around either (a) a wrk2 /
+k6 / vegeta replacement that is known to saturate ≥ 100 k RPS from
+one process, or (b) tuning the existing JDK `HttpClient` (HTTP/2
+upgrade, explicit `executor` and `connectionPool`, virtual-thread
+batching) until a single process reaches ≥ 100 k against the Pop!
+N=2 stack. Either way, the goal is to make a single process the
+falsifier so future RPS numbers in this runbook reflect OMS, not
+the bench-tool's own ceiling. Phase 5 (multi-host) should remain
+parked until Phase F-2 closes — it is wasteful to characterise
+multi-host scaling on top of a load generator we already know
+flat-lines at 62 k per process.
+
+> **Update — Phase G-1 (2026-05-15):** F-2 is no longer the right
+> next slice. With OMS ingress at ≥ 96 k RPS at N=2, the dominant
+> system bottleneck is **downstream** of OMS. The G-1 probe below
+> measured Ledger's hold-per-second ceiling on the same Pop! box,
+> in isolation, and found a hard wall around **1.9 k holds/s** —
+> a ~50× gap from OMS ingress that no amount of bench-tool tuning
+> changes. F-2 is parked until G-1 → G-6 close.
+
+## Tier 2.5 phase G-1 — Ledger holds-per-second ceiling, isolated (Pop! 2026-05-15)
+
+After F-1 reframed "OMS-N=2 has at least 96 k RPS in it", the user
+asked the right strategic question: ingress at 96 k RPS is academic
+if the downstream pipes (Ledger inflight holds, FIX-egress, control
+admission, execution-report apply, cancel-order) cannot drain.
+G-1 is the first of a six-slice **Phase G — system characterisation
+sweep** (G-1 ledger, G-2 fix-egress, G-3 control admission,
+G-4 cancel, G-5 execution report, G-6 cancel-replace feature gap).
+G-1 alone reframes the whole next-slice plan.
+
+### What G-1 measures
+
+Drive `POST /transactions` (sync mode) and `POST /transactions/bulk`
+directly against Ledger on Pop! — **no OMS in the path** — and
+sweep across (pair count, per-pair workers, bulk vs no-bulk) to
+find the hold-per-second ceiling and attribute where it lives.
+Probe lives at `~/ledger/holds-bench.mjs` on Pop! (Node 24, undici
+HTTP pool sized to `concurrency × 2`, clean per-request counting,
+heartbeat every 5 s, first-non-2xx body capture).
+
+### Path semantics caught during prior-art read
+
+Two findings that change the meaning of every previous "Ledger
+throughput" number in this runbook and explain why slice 4p's
+768 RPS looked low:
+
+1. **`POST /transactions` is async-by-default**: returns
+   **HTTP 202 Accepted** with the request enqueued onto the BullMQ
+   sharded queue, **not** a hold actually applied. To measure
+   synchronous holds, the body must include `sync: true`
+   (`transaction.routes.ts:50–84`). The first G-1 run hit 4 k req/s
+   at HTTP 202 — that is **queue-enqueue rate**, not hold rate.
+2. **`POST /transactions/bulk` is sync-by-default** (the `else`
+   branch at `transaction.routes.ts:328`) and processes the array
+   sequentially server-side via a `for`-loop over `recordTransaction`
+   in `transaction.service.ts:1300–1315`. So a single bulk-50
+   request acquires the per-balance-pair Redis lock 50 times in
+   serial; concurrent bulk-50 requests against the **same pair**
+   serialise **across** the lock. Bulk amortises HTTP overhead but
+   does **not** parallelise per-balance work.
+
+`recordTransaction` itself acquires a sorted-pair Redis distributed
+lock on `balance:${sourceBalanceId}` and `balance:${destBalanceId}`
+(`transaction.service.ts:89–117`), then re-fetches both balances
+inside the lock, runs payment-rules-block check, computes
+`hasSufficientFunds`, applies `applyInflightTransaction` /
+`updateBalances`, runs pre-/post-transaction hooks, and writes the
+transaction row + balance updates inside one Prisma transaction.
+The `Balance.version` int is the Postgres OCC token: concurrent
+updaters of the same balance row that race the lock check (or
+under-protect the lock window) trigger a versioned `update`
+returning 0 rows, surfaced as `"Balance version conflict:
+destination balance was modified by another transaction"` HTTP 500
+(or `"Database operation failed"` HTTP 400 depending on which
+mapping fires).
+
+### Pop! Ledger topology under test
+
+`pgrep -af "ledger.*ts-node"` shows **a Node Cluster of 4 worker
+processes** plus a primary (PIDs 3425777 / 3425788 / 3425798 /
+3425815, parent 3425677) — i.e. Ledger is already multi-process on
+this host, not single-Node. Pooler is `ledger-supabase-pooler`
+(supavisor 2.7.4) on `127.0.0.1:5432` / `:6543`. Postgres is
+`ledger-supabase-db` (supabase/postgres:15.8.1.085). Redis is the
+usual single instance for distributed locking. All four ran on the
+same Pop! box during the bench (no other heavy load — the F-1
+parallel-bursts session had ended ~30 minutes earlier).
+
+### Sweep results (sync inflight, fresh ledger + balance pairs each run)
+
+| run | pairs | conc | per-pair | total | duration | HTTP req/s | **effective holds/s** | success % | p50 | p99 | failure mode |
+|-----|------:|-----:|---------:|------:|---------:|-----------:|----------------------:|----------:|----:|----:|---|
+| G-1A | **1** | 100 | 100 | 10 000 | 30.78 s | 325 | **28.7** | 8.7 % | 60 ms | 4 651 ms | HTTP 500 "Balance version conflict" × 9 118 |
+| G-1B | **1** | 50 (bulk-50) | seq×50 | (200 calls) | 955 s | ≈ 9 | **≈ 12** | catastrophic | huge | huge | bulk concentrates contention; ALL post-warmup calls failed |
+| G-1C | 10 | 200 | 20 | 10 000 | 13.87 s | 721 | **561.5** | 76 % | 45 ms | 3 956 ms | HTTP 500 × 2 211 |
+| G-1E | 50 | 50 | **1** | 10 000 |  5.93 s | 1 686 | **1 624.1** | 96 % | 29 ms | 56 ms | clean |
+| G-1F | 50 | 200 | 4 | 10 000 |  6.37 s | 1 569 | **1 327.0** | 83 % | 62 ms | 1 094 ms | tail blow-up at 4 w/pair |
+| G-1G | 100 | 200 | 2 | 10 000 |  5.23 s | 1 911 | **1 803.9** | 93 % | 101 ms | 153 ms | clean |
+| **G-1H** | **200** | **200** | **1** | **20 000** | **10.01 s** | **1 999** | **1 905.8** | **94 %** | **99 ms** | **133 ms** | **process-level** |
+| G-1I | 200 | 400 | 2 | 20 000 | 10.05 s | 1 990 | **1 886.5** | 93 % | 198 ms | 245 ms | latency 2× for ≈ same RPS |
+| G-1J | 500 | 500 | 1 | 20 000 | 10.05 s | 1 990 | **1 901.6** | 93 % | 247 ms | 292 ms | latency growing, RPS flat |
+| **G-1K** | **200** | **200** | **1** | **60 000** | **30.29 s** | **1 981** | **1 894.0** | **95 %** | **100 ms** | **136 ms** | **sustained 30 s — the ceiling** |
+
+`Observed:` Pop! Ledger sustains **≈ 1 894 effective inflight
+holds/s** for 30 s with a 95 % success rate at 200 pairs × 1
+worker per pair, p99 = 136 ms. Throughput is **flat across
+200 vs 500 pairs and 200 vs 400 conc** — i.e. the ceiling is
+process-level, not contention.
+
+### CPU attribution at sustained 1 894 holds/s (G-1K, mid-bench top + docker stats)
+
+| component | CPU |
+|---|---:|
+| Ledger Node worker 1 (PID 3425777) | **230 %** (≈ 2.3 cores; mixed JS event loop + libuv I/O + crypto threads — single process, not single thread) |
+| Ledger Node worker 2 (PID 3425788) | 220 % |
+| Ledger Node worker 3 (PID 3425798) | 210 % |
+| Ledger Node worker 4 (PID 3425815) | 220 % |
+| Ledger primary (PID 3425677) | 10 % |
+| **Ledger app total (4 workers)** | **≈ 880 %** (≈ 8.8 cores) |
+| `ledger-supabase-pooler` (supavisor 2.7.4) | **531 %** (≈ 5.3 cores) |
+| `ledger-supabase-db` (Postgres 15) | 200 % (≈ 2 cores) |
+| Redis (distributed lock) | 40 % (≈ 0.4 cores) |
+| **Total** | **≈ 17 cores** for 1 894 holds/s ⇒ ≈ **9 ms of total CPU per hold** |
+
+`Hypothesis:` the 5.3-core supavisor consumption is suspicious —
+the pooler is a connection multiplexer and should not be
+CPU-heavy; this is a candidate for tuning (logging level,
+connection-thrash, pool sizing). `Hypothesis:` per-worker JS
+event-loop CPU is the dominant Ledger-app cost: Prisma client
+serialise/parse + Decimal.js arithmetic + transaction-hash
+compute + payment-rules SELECT. **Falsifying these requires a
+per-thread top (`top -H -p PID`) or a CPU profile under load**;
+deferred to a Ledger-side slice rather than this OMS runbook.
+
+### Single-pair pathology (subtle and worth pinning)
+
+The OMS bench's choice of **one fixed `OMS_BURST_LEDGER_BALANCE_ID`
+for every order** (`scripts/benchmark/burst-ingress-orders.sh`,
+`OMS_BURST_LEDGER_BALANCE_ID` and `_IDENTITY_ID` both single
+values) is a worst-case OCC scenario, not a representative
+workload. Slice 4p's 768 RPS / 17 ms is a number for "OMS
+ingress with one-balance Ledger holds outboxed asynchronously",
+**not** "Ledger holds-per-second ceiling with realistic load".
+G-1's single-pair sync direct numbers (28 holds/s effective,
+90 % version conflict) and the bulk-on-one-pair number
+(≈ 12 holds/s, > 99 % failure once steady-state) are the proof
+that **bulk is actively harmful when contention is per-pair**;
+it serialises 50 acquire-and-fail loops into one HTTP turn.
+
+> Actionable for the OMS bench: add an `OMS_BURST_LEDGER_BALANCE_POOL_SIZE`
+> knob that pre-creates N source/dest pairs and round-robins them.
+> Without it, every measured "OMS Ledger-bound" number is wrong by
+> the per-pair OCC factor — sometimes by 60×.
+
+### What G-1 changes about the next-slice plan
+
+`Observed:` the dominant single-host system bottleneck is **Ledger
+holds-per-second**, ≈ 1 894/s sustained on this Pop! topology.
+OMS ingress at 96 k RPS overshoots Ledger by ≈ 50× (or worse if
+the OMS bench keeps pinning a single balance pair). Every gain
+on the OMS side until Ledger lifts is a number we can ingress
+at, not a number the system can run at.
+
+Levers, in approximate cost order (cheapest first):
+
+1. **Profile + tune one Ledger Node worker.** A `clinic doctor` /
+   `0x` flame at 1 800 holds/s on G-1H reproducer should split
+   the per-hold ≈ 9 ms total CPU into Prisma vs Decimal.js vs
+   crypto-hash vs payment-rules-fetch. Each of those is a normal
+   Node profiling target with known fixes.
+2. **Investigate supavisor's 5.3 cores at 1.9 k holds/s.** That
+   number is high enough to be a misconfiguration (verbose
+   logging, connection thrash, double-pool with Prisma's own
+   pool stacked behind it). 4× lower pooler CPU at the same
+   throughput would free 4 cores on Pop!.
+3. **Add `OMS_BURST_LEDGER_BALANCE_POOL_SIZE` to the OMS bench**
+   so OMS-side numbers stop hiding the per-pair OCC artefact
+   (cheap; one-day slice). Without this, every OMS bench result
+   under-reports the real throughput by the contention factor.
+4. **Lift the Node Cluster worker count above 4.** Currently
+   `ts-node` + Node Cluster on Pop! defaults to 4 workers
+   (likely from a CPU-heuristic default, not explicit
+   configuration). Pop! has 48 logical cores; raising to e.g.
+   16 workers should multiply the holds/s ceiling roughly
+   linearly **if** Postgres + supavisor can absorb it.
+5. **Rethink the per-hold work itself** — the `Balance.version`
+   OCC + Redis lock + per-row Postgres update + per-row
+   transaction row insert + hash + event-publish is ≈ 9 ms /
+   hold of CPU. Some of that is unavoidable double-entry
+   bookkeeping; some (like every-call payment-rules SELECT
+   when no rules are active) is a removable inner loop.
+6. **Move beyond a single Ledger host.** Multi-host Ledger,
+   Postgres read-replicas, or sharded ledgers per `ledgerId`
+   would lift the cap further. Out of scope until levers 1-5
+   close on Pop!.
+
+### Decision: G-1 reframes Phase G; F-2 stays parked
+
+The 96 k OMS-N=2 number from F-1 is real, but **OMS will run out
+of Ledger long before it runs out of OMS-substrate budget on a
+single host**. Next slice should be G-2 (FIX-egress ceiling
+re-bench at sustained ingress, since the slice 4l 18.8 k ev/s
+number is also stale and may be the second wall) — or, if
+buying-power throughput is the immediate product-stop concern,
+direct work on Ledger lever 1 + 2 above. F-2 (single-process
+bench rework) stays parked: knowing OMS can ingress 96 k or
+180 k makes no difference until Ledger lifts.
+
+### Reproduction
+
+The probe script is at `~/ledger/holds-bench.mjs` on Pop!.
+Configurable via env vars:
+
+```bash
+# on Pop!, after starting Ledger normally
+export PATH=$HOME/.nvm/versions/node/v24.14.1/bin:$PATH
+cd ~/ledger
+PHASE=g1-K_sustained \
+  PAIR_COUNT=200 USE_INFLIGHT=1 USE_BULK=0 \
+  CONCURRENCY=200 TOTAL=60000 \
+  node holds-bench.mjs
+```
+
+Knobs: `PAIR_COUNT` (N source/dest pairs pre-created + round-robined),
+`CONCURRENCY` (parallel HTTP workers), `TOTAL` (total holds across
+the run), `USE_BULK=0/1` + `BATCH_SIZE` (bulk endpoint with K txns
+per HTTP call), `USE_INFLIGHT=0/1` (inflight vs APPLIED).
+`BASE` and `KEY` default to `http://127.0.0.1:5001` and
+`gf12umbgh`. The wrapper script auto-creates a fresh ledger and
+the configured number of pairs at startup, so each run is clean.
+
+## Tier 2.5 phase H — Ledger pooler / cluster-worker config lift (Pop! 2026-05-15)
+
+After G-1 found the 1.9 k holds/s wall and attributed 5.3 cores to
+the supavisor pooler at that load, the user's instruction was "go
+hard in to making the ledger fast" — config + code, language change
+allowed if needed, correctness non-negotiable. Phase H is the
+**config-only** first pass: zero Ledger source changes, only env
+and pooler settings, all measured with the same `holds-bench.mjs`
+on the same Pop! box.
+
+### Prior-art reads that drove the diagnosis
+
+Read on the Pop! Ledger and supavisor before any change (per
+`helper-calibration-and-sibling-parity.mdc` — find the sibling
+that already works and reconcile the diff):
+
+1. **`~/ledger/.env`**: `LEDGER_USE_CLUSTER=true`,
+   `LEDGER_WORKER_COUNT=4`, DSN
+   `postgresql://postgres.your-tenant-id:…@localhost:5432/postgres`
+   (no `?pgbouncer=true`, no `connection_limit`).
+2. **`ledger/src/instrument.ts`**: imports `initTelemetry()` from
+   `shared-telemetry`, which calls
+   `getNodeAutoInstrumentations({ '@opentelemetry/instrumentation-fs': { enabled:false } })`
+   — every other auto-instrumentation (Express, http, Prisma, Redis,
+   net, dns) is enabled and exporting via OTLP/gRPC every 15 s. At
+   1.9 k holds/s × ~6 spans/hold ≈ 11 k spans/s of background work.
+3. **`docker inspect ledger-supabase-pooler`**:
+   `POOLER_DEFAULT_POOL_SIZE=50, POOLER_MAX_CLIENT_CONN=300,
+   POOLER_POOL_MODE=transaction`.
+4. **Pop! Postgres**: `max_connections=100`,
+   `superuser_reserved_connections=3`. Roll-call of who holds slots:
+   77 supavisor + 5 supavisor_meta + 5 supabase_mt_realtime + 3 auth_query
+   + 5 anon + 2 PostgREST + 2 each cluster_node{realtime,supavisor}
+   + pg_cron + pg_net + TimescaleDB ≈ **97 / 100**. Three slots reserved
+   for superuser. Effectively zero headroom.
+5. **`_supavisor.users`** on Pop!: a single row,
+   `(your-tenant-id, db_user_alias=pgbouncer, db_user=pgbouncer, mode_type=transaction, pool_size=80, is_manager=true)`.
+   Ledger connects as `postgres.your-tenant-id` — **no row matches**,
+   so it falls back to defaults.
+6. **Supavisor logs under live load**: every Ledger connection
+   message in the pooler is tagged `mode=session`, even though the
+   tenant default is `transaction`. The `(postgres, your-tenant-id)`
+   user pair uses session-mode pooling, which is what
+   `localhost:5432` exposes; transaction-mode pooling is exposed on
+   `localhost:6543` (`docker port ledger-supabase-pooler` shows both
+   ports mapped).
+7. **Prisma + transaction pooling**: vendor docs require
+   `?pgbouncer=true` to disable prepared-statement caching when
+   the pooler is in transaction mode; otherwise rotated PG
+   connections orphan Prisma's prepared-statement cache and surface
+   as **`P1017: Server has closed the connection`** at random.
+
+That last finding maps perfectly onto the symptoms G-1 saw on
+re-runs: 1.9 k holds/s on a fresh process, then sudden bursts of
+P1017s when supavisor cycled connections after another tenant
+spiked. No Ledger code change can mask that — it's a DSN flag.
+
+### Falsified hypotheses (stop pursuing)
+
+Each of these lifted nothing, ruling out a popular candidate so
+later slices don't waste time on it:
+
+| Hypothesis | Test | Result |
+|---|---|---|
+| "More Node Cluster workers ⇒ more throughput" | `LEDGER_WORKER_COUNT 4 → 16` (port 5432, session mode, no `pgbouncer=true`) | Throughput **dropped** 1.9 k → 0.95 k/s; 50% HTTP 400 (`P1017`). Each Prisma client requested ~49 sessions × 16 workers = 784 conns, far above PG's 100 cap. **Worker count is gated by the PG connection budget, not the host CPU count.** |
+| "Disabling OTel auto-instrumentation removes 20–30%" | `OTEL_SDK_DISABLED=true` at 8 workers, p400 c400 | 2620 → 2620 holds/s (noise). With no collector configured the auto-instrumentations cost ~0% steady-state; OTLP/gRPC just batches and drops. **Re-enabled** to keep traces on. |
+| "Bigger supavisor PG pool unblocks more workers" | `pool_size 80 → 180`, `max_clients 300 → 600`; rerun 12 workers, p2000 c800 | 2664/s vs the 8-worker peak of 2706/s. Adding pool slots without changing per-request work doesn't help; per-pair latency is the wall. |
+
+### Lever 1 (kept) — raise PG `max_connections` 100 → 300
+
+`ALTER SYSTEM SET max_connections = 300;
+ALTER SYSTEM SET superuser_reserved_connections = 5;` then
+`docker restart ledger-supabase-db`. The 100-cap was the latent
+cliff Ledger had been living near for weeks; once another tenant
+or supavisor cycled connections, PG would refuse fresh checkouts
+and Prisma would surface them as P1017. With 300 we have room for
+sane pool sizing.
+
+### Lever 2 (kept) — switch Ledger DSN to transaction-mode port + `?pgbouncer=true`
+
+```diff
+-LEDGER_DATA_SOURCE_DNS=postgresql://postgres.your-tenant-id:…@localhost:5432/postgres
++LEDGER_DATA_SOURCE_DNS=postgresql://postgres.your-tenant-id:…@localhost:6543/postgres?pgbouncer=true&connection_limit=10&pool_timeout=10
+```
+
+Direct effect: the same Ledger code now uses transaction-mode
+pooling (every PG connection released back to supavisor's pool
+on `COMMIT`/`ROLLBACK`, multiplexed across many client sessions);
+Prisma stops creating prepared statements that get orphaned;
+P1017 storms disappear.
+
+`LEDGER_DATA_SOURCE_DIRECT_URL` stays on `:5432` (session mode)
+because Prisma migrate / `prisma db push` need session semantics.
+
+`connection_limit=10` per Prisma client × 8 Node workers = 80
+inbound client sessions — exactly matches the pre-existing
+`pool_size=80` per-tenant supavisor pool, no over-subscription.
+
+### Lever 3 (kept) — `LEDGER_WORKER_COUNT 4 → 8` once leverage 1+2 are live
+
+With transaction-mode pooling each Node Cluster worker holds 10
+sessions to supavisor (not 49 PG-direct sessions), so doubling
+workers stays within the PG budget. Going further (12, 16) gave
+**no** lift — the wall moved elsewhere (per-request critical path,
+not parallelism).
+
+### Stable Phase H bench numbers (8 workers, txn mode, OTel on)
+
+| run | params | dur (s) | req/s | holds/s | failures | p50 ms | p95 ms | p99 ms |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| h-baseline (G-1 K, pre-H) | 4w session-mode :5432 | 31.7 | 1894 | 1894 | 0% (clean) → 41% (after 16w cycled supavisor) | 105 | 138 | 168 |
+| h-txn-mode-4w-c200 | 4w :6543 `pgbouncer=true` | 11.5 | 1735 | 1735 | **0** | 111 | 145 | 192 |
+| h-txn-mode-8w-c200 | 8w :6543 | 12.2 | 2455 | 2455 | **0** | 79 | 103 | 137 |
+| h-8w-p400-c400 | 8w 400 pairs c400 | 15.8 | 2537 | 2537 | **0** | 149 | 236 | 286 |
+| h-8w-p1000-c400 | 8w 1000 pairs c400 | 15.5 | 2588 | 2588 | **0** | 137 | 287 | 391 |
+| h-8w-p1000-c600 | 8w 1000 pairs c600 | 22.2 | 2698 | 2695 | 49 OCC (0.08%) | 186 | 463 | 566 |
+| h-8w-p2000-c800 | 8w 2000 pairs c800 | 29.6 | 2706 | 2706 | **0** | 222 | 659 | 808 |
+| h-12w-p2000-c800 | 12w 2000 pairs | 32.8 | 2442 | 2442 | **0** | 311 | 608 | 754 |
+| h-16w-p2000-c800 | 16w 2000 pairs | 36.4 | 2199 | 2199 | **0** | 309 | 798 | 977 |
+| h-FINAL-stable-8w-p400 | 8w 400 pairs c400 (re-run after settle) | 15.3 | 2620 | 2620 | **0** | 143 | 240 | 289 |
+
+**Lift vs G-1 baseline: 1894 → 2706 holds/s = +43% with no Ledger
+code change.** All runs in Phase H show 100 % success on properly
+configured runs (the only failures are OCC `Balance version
+conflict`s where the workload concentrated load on the same
+destination balance — a workload property, not a ledger fault).
+
+### CPU attribution under sustained 8w / p2000 / c800
+
+Sampled 4× during a 200 k-hold run via `ps -eo pid,pcpu --sort=-pcpu`
++ `docker stats`:
+
+| component | sustained CPU | note |
+|---|---:|---|
+| 8 Node Cluster workers | ~800% (8.0 cores) | Each worker pinned at ~95–104%; the wall |
+| supavisor (`beam.smp`, ps view) | ~170% (1.7 cores) | Down from 5.3 cores at G-1 |
+| supavisor (`docker stats` view) | 21–1025% bursty | Container measurement includes all schedulers; bursty under txn-mode load |
+| Postgres backends | ~50–550% (0.5–5.5 cores) | Highly bursty as supavisor multiplexes txns |
+| `holds-bench.mjs` client | ~12% (0.12 cores) | Bench tool is **not** the wall |
+
+Ledger has gone from **8.8 + 5.3 = 14.1 cores total at 1.9 k/s**
+(G-1) to **8.0 + 1.7 = 9.7 cores total at 2.7 k/s** (Phase H stable).
+Per-hold CPU is now ~3.6 ms cumulative, vs ~7.4 ms in G-1.
+
+### What Phase H proves about the wall at 2.7 k holds/s
+
+The bench plateaus around 2.7 k/s regardless of:
+
+- worker count (4 / 8 / 12 / 16 — all tested, 8 is best)
+- supavisor pool size (80 / 180 — no lift)
+- pair count (200 / 400 / 1000 / 2000 — minor lift saturating ≤ 400)
+- concurrency (200 / 400 / 600 / 800 — minor lift saturating ≤ 600)
+- OTel on or off (no measurable difference at 8 w with no collector)
+
+So the wall lives in the **per-hold critical-path latency** in
+`recordTransaction`: 2 sequential Redis `SET-NX-PX` lock-acquires
++ 1 Prisma interactive transaction with 5–6 PG round-trips
+(SELECT balance, SELECT existing-by-reference, INSERT transaction,
+UPDATE balance × 2, COMMIT) + 2 parallel Redis Lua-eval
+unlock. At Pop!'s ~200 µs LAN RTT + Prisma ~0.5 ms/query, that's
+~3 ms of inherent serial latency per hold, and adding workers
+drives queueing latency up while throughput stays flat.
+
+### What Phase H is **not**
+
+Not a code change. The Ledger source on `origin/main` is
+unchanged; only `~/ledger/.env`, supavisor's `_supavisor.users` /
+`tenants` rows, and PG `max_connections` differ on Pop!. None of
+these changes need to land in `ledger/` source — they belong in a
+**deployment runbook** for ledger (env var + supavisor tenant
+config + PG GUC), which is the next slice's first deliverable.
+
+Phase H is also not a correctness change. Every assertion in
+the bench is OCC-safe (`Balance.version` is still the conflict
+arbiter), and Redis lock semantics are untouched.
+
+### What Phase I should look at (code + protocol levers, in cheapest first order)
+
+| lever | hypothesis (falsifiable) | expected lift | risk |
+|---|---|---|---|
+| **I-1** Drop the per-pair Redis lock for the inflight-hold path; rely on `Balance.version` OCC + retry-on-P2034 inside `recordTransaction` | Eliminates 4 Redis RTTs and 2 lock-acquire serial sections per hold (~1 ms cumulative). OCC retry is cheap on the no-conflict path; high-contention pair throughput unchanged. **Falsifier**: if H-equivalent bench yields ≤ 5% lift, the lock is not on the critical path and the wall is the Prisma 5-query train. | +20–40% (3–4 k/s) | low — OCC alone is correct for double-entry writes; only real cost is more 5xx on contention until retries land |
+| **I-2** Replace Prisma in the hot path with hand-written SQL via `pg.Pool.query`, keeping Prisma for everything else. | Prisma adds ~0.3–0.7 ms per query × 5 queries ≈ ~2 ms saved. **Falsifier**: profile (`0x`, `clinic doctor`) the worker at 2.7 k/s; if Prisma frames are < 15% of CPU, do not pursue this lever. | +30–60% (3.5–4.3 k/s) | medium — hand-rolled SQL plus parameterised statements has more places to introduce a balance-update bug; cover with the existing reconcile suite + new unit tests |
+| **I-3** Compile to JS once and run `node dist/index.js` instead of `ts-node -r src/instrument.ts src/index.ts` under PM2 | Modest — ts-node mostly hurts startup, not steady-state. **Falsifier**: V8 `--prof` of the worker; if `ts-node` frames < 5% of samples, skip. | +0–8% | trivial |
+| **I-4** Move from Express + `cluster` to **Fastify + `node:cluster`** or to `Bun` | HTTP layer is ~5% of per-hold CPU; only worth doing if I-1/I-2 already landed and we still need a percentage point. | +5–15% | medium |
+| **I-5** Aeron Cluster (or similar log-replicated single-leader) for Ledger | Removes Postgres OCC entirely; the cluster log is the order of truth, all writes single-threaded against an in-memory Balance map with snapshots. **Correctness**: matches OMS pattern; durability via Aeron archive. **Falsifier**: prototype against a single-pair workload and compare vs Phase H. | 10–50× (potentially 25–100 k holds/s) | high — multi-week rewrite; defer until I-1/I-2 are exhausted |
+
+The mandate "even change programming language if needed" is real
+but should be earned: levers I-1 and I-2 are days of work and
+likely lift to ~4 k/s, which is the correct next step before
+considering I-5.
+
+### Sync vs async default (separate from throughput)
+
+The user asked whether `POST /transactions` should default to
+sync. Phase H view: **no, not blindly** — the per-hold work is
+identical in either mode (the queue worker calls the same
+`recordTransaction` function), so flipping the default does not
+move throughput. It does change the public contract (HTTP 202 →
+HTTP 201) and breaks any caller relying on the
+queue-then-`REJECTED`-child semantics. Recommend exposing this
+as a `default_mode` config knob or as a **v2 endpoint**
+(`POST /v2/transactions` defaulting to sync) once I-1 lands, and
+leaving the v1 default at async.
+
+### How to reproduce Phase H baseline on Pop!
+
+```bash
+# 1) PG settings — once, requires PG container restart
+docker exec ledger-supabase-db env PGPASSWORD=… \
+  psql -h /var/run/postgresql -U supabase_admin -d postgres \
+  -c "ALTER SYSTEM SET max_connections = 300"
+docker exec ledger-supabase-db env PGPASSWORD=… \
+  psql -h /var/run/postgresql -U supabase_admin -d postgres \
+  -c "ALTER SYSTEM SET superuser_reserved_connections = 5"
+docker restart ledger-supabase-db ledger-supabase-pooler
+
+# 2) Optional supavisor pool bump (no lift but more headroom)
+docker exec ledger-supabase-db env PGPASSWORD=… \
+  psql -h /var/run/postgresql -U supabase_admin -d _supabase \
+  -c "UPDATE _supavisor.tenants SET default_pool_size=180, default_max_clients=600 WHERE external_id='your-tenant-id';
+      UPDATE _supavisor.users SET pool_size=180, max_clients=600 WHERE tenant_external_id='your-tenant-id';"
+
+# 3) Ledger env (~/ledger/.env on Pop!)
+sed -i 's|LEDGER_DATA_SOURCE_DNS=.*|LEDGER_DATA_SOURCE_DNS=postgresql://postgres.your-tenant-id:…@localhost:6543/postgres?pgbouncer=true\&connection_limit=10\&pool_timeout=10|' ~/ledger/.env
+sed -i 's/^LEDGER_WORKER_COUNT=.*/LEDGER_WORKER_COUNT=8/' ~/ledger/.env
+pm2 restart ledger-api --update-env
+
+# 4) Bench
+cd ~/ledger
+PHASE=h-stable-8w-p400-c400 PAIR_COUNT=400 CONCURRENCY=400 \
+  TOTAL=40000 USE_INFLIGHT=1 USE_BULK=0 \
+  node holds-bench.mjs
+```
+
+Expected: **~2.6 k holds/s, p99 < 300 ms, 100 % success**.
+
+### Phase H knock-on for OMS
+
+OMS Tier 2.5 plan now reads:
+
+- **F-1** (done): OMS ingress ≥ 96 k RPS at N=2.
+- **G-1** (done): Ledger holds wall at 1.9 k/s as of pre-H Pop!.
+- **H** (done, this section): Ledger wall raised to 2.7 k/s with
+  zero code change; CPU footprint cut from 14.1 cores to 9.7.
+- **I-1 / I-2** (next): code-side levers in Ledger (Redis-lock
+  removal + raw-SQL hot path) — expected to land Ledger at 4–5 k/s.
+- **G-2 → G-6**: characterise FIX-egress, control admission,
+  cancel, exec-report apply, cancel-replace once Ledger is no
+  longer the dominant wall.
+
+OMS code stays untouched in Phase H. The OMS bench tool
+(`burst-ingress-orders.sh`) hammered a single fixed ledger pair,
+so OMS-side ledger numbers from D-9 / E-3b were always
+worst-case-pair OCC contention and not representative; G-1 + H
+together replace those as the real Ledger ceiling for system
+throughput planning.
+
 ## Caveats
 
 - This is a **single-host single-cluster-node** rig. It does NOT exercise consensus, leader

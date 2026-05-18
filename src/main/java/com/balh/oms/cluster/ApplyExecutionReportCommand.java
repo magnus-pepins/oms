@@ -80,6 +80,28 @@ public record ApplyExecutionReportCommand(
     public static final byte EXEC_TYPE_CANCEL = 1;
     public static final byte EXEC_TYPE_VENUE_REJECT = 2;
 
+    /**
+     * Wed-demo addition. ER ET=5 (REPLACED) from the broker in response to a 35=G we sent. The
+     * cluster's apply path interprets {@code lastQtyScaled} as the <strong>new total OrderQty</strong>
+     * (broker's authoritative replacement quantity, not the trade quantity — there is no fill on a
+     * pure replace) and {@code lastPxScaled} as the <strong>new limit price</strong>. The order
+     * record's {@code quantityScaled} / {@code limitPriceScaledOrZero} are overwritten and version
+     * is bumped; status / cumQty stay unchanged.
+     */
+    public static final byte EXEC_TYPE_REPLACE = 3;
+
+    /**
+     * Wed-demo addition. 35=9 OrderCancelReject from the broker in response to one of our 35=F
+     * cancels. The cluster's apply path emits an {@link OrderCancelRejectedEvent} for the projector
+     * + UI toast and otherwise leaves the order untouched (status, cumQty, version all unchanged).
+     * Carried inside {@link ApplyExecutionReportCommand} so the existing FIX inbound sink can
+     * submit one command-shape for every ER-or-OCR; the cluster decodes the byte and dispatches.
+     */
+    public static final byte EXEC_TYPE_CANCEL_REJECT = 4;
+
+    /** Mirror of {@link #EXEC_TYPE_CANCEL_REJECT} for a 35=9 against a 35=G replace. */
+    public static final byte EXEC_TYPE_REPLACE_REJECT = 5;
+
     public ApplyExecutionReportCommand {
         Objects.requireNonNull(orderId, "orderId");
         Objects.requireNonNull(venueId, "venueId");

@@ -274,6 +274,8 @@ public class OmsClusterIngressClient {
     static final String COMMAND_ACCEPT_ORDER = "accept_order";
     static final String COMMAND_APPLY_EXECUTION_REPORT = "apply_execution_report";
     static final String COMMAND_CANCEL_ORDER = "cancel_order";
+    static final String COMMAND_REQUEST_CANCEL_ORDER = "request_cancel_order";
+    static final String COMMAND_REQUEST_REPLACE_ORDER = "request_replace_order";
 
     /**
      * Per-submit terminal state. Maps to the {@code outcome} tag on
@@ -296,6 +298,8 @@ public class OmsClusterIngressClient {
     private final EnumMap<Outcome, Timer> acceptOrderTimers;
     private final EnumMap<Outcome, Timer> applyExecutionReportTimers;
     private final EnumMap<Outcome, Timer> cancelOrderTimers;
+    private final EnumMap<Outcome, Timer> requestCancelOrderTimers;
+    private final EnumMap<Outcome, Timer> requestReplaceOrderTimers;
 
     /**
      * Back-compat overload used by ITs and other tests that don't care about meter assertions.
@@ -332,6 +336,8 @@ public class OmsClusterIngressClient {
         this.acceptOrderTimers = registerTimers(meterRegistry, COMMAND_ACCEPT_ORDER);
         this.applyExecutionReportTimers = registerTimers(meterRegistry, COMMAND_APPLY_EXECUTION_REPORT);
         this.cancelOrderTimers = registerTimers(meterRegistry, COMMAND_CANCEL_ORDER);
+        this.requestCancelOrderTimers = registerTimers(meterRegistry, COMMAND_REQUEST_CANCEL_ORDER);
+        this.requestReplaceOrderTimers = registerTimers(meterRegistry, COMMAND_REQUEST_REPLACE_ORDER);
         this.admitBatchQueue =
                 this.config.getAdmitBatch().isEnabled()
                         ? new ArrayBlockingQueue<>(this.config.getAdmitBatch().getQueueCapacity())
@@ -615,6 +621,88 @@ public class OmsClusterIngressClient {
             }
         } finally {
             sample.stop(cancelOrderTimers.get(outcome));
+        }
+    }
+
+    /**
+     * Wed-demo addition. Submits a {@link RequestCancelOrderCommand} fire-and-forget. The cluster
+     * applies it deterministically and emits one {@link OrderCancelRequestedEvent} that
+     * {@code oms-fix-egress} reads + turns into a 35=F OrderCancelRequest to the broker.
+     *
+     * <p>Distinct from {@link #submitCancelOrder} (which is the internal inflight-failure path
+     * that immediately CANCELS the order without touching a venue): this one is the user-facing
+     * cancel that round-trips the broker. The order's status only flips to CANCELLED once the
+     * broker's 35=8 ET=4 ER lands and walks through {@code FixInboundClusterSink}.
+     *
+     * <p>Back-pressure semantics mirror {@link #submitCancelOrder}: offer-retry under
+     * {@code BACK_PRESSURED} / {@code NOT_CONNECTED} / {@code ADMIN_ACTION} until the deadline.
+     */
+    public void submitRequestCancelOrder(RequestCancelOrderCommand cmd, Duration timeout)
+            throws TimeoutException, InterruptedException {
+        submitFireAndForget(cmd::encode, cmd.correlationId(), timeout, requestCancelOrderTimers,
+                "RequestCancelOrderCommand orderId=" + cmd.orderId());
+    }
+
+    /**
+     * Wed-demo addition. Submits a {@link RequestReplaceOrderCommand} fire-and-forget. Mirrors
+     * {@link #submitRequestCancelOrder}: cluster emits an {@link OrderReplaceRequestedEvent},
+     * egress sends 35=G OrderCancelReplaceRequest, the order updates only when the broker's
+     * 35=8 ET=5 lands.
+     */
+    public void submitRequestReplaceOrder(RequestReplaceOrderCommand cmd, Duration timeout)
+            throws TimeoutException, InterruptedException {
+        submitFireAndForget(cmd::encode, cmd.correlationId(), timeout, requestReplaceOrderTimers,
+                "RequestReplaceOrderCommand orderId=" + cmd.orderId());
+    }
+
+    /**
+     * Common fire-and-forget submit. Buffer-encode the command, take the client lock, offer-retry
+     * under back-pressure, release. No egress wait — caller proceeds as soon as the cluster log
+     * commit succeeds. Used by {@link #submitRequestCancelOrder} +
+     * {@link #submitRequestReplaceOrder} to keep their shapes identical (and to avoid copy-paste
+     * drift on the back-pressure loop).
+     */
+    private void submitFireAndForget(
+            java.util.function.ToIntBiFunction<org.agrona.MutableDirectBuffer, Integer> encoder,
+            long correlationId,
+            Duration timeout,
+            EnumMap<Outcome, Timer> timers,
+            String diagnosticContext)
+            throws TimeoutException, InterruptedException {
+        Objects.requireNonNull(timeout, "timeout");
+
+        ExpandableArrayBuffer buffer = new ExpandableArrayBuffer(OmsClusterWireFormat.MAX_COMMAND_BYTES);
+        int written = encoder.applyAsInt(buffer, 0);
+        long deadlineNanos = System.nanoTime() + timeout.toNanos();
+
+        Timer.Sample sample = Timer.start(meterRegistry);
+        Outcome outcome = Outcome.ERROR;
+        try {
+            clientLock.lockInterruptibly();
+            try {
+                AeronCluster active = client;
+                if (active == null) {
+                    throw new IllegalStateException("OMS cluster client is not connected");
+                }
+                long offerResult;
+                do {
+                    offerResult = active.offer(buffer, 0, written);
+                    if (offerResult < 0L) {
+                        if (System.nanoTime() > deadlineNanos) {
+                            outcome = Outcome.TIMEOUT;
+                            throw new TimeoutException(
+                                    "cluster offer back-pressure timeout for " + diagnosticContext
+                                            + " correlationId=" + correlationId);
+                        }
+                        parkOrThrow(config.getOfferBackpressureParkNanos());
+                    }
+                } while (offerResult < 0L);
+                outcome = Outcome.COMMIT;
+            } finally {
+                clientLock.unlock();
+            }
+        } finally {
+            sample.stop(timers.get(outcome));
         }
     }
 

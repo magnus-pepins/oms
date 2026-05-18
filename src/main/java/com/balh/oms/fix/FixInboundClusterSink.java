@@ -16,6 +16,7 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Service;
 import quickfix.FieldNotFound;
 import quickfix.Message;
+import quickfix.field.CxlRejResponseTo;
 import quickfix.field.MsgSeqNum;
 import quickfix.field.SenderCompID;
 
@@ -113,6 +114,14 @@ public class FixInboundClusterSink {
             submit(cmd, "cancel");
             return;
         }
+        // Wed-demo addition. ER ET=5 REPLACED carries the broker's authoritative new OrderQty
+        // and Price; the cluster's apply path on EXEC_TYPE_REPLACE updates the order in place.
+        Optional<ExecutionTradeCommand> replace = mapper.tryParseReplace(message, venueId);
+        if (replace.isPresent()) {
+            ApplyExecutionReportCommand cmd = buildReplace(message, replace.get());
+            submit(cmd, "replace");
+            return;
+        }
         Optional<ExecutionVenueRejectCommand> reject = mapper.tryParseVenueReject(message, venueId);
         if (reject.isPresent()) {
             ApplyExecutionReportCommand cmd = buildVenueReject(message, reject.get());
@@ -131,8 +140,24 @@ public class FixInboundClusterSink {
                     .increment();
             return;
         }
-        ApplyExecutionReportCommand cmd = buildVenueReject(message, ocr.get());
-        submit(cmd, "ocr");
+        // Wed-demo fix. CxlRejResponseTo=1 → cancel reject; =2 → cancel-replace reject. The two
+        // route to distinct execTypeCodes so the cluster's apply path emits the right
+        // ExecutionAppliedEvent shape (and the projector writes the right domain envelope kind
+        // — OrderCancelRejected vs OrderReplaceRejected). Both must NOT mutate the order's
+        // status (the order stays WORKING / PARTIALLY_FILLED), which is what was broken before:
+        // {@code buildVenueReject} set {@code EXEC_TYPE_VENUE_REJECT} and the cluster moved the
+        // order to REJECTED. Now the cluster sees the dedicated reject discriminator and bumps
+        // version only, leaving status / cumQty untouched.
+        int cxlRejResponseTo = message.isSetField(CxlRejResponseTo.FIELD)
+                ? message.getInt(CxlRejResponseTo.FIELD)
+                : CxlRejResponseTo.ORDER_CANCEL_REQUEST;
+        byte execTypeCode = cxlRejResponseTo == CxlRejResponseTo.ORDER_CANCEL_REPLACE_REQUEST
+                ? ApplyExecutionReportCommand.EXEC_TYPE_REPLACE_REJECT
+                : ApplyExecutionReportCommand.EXEC_TYPE_CANCEL_REJECT;
+        ApplyExecutionReportCommand cmd = buildCancelOrReplaceReject(message, ocr.get(), execTypeCode);
+        submit(cmd, cxlRejResponseTo == CxlRejResponseTo.ORDER_CANCEL_REPLACE_REQUEST
+                ? "ocr_replace_reject"
+                : "ocr_cancel_reject");
     }
 
     private void submit(ApplyExecutionReportCommand cmd, String disposition) {
@@ -203,6 +228,34 @@ public class FixInboundClusterSink {
                 rawCancelJson(c));
     }
 
+    /**
+     * Wed-demo addition. Build an ApplyExecutionReportCommand for a 35=8 ER ET=5 REPLACED. The
+     * {@code lastQtyScaled} slot carries the broker's new authoritative OrderQty (NOT a fill
+     * quantity), and {@code lastPxScaled} carries the new limit price (0 means "unchanged" — the
+     * cluster preserves the existing price in that case). See
+     * {@link ApplyExecutionReportCommand#EXEC_TYPE_REPLACE} for the overloaded semantic.
+     */
+    private ApplyExecutionReportCommand buildReplace(Message message, ExecutionTradeCommand r)
+            throws FieldNotFound {
+        long newOrderQtyScaled = scaleQty(r.lastQuantity());
+        long newLimitPxScaled = r.lastPrice() != null && r.lastPrice().signum() != 0
+                ? scalePx(r.lastPrice())
+                : 0L;
+        return new ApplyExecutionReportCommand(
+                0L,
+                r.orderId(),
+                newOrderQtyScaled,
+                newLimitPxScaled,
+                instantToNanos(r.venueTs()),
+                msgSeqNum(message),
+                ApplyExecutionReportCommand.EXEC_TYPE_REPLACE,
+                (byte) 0,
+                r.venueId(),
+                r.venueExecRef(),
+                senderCompId(message),
+                rawReplaceJson(r));
+    }
+
     private ApplyExecutionReportCommand buildVenueReject(Message message, ExecutionVenueRejectCommand v)
             throws FieldNotFound {
         return new ApplyExecutionReportCommand(
@@ -214,6 +267,30 @@ public class FixInboundClusterSink {
                 msgSeqNum(message),
                 ApplyExecutionReportCommand.EXEC_TYPE_VENUE_REJECT,
                 (byte) com.balh.oms.domain.RejectCode.VENUE_REJECT.ordinal(),
+                v.venueId(),
+                v.venueExecRef(),
+                senderCompId(message),
+                v.rawEnvelopeJson());
+    }
+
+    /**
+     * Wed-demo addition. Same shape as {@link #buildVenueReject} but parameterised on
+     * {@code execTypeCode} so the cluster apply path can distinguish "broker rejected our 35=F"
+     * ({@link ApplyExecutionReportCommand#EXEC_TYPE_CANCEL_REJECT}) from "broker rejected our
+     * 35=G" ({@link ApplyExecutionReportCommand#EXEC_TYPE_REPLACE_REJECT}). Neither mutates the
+     * order's status — the order stays WORKING / PARTIALLY_FILLED.
+     */
+    private ApplyExecutionReportCommand buildCancelOrReplaceReject(
+            Message message, ExecutionVenueRejectCommand v, byte execTypeCode) throws FieldNotFound {
+        return new ApplyExecutionReportCommand(
+                0L,
+                v.orderId(),
+                0L,
+                0L,
+                instantToNanos(v.venueTs()),
+                msgSeqNum(message),
+                execTypeCode,
+                (byte) 0,
                 v.venueId(),
                 v.venueExecRef(),
                 senderCompId(message),
@@ -261,6 +338,19 @@ public class FixInboundClusterSink {
         n.put("execType", "CANCEL");
         n.put("venueId", cmd.venueId());
         n.put("venueExecRef", cmd.venueExecRef());
+        return writeJson(n);
+    }
+
+    private String rawReplaceJson(ExecutionTradeCommand cmd) {
+        ObjectNode n = objectMapper.createObjectNode();
+        n.put("kind", "ExecutionReport");
+        n.put("execType", "REPLACE");
+        n.put("venueId", cmd.venueId());
+        n.put("venueExecRef", cmd.venueExecRef());
+        n.put("newOrderQty", cmd.lastQuantity().toPlainString());
+        if (cmd.lastPrice() != null) {
+            n.put("newLimitPrice", cmd.lastPrice().toPlainString());
+        }
         return writeJson(n);
     }
 

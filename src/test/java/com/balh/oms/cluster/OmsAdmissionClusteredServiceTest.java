@@ -704,6 +704,18 @@ class OmsAdmissionClusteredServiceTest {
         service.onSessionMessage(session, clusterTimestampMillis, buffer, 0, written, /* header = */ null);
     }
 
+    private void deliverCommand(RequestCancelOrderCommand cmd, long clusterTimestampMillis) {
+        ExpandableArrayBuffer buffer = new ExpandableArrayBuffer(COMMAND_BUFFER_BYTES);
+        int written = cmd.encode(buffer, 0);
+        service.onSessionMessage(session, clusterTimestampMillis, buffer, 0, written, /* header = */ null);
+    }
+
+    private void deliverCommand(RequestReplaceOrderCommand cmd, long clusterTimestampMillis) {
+        ExpandableArrayBuffer buffer = new ExpandableArrayBuffer(COMMAND_BUFFER_BYTES);
+        int written = cmd.encode(buffer, 0);
+        service.onSessionMessage(session, clusterTimestampMillis, buffer, 0, written, /* header = */ null);
+    }
+
     // ------------------------------------------------------------------------
     // Slice 4p: CancelOrderCommand (OMS-initiated cancel)
     // ------------------------------------------------------------------------
@@ -964,5 +976,208 @@ class OmsAdmissionClusteredServiceTest {
             return 1;
         });
         return image;
+    }
+
+    // ========================================================================
+    // Wed-demo: RequestCancelOrder / RequestReplaceOrder / ER ET=5 + 35=9 paths
+    // ========================================================================
+
+    @Test
+    void applyRequestCancelOrder_liveOrder_emitsCancelRequestedEvent_andDoesNotMutateStatus() {
+        UUID orderId = UUID.fromString("00000000-0000-4000-8000-000000005001");
+        deliverCommand(sampleAccept(1L, "acct", "idem", orderId), ANY_TIMESTAMP_MS);
+        OmsAdmissionClusteredService.AdmittedOrder beforeRequest = service.lookupByOrderId(orderId);
+        int eventsBefore = capturedAdmittedEvents.size();
+
+        deliverCommand(
+                new RequestCancelOrderCommand(2L, orderId, 1L, "idem-cancel-1", "user-cancel"),
+                ANY_TIMESTAMP_MS + 1);
+
+        OmsAdmissionClusteredService.AdmittedOrder afterRequest = service.lookupByOrderId(orderId);
+        assertThat(afterRequest.statusCode())
+                .as("order status must NOT change on RequestCancel — wait for broker ER")
+                .isEqualTo(beforeRequest.statusCode());
+        assertThat(afterRequest.version())
+                .as("RequestCancel must not bump version (no orders-row change to project)")
+                .isEqualTo(beforeRequest.version());
+        assertThat(capturedAdmittedEvents).hasSize(eventsBefore + 1);
+
+        OrderCancelRequestedEvent ev = OrderCancelRequestedEvent.decode(
+                new UnsafeBuffer(capturedAdmittedEvents.get(eventsBefore)),
+                0,
+                capturedAdmittedEvents.get(eventsBefore).length);
+        assertThat(ev.orderId()).isEqualTo(orderId);
+        assertThat(ev.clientRequestKey()).isEqualTo("idem-cancel-1");
+        assertThat(ev.reason()).isEqualTo("user-cancel");
+    }
+
+    @Test
+    void applyRequestCancelOrder_unknownOrder_silentNoOp() {
+        UUID orderId = UUID.fromString("00000000-0000-4000-8000-000000005002");
+
+        deliverCommand(
+                new RequestCancelOrderCommand(1L, orderId, 1L, "idem-cancel", "race"),
+                ANY_TIMESTAMP_MS);
+
+        assertThat(capturedAdmittedEvents).isEmpty();
+        assertThat(service.lookupByOrderId(orderId)).isNull();
+    }
+
+    @Test
+    void applyRequestCancelOrder_duplicateClientRequestKey_silentNoOp() {
+        UUID orderId = UUID.fromString("00000000-0000-4000-8000-000000005003");
+        deliverCommand(sampleAccept(1L, "acct", "idem", orderId), ANY_TIMESTAMP_MS);
+        deliverCommand(
+                new RequestCancelOrderCommand(2L, orderId, 1L, "dup-key", "first"),
+                ANY_TIMESTAMP_MS + 1);
+        int eventsAfterFirst = capturedAdmittedEvents.size();
+
+        deliverCommand(
+                new RequestCancelOrderCommand(3L, orderId, 1L, "dup-key", "second"),
+                ANY_TIMESTAMP_MS + 2);
+
+        assertThat(capturedAdmittedEvents)
+                .as("re-delivered RequestCancel with same clientRequestKey must not double-emit")
+                .hasSize(eventsAfterFirst);
+    }
+
+    @Test
+    void applyRequestReplaceOrder_liveOrder_emitsReplaceRequestedEvent_andDoesNotMutateQtyOrPrice() {
+        UUID orderId = UUID.fromString("00000000-0000-4000-8000-000000005010");
+        deliverCommand(sampleAccept(1L, "acct", "idem", orderId), ANY_TIMESTAMP_MS);
+        OmsAdmissionClusteredService.AdmittedOrder beforeRequest = service.lookupByOrderId(orderId);
+        int eventsBefore = capturedAdmittedEvents.size();
+
+        deliverCommand(
+                new RequestReplaceOrderCommand(
+                        2L, orderId, /* newQty = */ 5_000_000_000L,
+                        /* newLimitPx = */ 200_000_000L, 1L, "idem-rep-1", "operator-resize"),
+                ANY_TIMESTAMP_MS + 1);
+
+        OmsAdmissionClusteredService.AdmittedOrder afterRequest = service.lookupByOrderId(orderId);
+        assertThat(afterRequest.quantityScaled())
+                .as("qty must NOT change on RequestReplace — wait for broker ER ET=5")
+                .isEqualTo(beforeRequest.quantityScaled());
+        assertThat(afterRequest.limitPriceScaledOrZero())
+                .as("price must NOT change on RequestReplace")
+                .isEqualTo(beforeRequest.limitPriceScaledOrZero());
+        assertThat(afterRequest.version())
+                .isEqualTo(beforeRequest.version());
+
+        assertThat(capturedAdmittedEvents).hasSize(eventsBefore + 1);
+        OrderReplaceRequestedEvent ev = OrderReplaceRequestedEvent.decode(
+                new UnsafeBuffer(capturedAdmittedEvents.get(eventsBefore)),
+                0,
+                capturedAdmittedEvents.get(eventsBefore).length);
+        assertThat(ev.orderId()).isEqualTo(orderId);
+        assertThat(ev.newQuantityScaled()).isEqualTo(5_000_000_000L);
+        assertThat(ev.newLimitPriceScaledOrZero()).isEqualTo(200_000_000L);
+        assertThat(ev.originalQuantityScaled()).isEqualTo(beforeRequest.quantityScaled());
+    }
+
+    @Test
+    void applyRequestReplaceOrder_newQtyBelowCumQty_silentNoOp() {
+        UUID orderId = UUID.fromString("00000000-0000-4000-8000-000000005011");
+        deliverCommand(sampleAccept(1L, "acct", "idem", orderId), ANY_TIMESTAMP_MS);
+        // sampleAccept seeds qty = 10_000_000_000. Apply a partial fill of 6_000_000_000 first.
+        deliverCommand(
+                new ApplyExecutionReportCommand(
+                        0L, orderId, 6_000_000_000L, 100_000_000L, 1L, 1,
+                        ApplyExecutionReportCommand.EXEC_TYPE_TRADE, (byte) 0,
+                        "v1", "exec-partial-1", "S", "{}"),
+                ANY_TIMESTAMP_MS + 1);
+        int eventsAfterFill = capturedAdmittedEvents.size();
+
+        // Request a replace down to 5_000_000_000 — below the already-filled cumQty.
+        deliverCommand(
+                new RequestReplaceOrderCommand(
+                        2L, orderId, /* newQty = */ 5_000_000_000L, 0L, 1L,
+                        "idem-rep-impossible", ""),
+                ANY_TIMESTAMP_MS + 2);
+
+        assertThat(capturedAdmittedEvents)
+                .as("cumQty-overflow RequestReplace must silently drop, no event emission")
+                .hasSize(eventsAfterFill);
+    }
+
+    @Test
+    void applyExecutionReport_execTypeReplace_updatesQtyAndPriceAndStatus_emitsEvent() {
+        UUID orderId = UUID.fromString("00000000-0000-4000-8000-000000005020");
+        deliverCommand(sampleAccept(1L, "acct", "idem", orderId), ANY_TIMESTAMP_MS);
+        OmsAdmissionClusteredService.AdmittedOrder beforeReplace = service.lookupByOrderId(orderId);
+        int eventsBefore = capturedAdmittedEvents.size();
+
+        deliverCommand(
+                new ApplyExecutionReportCommand(
+                        0L, orderId,
+                        /* lastQtyScaled (overloaded: newOrderQty) = */ 7_500_000_000L,
+                        /* lastPxScaled (overloaded: newLimitPx) = */ 150_000_000L,
+                        1L, 2,
+                        ApplyExecutionReportCommand.EXEC_TYPE_REPLACE, (byte) 0,
+                        "v1", "exec-replace-1", "BROKER_ACCEPT",
+                        "{\"kind\":\"ExecutionReport\",\"execType\":\"REPLACE\"}"),
+                ANY_TIMESTAMP_MS + 1);
+
+        OmsAdmissionClusteredService.AdmittedOrder afterReplace = service.lookupByOrderId(orderId);
+        assertThat(afterReplace.quantityScaled())
+                .as("REPLACE ER must update quantityScaled to the new total")
+                .isEqualTo(7_500_000_000L);
+        assertThat(afterReplace.limitPriceScaledOrZero())
+                .as("REPLACE ER with non-zero price must update limitPriceScaled")
+                .isEqualTo(150_000_000L);
+        assertThat(afterReplace.version())
+                .as("REPLACE ER must bump version (orders-row mutation)")
+                .isEqualTo(beforeReplace.version() + 1);
+        assertThat(afterReplace.statusCode())
+                .as("REPLACE with no fill keeps order WORKING")
+                .isEqualTo(beforeReplace.statusCode());
+        assertThat(capturedAdmittedEvents).hasSize(eventsBefore + 1);
+    }
+
+    @Test
+    void applyExecutionReport_execTypeCancelReject_doesNotMutateStatus_butBumpsVersionAndEmits() {
+        UUID orderId = UUID.fromString("00000000-0000-4000-8000-000000005030");
+        deliverCommand(sampleAccept(1L, "acct", "idem", orderId), ANY_TIMESTAMP_MS);
+        OmsAdmissionClusteredService.AdmittedOrder beforeReject = service.lookupByOrderId(orderId);
+        int eventsBefore = capturedAdmittedEvents.size();
+
+        deliverCommand(
+                new ApplyExecutionReportCommand(
+                        0L, orderId, 0L, 0L, 1L, 3,
+                        ApplyExecutionReportCommand.EXEC_TYPE_CANCEL_REJECT, (byte) 0,
+                        "v1", "ocr-broker-1", "BROKER_ACCEPT",
+                        "{\"kind\":\"OrderCancelReject\",\"cxlRejReason\":1}"),
+                ANY_TIMESTAMP_MS + 1);
+
+        OmsAdmissionClusteredService.AdmittedOrder afterReject = service.lookupByOrderId(orderId);
+        assertThat(afterReject.statusCode())
+                .as("35=9 CANCEL_REJECT must NOT move the order to REJECTED — it stays in its prior state")
+                .isEqualTo(beforeReject.statusCode());
+        assertThat(afterReject.cumQtyScaled()).isEqualTo(beforeReject.cumQtyScaled());
+        assertThat(afterReject.quantityScaled()).isEqualTo(beforeReject.quantityScaled());
+        assertThat(afterReject.version())
+                .as("version must still bump so the projector sees the event and writes the toast outbox row")
+                .isEqualTo(beforeReject.version() + 1);
+        assertThat(capturedAdmittedEvents).hasSize(eventsBefore + 1);
+    }
+
+    @Test
+    void applyExecutionReport_execTypeReplaceReject_doesNotMutateStatus_butBumpsVersion() {
+        UUID orderId = UUID.fromString("00000000-0000-4000-8000-000000005031");
+        deliverCommand(sampleAccept(1L, "acct", "idem", orderId), ANY_TIMESTAMP_MS);
+        OmsAdmissionClusteredService.AdmittedOrder beforeReject = service.lookupByOrderId(orderId);
+
+        deliverCommand(
+                new ApplyExecutionReportCommand(
+                        0L, orderId, 0L, 0L, 1L, 4,
+                        ApplyExecutionReportCommand.EXEC_TYPE_REPLACE_REJECT, (byte) 0,
+                        "v1", "ocr-broker-2", "BROKER_ACCEPT",
+                        "{\"kind\":\"OrderCancelReject\",\"cxlRejReason\":2}"),
+                ANY_TIMESTAMP_MS + 1);
+
+        OmsAdmissionClusteredService.AdmittedOrder afterReject = service.lookupByOrderId(orderId);
+        assertThat(afterReject.statusCode()).isEqualTo(beforeReject.statusCode());
+        assertThat(afterReject.quantityScaled()).isEqualTo(beforeReject.quantityScaled());
+        assertThat(afterReject.version()).isEqualTo(beforeReject.version() + 1);
     }
 }

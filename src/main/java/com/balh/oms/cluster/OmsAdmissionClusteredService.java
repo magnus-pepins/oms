@@ -157,6 +157,18 @@ public class OmsAdmissionClusteredService implements ClusteredService {
      */
     private final Map<String, Set<Integer>> senderSeqIndex = new HashMap<>(INITIAL_INDEX_CAPACITY);
 
+    /**
+     * HTTP-layer idempotency keys per order for {@link RequestCancelOrderCommand} +
+     * {@link RequestReplaceOrderCommand}. The first character of each stored key is the kind
+     * discriminator: {@code 'c'} for cancel, {@code 'r'} for replace. A re-delivered command with
+     * a matching {@code (orderId, kind+clientRequestKey)} is a silent no-op so HTTP retries do not
+     * issue a second 35=F / 35=G to the broker. Not snapshot-persisted: a snapshot-then-restart
+     * loses this dedupe; a duplicate retry across a snapshot would emit a second venue request,
+     * which the broker handles as "unknown order" 35=9 — bounded and operator-visible. Adding to
+     * the snapshot is a follow-up if we ever see customer-frontend doubles in production logs.
+     */
+    private final Map<UUID, Set<String>> requestedKeysIndex = new HashMap<>(INITIAL_INDEX_CAPACITY);
+
     private final ExpandableArrayBuffer egressBuffer = new ExpandableArrayBuffer(INITIAL_BUFFER_CAPACITY);
 
     /**
@@ -383,6 +395,10 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                     applyExecutionReport(timestamp, buffer, offset, length);
             case OmsClusterWireFormat.TYPE_ID_CANCEL_ORDER ->
                     applyCancelOrder(timestamp, buffer, offset, length);
+            case OmsClusterWireFormat.TYPE_ID_REQUEST_CANCEL_ORDER ->
+                    applyRequestCancelOrder(timestamp, buffer, offset, length);
+            case OmsClusterWireFormat.TYPE_ID_REQUEST_REPLACE_ORDER ->
+                    applyRequestReplaceOrder(timestamp, buffer, offset, length);
             default -> {
                 // Unknown command — silently ignored. A real reject would require an event;
                 // adding an UnknownCommandRejected event is a Phase 2 concern.
@@ -650,6 +666,8 @@ public class OmsAdmissionClusteredService implements ClusteredService {
 
         long newCumQty = order.cumQtyScaled();
         byte newStatus = order.statusCode();
+        long newQuantityScaled = order.quantityScaled();
+        long newLimitPriceScaledOrZero = order.limitPriceScaledOrZero();
         switch (cmd.execTypeCode()) {
             case ApplyExecutionReportCommand.EXEC_TYPE_TRADE -> {
                 if (cmd.lastQtyScaled() <= 0L) {
@@ -671,6 +689,44 @@ public class OmsAdmissionClusteredService implements ClusteredService {
             }
             case ApplyExecutionReportCommand.EXEC_TYPE_CANCEL -> newStatus = STATUS_CANCELLED;
             case ApplyExecutionReportCommand.EXEC_TYPE_VENUE_REJECT -> newStatus = STATUS_REJECTED;
+            case ApplyExecutionReportCommand.EXEC_TYPE_REPLACE -> {
+                // Wed-demo addition. ER ET=5 (REPLACED) from the broker carries the
+                // authoritative new total OrderQty and limit price; cumQty is unchanged.
+                // {@code lastQtyScaled} on a REPLACE wire-record is the new total OrderQty
+                // (not a trade quantity); {@code lastPxScaled} is the new limit price (0
+                // means market / unchanged). Reuses ER plumbing so the FIX inbound sink
+                // only emits one command shape.
+                if (cmd.lastQtyScaled() <= 0L) {
+                    return;
+                }
+                if (cmd.lastQtyScaled() < order.cumQtyScaled()) {
+                    // Broker honored a replace below our cum-fill (would imply a partial
+                    // fill we don't know about). Refuse to apply — operations alert.
+                    return;
+                }
+                newQuantityScaled = cmd.lastQtyScaled();
+                if (cmd.lastPxScaled() > 0L) {
+                    newLimitPriceScaledOrZero = cmd.lastPxScaled();
+                }
+                // Status derived from cumQty vs new qty (mirrors TRADE branch).
+                if (newCumQty >= newQuantityScaled) {
+                    newStatus = STATUS_FILLED;
+                } else if (newCumQty > 0L) {
+                    newStatus = STATUS_PARTIALLY_FILLED;
+                } else {
+                    newStatus = STATUS_WORKING;
+                }
+            }
+            case ApplyExecutionReportCommand.EXEC_TYPE_CANCEL_REJECT, ApplyExecutionReportCommand.EXEC_TYPE_REPLACE_REJECT -> {
+                // 35=9 OrderCancelReject: the broker declined our cancel / modify. The order
+                // is unchanged on the venue's books; cluster state stays as-is too. We still
+                // bump version + emit one ExecutionAppliedEvent so the projector can write
+                // the {@code OrderCancelRejected} / {@code OrderReplaceRejected} envelope
+                // to {@code domain_event_outbox} (no orders.status mutation; the projector
+                // branches on execTypeCode).
+                // No status / cumQty / qty / price change; fall through to the version bump
+                // + emit below.
+            }
             default -> {
                 // Unknown execTypeCode — silently dropped, same shape as unknown command typeIds in
                 // {@link #onSessionMessage}.
@@ -686,8 +742,8 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                 order.accountIdHash(),
                 order.instrumentSymbol(),
                 order.side(),
-                order.quantityScaled(),
-                order.limitPriceScaledOrZero(),
+                newQuantityScaled,
+                newLimitPriceScaledOrZero,
                 order.timeInForceCode(),
                 order.ledgerBalanceIdOrNull(),
                 newVersion,
@@ -777,6 +833,135 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                 new IdempotencyKey(mutated.accountId(), mutated.clientIdempotencyKey()), mutated);
 
         emitOrderCancelApplied(mutated, clusterTimestampMillis, cmd.reason());
+    }
+
+    /**
+     * Wed-demo addition: user-initiated cancel routed to the broker via FIX 35=F.
+     *
+     * <p>Distinct from {@link #applyCancelOrder} (which is the internal inflight-failure path that
+     * never touches a venue and CANCELS the order immediately): this admits a venue-routed cancel,
+     * leaves the order's status untouched, and emits an {@link OrderCancelRequestedEvent} for
+     * {@code oms-fix-egress} to consume + send 35=F to the broker. The order only flips to
+     * CANCELLED once the broker's ER (ET=4 via {@link ApplyExecutionReportCommand#EXEC_TYPE_CANCEL})
+     * lands and walks through {@link #applyExecutionReport}.
+     */
+    private void applyRequestCancelOrder(
+            long clusterTimestampMillis, DirectBuffer buffer, int offset, int length) {
+        RequestCancelOrderCommand cmd = RequestCancelOrderCommand.decode(buffer, offset, length);
+
+        AdmittedOrder order = orderIndex.get(cmd.orderId());
+        if (order == null) {
+            // Unknown order — silent no-op. HTTP layer races admission and a retry will land it.
+            return;
+        }
+        if (isTerminal(order.statusCode())) {
+            // Order is already FILLED / CANCELLED / REJECTED — no broker request to send.
+            return;
+        }
+        // HTTP idempotency: dedupe on ('c' + clientRequestKey) per orderId. Empty key opts out.
+        if (!cmd.clientRequestKey().isEmpty()) {
+            String dedupeKey = "c:" + cmd.clientRequestKey();
+            Set<String> seen = requestedKeysIndex.computeIfAbsent(cmd.orderId(), k -> new HashSet<>(2));
+            if (!seen.add(dedupeKey)) {
+                return;
+            }
+        }
+        emitOrderCancelRequested(order, clusterTimestampMillis, cmd.clientRequestKey(), cmd.reason());
+    }
+
+    /**
+     * Wed-demo addition: user-initiated modify (qty + limit price) routed to the broker via FIX
+     * 35=G. Emits an {@link OrderReplaceRequestedEvent} for {@code oms-fix-egress}; the order's
+     * quantity / price stay at their current values until the broker's ER (ET=5 via
+     * {@link ApplyExecutionReportCommand#EXEC_TYPE_REPLACE}) lands.
+     */
+    private void applyRequestReplaceOrder(
+            long clusterTimestampMillis, DirectBuffer buffer, int offset, int length) {
+        RequestReplaceOrderCommand cmd = RequestReplaceOrderCommand.decode(buffer, offset, length);
+
+        AdmittedOrder order = orderIndex.get(cmd.orderId());
+        if (order == null) {
+            return;
+        }
+        if (isTerminal(order.statusCode())) {
+            return;
+        }
+        // Cumulative-fill overflow: the broker cannot honor a replace below what we've already
+        // filled. Silent drop (HTTP layer surfaces 409 by reading the unchanged order state).
+        if (cmd.newQuantityScaled() < order.cumQtyScaled()) {
+            return;
+        }
+        if (!cmd.clientRequestKey().isEmpty()) {
+            String dedupeKey = "r:" + cmd.clientRequestKey();
+            Set<String> seen = requestedKeysIndex.computeIfAbsent(cmd.orderId(), k -> new HashSet<>(2));
+            if (!seen.add(dedupeKey)) {
+                return;
+            }
+        }
+        emitOrderReplaceRequested(
+                order,
+                clusterTimestampMillis,
+                cmd.newQuantityScaled(),
+                cmd.newLimitPriceScaledOrZero(),
+                cmd.clientRequestKey(),
+                cmd.reason());
+    }
+
+    private void emitOrderCancelRequested(
+            AdmittedOrder order, long requestedAtMillis, String clientRequestKey, String reason) {
+        if (eventsPublication == null) {
+            return;
+        }
+        OrderCancelRequestedEvent ev = new OrderCancelRequestedEvent(
+                order.orderId(),
+                requestedAtMillis,
+                order.shardId(),
+                order.accountId(),
+                order.instrumentSymbol(),
+                clientRequestKey,
+                reason);
+        int len = ev.encode(eventsBuffer, 0);
+        long pos;
+        while ((pos = eventsPublication.offer(eventsBuffer, 0, len)) < 0L) {
+            if (pos == io.aeron.Publication.CLOSED || pos == io.aeron.Publication.MAX_POSITION_EXCEEDED) {
+                throw new IllegalStateException("eventsPublication offer closed; pos=" + pos);
+            }
+            Thread.yield();
+        }
+    }
+
+    private void emitOrderReplaceRequested(
+            AdmittedOrder order,
+            long requestedAtMillis,
+            long newQuantityScaled,
+            long newLimitPriceScaledOrZero,
+            String clientRequestKey,
+            String reason) {
+        if (eventsPublication == null) {
+            return;
+        }
+        OrderReplaceRequestedEvent ev = new OrderReplaceRequestedEvent(
+                order.orderId(),
+                order.quantityScaled(),
+                order.limitPriceScaledOrZero(),
+                newQuantityScaled,
+                newLimitPriceScaledOrZero,
+                requestedAtMillis,
+                order.shardId(),
+                order.side(),
+                order.timeInForceCode(),
+                order.accountId(),
+                order.instrumentSymbol(),
+                clientRequestKey,
+                reason);
+        int len = ev.encode(eventsBuffer, 0);
+        long pos;
+        while ((pos = eventsPublication.offer(eventsBuffer, 0, len)) < 0L) {
+            if (pos == io.aeron.Publication.CLOSED || pos == io.aeron.Publication.MAX_POSITION_EXCEEDED) {
+                throw new IllegalStateException("eventsPublication offer closed; pos=" + pos);
+            }
+            Thread.yield();
+        }
     }
 
     private void emitOrderCancelApplied(AdmittedOrder mutated, long cancelledAtMillis, String reason) {

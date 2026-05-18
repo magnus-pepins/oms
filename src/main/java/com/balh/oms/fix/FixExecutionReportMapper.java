@@ -21,7 +21,9 @@ import quickfix.field.LeavesQty;
 import quickfix.field.MsgType;
 import quickfix.field.OrdStatus;
 import quickfix.field.OrderID;
+import quickfix.field.OrderQty;
 import quickfix.field.OrigClOrdID;
+import quickfix.field.Price;
 import quickfix.field.Text;
 import quickfix.field.TransactTime;
 
@@ -65,6 +67,41 @@ public class FixExecutionReportMapper {
         BigDecimal leaves = new BigDecimal(msg.getString(LeavesQty.FIELD));
         BigDecimal cum = new BigDecimal(msg.getString(CumQty.FIELD));
         return Optional.of(new ExecutionTradeCommand(orderId, venueId, venueTs, venueExecRef, lastQty, lastPx, leaves, cum));
+    }
+
+    /**
+     * Wed-demo addition. ER ET=5 (REPLACED) from the broker in response to a 35=G we sent. Maps
+     * to an {@link ExecutionTradeCommand}-shaped record where {@code lastQuantity} carries the
+     * <strong>new total OrderQty</strong> (broker's authoritative replacement quantity, not a
+     * trade quantity — there is no fill on a pure replace) and {@code lastPrice} carries the
+     * <strong>new limit price</strong>. The cluster's apply path on
+     * {@link com.balh.oms.cluster.ApplyExecutionReportCommand#EXEC_TYPE_REPLACE} interprets the
+     * fields with that overloaded semantic. Matches the loopback acceptor's
+     * {@code onOrderCancelReplaceRequest} which echoes the inbound 35=G's OrderQty + Price back
+     * to OMS in the ER's OrderQty + Price fields.
+     */
+    public Optional<ExecutionTradeCommand> tryParseReplace(Message msg, String venueId) throws FieldNotFound {
+        if (msg.getChar(ExecType.FIELD) != ExecType.REPLACED) {
+            return Optional.empty();
+        }
+        UUID orderId = parseClOrdIdPreferOrig(msg);
+        if (orderId == null) {
+            return Optional.empty();
+        }
+        Instant venueTs = parseTransactTime(msg).orElse(Instant.now());
+        String venueExecRef = msg.getString(ExecID.FIELD);
+        BigDecimal newOrderQty = new BigDecimal(msg.getString(OrderQty.FIELD));
+        BigDecimal newLimitPx = msg.isSetField(Price.FIELD)
+                ? new BigDecimal(msg.getString(Price.FIELD))
+                : BigDecimal.ZERO;
+        BigDecimal leaves = msg.isSetField(LeavesQty.FIELD)
+                ? new BigDecimal(msg.getString(LeavesQty.FIELD))
+                : BigDecimal.ZERO;
+        BigDecimal cum = msg.isSetField(CumQty.FIELD)
+                ? new BigDecimal(msg.getString(CumQty.FIELD))
+                : BigDecimal.ZERO;
+        return Optional.of(new ExecutionTradeCommand(
+                orderId, venueId, venueTs, venueExecRef, newOrderQty, newLimitPx, leaves, cum));
     }
 
     public Optional<ExecutionCancelCommand> tryParseCancel(Message msg, String venueId) throws FieldNotFound {

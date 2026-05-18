@@ -102,6 +102,29 @@ public final class OmsClusterWireFormat {
      */
     public static final int TYPE_ID_CANCEL_ORDER = 3;
 
+    /**
+     * {@link RequestCancelOrderCommand}. User-initiated cancel routed to the broker via FIX 35=F.
+     * <strong>Distinct from {@link #TYPE_ID_CANCEL_ORDER}</strong>: the latter is an internal
+     * inflight-failure cancel that never touches a venue and immediately CANCELS the order; this
+     * one is the customer-/desk-initiated cancel that goes to the broker and only changes status
+     * once the broker's ER (ET=4 CANCELED) lands. The cluster service emits an
+     * {@link #TYPE_ID_ORDER_CANCEL_REQUESTED} event on the side publication; oms-fix-egress
+     * consumes that event and sends 35=F to the broker. No status mutation happens here — the
+     * order stays WORKING / PARTIALLY_FILLED until the ER arrives.
+     */
+    public static final int TYPE_ID_REQUEST_CANCEL_ORDER = 5;
+
+    /**
+     * {@link RequestReplaceOrderCommand}. User-initiated modify (qty + limit price) routed to
+     * the broker via FIX 35=G OrderCancelReplaceRequest. Cluster validates the order is live,
+     * dedupes on {@code (orderId, clientRequestKey)} to make HTTP retries idempotent, and emits
+     * an {@link #TYPE_ID_ORDER_REPLACE_REQUESTED} for oms-fix-egress. Status / qty / price stay
+     * unchanged on the apply path; the broker's ER (ET=5 REPLACED) carries the authoritative new
+     * values and {@link #TYPE_ID_APPLY_EXECUTION_REPORT} with {@code execTypeCode=EXEC_TYPE_REPLACE}
+     * mutates the order in place.
+     */
+    public static final int TYPE_ID_REQUEST_REPLACE_ORDER = 6;
+
     // ---- Event type IDs (1000..1999) ----
 
     /** {@link OrderAcceptedEvent}. */
@@ -129,6 +152,29 @@ public final class OmsClusterWireFormat {
      * venue) and a different domain event envelope shape (no {@code venueId} / {@code venueExecRef}).
      */
     public static final int TYPE_ID_ORDER_CANCEL_APPLIED = 1004;
+
+    /**
+     * {@link OrderCancelRequestedEvent}. Wed-demo addition: emitted by the cluster after a
+     * {@link #TYPE_ID_REQUEST_CANCEL_ORDER} command admits. The oms-fix-egress JVM consumes this
+     * from the side publication and sends 35=F OrderCancelRequest to the broker. The projector
+     * also writes a {@code domain_event_outbox} row carrying an {@code OrderCancelRequested}
+     * envelope so the trading-desk and customer-frontend can show a transient "cancel
+     * requested" badge while the broker round-trips.
+     */
+    public static final int TYPE_ID_ORDER_CANCEL_REQUESTED = 1005;
+
+    /**
+     * {@link OrderReplaceRequestedEvent}. Same role as {@link #TYPE_ID_ORDER_CANCEL_REQUESTED} but
+     * for the modify path: oms-fix-egress builds 35=G with the new qty + price, projector emits a
+     * domain envelope, UIs render the pending modify until the broker's ER ET=5 lands.
+     *
+     * <p>The matching 35=9 reject paths reuse {@link #TYPE_ID_EXECUTION_APPLIED} carrying
+     * {@code execTypeCode=EXEC_TYPE_CANCEL_REJECT} or {@code EXEC_TYPE_REPLACE_REJECT}; the
+     * projector branches on the discriminator to skip the {@code orders} status mutation and
+     * write only the {@code OrderCancelRejected} / {@code OrderReplaceRejected} domain envelope
+     * to {@code domain_event_outbox}.
+     */
+    public static final int TYPE_ID_ORDER_REPLACE_REQUESTED = 1006;
 
     // ---- Cluster→projector event stream (Phase 2) ----
 

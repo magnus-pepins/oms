@@ -207,6 +207,16 @@ const COMMON_ENV = {
   // budget and addStream OMS_EVENTS failed with JetStreamApiException 10047.
   OMS_NATS_ENABLED: 'true',
   OMS_NATS_URL: 'nats://127.0.0.1:4222',
+  // Bounded desk read API (GET /internal/v1/desk/orders/snapshot) on
+  // oms-ingress; the trading-desk BFF calls it via /api/desk/orders/snapshot
+  // to seed the blotter on first load (before the SSE delta stream starts
+  // pushing live OrderAccepted/Working/Filled events). Off by default in
+  // OmsConfig.Desk.snapshotEnabled because production reads should go
+  // through the dedicated read replica path; flipped on for the Wed demo so
+  // the operator UI on Pop:5310 has rows to show. Defaults: snapshotMaxLimit
+  // 50 / snapshotMaxAgeHours 24 are baked into OmsConfig and adequate for
+  // the demo.
+  OMS_DESK_SNAPSHOT_ENABLED: 'true',
   // Slice-4p bench applied V31 via launch-bench-stack.sh before V32 existed; this
   // PM2 stack now adds V32 alongside V31. On rebuild after we changed V31 (dropped
   // CONCURRENTLY for pgbouncer, see V31 source header), the DB checksum from the

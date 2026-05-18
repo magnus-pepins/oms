@@ -152,7 +152,11 @@ class FixInboundClusterSinkTest {
     }
 
     @Test
-    void orderCancelReject_buildsVenueRejectCommand_withSyntheticVenueExecRef() throws Exception {
+    void orderCancelReject_noCxlRejResponseTo_defaultsToCancelReject() throws Exception {
+        // Wed-demo fix (chunk #2): a 35=9 without explicit CxlRejResponseTo defaults to
+        // ORDER_CANCEL_REQUEST → EXEC_TYPE_CANCEL_REJECT. Prior behavior mapped it to
+        // EXEC_TYPE_VENUE_REJECT (which moved the order to REJECTED — wrong, the order is still
+        // live on the broker). This test pins the corrected default.
         UUID orderId = UUID.fromString("44444444-4444-4444-4444-444444444444");
         Message m = new Message();
         m.getHeader().setString(MsgType.FIELD, MsgType.ORDER_CANCEL_REJECT);
@@ -166,13 +170,58 @@ class FixInboundClusterSinkTest {
         sink.handleOrderCancelReject(m);
 
         ApplyExecutionReportCommand sent = captureSubmitted();
-        assertThat(sent.execTypeCode()).isEqualTo(ApplyExecutionReportCommand.EXEC_TYPE_VENUE_REJECT);
+        assertThat(sent.execTypeCode())
+                .as("35=9 with no CxlRejResponseTo ⇒ CANCEL_REJECT, NOT VENUE_REJECT")
+                .isEqualTo(ApplyExecutionReportCommand.EXEC_TYPE_CANCEL_REJECT);
         assertThat(sent.orderId()).isEqualTo(orderId);
         assertThat(sent.venueExecRef())
                 .as("OCR has no ExecID; mapper synthesises one from broker order id + reason")
                 .isEqualTo("ocr-BR-99-" + CxlRejReason.UNKNOWN_ORDER);
         assertThat(sent.senderCompId()).isEqualTo("BROKER_ACCEPT");
         assertThat(sent.msgSeqNum()).isEqualTo(45);
+    }
+
+    @Test
+    void orderCancelReject_cxlRejResponseToCancel_buildsCancelRejectCommand() throws Exception {
+        UUID orderId = UUID.fromString("44444444-4444-4444-4444-444444444444");
+        Message m = new Message();
+        m.getHeader().setString(MsgType.FIELD, MsgType.ORDER_CANCEL_REJECT);
+        m.setString(OrigClOrdID.FIELD, orderId.toString());
+        m.setString(OrderID.FIELD, "BR-100");
+        m.setInt(CxlRejReason.FIELD, CxlRejReason.UNKNOWN_ORDER);
+        m.setInt(quickfix.field.CxlRejResponseTo.FIELD,
+                quickfix.field.CxlRejResponseTo.ORDER_CANCEL_REQUEST);
+        m.setString(TransactTime.FIELD, "20260512-12:04:00.000");
+        m.getHeader().setString(SenderCompID.FIELD, "BROKER_ACCEPT");
+        m.getHeader().setInt(MsgSeqNum.FIELD, 46);
+
+        sink.handleOrderCancelReject(m);
+
+        ApplyExecutionReportCommand sent = captureSubmitted();
+        assertThat(sent.execTypeCode())
+                .isEqualTo(ApplyExecutionReportCommand.EXEC_TYPE_CANCEL_REJECT);
+    }
+
+    @Test
+    void orderCancelReject_cxlRejResponseToReplace_buildsReplaceRejectCommand() throws Exception {
+        UUID orderId = UUID.fromString("44444444-4444-4444-4444-444444444444");
+        Message m = new Message();
+        m.getHeader().setString(MsgType.FIELD, MsgType.ORDER_CANCEL_REJECT);
+        m.setString(OrigClOrdID.FIELD, orderId.toString());
+        m.setString(OrderID.FIELD, "BR-101");
+        m.setInt(CxlRejReason.FIELD, CxlRejReason.UNKNOWN_ORDER);
+        m.setInt(quickfix.field.CxlRejResponseTo.FIELD,
+                quickfix.field.CxlRejResponseTo.ORDER_CANCEL_REPLACE_REQUEST);
+        m.setString(TransactTime.FIELD, "20260512-12:05:00.000");
+        m.getHeader().setString(SenderCompID.FIELD, "BROKER_ACCEPT");
+        m.getHeader().setInt(MsgSeqNum.FIELD, 47);
+
+        sink.handleOrderCancelReject(m);
+
+        ApplyExecutionReportCommand sent = captureSubmitted();
+        assertThat(sent.execTypeCode())
+                .as("35=9 with CxlRejResponseTo=ORDER_CANCEL_REPLACE_REQUEST ⇒ REPLACE_REJECT")
+                .isEqualTo(ApplyExecutionReportCommand.EXEC_TYPE_REPLACE_REJECT);
     }
 
     @Test

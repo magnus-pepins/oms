@@ -321,6 +321,55 @@ public class PositionsRepository {
         insertHistory(accountId, sym, custodyAccountId, "SETTLEMENT_SELL_SETTLED", settleQuantity, executionId);
     }
 
+    private static final String SELECT_BY_ACCOUNT_SQL = """
+            SELECT instrument_symbol, custody_account_id,
+                   quantity_total, quantity_settled, quantity_pending_buy_settle,
+                   quantity_pending_sell_settle, avg_cost_amount, currency, updated_at
+            FROM positions
+            WHERE account_id = :account_id
+              AND quantity_total > 0
+            ORDER BY instrument_symbol
+            """;
+
+    /**
+     * Read-side projection of {@code positions} for a single account: rows with
+     * {@code quantity_total > 0} only (closed positions filter out at the SQL boundary
+     * so callers cannot accidentally render zero-quantity rows). Powers the customer
+     * "My positions" view; ordered by {@code instrument_symbol} for deterministic UI.
+     *
+     * <p>Note: {@code avg_cost_amount} is currently always {@code null} — the V11 schema
+     * carries the column but no projector path writes it yet. Callers should treat
+     * {@code null} as "cost basis unknown" until that gap is closed.
+     */
+    public List<PositionRow> findByAccountId(UUID accountId) {
+        return jdbc.query(
+                SELECT_BY_ACCOUNT_SQL,
+                new MapSqlParameterSource().addValue("account_id", accountId),
+                (rs, rowNum) ->
+                        new PositionRow(
+                                rs.getString("instrument_symbol"),
+                                (UUID) rs.getObject("custody_account_id"),
+                                rs.getBigDecimal("quantity_total"),
+                                rs.getBigDecimal("quantity_settled"),
+                                rs.getBigDecimal("quantity_pending_buy_settle"),
+                                rs.getBigDecimal("quantity_pending_sell_settle"),
+                                rs.getBigDecimal("avg_cost_amount"),
+                                rs.getString("currency"),
+                                rs.getTimestamp("updated_at").toInstant()));
+    }
+
+    /** Read-side row for {@link #findByAccountId(UUID)}. */
+    public record PositionRow(
+            String instrumentSymbol,
+            UUID custodyAccountId,
+            BigDecimal quantityTotal,
+            BigDecimal quantitySettled,
+            BigDecimal quantityPendingBuySettle,
+            BigDecimal quantityPendingSellSettle,
+            BigDecimal avgCostAmount,
+            String currency,
+            java.time.Instant updatedAt) {}
+
     public BigDecimal findQuantityTotal(UUID accountId, String instrumentSymbol, UUID custodyAccountId) {
         String sym = instrumentSymbol == null ? "" : instrumentSymbol.trim();
         if (sym.isEmpty()) {

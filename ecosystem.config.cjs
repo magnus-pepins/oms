@@ -68,13 +68,11 @@
  *   - It does NOT start ledger-cluster (already managed by
  *     ~/ledger-cluster/ecosystem.config.cjs on Pop).
  *   - It does NOT start NATS (Pop already has obs-nats at :4222 with JetStream
- *     enabled; re-running would split the consumer group). OMS_NATS_ENABLED is
- *     temporarily off in COMMON_ENV because Pop's obs-nats has its JetStream
- *     max_file budget fully reserved by the existing EVENTS + DEAD_LETTERS
- *     streams; see the inline note next to OMS_NATS_ENABLED below for the
- *     three remediation paths under discussion. Once unblocked, the demo
- *     drains DomainFanoutReconciler → OMS_EVENTS → trading-desk JetStream
- *     consumer → WebSocket.
+ *     enabled; re-running would split the consumer group). The demo flips
+ *     OMS_NATS_ENABLED=true in COMMON_ENV below so DomainFanoutReconciler
+ *     drains the Postgres outbox into the OMS_EVENTS JetStream stream. The
+ *     trading-desk BFF consumes that stream via a durable JetStream consumer
+ *     and pushes deltas to the React blotter over WebSocket.
  *   - It does NOT start the customer-frontend / trading-desk BFFs (those have
  *     their own PM2 entries: customer-frontend / customer-frontend-api on Pop
  *     today, trading-desk to be added separately).
@@ -194,22 +192,20 @@ const COMMON_ENV = {
   // application.yaml's default `false`), so we layer it here so production deploys
   // stay safe and only the demo gets the new behavior.
   OMS_LEDGER_INFLIGHT_LIFECYCLE_RECONCILER_ENABLED: 'true',
-  // Trading-desk live blotter via NATS JetStream is the target for the Wed demo
-  // (DomainFanoutReconciler → OMS_EVENTS stream → trading-desk durable consumer
-  // → WebSocket). Blocked on Pop's obs-nats today: the existing EVENTS and
-  // DEAD_LETTERS streams already book the full 2GB jetstream max_file budget
-  // (EVENTS max_bytes=1GB + DEAD_LETTERS max_bytes=1GB = 100% reserved), so
-  // NatsFanoutClient.ensureJetStreamStream() fails with JetStreamApiException
-  // 10047 "insufficient storage resources available" when it tries to addStream
-  // OMS_EVENTS with StorageType.File. Memory budget (256MB) is at 0% so a
-  // Memory-backed OMS_EVENTS would fit, but NatsFanoutClient currently hardcodes
-  // StorageType.File. Three remediation paths under discussion:
-  //   A. Raise obs-nats max_file (e.g. 8GB) in /etc/nats/nats.conf + restart.
-  //   B. Make OMS_NATS_STORAGE_TYPE configurable (File|Memory) + flip to Memory.
-  //   C. Shrink EVENTS stream max_bytes to free file budget for OMS_EVENTS.
-  // Keep the flag off until the path is chosen so the projector / ingress /
-  // fix-egress JVMs do not crash-loop on bean creation.
-  OMS_NATS_ENABLED: 'false',
+  // Live trading-desk blotter for the Wed demo runs off NATS JetStream rather
+  // than HTTP polling. DomainFanoutReconciler (in whichever JVM picks it up via
+  // @ComponentScan + @Scheduled) drains the Postgres oms_domain_outbox into
+  // subject oms.events.<EventType>; NatsFanoutClient.ensureJetStreamStream()
+  // auto-creates the OMS_EVENTS stream on first publish, so no out-of-band
+  // `nats stream add` is needed. Pop's obs-nats runs with -js and the existing
+  // EVENTS stream uses prefix events.>, so OMS_EVENTS over oms.events.> does
+  // not collide. URL pinned to 127.0.0.1:4222 (matches the application.yaml
+  // default) so the JVMs talk to the local broker, not whatever a stale bench
+  // env might claim. Storage budget unblocked 2026-05-18: obs-nats was raised
+  // from max_file=2GB to 8GB (see ops-console/docker/config/nats/nats.conf)
+  // because EVENTS (1GB) + DEAD_LETTERS (1GB) already booked the full 2GB
+  // budget and addStream OMS_EVENTS failed with JetStreamApiException 10047.
+  OMS_NATS_ENABLED: 'true',
   OMS_NATS_URL: 'nats://127.0.0.1:4222',
   // Slice-4p bench applied V31 via launch-bench-stack.sh before V32 existed; this
   // PM2 stack now adds V32 alongside V31. On rebuild after we changed V31 (dropped

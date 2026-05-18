@@ -68,14 +68,15 @@ public class SettlementAutoStepScheduler {
     @Scheduled(fixedDelayString = "${oms.settlement.auto-step-scheduler-interval-ms:5000}")
     public void tick() {
         var settlement = config.getSettlement();
-        // Diagnostic: log per-tick so operators can confirm the scheduler is firing
-        // (regardless of whether it has work to do). INFO-level on purpose for the
-        // demo-prep window so it's visible in pm2 logs without raising the global log
-        // level. Drop to DEBUG once the demo stabilises.
-        log.info("auto-step scheduler tick: enabled={} maxAgeSec={} batch={}",
-                settlement.isAutoStepSchedulerEnabled(),
-                settlement.getAutoStepSchedulerMaxExecutionAgeSeconds(),
-                settlement.getAutoStepSchedulerBatchSize());
+        // DEBUG so operators can confirm the scheduler is firing without flooding
+        // pm2 logs every interval. Promote to INFO temporarily if a deploy looks
+        // dormant — see follow-up section in oms-ui-implementation-plan.md.
+        if (log.isDebugEnabled()) {
+            log.debug("auto-step scheduler tick: enabled={} maxAgeSec={} batch={}",
+                    settlement.isAutoStepSchedulerEnabled(),
+                    settlement.getAutoStepSchedulerMaxExecutionAgeSeconds(),
+                    settlement.getAutoStepSchedulerBatchSize());
+        }
         if (!settlement.isAutoStepSchedulerEnabled()) {
             return;
         }

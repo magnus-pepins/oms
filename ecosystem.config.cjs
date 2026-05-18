@@ -121,12 +121,68 @@ const AERON_MEDIA_DRIVER = path.join(AERON_DIR_BASE, 'media-driver');
 
 // Pop's existing slice-4p bench env. Already exports OMS_PG_URL / OMS_LEDGER_BASE_URL /
 // OMS_FIX_* / OMS_LEDGER_INFLIGHT_* etc. Each app inherits this then overrides what
-// the demo needs. If the file is absent (laptop dev), PM2 logs a warning and the
-// app still boots against the application.yaml defaults.
+// the demo needs. If the file is absent (laptop dev), the parser returns {} and the
+// app boots against the application.yaml defaults.
+//
+// PM2's built-in `env_file` is dotenv-style and silently DROPS bash `export KEY=VAL`
+// lines (it parses them as a key literally named `export OMS_PG_USER` rather than
+// `OMS_PG_USER`, leaving the JVM with the application.yaml default — exactly the
+// "Tenant or user not found" symptom we hit on the first 2026-05-18 bring-up).
+// Re-formatting ~/.oms-bench.env to drop `export` would break the launch-bench-stack
+// .sh path that dot-sources it. So we parse it here in JS with bash-source semantics
+// and inject the result into each app's `env` block.
 const BENCH_ENV_FILE =
   process.env.OMS_BENCH_ENV_FILE || path.join(process.env.HOME || '/root', '.oms-bench.env');
 
+/**
+ * Bash-source-equivalent env parser. Recognises:
+ *
+ *   export KEY=VALUE
+ *   KEY=VALUE
+ *   # comment
+ *   <blank line>
+ *
+ * Strips matching single or double quotes around VALUE. Does NOT do variable
+ * interpolation (`$FOO`, `${FOO}`) or command substitution — neither appears in
+ * ~/.oms-bench.env today, and silently expanding shell features inside a Node
+ * loader is the kind of "looks helpful, breaks unexpectedly" magic this rule set
+ * explicitly avoids. If the file ever needs `$()`-style values, swap this for a
+ * `bash -c '. file; env'` capture at PM2 start time.
+ */
+function loadBashEnvFile(filePath) {
+  let raw;
+  try {
+    raw = fs.readFileSync(filePath, 'utf8');
+  } catch (err) {
+    if (err.code === 'ENOENT') {
+      return {};
+    }
+    throw err;
+  }
+  const out = {};
+  const lineRe = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/;
+  for (const line of raw.split(/\r?\n/)) {
+    if (!line || line.trim().startsWith('#')) continue;
+    const m = line.match(lineRe);
+    if (!m) continue;
+    let value = m[2];
+    if (
+      (value.startsWith("'") && value.endsWith("'")) ||
+      (value.startsWith('"') && value.endsWith('"'))
+    ) {
+      value = value.slice(1, -1);
+    }
+    out[m[1]] = value;
+  }
+  return out;
+}
+
+const BENCH_ENV = loadBashEnvFile(BENCH_ENV_FILE);
+
+// BENCH_ENV first, then OMS_AERON_DIR_BASE (so this ecosystem's choice of dir wins
+// over any stale entry in ~/.oms-bench.env), then the demo-only reconciler flag.
 const COMMON_ENV = {
+  ...BENCH_ENV,
   OMS_AERON_DIR_BASE: AERON_DIR_BASE,
   // V32 reconciler is the load-bearing demo bit — Wed flow needs FILLED orders to
   // flip the held debit on the Ledger. Stays off in slice-4p bench (sliced under
@@ -151,7 +207,6 @@ const COMMON_PM2 = {
   kill_timeout: 30000,
   time: true,
   merge_logs: true,
-  env_file: BENCH_ENV_FILE,
 };
 
 const apps = [

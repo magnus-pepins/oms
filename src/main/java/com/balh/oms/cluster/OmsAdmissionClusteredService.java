@@ -914,8 +914,11 @@ public class OmsAdmissionClusteredService implements ClusteredService {
         }
         OrderCancelRequestedEvent ev = new OrderCancelRequestedEvent(
                 order.orderId(),
+                order.quantityScaled(),
+                order.cumQtyScaled(),
                 requestedAtMillis,
                 order.shardId(),
+                order.side(),
                 order.accountId(),
                 order.instrumentSymbol(),
                 clientRequestKey,

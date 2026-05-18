@@ -2,9 +2,13 @@ package com.balh.oms.fixegress;
 
 import com.balh.oms.cluster.OmsClusterWireFormat;
 import com.balh.oms.cluster.OrderAdmittedEvent;
+import com.balh.oms.cluster.OrderCancelRequestedEvent;
+import com.balh.oms.cluster.OrderReplaceRequestedEvent;
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.config.OmsProfiles;
 import com.balh.oms.fix.FixNewOrderSingleBuilder;
+import com.balh.oms.fix.FixOrderCancelReplaceRequestBuilder;
+import com.balh.oms.fix.FixOrderCancelRequestBuilder;
 import com.balh.oms.fix.FixOutboundSessionSend;
 import com.balh.oms.observability.metrics.OmsPipelineMetrics;
 import io.aeron.Aeron;
@@ -21,6 +25,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Profile;
 import org.springframework.stereotype.Component;
+import quickfix.Message;
 import quickfix.SessionNotFound;
 import quickfix.fix44.NewOrderSingle;
 
@@ -130,6 +135,8 @@ public class OmsFixEgressService {
     private final OmsConfig config;
     private final OmsFixEgressCursorRepository cursorRepository;
     private final FixNewOrderSingleBuilder newOrderSingleBuilder;
+    private final FixOrderCancelRequestBuilder orderCancelRequestBuilder;
+    private final FixOrderCancelReplaceRequestBuilder orderCancelReplaceRequestBuilder;
     private final FixOutboundSessionSend fixOutboundSessionSend;
     private final MeterRegistry meterRegistry;
     private final Clock wallClock;
@@ -161,8 +168,18 @@ public class OmsFixEgressService {
             OmsFixEgressCursorRepository cursorRepository,
             MeterRegistry meterRegistry,
             @Autowired(required = false) FixNewOrderSingleBuilder newOrderSingleBuilder,
+            @Autowired(required = false) FixOrderCancelRequestBuilder orderCancelRequestBuilder,
+            @Autowired(required = false) FixOrderCancelReplaceRequestBuilder orderCancelReplaceRequestBuilder,
             @Autowired(required = false) FixOutboundSessionSend fixOutboundSessionSend) {
-        this(config, cursorRepository, meterRegistry, Clock.systemUTC(), newOrderSingleBuilder, fixOutboundSessionSend);
+        this(
+                config,
+                cursorRepository,
+                meterRegistry,
+                Clock.systemUTC(),
+                newOrderSingleBuilder,
+                orderCancelRequestBuilder,
+                orderCancelReplaceRequestBuilder,
+                fixOutboundSessionSend);
     }
 
     /**
@@ -177,12 +194,16 @@ public class OmsFixEgressService {
             MeterRegistry meterRegistry,
             Clock wallClock,
             FixNewOrderSingleBuilder newOrderSingleBuilder,
+            FixOrderCancelRequestBuilder orderCancelRequestBuilder,
+            FixOrderCancelReplaceRequestBuilder orderCancelReplaceRequestBuilder,
             FixOutboundSessionSend fixOutboundSessionSend) {
         this.config = config;
         this.cursorRepository = cursorRepository;
         this.meterRegistry = meterRegistry;
         this.wallClock = wallClock;
         this.newOrderSingleBuilder = newOrderSingleBuilder;
+        this.orderCancelRequestBuilder = orderCancelRequestBuilder;
+        this.orderCancelReplaceRequestBuilder = orderCancelReplaceRequestBuilder;
         this.fixOutboundSessionSend = fixOutboundSessionSend;
     }
 
@@ -490,19 +511,50 @@ public class OmsFixEgressService {
                 int length,
                 io.aeron.logbuffer.Header header) {
             int typeId = buffer.getInt(offset + OmsClusterWireFormat.HEADER_TYPE_ID_OFFSET);
-            if (typeId != OmsClusterWireFormat.TYPE_ID_ORDER_ADMITTED) {
-                // Phase 3 only knows about admission events from this recording today.
-                // Slice 3c adds ApplyExecutionReport / ExecutionAppliedEvent typeIds that the
-                // egress service will (slice 3d) write back via the cluster ingress client.
-                return;
-            }
-            OrderAdmittedEvent ev = OrderAdmittedEvent.decode(buffer, offset, length);
             long newPosition = header.position();
-            boolean advanced = applyAdmittedEvent(ev, newPosition);
+            boolean advanced;
+            switch (typeId) {
+                case OmsClusterWireFormat.TYPE_ID_ORDER_ADMITTED -> {
+                    OrderAdmittedEvent ev = OrderAdmittedEvent.decode(buffer, offset, length);
+                    advanced = applyAdmittedEvent(ev, newPosition);
+                }
+                case OmsClusterWireFormat.TYPE_ID_ORDER_CANCEL_REQUESTED -> {
+                    OrderCancelRequestedEvent ev =
+                            OrderCancelRequestedEvent.decode(buffer, offset, length);
+                    advanced = applyCancelRequestedEvent(ev, newPosition);
+                }
+                case OmsClusterWireFormat.TYPE_ID_ORDER_REPLACE_REQUESTED -> {
+                    OrderReplaceRequestedEvent ev =
+                            OrderReplaceRequestedEvent.decode(buffer, offset, length);
+                    advanced = applyReplaceRequestedEvent(ev, newPosition);
+                }
+                default -> {
+                    // Other typeIds (ExecutionApplied / OrderRejected / OrderCancelApplied / ...)
+                    // are handled by other services; the FIX egress only consumes the venue-
+                    // outbound side. Advance the cursor so we don't loop on them.
+                    advanced = applyCursorOnly(newPosition);
+                }
+            }
             if (advanced) {
                 lastAppliedPosition.set(newPosition);
             }
         }
+    }
+
+    /**
+     * Cursor-only advance for event type-ids the egress does not care about. Mirrors the cursor
+     * advance shape from {@link #applyAdmittedEvent} so the at-least-once-at-broker semantics
+     * stay identical: on JVM crash before the cursor write, restart replays the unrelated
+     * fragment and we no-op again.
+     */
+    boolean applyCursorOnly(long newPosition) {
+        pendingCursorPosition = newPosition;
+        eventsSinceCursorFlush++;
+        if (eventsSinceCursorFlush >= cursorFlushEvery) {
+            cursorRepository.advance(EGRESS_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, newPosition);
+            eventsSinceCursorFlush = 0;
+        }
+        return true;
     }
 
     /**
@@ -535,29 +587,11 @@ public class OmsFixEgressService {
         boolean fixSendObserved = false;
         if (newOrderSingleBuilder != null && fixOutboundSessionSend != null) {
             NewOrderSingle nos = newOrderSingleBuilder.build(ev);
-            long parkNanos = config.getCluster().getFixEgress().getSessionNotReadyParkNanos();
-            while (running.get()) {
-                if (!fixOutboundSessionSend.hasActiveSession()) {
-                    LockSupport.parkNanos(parkNanos);
-                    continue;
-                }
-                try {
-                    fixOutboundSessionSend.send(nos);
-                    fixSendObserved = true;
-                    break;
-                } catch (SessionNotFound e) {
-                    log.warn(
-                            "oms-fix-egress: SessionNotFound on Session.sendToTarget for orderId={}; retrying in {}ns.",
-                            ev.orderId(),
-                            parkNanos);
-                    LockSupport.parkNanos(parkNanos);
-                }
-            }
-            if (!running.get()) {
-                // Service shutting down before the FIX send succeeded — leave the cursor
-                // un-advanced so the next start replays this fragment.
+            String sendOutcome = sendWithSessionRetry(nos, "NewOrderSingle", ev.orderId().toString());
+            if ("shutdown".equals(sendOutcome)) {
                 return false;
             }
+            fixSendObserved = "sent".equals(sendOutcome);
         }
         if (fixSendObserved) {
             // Phase 4j per-event histogram: record cluster-admit -> NOS-on-wire only when the FIX
@@ -567,9 +601,88 @@ public class OmsFixEgressService {
             OmsPipelineMetrics.recordClusterAdmitToFixNos(
                     meterRegistry, EGRESS_ID, ev.side(), ev.timeInForceCode(), latencyMs);
         }
-        // Slice 4l H2: gate the Postgres UPSERT on the configured batch size. Default 1
-        // preserves slice 3b-2 per-event semantics; >1 widens the at-least-once-at-broker
-        // redelivery window to up to (cursorFlushEvery-1) NOS per crash.
+        return advanceCursor(newPosition);
+    }
+
+    /**
+     * Wed-demo addition: consumes one {@link OrderCancelRequestedEvent} fragment, builds a FIX
+     * 4.4 35=F {@code OrderCancelRequest}, and sends it through the same
+     * {@link FixOutboundSessionSend} pipe the NOS path uses. Cursor advance matches
+     * {@link #applyAdmittedEvent}: post-send, with the same option-1 at-least-once-at-broker
+     * trade-off (broker rejects redelivered cancels via {@code DupClOrdID} because the cancel
+     * ClOrdID is derived deterministically from {@code orderId + clientRequestKey}).
+     */
+    boolean applyCancelRequestedEvent(OrderCancelRequestedEvent ev, long newPosition) {
+        if (orderCancelRequestBuilder == null || fixOutboundSessionSend == null) {
+            // Context-only ITs where FIX beans are absent — cursor-only fallback (mirrors
+            // applyAdmittedEvent's cursor-only mode for NOS).
+            return advanceCursor(newPosition);
+        }
+        Message msg = orderCancelRequestBuilder.build(ev);
+        String sendOutcome = sendWithSessionRetry(msg, "OrderCancelRequest", ev.orderId().toString());
+        if ("shutdown".equals(sendOutcome)) {
+            return false;
+        }
+        return advanceCursor(newPosition);
+    }
+
+    /**
+     * Wed-demo addition: consumes one {@link OrderReplaceRequestedEvent} fragment, builds a FIX
+     * 4.4 35=G {@code OrderCancelReplaceRequest}, and sends it. Same cursor + dedupe semantics
+     * as {@link #applyCancelRequestedEvent}.
+     */
+    boolean applyReplaceRequestedEvent(OrderReplaceRequestedEvent ev, long newPosition) {
+        if (orderCancelReplaceRequestBuilder == null || fixOutboundSessionSend == null) {
+            return advanceCursor(newPosition);
+        }
+        Message msg = orderCancelReplaceRequestBuilder.build(ev);
+        String sendOutcome = sendWithSessionRetry(
+                msg, "OrderCancelReplaceRequest", ev.orderId().toString());
+        if ("shutdown".equals(sendOutcome)) {
+            return false;
+        }
+        return advanceCursor(newPosition);
+    }
+
+    /**
+     * Shared session-retry + send loop used by all three FIX outbound paths (NOS / cancel /
+     * replace). Behaves identically to slice 3b-2's pre-refactor inline loop: parks on missing
+     * session, parks on {@link SessionNotFound}, exits via "shutdown" return when
+     * {@link #running} flips false mid-park.
+     *
+     * @return {@code "sent"} on a successful send; {@code "shutdown"} if the service is
+     *     shutting down before the send succeeds (caller must NOT advance the cursor —
+     *     restart replays the fragment).
+     */
+    private String sendWithSessionRetry(Message message, String messageKind, String correlator) {
+        long parkNanos = config.getCluster().getFixEgress().getSessionNotReadyParkNanos();
+        while (running.get()) {
+            if (!fixOutboundSessionSend.hasActiveSession()) {
+                LockSupport.parkNanos(parkNanos);
+                continue;
+            }
+            try {
+                fixOutboundSessionSend.send(message);
+                return "sent";
+            } catch (SessionNotFound e) {
+                log.warn(
+                        "oms-fix-egress: SessionNotFound on {} send for correlator={}; retrying in {}ns.",
+                        messageKind,
+                        correlator,
+                        parkNanos);
+                LockSupport.parkNanos(parkNanos);
+            }
+        }
+        return "shutdown";
+    }
+
+    /**
+     * Shared cursor-advance for all per-fragment paths. Slice 4l H2 batched-flush semantics
+     * preserved: with the default {@code cursorFlushEvery=1} every fragment flushes inline; with
+     * {@code N>1} the Postgres UPSERT is amortised across {@code N} fragments at the cost of up
+     * to {@code N-1} redelivered broker messages per crash.
+     */
+    private boolean advanceCursor(long newPosition) {
         pendingCursorPosition = newPosition;
         eventsSinceCursorFlush++;
         if (eventsSinceCursorFlush >= cursorFlushEvery) {

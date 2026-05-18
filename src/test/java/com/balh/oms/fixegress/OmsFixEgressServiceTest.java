@@ -12,8 +12,12 @@ import static org.mockito.Mockito.when;
 import com.balh.oms.cluster.AcceptOrderCommand;
 import com.balh.oms.cluster.OmsClusterWireFormat;
 import com.balh.oms.cluster.OrderAdmittedEvent;
+import com.balh.oms.cluster.OrderCancelRequestedEvent;
+import com.balh.oms.cluster.OrderReplaceRequestedEvent;
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.fix.FixNewOrderSingleBuilder;
+import com.balh.oms.fix.FixOrderCancelReplaceRequestBuilder;
+import com.balh.oms.fix.FixOrderCancelRequestBuilder;
 import com.balh.oms.fix.FixOutboundSessionSend;
 import com.balh.oms.observability.metrics.OmsPipelineMeterNames;
 import com.balh.oms.observability.metrics.OmsPipelineMetrics;
@@ -27,6 +31,8 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import quickfix.fix44.NewOrderSingle;
+import quickfix.fix44.OrderCancelReplaceRequest;
+import quickfix.fix44.OrderCancelRequest;
 
 import java.lang.reflect.Field;
 import java.time.Clock;
@@ -63,7 +69,14 @@ class OmsFixEgressServiceTest {
         config = new OmsConfig();
         Clock pinned = Clock.fixed(Instant.ofEpochMilli(NOW_MS), ZoneOffset.UTC);
         service = new OmsFixEgressService(
-                config, cursorRepository, meterRegistry, pinned, builder, send);
+                config,
+                cursorRepository,
+                meterRegistry,
+                pinned,
+                builder,
+                /* orderCancelRequestBuilder = */ null,
+                /* orderCancelReplaceRequestBuilder = */ null,
+                send);
         // applyAdmittedEvent's send loop checks running.get(); init() sets it true via PostConstruct,
         // but we skip init() so the replay thread doesn't spin up. Flip the flag directly so the
         // synchronous send-and-record path under test executes the way it would in production.
@@ -153,7 +166,14 @@ class OmsFixEgressServiceTest {
         // and the per-event Timer must stay silent because no NOS was actually emitted.
         Clock pinned = Clock.fixed(Instant.ofEpochMilli(NOW_MS), ZoneOffset.UTC);
         OmsFixEgressService cursorOnly = new OmsFixEgressService(
-                config, cursorRepository, meterRegistry, pinned, /* builder = */ null, /* send = */ null);
+                config,
+                cursorRepository,
+                meterRegistry,
+                pinned,
+                /* builder = */ null,
+                /* orderCancelRequestBuilder = */ null,
+                /* orderCancelReplaceRequestBuilder = */ null,
+                /* send = */ null);
         flipRunning(cursorOnly, true);
 
         OrderAdmittedEvent ev = sampleAdmitted(AcceptOrderCommand.SIDE_BUY, AcceptOrderCommand.TIF_DAY);
@@ -174,9 +194,14 @@ class OmsFixEgressServiceTest {
         // We carry the latest fragment position across the gap so the durable cursor never
         // points behind a fragment that has already shipped to the broker.
         OmsFixEgressService batched = new OmsFixEgressService(
-                config, cursorRepository, meterRegistry,
+                config,
+                cursorRepository,
+                meterRegistry,
                 Clock.fixed(Instant.ofEpochMilli(NOW_MS), ZoneOffset.UTC),
-                builder, send);
+                builder,
+                /* orderCancelRequestBuilder = */ null,
+                /* orderCancelReplaceRequestBuilder = */ null,
+                send);
         setCursorFlushEvery(batched, 3);
         flipRunning(batched, true);
 
@@ -240,5 +265,122 @@ class OmsFixEgressServiceTest {
                 "hash",
                 "AAPL",
                 /* ledgerBalanceIdOrNull = */ null);
+    }
+
+    // ========================================================================
+    // Wed-demo: cancel + replace request event dispatch
+    // ========================================================================
+
+    @Test
+    void applyCancelRequestedEvent_sendsOrderCancelRequest_andAdvancesCursor() throws Exception {
+        FixOrderCancelRequestBuilder cancelBuilder = org.mockito.Mockito.mock(FixOrderCancelRequestBuilder.class);
+        Clock pinned = Clock.fixed(Instant.ofEpochMilli(NOW_MS), ZoneOffset.UTC);
+        OmsFixEgressService egress = new OmsFixEgressService(
+                config,
+                cursorRepository,
+                meterRegistry,
+                pinned,
+                /* nosBuilder = */ null,
+                cancelBuilder,
+                /* replaceBuilder = */ null,
+                send);
+        flipRunning(egress, true);
+
+        OrderCancelRequestedEvent ev = sampleCancelRequested();
+        OrderCancelRequest msg = new OrderCancelRequest();
+        when(cancelBuilder.build(ev)).thenReturn(msg);
+        when(send.hasActiveSession()).thenReturn(true);
+
+        boolean advanced = egress.applyCancelRequestedEvent(ev, FRAGMENT_POSITION);
+
+        assertThat(advanced).isTrue();
+        verify(send).send(msg);
+        verify(cursorRepository)
+                .advance(OmsFixEgressService.EGRESS_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, FRAGMENT_POSITION);
+    }
+
+    @Test
+    void applyReplaceRequestedEvent_sendsOrderCancelReplaceRequest_andAdvancesCursor() throws Exception {
+        FixOrderCancelReplaceRequestBuilder replaceBuilder =
+                org.mockito.Mockito.mock(FixOrderCancelReplaceRequestBuilder.class);
+        Clock pinned = Clock.fixed(Instant.ofEpochMilli(NOW_MS), ZoneOffset.UTC);
+        OmsFixEgressService egress = new OmsFixEgressService(
+                config,
+                cursorRepository,
+                meterRegistry,
+                pinned,
+                /* nosBuilder = */ null,
+                /* cancelBuilder = */ null,
+                replaceBuilder,
+                send);
+        flipRunning(egress, true);
+
+        OrderReplaceRequestedEvent ev = sampleReplaceRequested();
+        OrderCancelReplaceRequest msg = new OrderCancelReplaceRequest();
+        when(replaceBuilder.build(ev)).thenReturn(msg);
+        when(send.hasActiveSession()).thenReturn(true);
+
+        boolean advanced = egress.applyReplaceRequestedEvent(ev, FRAGMENT_POSITION);
+
+        assertThat(advanced).isTrue();
+        verify(send).send(msg);
+        verify(cursorRepository)
+                .advance(OmsFixEgressService.EGRESS_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, FRAGMENT_POSITION);
+    }
+
+    @Test
+    void applyCancelRequestedEvent_buildersAbsent_cursorOnlyFallback() {
+        // Mirror applyAdmittedEvent_cursorOnlyMode: the cancel-request dispatch must also tolerate
+        // missing FIX beans (context-only ITs with oms.routing.backend=noop) and still advance the
+        // cursor so the replay loop does not stall.
+        Clock pinned = Clock.fixed(Instant.ofEpochMilli(NOW_MS), ZoneOffset.UTC);
+        OmsFixEgressService cursorOnly = new OmsFixEgressService(
+                config,
+                cursorRepository,
+                meterRegistry,
+                pinned,
+                /* nosBuilder = */ null,
+                /* cancelBuilder = */ null,
+                /* replaceBuilder = */ null,
+                /* send = */ null);
+        flipRunning(cursorOnly, true);
+
+        boolean advanced = cursorOnly.applyCancelRequestedEvent(sampleCancelRequested(), FRAGMENT_POSITION);
+
+        assertThat(advanced).isTrue();
+        verify(cursorRepository)
+                .advance(OmsFixEgressService.EGRESS_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, FRAGMENT_POSITION);
+        verifyNoInteractions(send);
+    }
+
+    private static OrderCancelRequestedEvent sampleCancelRequested() {
+        return new OrderCancelRequestedEvent(
+                UUID.randomUUID(),
+                /* originalQuantityScaled = */ 1_000_000_000L,
+                /* cumQtyScaled = */ 0L,
+                /* requestedAtMillis = */ ACCEPTED_AT_MS,
+                /* shardId = */ 0,
+                AcceptOrderCommand.SIDE_BUY,
+                "acct",
+                "AAPL",
+                "idem-cancel",
+                "user-cancel");
+    }
+
+    private static OrderReplaceRequestedEvent sampleReplaceRequested() {
+        return new OrderReplaceRequestedEvent(
+                UUID.randomUUID(),
+                /* originalQuantityScaled = */ 1_000_000_000L,
+                /* originalLimitPriceScaledOrZero = */ 100_000_000L,
+                /* newQuantityScaled = */ 1_500_000_000L,
+                /* newLimitPriceScaledOrZero = */ 120_000_000L,
+                /* requestedAtMillis = */ ACCEPTED_AT_MS,
+                /* shardId = */ 0,
+                AcceptOrderCommand.SIDE_BUY,
+                AcceptOrderCommand.TIF_DAY,
+                "acct",
+                "AAPL",
+                "idem-replace",
+                "operator-resize");
     }
 }

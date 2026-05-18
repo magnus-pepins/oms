@@ -34,18 +34,32 @@ import java.util.UUID;
  * <pre>
  *   offset 16  long   orderIdMsb
  *   offset 24  long   orderIdLsb
- *   offset 32  long   requestedAtMillis   (cluster timestamp; epoch millis)
- *   offset 40  int    shardId
- *   offset 44  string accountId
+ *   offset 32  long   originalQuantityScaled   (order.quantityScaled at request time)
+ *   offset 40  long   cumQtyScaled             (already-filled qty at request time)
+ *   offset 48  long   requestedAtMillis        (cluster timestamp; epoch millis)
+ *   offset 56  int    shardId
+ *   offset 60  byte   sideCode                 (mirrors AcceptOrderCommand.SIDE_*)
+ *   offset 61  byte   reserved (must be 0)
+ *   offset 62  byte   reserved (must be 0)
+ *   offset 63  byte   reserved (must be 0)
+ *   offset 64  string accountId
  *   offset N   string instrumentSymbol
  *   offset N   string clientRequestKey
  *   offset N   string reason
  * </pre>
+ *
+ * <p>{@code sideCode} + {@code originalQuantityScaled} + {@code cumQtyScaled} are carried so
+ * oms-fix-egress can build a complete FIX 35=F (which requires {@code Side(54)} and
+ * {@code OrderQty(38)}) without consulting Postgres or the cluster — preserving the
+ * Aeron→FIX hot send path.
  */
 public record OrderCancelRequestedEvent(
         UUID orderId,
+        long originalQuantityScaled,
+        long cumQtyScaled,
         long requestedAtMillis,
         int shardId,
+        byte sideCode,
         String accountId,
         String instrumentSymbol,
         String clientRequestKey,
@@ -70,10 +84,18 @@ public record OrderCancelRequestedEvent(
         p += Long.BYTES;
         buffer.putLong(p, orderId.getLeastSignificantBits());
         p += Long.BYTES;
+        buffer.putLong(p, originalQuantityScaled);
+        p += Long.BYTES;
+        buffer.putLong(p, cumQtyScaled);
+        p += Long.BYTES;
         buffer.putLong(p, requestedAtMillis);
         p += Long.BYTES;
         buffer.putInt(p, shardId);
         p += Integer.BYTES;
+        buffer.putByte(p++, sideCode);
+        buffer.putByte(p++, (byte) 0);
+        buffer.putByte(p++, (byte) 0);
+        buffer.putByte(p++, (byte) 0);
 
         p = writeString(buffer, p, accountId);
         p = writeString(buffer, p, instrumentSymbol);
@@ -107,10 +129,16 @@ public record OrderCancelRequestedEvent(
         p += Long.BYTES;
         long lsb = buffer.getLong(p);
         p += Long.BYTES;
+        long originalQuantityScaled = buffer.getLong(p);
+        p += Long.BYTES;
+        long cumQtyScaled = buffer.getLong(p);
+        p += Long.BYTES;
         long requestedAtMillis = buffer.getLong(p);
         p += Long.BYTES;
         int shardId = buffer.getInt(p);
         p += Integer.BYTES;
+        byte sideCode = buffer.getByte(p++);
+        p += 3; // reserved bytes
 
         String accountId = readString(buffer, p);
         p += stringByteLenAt(buffer, p);
@@ -122,8 +150,11 @@ public record OrderCancelRequestedEvent(
 
         return new OrderCancelRequestedEvent(
                 new UUID(msb, lsb),
+                originalQuantityScaled,
+                cumQtyScaled,
                 requestedAtMillis,
                 shardId,
+                sideCode,
                 accountId,
                 instrumentSymbol,
                 clientRequestKey,

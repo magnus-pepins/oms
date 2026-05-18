@@ -262,6 +262,8 @@ class OmsFixEgressBrokerIT extends AbstractPostgresIntegrationTest {
                         cursorRepository,
                         meterRegistry,
                         newOrderSingleBuilder,
+                        /* orderCancelRequestBuilder = */ null,
+                        /* orderCancelReplaceRequestBuilder = */ null,
                         fixOutboundSessionSend);
         restarted.init();
         try {

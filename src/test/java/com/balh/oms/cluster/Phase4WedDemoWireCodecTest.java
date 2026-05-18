@@ -85,8 +85,11 @@ class Phase4WedDemoWireCodecTest {
     void orderCancelRequested_roundTrip() {
         OrderCancelRequestedEvent original = new OrderCancelRequestedEvent(
                 UUID.fromString("11111111-2222-4333-9444-555555555555"),
-                1_700_000_000_000L,
+                /* originalQuantityScaled = */ 2_000_000_000L,
+                /* cumQtyScaled = */ 500_000_000L,
+                /* requestedAtMillis = */ 1_700_000_000_000L,
                 /* shardId = */ 3,
+                /* sideCode = */ AcceptOrderCommand.SIDE_SELL,
                 "acct-1",
                 "AAPL",
                 "idem-req-abc-123",

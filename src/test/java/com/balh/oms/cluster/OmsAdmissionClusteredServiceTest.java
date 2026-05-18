@@ -1009,6 +1009,17 @@ class OmsAdmissionClusteredServiceTest {
         assertThat(ev.orderId()).isEqualTo(orderId);
         assertThat(ev.clientRequestKey()).isEqualTo("idem-cancel-1");
         assertThat(ev.reason()).isEqualTo("user-cancel");
+        assertThat(ev.sideCode())
+                .as("egress needs Side(54) for FIX 35=F — carry it on the event so no Postgres lookup")
+                .isEqualTo(beforeRequest.side());
+        assertThat(ev.originalQuantityScaled())
+                .as("egress needs OrderQty(38) for FIX 35=F — must equal the order's original NOS qty")
+                .isEqualTo(beforeRequest.quantityScaled());
+        assertThat(ev.cumQtyScaled())
+                .as("carried so the egress can compute LeavesQty(151) for brokers that expect it")
+                .isEqualTo(beforeRequest.cumQtyScaled());
+        assertThat(ev.accountId()).isEqualTo(beforeRequest.accountId());
+        assertThat(ev.instrumentSymbol()).isEqualTo(beforeRequest.instrumentSymbol());
     }
 
     @Test

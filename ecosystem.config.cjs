@@ -273,12 +273,18 @@ const apps = [
     log: logPath('oms-ingress-combined', '.log'),
     env: {
       ...COMMON_ENV,
-      // No SPRING_PROFILES_ACTIVE: ingress is the default profile (OmsProfiles
-      // ORDER_ACCEPT_PROFILE = !oms-postgres-projector & !oms-fix-egress). Setting
-      // INGRESS_REPLICA would skip ingress's local cluster-node embed and use the
-      // cluster client only — that's a horizontal-scale role and not what the demo
-      // single-host setup needs.
-      OMS_AERON_CLUSTER_CLIENT_AERON_DIR: AERON_MEDIA_DRIVER,
+      // Use the oms-ingress-replica profile so application-oms-ingress-replica.yaml
+      // wires the cluster client (oms.cluster.client.enabled=true) and the
+      // OmsClusterShardRouter bean OrderIngressService depends on. The default profile
+      // leaves cluster.client.enabled at false (production assumed the future
+      // CLUSTER_CLIENT role would own this), which fails the order-accept JVM with
+      // "required a bean of type OmsClusterShardRouter that could not be found"
+      // (observed 2026-05-18 14:04 in oms-ingress-combined.log). ORDER_ACCEPT_PROFILE
+      // = "!oms-postgres-projector & !oms-fix-egress" so the ingress beans (HTTP
+      // /internal/v1/orders, new /cancel + /replace endpoints, the V32 lifecycle
+      // reconciler) all activate normally under this profile.
+      SPRING_PROFILES_ACTIVE: 'oms-ingress-replica',
+      OMS_CLUSTER_CLIENT_AERON_DIRECTORY: AERON_MEDIA_DRIVER,
     },
     ...COMMON_PM2,
   },

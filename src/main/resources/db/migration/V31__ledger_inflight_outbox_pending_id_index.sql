@@ -32,6 +32,16 @@
 -- Note: COMMENT ON INDEX kept in the migration file's own header above (same reason as V30
 -- — Flyway 10 + executeInTransaction=false rejects mixing non-transactional CREATE INDEX
 -- CONCURRENTLY with transactional COMMENT in the same migration).
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_ledger_inflight_outbox_pending_id
+--
+-- 2026-05-18: dropped CONCURRENTLY but kept the executeInTransaction=false pragma so the
+-- on-disk content matches what Pop's slice-4p bench applied (the user's local Pop-only edit
+-- ahead of this commit). Background: Pop runs OMS through the Supabase pgbouncer in
+-- transaction-pool mode, where pgbouncer wraps every statement in a transaction and
+-- rejects CONCURRENTLY with "cannot run inside a transaction block". Plain CREATE INDEX IF
+-- NOT EXISTS produces the SAME index — it just holds an AccessExclusiveLock on
+-- ledger_inflight_outbox briefly while building. For Wed-demo / single-host bench this is
+-- fine; for production cutover use a direct (non-pgbouncer) connection so CONCURRENTLY can
+-- come back.
+CREATE INDEX IF NOT EXISTS idx_ledger_inflight_outbox_pending_id
     ON ledger_inflight_outbox (id)
     WHERE published_at IS NULL AND compensated_at IS NULL;

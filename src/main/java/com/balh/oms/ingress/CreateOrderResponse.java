@@ -40,7 +40,14 @@ public record CreateOrderResponse(
          * so consumers don't drift on rounding. Always {@code >= 0}. Reaches 0 at the same moment
          * the status flips to {@code FILLED}.
          */
-        BigDecimal leavesQuantity
+        BigDecimal leavesQuantity,
+        /**
+         * Wed-demo: explicit order type ({@code "MARKET"} or {@code "LIMIT"}), decoupled from
+         * {@link #limitPrice} presence. Lets the customer-FE blotter render "Market" for orders
+         * the user placed as market even when {@code limitPrice} is set to a reference cap
+         * supplied by the BFF (the price the venue may fill at-or-better).
+         */
+        String ordType
 ) {
     public static CreateOrderResponse from(Order o) {
         return from(o, null);
@@ -67,7 +74,8 @@ public record CreateOrderResponse(
                 o.ledgerBalanceId(),
                 settlementStatus,
                 cumFilled,
-                leaves
+                leaves,
+                o.ordType() == null ? "MARKET" : o.ordType()
         );
     }
 }

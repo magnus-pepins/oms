@@ -285,7 +285,8 @@ public class OrderIngressService {
                 null,
                 accountIdHash,
                 ledgerBalanceId,
-                BigDecimal.ZERO);
+                BigDecimal.ZERO,
+                req.resolvedOrderType());
     }
 
     private AdmissionResult submitToClusterOrThrow(
@@ -352,6 +353,16 @@ public class OrderIngressService {
         }
         byte sideByte = order.side() == Side.BUY ? AcceptOrderCommand.SIDE_BUY : AcceptOrderCommand.SIDE_SELL;
         byte tifByte = tifByteFromString(order.timeInForce());
+        byte ordTypeByte;
+        try {
+            ordTypeByte = AcceptOrderCommand.ordTypeCodeFromName(order.ordType());
+        } catch (IllegalArgumentException e) {
+            throw new ClusterAdmissionException(
+                    HttpStatus.BAD_REQUEST,
+                    "ord_type_unsupported",
+                    "unsupported orderType '" + order.ordType() + "'; expected MARKET or LIMIT",
+                    e);
+        }
         long correlationId = cluster.nextCorrelationId();
         return new AcceptOrderCommand(
                 correlationId,
@@ -362,6 +373,7 @@ public class OrderIngressService {
                 order.shardId(),
                 sideByte,
                 tifByte,
+                ordTypeByte,
                 order.accountId().toString(),
                 order.clientIdempotencyKey(),
                 accountIdHash,

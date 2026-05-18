@@ -30,7 +30,7 @@ import java.util.UUID;
  *   offset 60  byte  side                  (0 == BUY, 1 == SELL)
  *   offset 61  byte  timeInForceCode       (0 == DAY, 1 == IOC, 2 == FOK, 3 == GTC)
  *   offset 62  byte  hasLedgerBalanceId    (0 == no, 1 == yes)
- *   offset 63  byte  reserved (must be 0)
+ *   offset 63  byte  ordTypeCode           (0 == MARKET, 1 == LIMIT)
  *   offset 64  string accountId
  *   offset N   string clientIdempotencyKey
  *   offset N   string accountIdHash         (PII-safe; computed at edge)
@@ -50,6 +50,7 @@ public record AcceptOrderCommand(
         int shardId,
         byte side,
         byte timeInForceCode,
+        byte ordTypeCode,
         String accountId,
         String clientIdempotencyKey,
         String accountIdHash,
@@ -71,6 +72,24 @@ public record AcceptOrderCommand(
     public static final byte TIF_IOC = 1;
     public static final byte TIF_FOK = 2;
     public static final byte TIF_GTC = 3;
+
+    /**
+     * Order-type wire codes. Repurposes the byte that historically lived at the "reserved"
+     * slot (offset 63) so old log entries that wrote 0 decode as MARKET — making the addition
+     * backward-compatible with replay of pre-existing Aeron cluster log/recordings.
+     *
+     * <p>Dual semantics for {@link #limitPriceScaledOrZero}:
+     * <ul>
+     *   <li>{@code ORD_TYPE_LIMIT}: strict limit price (must be {@code > 0}).</li>
+     *   <li>{@code ORD_TYPE_MARKET}: optional reference / cap price the venue may fill
+     *       at-or-better. When set, OMS uses it for the BUY inflight-hold notional and
+     *       FIX egress emits it as tag 44 alongside {@code OrdType=1 MARKET} so the simulator
+     *       / venue can fill at a realistic price rather than a placeholder. {@code 0} keeps
+     *       the legacy "MARKET with no price hint" behaviour (no inflight hold, no Price tag).</li>
+     * </ul>
+     */
+    public static final byte ORD_TYPE_MARKET = 0;
+    public static final byte ORD_TYPE_LIMIT = 1;
 
     /**
      * Map a wire {@code SIDE_*} byte to the canonical domain string ({@code "BUY"} / {@code "SELL"}).
@@ -103,12 +122,62 @@ public record AcceptOrderCommand(
         };
     }
 
+    /**
+     * Map a wire {@code ORD_TYPE_*} byte to the canonical {@code ord_type} string.
+     * See {@link #sideName(byte)} for the rationale (single canonical mapping shared by
+     * projector, NATS envelope, and any future repair tooling).
+     */
+    public static String ordTypeName(byte code) {
+        return switch (code) {
+            case ORD_TYPE_MARKET -> "MARKET";
+            case ORD_TYPE_LIMIT -> "LIMIT";
+            default -> throw new IllegalArgumentException("unknown ord-type code: " + code);
+        };
+    }
+
+    /** Inverse of {@link #ordTypeName(byte)}. Case-insensitive. */
+    public static byte ordTypeCodeFromName(String name) {
+        if (name == null) {
+            throw new IllegalArgumentException("ord-type name must not be null");
+        }
+        return switch (name.trim().toUpperCase(java.util.Locale.ROOT)) {
+            case "MARKET" -> ORD_TYPE_MARKET;
+            case "LIMIT" -> ORD_TYPE_LIMIT;
+            default -> throw new IllegalArgumentException("unknown ord-type name: " + name);
+        };
+    }
+
     public AcceptOrderCommand {
         Objects.requireNonNull(orderId, "orderId");
         Objects.requireNonNull(accountId, "accountId");
         Objects.requireNonNull(clientIdempotencyKey, "clientIdempotencyKey");
         Objects.requireNonNull(accountIdHash, "accountIdHash");
         Objects.requireNonNull(instrumentSymbol, "instrumentSymbol");
+    }
+
+    /**
+     * Back-compat constructor for callers (mostly tests / bench harnesses) that pre-date the
+     * Wed-demo {@code ordTypeCode} field. Defaults to {@link #ORD_TYPE_MARKET} — same semantic
+     * the historical wire format encoded when the slot was a hard-coded zero "reserved" byte.
+     * New code should always pass the explicit code.
+     */
+    public AcceptOrderCommand(
+            long correlationId,
+            UUID orderId,
+            long clientTimestampNanos,
+            long quantityScaled,
+            long limitPriceScaledOrZero,
+            int shardId,
+            byte side,
+            byte timeInForceCode,
+            String accountId,
+            String clientIdempotencyKey,
+            String accountIdHash,
+            String instrumentSymbol,
+            String ledgerBalanceIdOrNull) {
+        this(correlationId, orderId, clientTimestampNanos, quantityScaled, limitPriceScaledOrZero,
+                shardId, side, timeInForceCode, ORD_TYPE_MARKET,
+                accountId, clientIdempotencyKey, accountIdHash, instrumentSymbol, ledgerBalanceIdOrNull);
     }
 
     /**
@@ -141,7 +210,7 @@ public record AcceptOrderCommand(
         buffer.putByte(p++, side);
         buffer.putByte(p++, timeInForceCode);
         buffer.putByte(p++, (byte) (ledgerBalanceIdOrNull == null ? 0 : 1));
-        buffer.putByte(p++, (byte) 0);
+        buffer.putByte(p++, ordTypeCode);
 
         p = writeString(buffer, p, accountId);
         p = writeString(buffer, p, clientIdempotencyKey);
@@ -195,7 +264,9 @@ public record AcceptOrderCommand(
         byte side = buffer.getByte(p++);
         byte timeInForceCode = buffer.getByte(p++);
         byte hasLedgerBalanceId = buffer.getByte(p++);
-        p++;
+        // Pre-V33 events wrote 0 (reserved); decoded as ORD_TYPE_MARKET, which is the correct
+        // semantic for those historical events (limit_price > 0 was the only LIMIT signal then).
+        byte ordTypeCode = buffer.getByte(p++);
 
         String accountId = readString(buffer, p);
         p += stringByteLenAt(buffer, p);
@@ -219,6 +290,7 @@ public record AcceptOrderCommand(
                 shardId,
                 side,
                 timeInForceCode,
+                ordTypeCode,
                 accountId,
                 clientIdempotencyKey,
                 accountIdHash,

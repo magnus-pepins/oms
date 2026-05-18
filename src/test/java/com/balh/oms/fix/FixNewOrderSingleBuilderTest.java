@@ -40,6 +40,14 @@ class FixNewOrderSingleBuilderTest {
 
     private OrderAdmittedEvent admittedEvent(
             byte side, byte tif, long qtyScaled, long priceScaledOrZero, String instrumentSymbol) {
+        // These tests were written before ordTypeCode existed and relied on the legacy
+        // "limitPrice presence ⇒ LIMIT" inference. Reproduce that inference here so each
+        // existing assertion (LIMIT-with-price, MARKET-without-price) keeps its meaning
+        // without having to touch every call site. A Wed-demo-class test that explicitly
+        // exercises MARKET-with-reference-price should use the explicit ordTypeCode ctor.
+        byte ordTypeCode = priceScaledOrZero == 0L
+                ? AcceptOrderCommand.ORD_TYPE_MARKET
+                : AcceptOrderCommand.ORD_TYPE_LIMIT;
         return new OrderAdmittedEvent(
                 ORDER_ID,
                 /* clientTimestampNanos = */ 0L,
@@ -50,6 +58,7 @@ class FixNewOrderSingleBuilderTest {
                 /* version = */ 1,
                 side,
                 tif,
+                ordTypeCode,
                 /* accountId = */ "00000000-0000-0000-0000-000000000001",
                 /* clientIdempotencyKey = */ "idem-key",
                 /* accountIdHash = */ "hash",

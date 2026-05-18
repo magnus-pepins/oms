@@ -51,14 +51,14 @@ public class OrdersRepository {
             INSERT INTO orders (
                 id, account_id, client_idempotency_key, shard_id, version,
                 status, terminal_reason, side, instrument_symbol,
-                quantity, limit_price, time_in_force,
+                quantity, limit_price, time_in_force, ord_type,
                 received_at, accepted_at, terminal_at, account_id_hash, ledger_balance_id,
                 cum_filled_quantity
             ) VALUES (
                 :id, :account_id, :client_idempotency_key, :shard_id, 0,
                 CAST(:status AS order_status), CAST(:terminal_reason AS reject_code),
                 CAST(:side AS order_side), :instrument_symbol,
-                :quantity, :limit_price, :time_in_force,
+                :quantity, :limit_price, :time_in_force, :ord_type,
                 :received_at, :accepted_at, :terminal_at, :account_id_hash, :ledger_balance_id,
                 :cum_filled_quantity
             )
@@ -78,14 +78,14 @@ public class OrdersRepository {
             INSERT INTO orders (
                 id, account_id, client_idempotency_key, shard_id, version,
                 status, terminal_reason, side, instrument_symbol,
-                quantity, limit_price, time_in_force,
+                quantity, limit_price, time_in_force, ord_type,
                 received_at, accepted_at, terminal_at, account_id_hash, ledger_balance_id,
                 cum_filled_quantity
             ) VALUES (
                 :id, :account_id, :client_idempotency_key, :shard_id, 0,
                 CAST(:status AS order_status), CAST(:terminal_reason AS reject_code),
                 CAST(:side AS order_side), :instrument_symbol,
-                :quantity, :limit_price, :time_in_force,
+                :quantity, :limit_price, :time_in_force, :ord_type,
                 :received_at, :accepted_at, :terminal_at, :account_id_hash, :ledger_balance_id,
                 :cum_filled_quantity
             )
@@ -97,7 +97,7 @@ public class OrdersRepository {
                    status::text AS status,
                    terminal_reason::text AS terminal_reason,
                    side::text AS side,
-                   instrument_symbol, quantity, limit_price, time_in_force,
+                   instrument_symbol, quantity, limit_price, time_in_force, ord_type,
                    received_at, accepted_at, terminal_at, account_id_hash, ledger_balance_id,
                    cum_filled_quantity
             FROM orders WHERE id = :id
@@ -108,7 +108,7 @@ public class OrdersRepository {
                    status::text AS status,
                    terminal_reason::text AS terminal_reason,
                    side::text AS side,
-                   instrument_symbol, quantity, limit_price, time_in_force,
+                   instrument_symbol, quantity, limit_price, time_in_force, ord_type,
                    received_at, accepted_at, terminal_at, account_id_hash, ledger_balance_id,
                    cum_filled_quantity
             FROM orders
@@ -126,7 +126,7 @@ public class OrdersRepository {
                    status::text AS status,
                    terminal_reason::text AS terminal_reason,
                    side::text AS side,
-                   instrument_symbol, quantity, limit_price, time_in_force,
+                   instrument_symbol, quantity, limit_price, time_in_force, ord_type,
                    received_at, accepted_at, terminal_at, account_id_hash, ledger_balance_id,
                    cum_filled_quantity
             FROM orders
@@ -220,6 +220,7 @@ public class OrdersRepository {
                 .addValue("quantity", quantity)
                 .addValue("limit_price", limitPrice)
                 .addValue("time_in_force", AcceptOrderCommand.timeInForceName(ev.timeInForceCode()))
+                .addValue("ord_type", AcceptOrderCommand.ordTypeName(ev.ordTypeCode()))
                 .addValue("received_at", Timestamp.from(receivedAt))
                 .addValue("accepted_at", Timestamp.from(acceptedAt))
                 .addValue("terminal_at", null)
@@ -352,6 +353,7 @@ public class OrdersRepository {
                 .addValue("quantity", o.quantity())
                 .addValue("limit_price", o.limitPrice())
                 .addValue("time_in_force", o.timeInForce())
+                .addValue("ord_type", o.ordType() == null ? "MARKET" : o.ordType())
                 .addValue("received_at", Timestamp.from(o.receivedAt()))
                 .addValue("accepted_at", o.acceptedAt() == null ? null : Timestamp.from(o.acceptedAt()))
                 .addValue("terminal_at", o.terminalAt() == null ? null : Timestamp.from(o.terminalAt()))
@@ -367,6 +369,11 @@ public class OrdersRepository {
         String terminalReason = rs.getString("terminal_reason");
         String ledgerBalanceId = rs.getString("ledger_balance_id");
         BigDecimal cumFilled = rs.getBigDecimal("cum_filled_quantity");
+        // V33: ord_type column is NOT NULL after the migration, but tolerate null defensively
+        // (e.g. row inserted by a Spring context that ran against an older schema in a wider
+        // test harness). Same fallback the Order back-compat ctor uses.
+        String ordTypeRaw = rs.getString("ord_type");
+        String ordType = ordTypeRaw != null ? ordTypeRaw : (limitPrice == null ? "MARKET" : "LIMIT");
         return new Order(
                 (UUID) rs.getObject("id"),
                 (UUID) rs.getObject("account_id"),
@@ -385,7 +392,8 @@ public class OrdersRepository {
                 terminalAt == null ? null : terminalAt.toInstant(),
                 rs.getString("account_id_hash"),
                 ledgerBalanceId,
-                cumFilled == null ? BigDecimal.ZERO : cumFilled
+                cumFilled == null ? BigDecimal.ZERO : cumFilled,
+                ordType
         );
     };
 }

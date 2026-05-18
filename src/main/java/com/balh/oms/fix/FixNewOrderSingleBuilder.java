@@ -58,15 +58,26 @@ public class FixNewOrderSingleBuilder {
         nos.set(new quickfix.field.Side(
                 order.side() == Side.BUY ? quickfix.field.Side.BUY : quickfix.field.Side.SELL));
         nos.setString(OrderQty.FIELD, order.quantity().toPlainString());
+        // OrdType from the explicit order.ordType() string (canonical "MARKET"/"LIMIT"); Price
+        // tag is set whenever a limit_price is present, so MARKET orders with a reference cap
+        // carry a Price tag without being re-classified as LIMITs. See
+        // build(OrderAdmittedEvent) for the Wed-demo rationale.
+        nos.set(new OrdType(mapOrdTypeName(order.ordType())));
         if (order.limitPrice() != null) {
-            nos.set(new OrdType(OrdType.LIMIT));
             nos.setString(Price.FIELD, order.limitPrice().toPlainString());
-        } else {
-            nos.set(new OrdType(OrdType.MARKET));
         }
         nos.set(new TimeInForce(mapTimeInForce(order.timeInForce())));
         nos.set(new TransactTime(LocalDateTime.now(ZoneOffset.UTC)));
         return nos;
+    }
+
+    private static char mapOrdTypeName(String ordType) {
+        String n = ordType == null ? "MARKET" : ordType.trim().toUpperCase(java.util.Locale.ROOT);
+        return switch (n) {
+            case "MARKET" -> OrdType.MARKET;
+            case "LIMIT" -> OrdType.LIMIT;
+            default -> throw new IllegalArgumentException("unsupported order.ordType: " + ordType);
+        };
     }
 
     /**
@@ -93,10 +104,14 @@ public class FixNewOrderSingleBuilder {
                 .divide(QUANTITY_SCALE_BD, /* scale = */ 10, RoundingMode.UNNECESSARY)
                 .stripTrailingZeros();
         nos.setString(OrderQty.FIELD, plainString(quantity));
-        if (event.limitPriceScaledOrZero() == 0L) {
-            nos.set(new OrdType(OrdType.MARKET));
-        } else {
-            nos.set(new OrdType(OrdType.LIMIT));
+        // Wed-demo: OrdType is now driven by the explicit ordTypeCode field on the event, NOT
+        // by limitPrice presence. The Price tag is set independently whenever limit_price > 0
+        // so that a MARKET order can carry a reference / cap price the venue (or simulator)
+        // uses for the fill — without re-classifying the order as LIMIT (the simulator's LIMIT
+        // branch rests in book and never fills until cancel/replace; the MARKET branch
+        // instant-fills at the inbound Price tag if present, else falls back to "1").
+        nos.set(new OrdType(mapOrdType(event.ordTypeCode())));
+        if (event.limitPriceScaledOrZero() != 0L) {
             BigDecimal limitPrice = BigDecimal.valueOf(event.limitPriceScaledOrZero())
                     .divide(PRICE_SCALE_BD, /* scale = */ 10, RoundingMode.UNNECESSARY)
                     .stripTrailingZeros();
@@ -105,6 +120,15 @@ public class FixNewOrderSingleBuilder {
         nos.set(new TimeInForce(mapTimeInForceCode(event.timeInForceCode())));
         nos.set(new TransactTime(LocalDateTime.now(ZoneOffset.UTC)));
         return nos;
+    }
+
+    private static char mapOrdType(byte ordTypeCode) {
+        return switch (ordTypeCode) {
+            case AcceptOrderCommand.ORD_TYPE_MARKET -> OrdType.MARKET;
+            case AcceptOrderCommand.ORD_TYPE_LIMIT -> OrdType.LIMIT;
+            default -> throw new IllegalArgumentException(
+                    "unknown OrderAdmittedEvent.ordTypeCode: " + ordTypeCode);
+        };
     }
 
     private static char mapSide(byte sideCode) {

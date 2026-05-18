@@ -37,7 +37,7 @@ import java.util.UUID;
  *   offset 72  byte  side                         (AcceptOrderCommand.SIDE_*)
  *   offset 73  byte  timeInForceCode              (AcceptOrderCommand.TIF_*)
  *   offset 74  byte  hasLedgerBalanceId           (0 = no, 1 = yes)
- *   offset 75  byte  reserved (must be 0)
+ *   offset 75  byte  ordTypeCode                  (AcceptOrderCommand.ORD_TYPE_*)
  *   offset 76  string accountId
  *   offset N   string clientIdempotencyKey
  *   offset N   string accountIdHash
@@ -60,6 +60,7 @@ public record OrderAdmittedEvent(
         int version,
         byte side,
         byte timeInForceCode,
+        byte ordTypeCode,
         String accountId,
         String clientIdempotencyKey,
         String accountIdHash,
@@ -72,6 +73,33 @@ public record OrderAdmittedEvent(
         Objects.requireNonNull(clientIdempotencyKey, "clientIdempotencyKey");
         Objects.requireNonNull(accountIdHash, "accountIdHash");
         Objects.requireNonNull(instrumentSymbol, "instrumentSymbol");
+    }
+
+    /**
+     * Back-compat constructor for callers (mostly tests / projector unit harnesses) that
+     * pre-date the Wed-demo {@code ordTypeCode} field. Defaults to
+     * {@link AcceptOrderCommand#ORD_TYPE_MARKET} — same semantic the historical wire format
+     * encoded when the slot was a hard-coded zero "reserved" byte. New code (including the
+     * projector ↔ FIX-builder hot path) should always pass the explicit code.
+     */
+    public OrderAdmittedEvent(
+            UUID orderId,
+            long clientTimestampNanos,
+            long acceptedAtMillis,
+            long quantityScaled,
+            long limitPriceScaledOrZero,
+            int shardId,
+            int version,
+            byte side,
+            byte timeInForceCode,
+            String accountId,
+            String clientIdempotencyKey,
+            String accountIdHash,
+            String instrumentSymbol,
+            String ledgerBalanceIdOrNull) {
+        this(orderId, clientTimestampNanos, acceptedAtMillis, quantityScaled, limitPriceScaledOrZero,
+                shardId, version, side, timeInForceCode, AcceptOrderCommand.ORD_TYPE_MARKET,
+                accountId, clientIdempotencyKey, accountIdHash, instrumentSymbol, ledgerBalanceIdOrNull);
     }
 
     /**
@@ -89,6 +117,7 @@ public record OrderAdmittedEvent(
                 version,
                 cmd.side(),
                 cmd.timeInForceCode(),
+                cmd.ordTypeCode(),
                 cmd.accountId(),
                 cmd.clientIdempotencyKey(),
                 cmd.accountIdHash(),
@@ -122,7 +151,7 @@ public record OrderAdmittedEvent(
         buffer.putByte(p++, side);
         buffer.putByte(p++, timeInForceCode);
         buffer.putByte(p++, (byte) (ledgerBalanceIdOrNull == null ? 0 : 1));
-        buffer.putByte(p++, (byte) 0);
+        buffer.putByte(p++, ordTypeCode);
 
         p = writeString(buffer, p, accountId);
         p = writeString(buffer, p, clientIdempotencyKey);
@@ -174,7 +203,9 @@ public record OrderAdmittedEvent(
         byte side = buffer.getByte(p++);
         byte timeInForceCode = buffer.getByte(p++);
         byte hasLedgerBalanceId = buffer.getByte(p++);
-        p++;
+        // Pre-V33 events wrote 0 (reserved); decoded as ORD_TYPE_MARKET, matching the legacy
+        // semantic ("MARKET unless limit_price > 0"). See AcceptOrderCommand.ORD_TYPE_*.
+        byte ordTypeCode = buffer.getByte(p++);
 
         String accountId = readString(buffer, p);
         p += stringByteLenAt(buffer, p);
@@ -199,6 +230,7 @@ public record OrderAdmittedEvent(
                 version,
                 side,
                 timeInForceCode,
+                ordTypeCode,
                 accountId,
                 clientIdempotencyKey,
                 accountIdHash,

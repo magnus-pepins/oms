@@ -151,6 +151,13 @@ oms:
     broker-confirm-reconciler-interval-ms: ${OMS_SETTLEMENT_BROKER_CONFIRM_RECONCILER_INTERVAL_MS:10000}
     broker-confirm-reconciler-batch-size: ${OMS_SETTLEMENT_BROKER_CONFIRM_RECONCILER_BATCH_SIZE:50}
     broker-confirm-http-max-execution-ids: ${OMS_SETTLEMENT_BROKER_CONFIRM_HTTP_MAX_EXECUTION_IDS:100}
+    # Demo / dev: walks TRADE executions through executed -> matched -> ... -> settled
+    # one step per tick when the FIX counterparty is the simulator and no broker EOD
+    # file ever arrives. MUST stay false in production — see SettlementAutoStepScheduler.
+    auto-step-scheduler-enabled: ${OMS_SETTLEMENT_AUTO_STEP_SCHEDULER_ENABLED:false}
+    auto-step-scheduler-interval-ms: ${OMS_SETTLEMENT_AUTO_STEP_SCHEDULER_INTERVAL_MS:5000}
+    auto-step-scheduler-batch-size: ${OMS_SETTLEMENT_AUTO_STEP_SCHEDULER_BATCH_SIZE:50}
+    auto-step-scheduler-max-execution-age-seconds: ${OMS_SETTLEMENT_AUTO_STEP_SCHEDULER_MAX_EXECUTION_AGE_SECONDS:3600}
     file-import-max-bytes: ${OMS_SETTLEMENT_FILE_IMPORT_MAX_BYTES:10000000}
     file-import-max-rows: ${OMS_SETTLEMENT_FILE_IMPORT_MAX_ROWS:10000}
     file-import-register-slice-size: ${OMS_SETTLEMENT_FILE_IMPORT_REGISTER_SLICE_SIZE:50}

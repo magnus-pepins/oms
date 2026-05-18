@@ -249,6 +249,33 @@ public class OmsConfig {
         private long inflightCoalescerSubmitTimeoutMs = 2_000L;
         private boolean inflightCompensatorEnabled = false;
         /**
+         * Wed-demo (V32): when {@code true}, {@code LedgerInflightLifecycleReconciler} polls
+         * {@code ledger_inflight_outbox} for rows whose corresponding {@code orders.status} is
+         * terminal ({@code FILLED} / {@code CANCELLED} / {@code REJECTED} / {@code EXPIRED}) and
+         * issues {@code PUT /transactions/inflight/{txID}} {@code commit} (for FILLED) or
+         * {@code void} (for the rest) against the Ledger. Off by default so production deploys
+         * upgrade on opt-in; the demo turns it on alongside {@code inflight-async-enabled=true}.
+         */
+        private boolean inflightLifecycleReconcilerEnabled = false;
+        /**
+         * Bounds the per-row retry count for the lifecycle reconciler. After this many failed
+         * attempts the row is no longer eligible (the Ledger's expiry sweep is the safety net).
+         * Sized small (5) for the demo because the lifecycle call should be a strict no-op
+         * after a single 2xx — failures here usually signal a config / version mismatch that
+         * an operator should look at, not a transient blip to retry indefinitely.
+         */
+        private int inflightLifecycleAttemptsThreshold = 5;
+        private int inflightLifecycleBatchSize = 50;
+        private long inflightLifecycleIntervalMs = 1_000L;
+        /**
+         * Per-row minimum backoff between lifecycle attempts. A row that failed once must wait
+         * this long before being re-fetched. Demo-sized to 2 s so a Ledger blip recovers
+         * quickly; production should track Ledger's transient-failure SLO.
+         */
+        private long inflightLifecycleRetryBackoffMs = 2_000L;
+        /** Read-timeout for the PUT /transactions/inflight/{txID} HTTP call. */
+        private long inflightLifecycleSubmitTimeoutMs = 2_000L;
+        /**
          * Number of failed Ledger hold attempts before the compensator graduates a row to a
          * {@code CancelOrderCommand}. Below this, transient blips stay on the reconciler retry
          * path; at-or-above, the row is treated as a hold the Ledger will not accept (e.g.
@@ -405,6 +432,28 @@ public class OmsConfig {
         public long getInflightCompensatorSubmitTimeoutMs() { return inflightCompensatorSubmitTimeoutMs; }
         public void setInflightCompensatorSubmitTimeoutMs(long v) {
             this.inflightCompensatorSubmitTimeoutMs = Math.max(100L, v);
+        }
+        public boolean isInflightLifecycleReconcilerEnabled() { return inflightLifecycleReconcilerEnabled; }
+        public void setInflightLifecycleReconcilerEnabled(boolean v) { this.inflightLifecycleReconcilerEnabled = v; }
+        public int getInflightLifecycleAttemptsThreshold() { return inflightLifecycleAttemptsThreshold; }
+        public void setInflightLifecycleAttemptsThreshold(int v) {
+            this.inflightLifecycleAttemptsThreshold = Math.max(1, v);
+        }
+        public int getInflightLifecycleBatchSize() { return inflightLifecycleBatchSize; }
+        public void setInflightLifecycleBatchSize(int v) {
+            this.inflightLifecycleBatchSize = Math.max(1, v);
+        }
+        public long getInflightLifecycleIntervalMs() { return inflightLifecycleIntervalMs; }
+        public void setInflightLifecycleIntervalMs(long v) {
+            this.inflightLifecycleIntervalMs = Math.max(50L, v);
+        }
+        public long getInflightLifecycleRetryBackoffMs() { return inflightLifecycleRetryBackoffMs; }
+        public void setInflightLifecycleRetryBackoffMs(long v) {
+            this.inflightLifecycleRetryBackoffMs = Math.max(0L, v);
+        }
+        public long getInflightLifecycleSubmitTimeoutMs() { return inflightLifecycleSubmitTimeoutMs; }
+        public void setInflightLifecycleSubmitTimeoutMs(long v) {
+            this.inflightLifecycleSubmitTimeoutMs = Math.max(100L, v);
         }
 
         public boolean isSettlementOutboxEnabled() {

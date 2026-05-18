@@ -8,6 +8,12 @@ import java.util.UUID;
  *
  * <p>Uses {@code POST /transactions} with {@code sync: true} and {@code inflight: true}.
  * Call happens inside the same OMS DB transaction as the order insert; keep Ledger latency low.
+ *
+ * <p>Wed-demo: returns the Ledger {@code transactionId} from the response so the caller can
+ * persist it for the lifecycle reconciler ({@code PUT /transactions/inflight/{txID}} addressing).
+ * Implementations that cannot extract the id (e.g. test stubs) return {@code null} — the caller
+ * stores {@code null} in the outbox row and the lifecycle reconciler skips it (cannot settle a
+ * hold without the txn id; same shape as a pre-V32 outbox row).
  */
 public interface LedgerInflightReservationClient {
 
@@ -17,8 +23,11 @@ public interface LedgerInflightReservationClient {
      *
      * @param orderId        used for idempotent {@code reference} ({@code oms:order:{uuid}})
      * @param sourceBalanceId customer cash balance (Ledger {@code balance_id})
+     * @return Ledger {@code transactionId} (e.g. {@code "txn_<uuid>"}) parsed from the
+     *     response, or {@code null} when the implementation does not surface it (test stubs;
+     *     legacy callers should treat null as "lifecycle commit/void not available for this hold").
      */
-    void placeBuyNotionalHold(UUID orderId, String sourceBalanceId, BigDecimal quantity, BigDecimal limitPrice)
+    String placeBuyNotionalHold(UUID orderId, String sourceBalanceId, BigDecimal quantity, BigDecimal limitPrice)
             throws LedgerReservationException;
 
     final class LedgerReservationException extends Exception {

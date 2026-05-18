@@ -7,6 +7,8 @@ import com.balh.oms.ledger.LedgerInflightCoalescer;
 import com.balh.oms.ledger.LedgerInflightReservationClient;
 import com.balh.oms.ledger.RestLedgerBalanceClient;
 import com.balh.oms.ledger.RestLedgerInflightBulkDispatcher;
+import com.balh.oms.ledger.LedgerInflightLifecycleClient;
+import com.balh.oms.ledger.RestLedgerInflightLifecycleClient;
 import com.balh.oms.ledger.RestLedgerInflightReservationClient;
 import com.balh.oms.persistence.LedgerInflightOutboxRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -107,6 +109,29 @@ public class LedgerConfiguration {
                 dest.trim(),
                 currency.trim(),
                 prec);
+    }
+
+    /**
+     * Wed-demo (V32): {@code PUT /transactions/inflight/{txID}} client used by
+     * {@code LedgerInflightLifecycleReconciler}. Bean is loaded whenever the reservation client
+     * is loaded (same {@code oms.ledger.inflight-reservation-enabled} switch — the lifecycle
+     * client is meaningful only when we're actually placing holds in the first place); the
+     * reconciler itself stays off unless {@code oms.ledger.inflight-lifecycle-reconciler-enabled}
+     * is flipped.
+     */
+    @Bean
+    @ConditionalOnProperty(
+            prefix = "oms.ledger", name = "inflight-reservation-enabled", havingValue = "true")
+    LedgerInflightLifecycleClient ledgerInflightLifecycleClient(
+            RestClient omsLedgerRestClient,
+            OmsConfig config,
+            ObjectMapper objectMapper) {
+        String key = config.getLedger().getApiKey();
+        if (key == null || key.isBlank()) {
+            throw new IllegalStateException(
+                    "oms.ledger.api-key is required when oms.ledger.inflight-reservation-enabled=true");
+        }
+        return new RestLedgerInflightLifecycleClient(omsLedgerRestClient, key, objectMapper);
     }
 
     /**

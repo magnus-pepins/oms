@@ -460,6 +460,13 @@ public class OrderIngressService {
         }
         Timer.Sample sample = Timer.start(meterRegistry);
         try {
+            // Wed-demo (V32): the sync-mode hold path does NOT currently write a
+            // ledger_inflight_outbox row (that's the async path's projector). The returned
+            // txn id is therefore discarded here — the Ledger's expiry sweep is the safety
+            // net for sync-mode holds. The async path captures + persists txn id in
+            // LedgerInflightOutboxReconciler.runOnce(), where it does have an outbox row to
+            // update. If sync mode needs lifecycle reconciliation later, add a sync-side
+            // outbox INSERT here that stashes the returned txn id.
             client.placeBuyNotionalHold(order.id(), order.ledgerBalanceId(), order.quantity(), order.limitPrice());
             sample.stop(Timer.builder(METRIC_LEDGER_INFLIGHT_HOLD)
                     .description("Ledger sync inflight hold HTTP call at order accept")

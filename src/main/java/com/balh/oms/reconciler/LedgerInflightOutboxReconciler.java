@@ -89,8 +89,9 @@ public class LedgerInflightOutboxReconciler {
                     BigDecimal limitPrice = new BigDecimal(limitText);
                     UUID orderId = row.orderId();
                     Timer.Sample sample = Timer.start(meterRegistry);
+                    String ledgerTxnId;
                     try {
-                        client.placeBuyNotionalHold(orderId, balanceId, quantity, limitPrice);
+                        ledgerTxnId = client.placeBuyNotionalHold(orderId, balanceId, quantity, limitPrice);
                         sample.stop(Timer.builder(METRIC_LEDGER_INFLIGHT_HOLD)
                                 .description("Ledger sync inflight hold HTTP call (sync path or outbox reconciler)")
                                 .tag("result", "success")
@@ -105,6 +106,15 @@ public class LedgerInflightOutboxReconciler {
                         throw e;
                     }
                     outbox.markPublished(row.id(), Instant.now());
+                    // Wed-demo (V32): persist the Ledger-returned txn_<uuid> so the lifecycle
+                    // reconciler (commit-on-fill / void-on-cancel) can address the hold via
+                    // PUT /transactions/inflight/{txID}. Idempotent (setLedgerTxnId returns
+                    // false if the row already has a non-null id; that's the desired outcome on
+                    // a publish retry). A null id from the client (parse failure) leaves the row
+                    // unsettleable — Ledger expiry sweep is the safety net.
+                    if (ledgerTxnId != null) {
+                        outbox.setLedgerTxnId(row.id(), ledgerTxnId);
+                    }
                     meterRegistry.counter(METRIC_OUTBOX_PUBLISHED).increment();
                 } catch (Exception e) {
                     meterRegistry.counter(METRIC_OUTBOX_FAILED).increment();

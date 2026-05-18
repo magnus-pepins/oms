@@ -130,6 +130,87 @@ public class LedgerInflightOutboxRepository {
              WHERE id = :id
             """;
 
+    // ---- Wed-demo: inflight lifecycle reconciler (V32) -------------------------------------
+
+    /**
+     * Atomic upsert of the Ledger-returned {@code transactionId} after a successful
+     * {@code POST /transactions} on the published row. Idempotent: if the row already has a
+     * non-null {@code ledger_txn_id}, the UPDATE is a no-op rather than overwriting (the first
+     * Ledger txn id wins; a retry of the publish on the async path would resurface the same id
+     * via Ledger's {@code reference}-based dedupe).
+     */
+    private static final String SET_LEDGER_TXN_ID_SQL = """
+            UPDATE ledger_inflight_outbox
+               SET ledger_txn_id = :ledger_txn_id
+             WHERE id = :id
+               AND ledger_txn_id IS NULL
+            """;
+
+    /**
+     * Settle-eligible working set for the {@code LedgerInflightLifecycleReconciler}: rows where
+     * the hold has been published to Ledger ({@code ledger_txn_id IS NOT NULL}), the lifecycle
+     * has not been settled, the row has not been compensated, the lifecycle attempt budget has
+     * not been exhausted, the matching {@code orders} row is terminal, AND the per-row backoff
+     * has elapsed since the last attempt (or no attempt yet).
+     *
+     * <p>JOIN to {@code orders}: the FK from V4 guarantees totality. We read
+     * {@code orders.status} and {@code orders.shard_id} so the reconciler knows whether to
+     * issue {@code commit} (FILLED) or {@code void} (CANCELLED / REJECTED / EXPIRED) and which
+     * Ledger shim it would route through (single-cluster today; cross-shard later). FOR UPDATE
+     * OF lio SKIP LOCKED so multiple reconciler JVMs don't double-settle the same hold.
+     */
+    private static final String FETCH_LIFECYCLE_SETTLEABLE_SQL = """
+            SELECT lio.id,
+                   lio.order_id,
+                   lio.ledger_txn_id,
+                   lio.lifecycle_attempts,
+                   o.status        AS order_status,
+                   o.shard_id      AS shard_id
+              FROM ledger_inflight_outbox lio
+              JOIN orders o ON o.id = lio.order_id
+             WHERE lio.published_at IS NOT NULL
+               AND lio.ledger_txn_id IS NOT NULL
+               AND lio.lifecycle_settled_at IS NULL
+               AND lio.compensated_at IS NULL
+               AND lio.lifecycle_attempts < :attempts_threshold
+               AND (lio.lifecycle_last_attempt_at IS NULL
+                    OR lio.lifecycle_last_attempt_at <= :backoff_floor)
+               AND o.status IN ('FILLED', 'CANCELLED', 'REJECTED', 'EXPIRED')
+             ORDER BY lio.id
+             LIMIT :batch_size
+             FOR UPDATE OF lio SKIP LOCKED
+            """;
+
+    private static final String MARK_LIFECYCLE_SETTLED_SQL = """
+            UPDATE ledger_inflight_outbox
+               SET lifecycle_settled_at      = :settled_at,
+                   lifecycle_settled_action  = :action,
+                   lifecycle_last_attempt_at = :settled_at
+             WHERE id = :id
+            """;
+
+    private static final String MARK_LIFECYCLE_FAILED_SQL = """
+            UPDATE ledger_inflight_outbox
+               SET lifecycle_attempts        = lifecycle_attempts + 1,
+                   lifecycle_last_attempt_at = :now,
+                   lifecycle_last_error      = :error
+             WHERE id = :id
+            """;
+
+    /**
+     * Wed-demo (V32) row shape consumed by {@code LedgerInflightLifecycleReconciler}.
+     * Carries everything the reconciler needs to compose a {@code PUT /transactions/inflight/{txID}}
+     * call (txn id, intended action derived from {@code orderStatus}) plus the {@code shardId}
+     * for the future cross-cluster routing (E-2-style).
+     */
+    public record LifecycleSettleableRow(
+            long id,
+            UUID orderId,
+            String ledgerTxnId,
+            int lifecycleAttempts,
+            String orderStatus,
+            int shardId) {}
+
     public void insert(UUID orderId, String payloadJson) {
         var params = new MapSqlParameterSource()
                 .addValue("order_id", orderId)
@@ -195,6 +276,56 @@ public class LedgerInflightOutboxRepository {
                 .addValue("cancel_correlation_id", cancelCorrelationId)
                 .addValue("compensated_at", Timestamp.from(compensatedAt)));
     }
+
+    // ---- Wed-demo: inflight lifecycle reconciler (V32) -------------------------------------
+
+    /**
+     * Persists the Ledger-returned {@code transactionId} for an existing outbox row. Idempotent:
+     * never overwrites a non-null value (see SQL comment).
+     *
+     * @return {@code true} when the column was written by this call; {@code false} when it was
+     *     already set (which is the desired idempotency outcome — caller can treat as success).
+     */
+    public boolean setLedgerTxnId(long id, String ledgerTxnId) {
+        if (ledgerTxnId == null || ledgerTxnId.isBlank()) {
+            return false;
+        }
+        return jdbc.update(SET_LEDGER_TXN_ID_SQL, new MapSqlParameterSource()
+                .addValue("id", id)
+                .addValue("ledger_txn_id", ledgerTxnId)) == 1;
+    }
+
+    public List<LifecycleSettleableRow> fetchLifecycleSettleable(
+            int attemptsThreshold, int batchSize, Instant backoffFloor) {
+        var params = new MapSqlParameterSource()
+                .addValue("attempts_threshold", attemptsThreshold)
+                .addValue("batch_size", batchSize)
+                .addValue("backoff_floor", Timestamp.from(backoffFloor));
+        return jdbc.query(FETCH_LIFECYCLE_SETTLEABLE_SQL, params, LIFECYCLE_ROW_MAPPER);
+    }
+
+    public void markLifecycleSettled(long id, String action, Instant settledAt) {
+        jdbc.update(MARK_LIFECYCLE_SETTLED_SQL, new MapSqlParameterSource()
+                .addValue("id", id)
+                .addValue("action", action)
+                .addValue("settled_at", Timestamp.from(settledAt)));
+    }
+
+    public void markLifecycleFailed(long id, String error, Instant now) {
+        jdbc.update(MARK_LIFECYCLE_FAILED_SQL, new MapSqlParameterSource()
+                .addValue("id", id)
+                .addValue("error", truncateError(error))
+                .addValue("now", Timestamp.from(now)));
+    }
+
+    private static final RowMapper<LifecycleSettleableRow> LIFECYCLE_ROW_MAPPER = (rs, rowNum) -> new LifecycleSettleableRow(
+            rs.getLong("id"),
+            (UUID) rs.getObject("order_id"),
+            rs.getString("ledger_txn_id"),
+            rs.getInt("lifecycle_attempts"),
+            rs.getString("order_status"),
+            rs.getInt("shard_id")
+    );
 
     private static String truncateError(String error) {
         if (error == null) {

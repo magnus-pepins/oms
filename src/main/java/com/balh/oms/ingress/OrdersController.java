@@ -16,8 +16,10 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.List;
 import java.util.UUID;
 
 /**
@@ -93,5 +95,32 @@ public class OrdersController {
                     return ResponseEntity.ok(CreateOrderResponse.from(o, aggregate));
                 })
                 .orElseGet(() -> ResponseEntity.notFound().build());
+    }
+
+    /**
+     * Wed-demo (d2_fe_swap_oms): newest-first list of an account's orders for the customer-FE
+     * "my orders" surface. Account scoping is enforced at the BFF (per-user auth, account ==
+     * authenticated user); this controller only sees an opaque {@code accountId} query param
+     * and trusts the BFF's binding. {@code limit} defaults to 50 (matches the Alpaca my-orders
+     * page size today); upper-bounded at 200 so a misbehaving client can't pull the table.
+     *
+     * <p>Settlement-status aggregate is computed per-order — same shape as {@link #getOrder}
+     * — so the FE can render the chip without an extra round-trip. Skipped only when the
+     * order has no trade executions yet (the field is nullable on the DTO).
+     */
+    @GetMapping
+    public ResponseEntity<List<CreateOrderResponse>> listOrdersByAccount(
+            @RequestParam("accountId") UUID accountId,
+            @RequestParam(name = "limit", defaultValue = "50") int limit) {
+        int clamped = Math.min(Math.max(limit, 1), 200);
+        List<Order> rows = orders.findByAccount(accountId, clamped);
+        List<CreateOrderResponse> dtos = rows.stream()
+                .map(o -> {
+                    var tradeStatuses = executions.listTradeSettlementStatusesForOrder(o.id());
+                    String aggregate = OrderAggregateSettlementStatus.summarize(tradeStatuses);
+                    return CreateOrderResponse.from(o, aggregate);
+                })
+                .toList();
+        return ResponseEntity.ok(dtos);
     }
 }

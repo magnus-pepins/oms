@@ -115,6 +115,26 @@ public class OrdersRepository {
             WHERE account_id = :account_id AND client_idempotency_key = :key
             """;
 
+    /**
+     * Wed-demo (d2_fe_swap_oms): account-scoped list query for the customer-FE "my orders"
+     * surface. Ordered newest-first by {@code received_at} so the most recent order tops the
+     * list (matches Alpaca semantics the FE already renders). Bounded by {@code :limit} —
+     * caller picks 50 today; tighten when we add server-side pagination.
+     */
+    private static final String SELECT_BY_ACCOUNT_SQL = """
+            SELECT id, account_id, client_idempotency_key, shard_id, version,
+                   status::text AS status,
+                   terminal_reason::text AS terminal_reason,
+                   side::text AS side,
+                   instrument_symbol, quantity, limit_price, time_in_force,
+                   received_at, accepted_at, terminal_at, account_id_hash, ledger_balance_id,
+                   cum_filled_quantity
+            FROM orders
+            WHERE account_id = :account_id
+            ORDER BY received_at DESC
+            LIMIT :limit
+            """;
+
     private static final String SELECT_DESK_SNAPSHOT_SQL = """
             SELECT id, account_id, instrument_symbol, side::text AS side, status::text AS status,
                    version, received_at
@@ -231,6 +251,20 @@ public class OrdersRepository {
                 .addValue("key", idempotencyKey);
         var rows = jdbc.query(SELECT_BY_IDEMPOTENCY_SQL, params, ROW_MAPPER);
         return rows.stream().findFirst();
+    }
+
+    /**
+     * Wed-demo (d2_fe_swap_oms): newest-first list of {@code orders} for a single account,
+     * bounded by {@code limit}. Used by {@code GET /internal/v1/orders?accountId=...} which
+     * the customer-FE BFF calls when {@code OMS_BROKER_TRADE_LINK} is on. The query reads
+     * straight from Postgres — already the source of truth for the read DTO — so no extra
+     * load on the cluster.
+     */
+    public List<Order> findByAccount(UUID accountId, int limit) {
+        var params = new MapSqlParameterSource()
+                .addValue("account_id", accountId)
+                .addValue("limit", Math.max(1, limit));
+        return jdbc.query(SELECT_BY_ACCOUNT_SQL, params, ROW_MAPPER);
     }
 
     /** Bounded recent rows for desk / attendant snapshot (internal API only). */

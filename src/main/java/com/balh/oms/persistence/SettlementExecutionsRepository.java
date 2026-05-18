@@ -45,6 +45,30 @@ public class SettlementExecutionsRepository {
                     WHERE e.id = :id
                     """;
 
+    private static final String FIND_NON_TERMINAL_TRADE_IDS_SQL =
+            """
+                    SELECT id FROM executions
+                    WHERE exec_type = 'TRADE'
+                      AND settlement_status NOT IN ('settled', 'failed')
+                      AND created_at >= NOW() - make_interval(secs => :max_age_seconds)
+                    ORDER BY created_at
+                    LIMIT :lim
+                    """;
+
+    /**
+     * Returns ids of recent TRADE executions that have not yet reached a terminal settlement
+     * status. Used by {@link com.balh.oms.settlement.SettlementAutoStepScheduler} to walk fresh
+     * fills through the §12.3 state machine on a configurable cadence so beard-admin can show
+     * the transitions live. The {@code maxAgeSeconds} bound stops the scheduler from picking up
+     * stale rows from prior runs / replays.
+     */
+    public List<Long> findNonTerminalTradeIds(long maxAgeSeconds, int limit) {
+        var params = new MapSqlParameterSource()
+                .addValue("max_age_seconds", maxAgeSeconds)
+                .addValue("lim", limit);
+        return jdbc.query(FIND_NON_TERMINAL_TRADE_IDS_SQL, params, (rs, rowNum) -> rs.getLong("id"));
+    }
+
     /** Single execution joined to its order, or empty if missing or orphaned (no order row). */
     public Optional<SettlementExecutionDetailRow> findById(long executionId) {
         var params = new MapSqlParameterSource("id", executionId);

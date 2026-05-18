@@ -1213,6 +1213,25 @@ public class OmsConfig {
         private boolean freeRidingAttributionEnabled = false;
         /** Max prior execution ids merged into {@code unsettled_funded_by_exec_ids} per fill. */
         private int freeRidingAttributionMaxFundingExecutions = 8;
+        /**
+         * Demo / dev: when {@code true},
+         * {@link com.balh.oms.settlement.SettlementAutoStepScheduler} periodically advances any
+         * TRADE execution still in a non-terminal {@code settlement_status} one step forward
+         * (executed → matched → confirmed → settling → settled). Off by default so production
+         * stays driven by real broker confirmation files. Only intended for environments where
+         * the broker pipe is the {@code FixRoundTripAcceptorApplication} simulator and no
+         * broker EOD file ever arrives.
+         */
+        private boolean autoStepSchedulerEnabled = false;
+        /** Tick interval for the auto-step scheduler. Default 5s gives a visible per-state demo cadence. */
+        private long autoStepSchedulerIntervalMs = 5_000L;
+        /** Per-tick batch size for the auto-step scheduler. */
+        private int autoStepSchedulerBatchSize = 50;
+        /**
+         * Upper bound on {@code NOW() - created_at} for executions the auto-step scheduler will pick up.
+         * Stops the scheduler from churning over stale rows from prior runs. Default 1h.
+         */
+        private long autoStepSchedulerMaxExecutionAgeSeconds = 3600L;
 
         public String getDefaultCustodyAccountId() {
             return defaultCustodyAccountId;
@@ -1392,6 +1411,38 @@ public class OmsConfig {
 
         public void setFreeRidingAttributionMaxFundingExecutions(int freeRidingAttributionMaxFundingExecutions) {
             this.freeRidingAttributionMaxFundingExecutions = Math.min(256, Math.max(1, freeRidingAttributionMaxFundingExecutions));
+        }
+
+        public boolean isAutoStepSchedulerEnabled() {
+            return autoStepSchedulerEnabled;
+        }
+
+        public void setAutoStepSchedulerEnabled(boolean autoStepSchedulerEnabled) {
+            this.autoStepSchedulerEnabled = autoStepSchedulerEnabled;
+        }
+
+        public long getAutoStepSchedulerIntervalMs() {
+            return autoStepSchedulerIntervalMs;
+        }
+
+        public void setAutoStepSchedulerIntervalMs(long autoStepSchedulerIntervalMs) {
+            this.autoStepSchedulerIntervalMs = Math.max(100L, autoStepSchedulerIntervalMs);
+        }
+
+        public int getAutoStepSchedulerBatchSize() {
+            return autoStepSchedulerBatchSize;
+        }
+
+        public void setAutoStepSchedulerBatchSize(int autoStepSchedulerBatchSize) {
+            this.autoStepSchedulerBatchSize = Math.max(1, Math.min(500, autoStepSchedulerBatchSize));
+        }
+
+        public long getAutoStepSchedulerMaxExecutionAgeSeconds() {
+            return autoStepSchedulerMaxExecutionAgeSeconds;
+        }
+
+        public void setAutoStepSchedulerMaxExecutionAgeSeconds(long autoStepSchedulerMaxExecutionAgeSeconds) {
+            this.autoStepSchedulerMaxExecutionAgeSeconds = Math.max(1L, autoStepSchedulerMaxExecutionAgeSeconds);
         }
     }
 

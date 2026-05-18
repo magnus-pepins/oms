@@ -23,6 +23,7 @@ import quickfix.field.MsgType;
 import quickfix.field.OrderID;
 import quickfix.field.OrderQty;
 import quickfix.field.OrdStatus;
+import quickfix.field.OrdType;
 import quickfix.field.OrigClOrdID;
 import quickfix.field.Price;
 import quickfix.field.Side;
@@ -40,29 +41,43 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * FIX 4.4 acceptor for the Wednesday demo full-lifecycle round-trip + the existing slice-4 ITs.
+ * FIX 4.4 acceptor for the full-lifecycle round-trip + the existing slice-4 ITs.
  *
- * <h2>Behaviour by inbound message + Symbol trigger</h2>
+ * <h2>Behaviour by inbound message, {@code OrdType} (tag 40), and {@code Symbol} trigger</h2>
  *
- * <p>The trigger lives in the FIX {@code Symbol} (tag 55) field so the same demo script can
- * reproduce every outcome deterministically without an out-of-band toggle:
+ * <p>Two orthogonal signals control the synthesised reply: the standard FIX {@code OrdType}
+ * (which mirrors what a real venue uses to decide if an order can fill immediately) and a
+ * {@code Symbol}-based trigger for deterministic edge-case scenarios that don't have a clean
+ * FIX-native trigger (split fills, cancel/replace rejects).
  *
  * <table>
- *   <caption>Symbol-based behaviour matrix</caption>
- *   <tr><th>Inbound</th><th>Symbol = "REJECT"</th><th>Symbol = "PARTIAL"</th><th>Other</th></tr>
- *   <tr><td>35=D NewOrderSingle</td>
+ *   <caption>NewOrderSingle (35=D) reply by OrdType + Symbol trigger</caption>
+ *   <tr><th>Symbol = "PARTIAL"</th>
+ *       <th>OrdType = MARKET (40=1)</th>
+ *       <th>OrdType = LIMIT (40=2)</th></tr>
+ *   <tr><td>partial fill (ER ET=1) then full fill (ER ET=2)</td>
  *       <td>full fill (ER ET=2)</td>
- *       <td>partial fill (ER ET=1) then full fill (ER ET=2)</td>
- *       <td>full fill (ER ET=2)</td></tr>
+ *       <td>NEW ack (ER ET=0) — order rests in book, no fill until 35=F/35=G</td></tr>
+ * </table>
+ *
+ * <table>
+ *   <caption>Cancel/replace (35=F/35=G) reply by Symbol trigger</caption>
+ *   <tr><th>Inbound</th><th>Symbol = "REJECT"</th><th>Other</th></tr>
  *   <tr><td>35=F OrderCancelRequest</td>
  *       <td>OrderCancelReject 35=9 (CxlRejReason=1 unknown-order)</td>
- *       <td>cancel ack (ER ET=4)</td>
  *       <td>cancel ack (ER ET=4)</td></tr>
  *   <tr><td>35=G OrderCancelReplaceRequest</td>
  *       <td>OrderCancelReject 35=9 (CxlRejResponseTo=2)</td>
- *       <td>replace ack (ER ET=5)</td>
  *       <td>replace ack (ER ET=5)</td></tr>
  * </table>
+ *
+ * <p>The {@code OrdType=LIMIT} branch lets the operator see live ACCEPTED → WORKING states
+ * persist on the desk and customer screens (the order sits open at the venue) and then
+ * deliberately progress the lifecycle by cancelling or modifying. This mirrors how Alpaca
+ * paper, IBKR Paper, and Bloomberg EMSX test environments behave: market orders cross
+ * instantly, limit orders rest in the book until manually acted on or until a market move
+ * triggers a fill. Production venues do the same. This is not a demo hack — same path runs in
+ * CI for any future "LIMIT order lifecycle" integration tests.
  *
  * <p>For the partial-then-full split the first ER carries {@code LastQty = OrderQty / 2,
  * CumQty = OrderQty / 2, LeavesQty = OrderQty / 2, OrdStatus=1 PARTIALLY_FILLED}; the second
@@ -76,8 +91,8 @@ import java.util.concurrent.atomic.AtomicReference;
  * quantity/price. The replace ER carries {@code CumQty = 0, LeavesQty = newOrderQty,
  * OrdStatus=0 NEW} — same convention as the QuickFIX banzai sample acceptor.
  *
- * <p>The original slice-4 ITs that just check NOS → fill continue to work unchanged because the
- * "Other" column matches the pre-Wednesday behaviour.
+ * <p>The original slice-4 ITs that just check NOS → fill continue to work unchanged because
+ * those ITs send MARKET orders (no Price field), which still hit the instant-fill branch.
  */
 public final class FixRoundTripAcceptorApplication implements Application {
 
@@ -169,6 +184,9 @@ public final class FixRoundTripAcceptorApplication implements Application {
         LAST_NOS_SYMBOL.set(sym);
         BigDecimal orderQty = new BigDecimal(message.getString(OrderQty.FIELD));
         String px = message.isSetField(Price.FIELD) ? message.getString(Price.FIELD) : "1";
+        // OMS always sets tag 40; default to MARKET defensively for older slice-4 tests that
+        // build NOS by hand without OrdType.
+        char ordType = message.isSetField(OrdType.FIELD) ? message.getChar(OrdType.FIELD) : OrdType.MARKET;
 
         if (TRIGGER_SYMBOL_PARTIAL.equals(sym)) {
             // Two ERs sharing the same ClOrdID. ExecID is distinct per ER (OMS dedupes on
@@ -193,6 +211,26 @@ public final class FixRoundTripAcceptorApplication implements Application {
             return;
         }
 
+        if (ordType == OrdType.LIMIT) {
+            // LIMIT orders rest in the venue book — synthesise an ER ET=0 NEW so OMS sees an
+            // explicit venue ack and walks status to WORKING. No fill is sent: the order sits
+            // open at the (synthetic) venue until a 35=F or 35=G arrives. This is the standard
+            // behaviour real venues exhibit when a limit price doesn't cross the inside market.
+            sendExecutionReport(sessionId, clOrdId, sym, px,
+                    /* lastQty   = */ "0",
+                    /* cumQty    = */ "0",
+                    /* leavesQty = */ orderQty.toPlainString(),
+                    ExecType.NEW,
+                    OrdStatus.NEW,
+                    /* execIdSuffix = */ "ack");
+            log.info(
+                    "FIX IT acceptor sent NEW ack for LIMIT clOrdId={} px={} qty={} — order rests in book until cancel/replace",
+                    clOrdId,
+                    px,
+                    orderQty.toPlainString());
+            return;
+        }
+
         sendExecutionReport(sessionId, clOrdId, sym, px,
                 /* lastQty   = */ orderQty.toPlainString(),
                 /* cumQty    = */ orderQty.toPlainString(),
@@ -200,7 +238,7 @@ public final class FixRoundTripAcceptorApplication implements Application {
                 ExecType.FILL,
                 OrdStatus.FILLED,
                 /* execIdSuffix = */ "f");
-        log.info("FIX IT acceptor sent synthetic fill for clOrdId={}", clOrdId);
+        log.info("FIX IT acceptor sent synthetic fill for MARKET clOrdId={}", clOrdId);
     }
 
     // -----------------------------------------------------------------------

@@ -189,6 +189,17 @@ const COMMON_ENV = {
   // application.yaml's default `false`), so we layer it here so production deploys
   // stay safe and only the demo gets the new behavior.
   OMS_LEDGER_INFLIGHT_LIFECYCLE_RECONCILER_ENABLED: 'true',
+  // Slice-4p bench applied V31 via launch-bench-stack.sh before V32 existed; this
+  // PM2 stack now adds V32 alongside V31. On rebuild after we changed V31 (dropped
+  // CONCURRENTLY for pgbouncer, see V31 source header), the DB checksum from the
+  // pre-rebuild apply no longer matched the new file. Deleting V31 from
+  // flyway_schema_history (V31 is `CREATE INDEX IF NOT EXISTS`, safely re-applies)
+  // then triggers Flyway's strict ordering guard: V32 is already applied so V31
+  // would be applied "out of order". outOfOrder=true is the Flyway-documented escape
+  // hatch for exactly this case (slice/back-patch migrations). Demo/bench-only —
+  // production deploys should re-create the schema fresh or restore from a known
+  // baseline; tracked as a post-demo cleanup item.
+  SPRING_FLYWAY_OUT_OF_ORDER: 'true',
 };
 
 const COMMON_PM2 = {

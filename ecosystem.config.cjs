@@ -67,9 +67,12 @@
  *
  *   - It does NOT start ledger-cluster (already managed by
  *     ~/ledger-cluster/ecosystem.config.cjs on Pop).
- *   - It does NOT start NATS (Pop already has obs-nats at :4222 — re-running
- *     would split the consumer group). `OMS_NATS_ENABLED` stays inherited from
- *     the bench env (false today; demo can flip to true to point at obs-nats).
+ *   - It does NOT start NATS (Pop already has obs-nats at :4222 with JetStream
+ *     enabled; re-running would split the consumer group). The demo flips
+ *     OMS_NATS_ENABLED=true in COMMON_ENV below so DomainFanoutReconciler
+ *     drains the Postgres outbox into the OMS_EVENTS JetStream stream. The
+ *     trading-desk BFF consumes that stream via a durable JetStream consumer
+ *     and pushes deltas to the React blotter over WebSocket.
  *   - It does NOT start the customer-frontend / trading-desk BFFs (those have
  *     their own PM2 entries: customer-frontend / customer-frontend-api on Pop
  *     today, trading-desk to be added separately).
@@ -189,6 +192,18 @@ const COMMON_ENV = {
   // application.yaml's default `false`), so we layer it here so production deploys
   // stay safe and only the demo gets the new behavior.
   OMS_LEDGER_INFLIGHT_LIFECYCLE_RECONCILER_ENABLED: 'true',
+  // Live trading-desk blotter for the Wed demo runs off NATS JetStream rather
+  // than HTTP polling. DomainFanoutReconciler (in whichever JVM picks it up via
+  // @ComponentScan + @Scheduled) drains the Postgres oms_domain_outbox into
+  // subject oms.events.<EventType>; NatsFanoutClient.ensureJetStreamStream()
+  // auto-creates the OMS_EVENTS stream on first publish, so no out-of-band
+  // `nats stream add` is needed. Pop's obs-nats already runs with -js and the
+  // existing EVENTS stream uses prefix events.>, so OMS_EVENTS over oms.events.>
+  // does not collide. URL pinned to 127.0.0.1:4222 (matches the application.yaml
+  // default) so the JVMs talk to the local broker, not whatever a stale bench
+  // env might claim.
+  OMS_NATS_ENABLED: 'true',
+  OMS_NATS_URL: 'nats://127.0.0.1:4222',
   // Slice-4p bench applied V31 via launch-bench-stack.sh before V32 existed; this
   // PM2 stack now adds V32 alongside V31. On rebuild after we changed V31 (dropped
   // CONCURRENTLY for pgbouncer, see V31 source header), the DB checksum from the

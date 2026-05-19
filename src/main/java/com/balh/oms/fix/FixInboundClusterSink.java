@@ -148,8 +148,15 @@ public class FixInboundClusterSink {
         // {@code buildVenueReject} set {@code EXEC_TYPE_VENUE_REJECT} and the cluster moved the
         // order to REJECTED. Now the cluster sees the dedicated reject discriminator and bumps
         // version only, leaving status / cumQty untouched.
-        int cxlRejResponseTo = message.isSetField(CxlRejResponseTo.FIELD)
-                ? message.getInt(CxlRejResponseTo.FIELD)
+        //
+        // CxlRejResponseTo (tag 434) is a {@link CharField} in QuickFIX/J — the constants
+        // ({@link CxlRejResponseTo#ORDER_CANCEL_REQUEST} = '1', etc.) are {@code char} values.
+        // We MUST read it via {@code getChar} (not {@code getInt}, which would parse the wire
+        // value "2" as the integer 2 and never match the char constant promoted to int 50 — the
+        // bug that originally collapsed all replace-rejects into cancel-rejects on the venue
+        // path; bytecode-verified against {@code build/libs/oms-…-fix-egress.jar}).
+        char cxlRejResponseTo = message.isSetField(CxlRejResponseTo.FIELD)
+                ? message.getChar(CxlRejResponseTo.FIELD)
                 : CxlRejResponseTo.ORDER_CANCEL_REQUEST;
         byte execTypeCode = cxlRejResponseTo == CxlRejResponseTo.ORDER_CANCEL_REPLACE_REQUEST
                 ? ApplyExecutionReportCommand.EXEC_TYPE_REPLACE_REJECT

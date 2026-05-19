@@ -294,6 +294,30 @@ const COMMON_ENV = {
   // status change so the trading-desk Treasury page streams the audit row
   // in real time instead of polling. Same broker as the mid subscriber.
   OMS_FX_HEDGE_PUBLISHER_ENABLED: 'true',
+
+  // ---------------------------------------------------------------------------
+  // Settlement → Ledger money movement (Phase 1 multi-leg outbox — V39)
+  // ---------------------------------------------------------------------------
+  // SettlementConfirmProcessor enqueues two ledger_settlement_outbox rows when an
+  // execution reaches `settled`:
+  //   leg=cash → posts customer cash <-> @Nostro-<ccy>-Bank in tradeCurrency
+  //              (single-currency only in Phase 1; cross-currency uses
+  //              cash-base/cash-quote via @FX-Suspense-<ccy>).
+  //   leg=fee  → posts customer cash → @Fees-<feeCcy> for the commission amount,
+  //              fee schedule mirrored from customer-frontend STOCK_<market>.
+  //
+  // LedgerSettlementOutboxReconciler drains the outbox at the configured cadence
+  // and translates each row to a Ledger POST /transactions via
+  // LedgerSettlementLegPoster. Idempotent reference: settlement-<outboxId>-<leg>.
+  //
+  // Required Ledger balances (run scripts/seed-ledger-settlement.sh once on Pop;
+  // @Nostro-<ccy>-Bank already exists from seed-fx-nostros.sh):
+  //   @Fees-USD / @Fees-EUR / @Fees-GBP
+  //
+  // Off in production until the cross-currency leg + custody legs land
+  // (Phase 2 / Phase 3 of plans/oms-fix-gateway-and-settlement.md §11.6).
+  OMS_LEDGER_SETTLEMENT_OUTBOX_ENABLED: 'true',
+  OMS_LEDGER_SETTLEMENT_OUTBOX_RECONCILER_ENABLED: 'true',
 };
 
 const COMMON_PM2 = {

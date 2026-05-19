@@ -1,7 +1,7 @@
 package com.balh.oms.config;
 
+import com.balh.oms.ledger.LedgerSettlementLegPoster;
 import com.balh.oms.ledger.LedgerSettlementPostingClient;
-import com.balh.oms.ledger.RestLedgerSettlementPostingClient;
 import com.balh.oms.reconciler.LedgerSettlementOutboxReconciler;
 import com.balh.oms.settlement.LedgerSettlementOutboxRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -31,8 +31,9 @@ public class LedgerSettlementOutboxConfiguration {
         if (key == null || key.isBlank()) {
             throw new IllegalStateException("oms.ledger.api-key is required when settlement outbox reconciler is enabled");
         }
-        return new RestLedgerSettlementPostingClient(
-                omsLedgerRestClient, key, objectMapper, config.getLedger().getSettlementPostingHttpPath());
+        // V39 multi-leg poster: posts one Ledger /transactions per outbox row, dispatched by leg_kind.
+        // settlement-posting-http-path is no longer consulted; ignore or remove the property.
+        return new LedgerSettlementLegPoster(omsLedgerRestClient, key, objectMapper);
     }
 
     @Bean

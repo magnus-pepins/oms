@@ -77,19 +77,46 @@ class LedgerSettlementOutboxIntegrationTest extends AbstractPostgresIntegrationT
         processor.registerAndDrain(List.of(exId), 20, 20);
 
         assertThat(jdbc.queryForObject(
-                        "SELECT COUNT(*)::int FROM ledger_settlement_outbox WHERE execution_id = ? AND to_settlement_status = 'settled'",
+                        "SELECT COUNT(*)::int FROM ledger_settlement_outbox "
+                                + "WHERE execution_id = ? AND to_settlement_status = 'settled'",
+                        Integer.class,
+                        exId))
+                .isEqualTo(2);
+        assertThat(jdbc.queryForObject(
+                        "SELECT COUNT(*)::int FROM ledger_settlement_outbox "
+                                + "WHERE execution_id = ? AND leg_kind = 'cash'",
                         Integer.class,
                         exId))
                 .isEqualTo(1);
         assertThat(jdbc.queryForObject(
-                        "SELECT payload_json->>'event' FROM ledger_settlement_outbox WHERE execution_id = ?",
+                        "SELECT COUNT(*)::int FROM ledger_settlement_outbox "
+                                + "WHERE execution_id = ? AND leg_kind = 'fee'",
+                        Integer.class,
+                        exId))
+                .isEqualTo(1);
+        assertThat(jdbc.queryForObject(
+                        "SELECT payload_json->>'event' FROM ledger_settlement_outbox "
+                                + "WHERE execution_id = ? AND leg_kind = 'cash'",
                         String.class,
                         exId))
                 .isEqualTo("SETTLEMENT_SETTLED");
         assertThat(jdbc.queryForObject(
-                        "SELECT payload_json->>'schemaVersion' FROM ledger_settlement_outbox WHERE execution_id = ?",
+                        "SELECT payload_json->>'schemaVersion' FROM ledger_settlement_outbox "
+                                + "WHERE execution_id = ? AND leg_kind = 'cash'",
                         String.class,
                         exId))
-                .isEqualTo("1");
+                .isEqualTo("2");
+        assertThat(jdbc.queryForObject(
+                        "SELECT payload_json->>'feeAmount' FROM ledger_settlement_outbox "
+                                + "WHERE execution_id = ? AND leg_kind = 'fee'",
+                        String.class,
+                        exId))
+                .isEqualTo("1.00");
+        assertThat(jdbc.queryForObject(
+                        "SELECT payload_json->>'cashCurrency' FROM ledger_settlement_outbox "
+                                + "WHERE execution_id = ? AND leg_kind = 'cash'",
+                        String.class,
+                        exId))
+                .isEqualTo("USD");
     }
 }

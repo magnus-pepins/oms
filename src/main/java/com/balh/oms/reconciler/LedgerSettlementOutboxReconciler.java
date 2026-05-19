@@ -64,22 +64,28 @@ public class LedgerSettlementOutboxReconciler {
                 Timer.Sample sample = Timer.start(meterRegistry);
                 try {
                     postingClient.postSettlementOutbox(
-                            row.id(), row.executionId(), row.toSettlementStatus(), row.payloadJson());
+                            row.id(),
+                            row.executionId(),
+                            row.toSettlementStatus(),
+                            row.legKind(),
+                            row.payloadJson());
                     outbox.markPosted(row.id(), Instant.now());
                     meterRegistry.counter(METRIC_PUBLISHED).increment();
                 } catch (LedgerSettlementPostingClient.LedgerSettlementPostingException e) {
                     meterRegistry.counter(METRIC_FAILED).increment();
                     log.warn(
-                            "ledger settlement outbox deliver failed id={} executionId={}: {}",
+                            "ledger settlement outbox deliver failed id={} executionId={} leg={}: {}",
                             row.id(),
                             row.executionId(),
+                            row.legKind(),
                             e.getMessage());
                 } catch (RuntimeException e) {
                     meterRegistry.counter(METRIC_FAILED).increment();
                     log.warn(
-                            "ledger settlement outbox deliver failed id={} executionId={}",
+                            "ledger settlement outbox deliver failed id={} executionId={} leg={}",
                             row.id(),
                             row.executionId(),
+                            row.legKind(),
                             e);
                 } finally {
                     sample.stop(ledgerSettlementOutboxPostTimer);

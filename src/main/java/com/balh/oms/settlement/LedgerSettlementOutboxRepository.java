@@ -15,14 +15,25 @@ import java.util.List;
 @Repository
 public class LedgerSettlementOutboxRepository {
 
+    /** Default leg kind, used by older call sites that pre-date V39 multi-leg. */
+    public static final String LEG_CASH = "cash";
+
+    /** Cross-currency cash legs (Phase 2: two single-currency legs via @FX-Suspense). */
+    public static final String LEG_CASH_BASE = "cash-base";
+
+    public static final String LEG_CASH_QUOTE = "cash-quote";
+
+    /** Commission revenue leg. */
+    public static final String LEG_FEE = "fee";
+
     private static final String INSERT_IGNORE = """
-            INSERT INTO ledger_settlement_outbox (execution_id, to_settlement_status, payload_json)
-            VALUES (:eid, :st, CAST(:payload AS JSONB))
-            ON CONFLICT (execution_id, to_settlement_status) DO NOTHING
+            INSERT INTO ledger_settlement_outbox (execution_id, to_settlement_status, leg_kind, payload_json)
+            VALUES (:eid, :st, :leg, CAST(:payload AS JSONB))
+            ON CONFLICT (execution_id, to_settlement_status, leg_kind) DO NOTHING
             """;
 
     private static final String LOCK_UNPOSTED_SQL = """
-            SELECT id, execution_id, to_settlement_status, payload_json::text AS payload_json
+            SELECT id, execution_id, to_settlement_status, leg_kind, payload_json::text AS payload_json
             FROM ledger_settlement_outbox
             WHERE posted_at IS NULL
               AND created_at <= :older_than
@@ -35,7 +46,8 @@ public class LedgerSettlementOutboxRepository {
             UPDATE ledger_settlement_outbox SET posted_at = :ts WHERE id = :id
             """;
 
-    public record OutboxRow(long id, long executionId, String toSettlementStatus, String payloadJson) {}
+    public record OutboxRow(
+            long id, long executionId, String toSettlementStatus, String legKind, String payloadJson) {}
 
     private static final RowMapper<OutboxRow> ROW_MAPPER =
             (rs, rowNum) ->
@@ -43,6 +55,7 @@ public class LedgerSettlementOutboxRepository {
                             rs.getLong("id"),
                             rs.getLong("execution_id"),
                             rs.getString("to_settlement_status"),
+                            rs.getString("leg_kind"),
                             rs.getString("payload_json"));
 
     private final NamedParameterJdbcTemplate jdbc;
@@ -51,13 +64,22 @@ public class LedgerSettlementOutboxRepository {
         this.jdbc = jdbc;
     }
 
-    /** @return number of rows inserted (0 if duplicate) */
+    /** Pre-V39 callers default to the {@code cash} leg. @return number of rows inserted (0 if duplicate) */
     public int insertIgnore(long executionId, String toSettlementStatus, String payloadJson) {
+        return insertIgnore(executionId, toSettlementStatus, LEG_CASH, payloadJson);
+    }
+
+    /** @return number of rows inserted (0 if duplicate on (execution_id, to_settlement_status, leg_kind)) */
+    public int insertIgnore(long executionId, String toSettlementStatus, String legKind, String payloadJson) {
+        if (legKind == null || legKind.isBlank()) {
+            throw new IllegalArgumentException("legKind required");
+        }
         return jdbc.update(
                 INSERT_IGNORE,
                 new MapSqlParameterSource()
                         .addValue("eid", executionId)
                         .addValue("st", toSettlementStatus)
+                        .addValue("leg", legKind)
                         .addValue("payload", payloadJson == null || payloadJson.isBlank() ? "{}" : payloadJson));
     }
 

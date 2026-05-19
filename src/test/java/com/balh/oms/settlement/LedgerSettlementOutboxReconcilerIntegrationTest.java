@@ -15,6 +15,7 @@ import org.springframework.test.context.DynamicPropertySource;
 import java.util.UUID;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
+import static com.github.tomakehurst.wiremock.client.WireMock.containing;
 import static com.github.tomakehurst.wiremock.client.WireMock.equalTo;
 import static com.github.tomakehurst.wiremock.client.WireMock.post;
 import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
@@ -22,7 +23,10 @@ import static com.github.tomakehurst.wiremock.client.WireMock.urlPathEqualTo;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * {@link LedgerSettlementOutboxReconciler} POSTs locked rows to Ledger and sets {@code posted_at} on success.
+ * {@link LedgerSettlementOutboxReconciler} POSTs locked rows to Ledger via
+ * {@link com.balh.oms.ledger.LedgerSettlementLegPoster} (one Ledger
+ * {@code POST /transactions} per outbox row, dispatched by {@code leg_kind})
+ * and sets {@code posted_at} on success.
  */
 class LedgerSettlementOutboxReconcilerIntegrationTest extends AbstractPostgresIntegrationTest {
 
@@ -44,7 +48,7 @@ class LedgerSettlementOutboxReconcilerIntegrationTest extends AbstractPostgresIn
         registry.add("oms.ledger.api-key", () -> "it-key");
         registry.add("oms.ledger.settlement-outbox-reconciler-enabled", () -> "true");
         registry.add("oms.ledger.settlement-outbox-reconciler-age-ms", () -> "0");
-        registry.add("oms.ledger.settlement-posting-http-path", () -> "/internal/v0/settlement-outbox");
+        // settlement-posting-http-path is unused by LedgerSettlementLegPoster (V39+); kept for back-compat only.
     }
 
     @AfterAll
@@ -71,52 +75,92 @@ class LedgerSettlementOutboxReconcilerIntegrationTest extends AbstractPostgresIn
     }
 
     @Test
-    void reconcilerPostsToLedgerAndSetsPostedAt() {
-        ledgerWireMock.stubFor(post(urlPathEqualTo("/internal/v0/settlement-outbox"))
+    void reconcilerPostsCashAndFeeLegsToLedgerAndMarksBothPosted() {
+        ledgerWireMock.stubFor(post(urlPathEqualTo("/transactions"))
                 .withHeader("X-Ledger-Key", equalTo("it-key"))
-                .willReturn(aResponse().withStatus(204)));
+                .willReturn(aResponse()
+                        .withStatus(201)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\"transactionId\":\"txn-stub\"}")));
 
         long exId = insertFilledBuyExecution();
-        ledgerSettlementOutboxRepository.insertIgnore(exId, "settled", "{\"event\":\"SETTLEMENT_SETTLED\"}");
+        UUID accountId = accountIdOf(exId);
+        ledgerSettlementOutboxRepository.insertIgnore(
+                exId, "settled", LedgerSettlementOutboxRepository.LEG_CASH, cashPayload(exId, accountId));
+        ledgerSettlementOutboxRepository.insertIgnore(
+                exId, "settled", LedgerSettlementOutboxRepository.LEG_FEE, feePayload(exId, accountId));
         jdbc.update(
                 "UPDATE ledger_settlement_outbox SET created_at = NOW() - interval '1 second' WHERE execution_id = ?",
                 exId);
 
         assertThat(jdbc.queryForObject(
-                        "SELECT posted_at IS NULL FROM ledger_settlement_outbox WHERE execution_id = ?",
-                        Boolean.class,
+                        "SELECT COUNT(*) FROM ledger_settlement_outbox WHERE execution_id = ? AND posted_at IS NULL",
+                        Integer.class,
                         exId))
-                .isTrue();
+                .isEqualTo(2);
 
         ledgerSettlementOutboxReconciler.runOnce();
 
-        ledgerWireMock.verify(1, postRequestedFor(urlPathEqualTo("/internal/v0/settlement-outbox")));
+        ledgerWireMock.verify(2, postRequestedFor(urlPathEqualTo("/transactions")));
+        ledgerWireMock.verify(
+                1,
+                postRequestedFor(urlPathEqualTo("/transactions"))
+                        .withRequestBody(containing("settlement-"))
+                        .withRequestBody(containing("-cash")));
+        ledgerWireMock.verify(
+                1,
+                postRequestedFor(urlPathEqualTo("/transactions"))
+                        .withRequestBody(containing("settlement-"))
+                        .withRequestBody(containing("-fee")));
         assertThat(jdbc.queryForObject(
-                        "SELECT posted_at IS NOT NULL FROM ledger_settlement_outbox WHERE execution_id = ?",
+                        "SELECT COUNT(*) FROM ledger_settlement_outbox WHERE execution_id = ? AND posted_at IS NOT NULL",
+                        Integer.class,
+                        exId))
+                .isEqualTo(2);
+    }
+
+    @Test
+    void reconcilerLeavesPostedAtNullWhenLedgerReturnsError() {
+        ledgerWireMock.stubFor(post(urlPathEqualTo("/transactions"))
+                .withHeader("X-Ledger-Key", equalTo("it-key"))
+                .willReturn(aResponse().withStatus(503).withBody("unavailable")));
+
+        long exId = insertFilledBuyExecution();
+        UUID accountId = accountIdOf(exId);
+        ledgerSettlementOutboxRepository.insertIgnore(
+                exId, "settled", LedgerSettlementOutboxRepository.LEG_CASH, cashPayload(exId, accountId));
+        jdbc.update(
+                "UPDATE ledger_settlement_outbox SET created_at = NOW() - interval '1 second' WHERE execution_id = ?",
+                exId);
+
+        ledgerSettlementOutboxReconciler.runOnce();
+
+        assertThat(jdbc.queryForObject(
+                        "SELECT posted_at IS NULL FROM ledger_settlement_outbox WHERE execution_id = ?",
                         Boolean.class,
                         exId))
                 .isTrue();
     }
 
-    @Test
-    void reconcilerLeavesPostedAtNullWhenLedgerReturnsError() {
-        ledgerWireMock.stubFor(post(urlPathEqualTo("/internal/v0/settlement-outbox"))
-                .withHeader("X-Ledger-Key", equalTo("it-key"))
-                .willReturn(aResponse().withStatus(503).withBody("unavailable")));
+    private UUID accountIdOf(long executionId) {
+        return jdbc.queryForObject(
+                "SELECT account_id FROM executions WHERE id = ?", UUID.class, executionId);
+    }
 
-        long exId = insertFilledBuyExecution();
-        ledgerSettlementOutboxRepository.insertIgnore(exId, "settled", "{}");
-        jdbc.update(
-                "UPDATE ledger_settlement_outbox SET created_at = NOW() - interval '1 second' WHERE execution_id = ?",
-                exId);
+    private static String cashPayload(long executionId, UUID accountId) {
+        return "{\"schemaVersion\":2,\"leg\":\"cash\",\"executionId\":" + executionId
+                + ",\"accountId\":\"" + accountId
+                + "\",\"side\":\"BUY\",\"instrumentSymbol\":\"AAPL\",\"market\":\"US\","
+                + "\"quantity\":\"10\",\"price\":\"5\","
+                + "\"tradeCurrency\":\"USD\",\"cashCurrency\":\"USD\",\"notional\":\"50.00\"}";
+    }
 
-        ledgerSettlementOutboxReconciler.runOnce();
-
-        assertThat(jdbc.queryForObject(
-                        "SELECT posted_at IS NULL FROM ledger_settlement_outbox WHERE execution_id = ?",
-                        Boolean.class,
-                        exId))
-                .isTrue();
+    private static String feePayload(long executionId, UUID accountId) {
+        return "{\"schemaVersion\":2,\"leg\":\"fee\",\"executionId\":" + executionId
+                + ",\"accountId\":\"" + accountId
+                + "\",\"side\":\"BUY\",\"instrumentSymbol\":\"AAPL\",\"market\":\"US\","
+                + "\"feeAmount\":\"1.00\",\"feeCurrency\":\"USD\","
+                + "\"feeBalanceIndicator\":\"@Fees-USD\",\"notional\":\"50.00\"}";
     }
 
     private long insertFilledBuyExecution() {

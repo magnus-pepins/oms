@@ -33,12 +33,14 @@ public final class RestLedgerSettlementPostingClient implements LedgerSettlement
     }
 
     @Override
-    public void postSettlementOutbox(long outboxId, long executionId, String toSettlementStatus, String payloadJson)
+    public void postSettlementOutbox(
+            long outboxId, long executionId, String toSettlementStatus, String legKind, String payloadJson)
             throws LedgerSettlementPostingException {
         ObjectNode body = objectMapper.createObjectNode();
         body.put("outboxId", outboxId);
         body.put("executionId", executionId);
         body.put("toSettlementStatus", toSettlementStatus);
+        body.put("legKind", legKind == null ? "" : legKind);
         try {
             body.set(
                     "payload",

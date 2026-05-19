@@ -251,7 +251,7 @@ public class ExecutionsRepository {
 
     private static final String SELECT_SETTLEMENT_ROW = """
             SELECT e.id AS execution_id, e.settlement_status::text AS settlement_status, e.exec_type::text AS exec_type,
-                   e.last_quantity, e.account_id, o.instrument_symbol, o.side::text AS side,
+                   e.last_quantity, e.last_price, e.account_id, o.instrument_symbol, o.side::text AS side,
                    e.sell_position_from_pending_buy, e.sell_position_from_settled
             FROM executions e
             JOIN orders o ON o.id = e.order_id
@@ -275,6 +275,7 @@ public class ExecutionsRepository {
                         rs.getString("settlement_status"),
                         rs.getString("exec_type"),
                         rs.getBigDecimal("last_quantity"),
+                        rs.getBigDecimal("last_price"),
                         rs.getObject("account_id", UUID.class),
                         rs.getString("instrument_symbol"),
                         rs.getString("side"),

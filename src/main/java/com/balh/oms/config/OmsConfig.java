@@ -1171,6 +1171,20 @@ public class OmsConfig {
      */
     public static class Settlement {
         private String defaultCustodyAccountId = "a0000001-0000-4000-8000-000000000001";
+        /**
+         * Default market code for stocks when no instrument table is available.
+         * Selects the commission schedule and trade currency used by the Ledger
+         * settlement outbox (see {@link com.balh.oms.settlement.StockCommissionCalculator}).
+         * One of: {@code US}, {@code EU}, {@code UK}.
+         */
+        private String defaultInstrumentMarket = "US";
+        /**
+         * Default cash currency for the customer's settlement cash leg when not
+         * threaded through from order placement. Phase 1 assumes
+         * {@code cashCurrency == tradeCurrency} so the cash leg is a single
+         * Ledger transaction; when they differ, Phase 2 splits via {@code @FX-Suspense}.
+         */
+        private String defaultCashCurrency = "USD";
         private boolean brokerConfirmReconcilerEnabled = false;
         private long brokerConfirmReconcilerIntervalMs = 10_000L;
         private int brokerConfirmReconcilerBatchSize = 50;
@@ -1243,6 +1257,28 @@ public class OmsConfig {
                     : defaultCustodyAccountId.trim();
             UUID.fromString(trimmed);
             this.defaultCustodyAccountId = trimmed;
+        }
+
+        public String getDefaultInstrumentMarket() {
+            return defaultInstrumentMarket;
+        }
+
+        public void setDefaultInstrumentMarket(String defaultInstrumentMarket) {
+            String m = defaultInstrumentMarket == null || defaultInstrumentMarket.isBlank()
+                    ? "US"
+                    : defaultInstrumentMarket.trim().toUpperCase();
+            this.defaultInstrumentMarket = m;
+        }
+
+        public String getDefaultCashCurrency() {
+            return defaultCashCurrency;
+        }
+
+        public void setDefaultCashCurrency(String defaultCashCurrency) {
+            String c = defaultCashCurrency == null || defaultCashCurrency.isBlank()
+                    ? "USD"
+                    : defaultCashCurrency.trim().toUpperCase();
+            this.defaultCashCurrency = c;
         }
 
         public boolean isBrokerConfirmReconcilerEnabled() {

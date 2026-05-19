@@ -217,23 +217,93 @@ public class SettlementConfirmProcessor {
                             .formatted(snapshot.executionId(), cur, next));
         }
         if (config.getLedger().isSettlementOutboxEnabled() && "settled".equals(next)) {
-            try {
-                ObjectNode p = objectMapper.createObjectNode();
-                p.put("schemaVersion", 1);
-                p.put("event", "SETTLEMENT_SETTLED");
-                p.put("executionId", snapshot.executionId());
-                p.put("side", snapshot.side());
-                p.put("instrumentSymbol", snapshot.instrumentSymbol());
-                p.put("quantity", snapshot.lastQuantity().toPlainString());
-                int inserted = ledgerSettlementOutbox.insertIgnore(
-                        snapshot.executionId(), "settled", objectMapper.writeValueAsString(p));
-                log.debug(
-                        "ledger settlement outbox enqueue executionId={} inserted={}",
+            enqueueSettlementLegs(snapshot);
+        }
+    }
+
+    /**
+     * Writes one outbox row per Ledger leg for a settled TRADE row, so cash and
+     * fee retry independently (V39 unique key includes leg_kind).
+     *
+     * <p>Phase 1 (single-currency): customer's cash currency == instrument's trade currency,
+     * so the cash leg is a single Ledger transaction. Phase 2 splits cash into
+     * cash-base + cash-quote when they differ (mirrors {@code FxHedgeService}'s
+     * {@code @FX-Suspense-<ccy>} pattern).
+     *
+     * <p>The instrument's market is currently defaulted to {@code US} — see
+     * {@link com.balh.oms.config.OmsConfig.Settlement#getDefaultInstrumentMarket()}.
+     * Once an instrument reference table lands we'll look it up by symbol.
+     */
+    private void enqueueSettlementLegs(SettlementExecutionRow snapshot) {
+        if (snapshot.lastPrice() == null) {
+            log.warn(
+                    "ledger settlement outbox skipped: last_price is null executionId={}",
+                    snapshot.executionId());
+            return;
+        }
+        var settlementCfg = config.getSettlement();
+        String market = settlementCfg.getDefaultInstrumentMarket();
+        StockCommissionCalculator.Schedule schedule =
+                StockCommissionCalculator.defaultScheduleFor(market);
+        String tradeCurrency = schedule.currency();
+        String cashCurrency = settlementCfg.getDefaultCashCurrency();
+        java.math.BigDecimal notional =
+                StockCommissionCalculator.notional(snapshot.lastQuantity(), snapshot.lastPrice());
+        java.math.BigDecimal feeAmount = StockCommissionCalculator.feeFor(schedule, notional);
+
+        try {
+            // Cash leg payload (Phase 1: assumes cashCcy == tradeCcy and writes a single
+            // 'cash' row; Phase 2 will branch to 'cash-base' + 'cash-quote' here).
+            ObjectNode cash = objectMapper.createObjectNode();
+            cash.put("schemaVersion", 2);
+            cash.put("event", "SETTLEMENT_SETTLED");
+            cash.put("leg", LedgerSettlementOutboxRepository.LEG_CASH);
+            cash.put("executionId", snapshot.executionId());
+            cash.put("accountId", snapshot.accountId().toString());
+            cash.put("side", snapshot.side());
+            cash.put("instrumentSymbol", snapshot.instrumentSymbol());
+            cash.put("market", market);
+            cash.put("quantity", snapshot.lastQuantity().toPlainString());
+            cash.put("price", snapshot.lastPrice().toPlainString());
+            cash.put("tradeCurrency", tradeCurrency);
+            cash.put("cashCurrency", cashCurrency);
+            cash.put("notional", notional.toPlainString());
+            cash.put("settledAt", Instant.now().toString());
+            int cashInserted = ledgerSettlementOutbox.insertIgnore(
+                    snapshot.executionId(),
+                    "settled",
+                    LedgerSettlementOutboxRepository.LEG_CASH,
+                    objectMapper.writeValueAsString(cash));
+
+            int feeInserted = 0;
+            if (feeAmount.signum() > 0) {
+                ObjectNode fee = objectMapper.createObjectNode();
+                fee.put("schemaVersion", 2);
+                fee.put("event", "SETTLEMENT_SETTLED");
+                fee.put("leg", LedgerSettlementOutboxRepository.LEG_FEE);
+                fee.put("executionId", snapshot.executionId());
+                fee.put("accountId", snapshot.accountId().toString());
+                fee.put("side", snapshot.side());
+                fee.put("instrumentSymbol", snapshot.instrumentSymbol());
+                fee.put("market", market);
+                fee.put("feeAmount", feeAmount.toPlainString());
+                fee.put("feeCurrency", schedule.currency());
+                fee.put("feeBalanceIndicator", schedule.feeBalanceIndicator());
+                fee.put("notional", notional.toPlainString());
+                fee.put("settledAt", Instant.now().toString());
+                feeInserted = ledgerSettlementOutbox.insertIgnore(
                         snapshot.executionId(),
-                        inserted);
-            } catch (JsonProcessingException e) {
-                throw new IllegalStateException("ledger settlement outbox payload failed", e);
+                        "settled",
+                        LedgerSettlementOutboxRepository.LEG_FEE,
+                        objectMapper.writeValueAsString(fee));
             }
+            log.debug(
+                    "ledger settlement outbox enqueue executionId={} cashInserted={} feeInserted={}",
+                    snapshot.executionId(),
+                    cashInserted,
+                    feeInserted);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("ledger settlement outbox payload failed", e);
         }
     }
 

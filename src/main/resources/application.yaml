@@ -172,6 +172,12 @@ oms:
     manual-action-auto-apply-enabled: ${OMS_SETTLEMENT_MANUAL_ACTION_AUTO_APPLY_ENABLED:true}
     file-import-drop-folder-enabled: ${OMS_SETTLEMENT_FILE_IMPORT_DROP_FOLDER_ENABLED:false}
     file-import-drop-folder-path: ${OMS_SETTLEMENT_FILE_IMPORT_DROP_FOLDER_PATH:}
+    # Defaults used by SettlementConfirmProcessor when enqueueing Ledger settlement legs
+    # for executions that don't yet carry market / cash-currency in the persisted row
+    # (Phase 1 of the multi-leg outbox path — wired in OMS V39).
+    # Override per-deploy via OMS_SETTLEMENT_DEFAULT_INSTRUMENT_MARKET / _DEFAULT_CASH_CURRENCY.
+    default-instrument-market: ${OMS_SETTLEMENT_DEFAULT_INSTRUMENT_MARKET:US}
+    default-cash-currency: ${OMS_SETTLEMENT_DEFAULT_CASH_CURRENCY:USD}
     file-import-drop-folder-poll-interval-ms: ${OMS_SETTLEMENT_FILE_IMPORT_DROP_FOLDER_POLL_INTERVAL_MS:30000}
     file-import-drop-folder-max-files-per-poll: ${OMS_SETTLEMENT_FILE_IMPORT_DROP_FOLDER_MAX_FILES_PER_POLL:20}
     free-riding-attribution-enabled: ${OMS_SETTLEMENT_FREE_RIDING_ATTRIBUTION_ENABLED:false}

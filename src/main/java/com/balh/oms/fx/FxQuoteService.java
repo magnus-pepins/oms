@@ -50,17 +50,76 @@ public class FxQuoteService {
     private static final int  RATE_SCALE = 8;
 
     /**
-     * Static prime-broker mid map. Stub for the demo until the marketdata-platform
-     * subscriber lands. Override per-pair via {@code OMS_FX_MID_<PAIR>} (not wired
-     * yet — left as a follow-up so the demo numbers stay predictable).
+     * Cold-start prime-broker mid map.
+     *
+     * <p>Used both as (a) the catalogue advertised by {@code /internal/v1/fx/mids}
+     * (the trading-desk Treasury page renders one card per entry here) and
+     * (b) the fallback {@link #midWithSourceForPair} returns when the
+     * {@link OmsFxMidSubscriber} has not yet seen a live tick for the pair
+     * (typical for the first ~1 s after a fresh deploy, or for pairs the
+     * vendor feed is currently muted on).
+     *
+     * <p>Keep in lockstep with:
+     * <ul>
+     *   <li>{@code marketdata-platform/src/config/massive-fx-limits.ts#MASSIVE_FX_DEFAULT_PAIRS}
+     *       — the vendor subscription that produces the live ticks that
+     *       eventually overwrite these stubs.
+     *   <li>{@code db/migration/V38__fx_pair_markups_european_bank_set.sql}
+     *       — at least one {@code default}-tier markup row per pair so
+     *       {@link #lookupMarkupBps} resolves on every advertised pair.
+     * </ul>
+     *
+     * <p>Values are approximate G10/Nordic/CEE market levels as of 2026-05;
+     * they only get used until the first live tick arrives, so absolute
+     * precision is not required.
      */
-    private static final Map<String, BigDecimal> STUB_MIDS = Map.of(
-            "EURUSD", new BigDecimal("1.0850"),
-            "USDEUR", new BigDecimal("0.9217"),
-            "GBPUSD", new BigDecimal("1.2700"),
-            "USDGBP", new BigDecimal("0.7874"),
-            "EURGBP", new BigDecimal("0.8543"),
-            "GBPEUR", new BigDecimal("1.1706")
+    private static final Map<String, BigDecimal> STUB_MIDS = Map.ofEntries(
+            // EUR base
+            Map.entry("EURUSD", new BigDecimal("1.0850")),
+            Map.entry("EURGBP", new BigDecimal("0.8543")),
+            Map.entry("EURCHF", new BigDecimal("0.9525")),
+            Map.entry("EURJPY", new BigDecimal("166.55")),
+            Map.entry("EURSEK", new BigDecimal("11.3383")),
+            Map.entry("EURNOK", new BigDecimal("11.7180")),
+            Map.entry("EURDKK", new BigDecimal("7.4540")),
+            Map.entry("EURPLN", new BigDecimal("4.3671")),
+            Map.entry("EURCZK", new BigDecimal("25.1178")),
+            Map.entry("EURHUF", new BigDecimal("391.14")),
+            Map.entry("EURCAD", new BigDecimal("1.4810")),
+            Map.entry("EURAUD", new BigDecimal("1.6316")),
+
+            // GBP base
+            Map.entry("GBPUSD", new BigDecimal("1.2700")),
+            Map.entry("GBPEUR", new BigDecimal("1.1706")),
+            Map.entry("GBPCHF", new BigDecimal("1.1151")),
+            Map.entry("GBPJPY", new BigDecimal("194.95")),
+            Map.entry("GBPSEK", new BigDecimal("13.2715")),
+            Map.entry("GBPNOK", new BigDecimal("13.7160")),
+            Map.entry("GBPAUD", new BigDecimal("1.9098")),
+            Map.entry("GBPCAD", new BigDecimal("1.7336")),
+
+            // USD base
+            Map.entry("USDEUR", new BigDecimal("0.9217")),
+            Map.entry("USDGBP", new BigDecimal("0.7874")),
+            Map.entry("USDJPY", new BigDecimal("153.50")),
+            Map.entry("USDCHF", new BigDecimal("0.8780")),
+            Map.entry("USDCAD", new BigDecimal("1.3650")),
+            Map.entry("USDSEK", new BigDecimal("10.4500")),
+            Map.entry("USDNOK", new BigDecimal("10.8000")),
+            Map.entry("USDDKK", new BigDecimal("6.8700")),
+            Map.entry("USDPLN", new BigDecimal("4.0250")),
+            Map.entry("USDCZK", new BigDecimal("23.1500")),
+            Map.entry("USDHUF", new BigDecimal("360.50")),
+            Map.entry("USDSGD", new BigDecimal("1.3500")),
+            Map.entry("USDHKD", new BigDecimal("7.7900")),
+            Map.entry("USDCNH", new BigDecimal("7.2500")),
+            Map.entry("USDMXN", new BigDecimal("17.2500")),
+            Map.entry("USDZAR", new BigDecimal("18.3500")),
+            Map.entry("USDTRY", new BigDecimal("32.8000")),
+
+            // *-USD (parity with the prior list / customer-frontend rate fetches)
+            Map.entry("AUDUSD", new BigDecimal("0.6650")),
+            Map.entry("NZDUSD", new BigDecimal("0.6050"))
     );
 
     private final JdbcTemplate jdbc;

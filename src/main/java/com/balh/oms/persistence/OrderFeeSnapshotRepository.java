@@ -29,17 +29,20 @@ public class OrderFeeSnapshotRepository {
     private static final String INSERT_SQL = """
             INSERT INTO order_fee_snapshots (
                 order_id, fee_amount, fee_currency, fee_balance_indicator,
-                fee_tier, fee_source, fee_schedule_id, user_fee_override_id
+                fee_tier, fee_source, fee_schedule_id, user_fee_override_id,
+                cash_currency, cash_amount, fx_rate
             ) VALUES (
                 :order_id, :fee_amount, :fee_currency, :fee_balance_indicator,
-                :fee_tier, :fee_source, :fee_schedule_id, :user_fee_override_id
+                :fee_tier, :fee_source, :fee_schedule_id, :user_fee_override_id,
+                :cash_currency, :cash_amount, :fx_rate
             )
             ON CONFLICT (order_id) DO NOTHING
             """;
 
     private static final String SELECT_BY_ORDER_ID_SQL = """
             SELECT order_id, fee_amount, fee_currency, fee_balance_indicator,
-                   fee_tier, fee_source, fee_schedule_id, user_fee_override_id, created_at
+                   fee_tier, fee_source, fee_schedule_id, user_fee_override_id,
+                   cash_currency, cash_amount, fx_rate, created_at
             FROM order_fee_snapshots
             WHERE order_id = :order_id
             """;
@@ -54,7 +57,10 @@ public class OrderFeeSnapshotRepository {
                 .addValue("fee_tier", snapshot.feeTier())
                 .addValue("fee_source", snapshot.feeSource())
                 .addValue("fee_schedule_id", snapshot.feeScheduleId())
-                .addValue("user_fee_override_id", snapshot.userFeeOverrideId());
+                .addValue("user_fee_override_id", snapshot.userFeeOverrideId())
+                .addValue("cash_currency", snapshot.cashCurrency())
+                .addValue("cash_amount", snapshot.cashAmount())
+                .addValue("fx_rate", snapshot.fxRate());
         return jdbc.update(INSERT_SQL, params) == 1;
     }
 
@@ -76,6 +82,9 @@ public class OrderFeeSnapshotRepository {
                             rs.getString("fee_source"),
                             feeScheduleId,
                             userFeeOverrideId,
+                            rs.getString("cash_currency"),
+                            rs.getBigDecimal("cash_amount"),
+                            rs.getBigDecimal("fx_rate"),
                             createdAt == null ? null : createdAt.toInstant());
                 });
         return rows.stream().findFirst();

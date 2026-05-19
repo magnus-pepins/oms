@@ -251,7 +251,6 @@ public class SettlementConfirmProcessor {
         StockCommissionCalculator.Schedule schedule =
                 StockCommissionCalculator.defaultScheduleFor(market);
         String tradeCurrency = schedule.currency();
-        String cashCurrency = settlementCfg.getDefaultCashCurrency();
         java.math.BigDecimal notional =
                 StockCommissionCalculator.notional(snapshot.lastQuantity(), snapshot.lastPrice());
 
@@ -284,29 +283,52 @@ public class SettlementConfirmProcessor {
             feeSource = "default-schedule";
         }
 
+        // V41 cross-currency cash routing. cashCurrency falls back to:
+        //   1. snapshot.cashCurrency (V41 BFF-pinned)
+        //   2. defaultCashCurrency from OmsConfig (single-currency assumption)
+        // When cashCurrency != tradeCurrency we'll emit cash-base + cash-quote
+        // legs instead of a single cash leg (see enqueueCashLegs below).
+        String cashCurrency = pinned
+                .map(OrderFeeSnapshot::cashCurrency)
+                .filter(s -> s != null && !s.isBlank())
+                .orElseGet(settlementCfg::getDefaultCashCurrency);
+        java.math.BigDecimal cashAmount = pinned.map(OrderFeeSnapshot::cashAmount).orElse(null);
+        java.math.BigDecimal fxRate = pinned.map(OrderFeeSnapshot::fxRate).orElse(null);
+
         try {
-            // Cash leg payload (Phase 1: assumes cashCcy == tradeCcy and writes a single
-            // 'cash' row; Phase 2 will branch to 'cash-base' + 'cash-quote' here).
-            ObjectNode cash = objectMapper.createObjectNode();
-            cash.put("schemaVersion", 2);
-            cash.put("event", "SETTLEMENT_SETTLED");
-            cash.put("leg", LedgerSettlementOutboxRepository.LEG_CASH);
-            cash.put("executionId", snapshot.executionId());
-            cash.put("accountId", snapshot.accountId().toString());
-            cash.put("side", snapshot.side());
-            cash.put("instrumentSymbol", snapshot.instrumentSymbol());
-            cash.put("market", market);
-            cash.put("quantity", snapshot.lastQuantity().toPlainString());
-            cash.put("price", snapshot.lastPrice().toPlainString());
-            cash.put("tradeCurrency", tradeCurrency);
-            cash.put("cashCurrency", cashCurrency);
-            cash.put("notional", notional.toPlainString());
-            cash.put("settledAt", Instant.now().toString());
-            int cashInserted = ledgerSettlementOutbox.insertIgnore(
-                    snapshot.executionId(),
-                    "settled",
-                    LedgerSettlementOutboxRepository.LEG_CASH,
-                    objectMapper.writeValueAsString(cash));
+            int cashInserted;
+            if (cashCurrency.equals(tradeCurrency)) {
+                // Phase 1 single-currency cash leg: customer pays in the same currency
+                // the trade is denominated in (e.g. USD-funded user buying USD AAPL).
+                ObjectNode cash = objectMapper.createObjectNode();
+                cash.put("schemaVersion", 2);
+                cash.put("event", "SETTLEMENT_SETTLED");
+                cash.put("leg", LedgerSettlementOutboxRepository.LEG_CASH);
+                cash.put("executionId", snapshot.executionId());
+                cash.put("accountId", snapshot.accountId().toString());
+                cash.put("side", snapshot.side());
+                cash.put("instrumentSymbol", snapshot.instrumentSymbol());
+                cash.put("market", market);
+                cash.put("quantity", snapshot.lastQuantity().toPlainString());
+                cash.put("price", snapshot.lastPrice().toPlainString());
+                cash.put("tradeCurrency", tradeCurrency);
+                cash.put("cashCurrency", cashCurrency);
+                cash.put("notional", notional.toPlainString());
+                cash.put("settledAt", Instant.now().toString());
+                cashInserted = ledgerSettlementOutbox.insertIgnore(
+                        snapshot.executionId(),
+                        "settled",
+                        LedgerSettlementOutboxRepository.LEG_CASH,
+                        objectMapper.writeValueAsString(cash));
+            } else {
+                // Phase 2 cross-currency cash: emit two single-currency legs that meet
+                // in @FX-Suspense-<ccy>, mirroring FxHedgeService. cash-base moves the
+                // customer's cashCurrency cash; cash-quote moves tradeCurrency into the
+                // bank's nostro. Both must succeed for the trade to settle correctly;
+                // the reconciler retries each leg independently.
+                cashInserted = enqueueCrossCurrencyCashLegs(
+                        snapshot, market, tradeCurrency, cashCurrency, cashAmount, fxRate, notional);
+            }
 
             int feeInserted = 0;
             if (feeAmount.signum() > 0) {
@@ -340,6 +362,107 @@ public class SettlementConfirmProcessor {
         } catch (JsonProcessingException e) {
             throw new IllegalStateException("ledger settlement outbox payload failed", e);
         }
+    }
+
+    /**
+     * Phase 2 cross-currency cash leg emission: write two outbox rows that
+     * the {@link com.balh.oms.ledger.LedgerSettlementLegPoster} will turn into
+     * {@code cash-base} / {@code cash-quote} Ledger transactions via
+     * {@code @FX-Suspense-<ccy>}. Requires the BFF to have pinned a non-null
+     * {@code cashAmount} on the snapshot (computed from notional / fxRate at
+     * quote time); if absent we log and fall back to single-currency emission
+     * with a clear marker so operators can spot the misconfiguration.
+     */
+    private int enqueueCrossCurrencyCashLegs(
+            SettlementExecutionRow snapshot,
+            String market,
+            String tradeCurrency,
+            String cashCurrency,
+            java.math.BigDecimal cashAmount,
+            java.math.BigDecimal fxRate,
+            java.math.BigDecimal notional)
+            throws JsonProcessingException {
+        if (cashAmount == null || fxRate == null) {
+            log.warn(
+                    "cross-currency settlement requested but cashAmount/fxRate missing; "
+                            + "executionId={} cashCurrency={} tradeCurrency={} — falling back to single-currency LEG_CASH (will fail in poster cash-base/quote validation if used)",
+                    snapshot.executionId(),
+                    cashCurrency,
+                    tradeCurrency);
+            // Defensive fallback so the trade still settles in trade currency; operator
+            // sees the warning + a fee-tier audit row pointing at the orderId.
+            ObjectNode cash = objectMapper.createObjectNode();
+            cash.put("schemaVersion", 2);
+            cash.put("event", "SETTLEMENT_SETTLED");
+            cash.put("leg", LedgerSettlementOutboxRepository.LEG_CASH);
+            cash.put("executionId", snapshot.executionId());
+            cash.put("accountId", snapshot.accountId().toString());
+            cash.put("side", snapshot.side());
+            cash.put("instrumentSymbol", snapshot.instrumentSymbol());
+            cash.put("market", market);
+            cash.put("quantity", snapshot.lastQuantity().toPlainString());
+            cash.put("price", snapshot.lastPrice().toPlainString());
+            // Force tradeCurrency==cashCurrency for the fallback to keep poster invariants.
+            cash.put("tradeCurrency", tradeCurrency);
+            cash.put("cashCurrency", tradeCurrency);
+            cash.put("notional", notional.toPlainString());
+            cash.put("settledAt", Instant.now().toString());
+            return ledgerSettlementOutbox.insertIgnore(
+                    snapshot.executionId(),
+                    "settled",
+                    LedgerSettlementOutboxRepository.LEG_CASH,
+                    objectMapper.writeValueAsString(cash));
+        }
+
+        // cash-base: customer ↔ @FX-Suspense-<cashCcy>, amount in cashCurrency.
+        ObjectNode base = objectMapper.createObjectNode();
+        base.put("schemaVersion", 2);
+        base.put("event", "SETTLEMENT_SETTLED");
+        base.put("leg", LedgerSettlementOutboxRepository.LEG_CASH_BASE);
+        base.put("executionId", snapshot.executionId());
+        base.put("accountId", snapshot.accountId().toString());
+        base.put("side", snapshot.side());
+        base.put("instrumentSymbol", snapshot.instrumentSymbol());
+        base.put("market", market);
+        base.put("quantity", snapshot.lastQuantity().toPlainString());
+        base.put("price", snapshot.lastPrice().toPlainString());
+        base.put("tradeCurrency", tradeCurrency);
+        base.put("cashCurrency", cashCurrency);
+        base.put("cashAmount", cashAmount.toPlainString());
+        base.put("notional", notional.toPlainString());
+        base.put("fxRate", fxRate.toPlainString());
+        base.put("settledAt", Instant.now().toString());
+
+        // cash-quote: @FX-Suspense-<tradeCcy> ↔ @Nostro-<tradeCcy>-Bank, amount in tradeCurrency.
+        ObjectNode quote = objectMapper.createObjectNode();
+        quote.put("schemaVersion", 2);
+        quote.put("event", "SETTLEMENT_SETTLED");
+        quote.put("leg", LedgerSettlementOutboxRepository.LEG_CASH_QUOTE);
+        quote.put("executionId", snapshot.executionId());
+        quote.put("accountId", snapshot.accountId().toString());
+        quote.put("side", snapshot.side());
+        quote.put("instrumentSymbol", snapshot.instrumentSymbol());
+        quote.put("market", market);
+        quote.put("quantity", snapshot.lastQuantity().toPlainString());
+        quote.put("price", snapshot.lastPrice().toPlainString());
+        quote.put("tradeCurrency", tradeCurrency);
+        quote.put("cashCurrency", cashCurrency);
+        quote.put("cashAmount", cashAmount.toPlainString());
+        quote.put("notional", notional.toPlainString());
+        quote.put("fxRate", fxRate.toPlainString());
+        quote.put("settledAt", Instant.now().toString());
+
+        int baseInserted = ledgerSettlementOutbox.insertIgnore(
+                snapshot.executionId(),
+                "settled",
+                LedgerSettlementOutboxRepository.LEG_CASH_BASE,
+                objectMapper.writeValueAsString(base));
+        int quoteInserted = ledgerSettlementOutbox.insertIgnore(
+                snapshot.executionId(),
+                "settled",
+                LedgerSettlementOutboxRepository.LEG_CASH_QUOTE,
+                objectMapper.writeValueAsString(quote));
+        return baseInserted + quoteInserted;
     }
 
     /**

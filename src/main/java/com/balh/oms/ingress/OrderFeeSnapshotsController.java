@@ -39,7 +39,14 @@ public class OrderFeeSnapshotsController {
             @NotBlank String feeTier,
             @NotBlank String feeSource,
             UUID feeScheduleId,
-            UUID userFeeOverrideId) {}
+            UUID userFeeOverrideId,
+            // V41 cross-currency pinning — all null when the customer pays in the
+            // trade currency (the common case for the demo). When cashCurrency
+            // is set and differs from feeCurrency / tradeCurrency, settlement
+            // routes the cash leg base/quote via @FX-Suspense-<ccy>.
+            String cashCurrency,
+            BigDecimal cashAmount,
+            BigDecimal fxRate) {}
 
     public record CreateOrderFeeSnapshotResponse(boolean created) {}
 
@@ -61,6 +68,9 @@ public class OrderFeeSnapshotsController {
                 req.feeSource(),
                 req.feeScheduleId(),
                 req.userFeeOverrideId(),
+                req.cashCurrency(),
+                req.cashAmount(),
+                req.fxRate(),
                 null);
         boolean created = repo.insertIgnoreOnConflict(snap);
         // 201 on first insert, 200 on idempotent duplicate — same contract as OrdersController.

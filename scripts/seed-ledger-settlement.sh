@@ -24,6 +24,18 @@ FEES=(
   "GBP|@Fees-GBP|Bank fee revenue GBP (demo)"
 )
 
+# V41 cross-currency cash legs land on @FX-Suspense-<ccy> first (cash-base in
+# cashCurrency, cash-quote in tradeCurrency) before the bank's nostro picks
+# up the tradeCurrency side. The pair sits at zero in steady state and is
+# allowed to overdraft (see LedgerSettlementLegPoster#legBody) because the
+# matched leg may post first and rebalance later. Seeding the balances here
+# is required so the poster does not fail with BALANCE_NOT_FOUND on first use.
+FX_SUSPENSE=(
+  "USD|@FX-Suspense-USD|FX cross-currency settlement suspense USD (demo)"
+  "EUR|@FX-Suspense-EUR|FX cross-currency settlement suspense EUR (demo)"
+  "GBP|@FX-Suspense-GBP|FX cross-currency settlement suspense GBP (demo)"
+)
+
 curl_ledger() {
   curl -sS -H "X-Ledger-Key: ${LEDGER_KEY}" -H 'Content-Type: application/json' "$@"
 }
@@ -41,23 +53,29 @@ create_balance() {
     | python3 -c "import sys,json; r=json.load(sys.stdin); print(r['balanceId'], end='')"
 }
 
-CSV=""
-for spec in "${FEES[@]}"; do
-  IFS='|' read -r ccy ind desc <<< "${spec}"
-  existing="$(find_existing "${ind}")"
-  if [[ -z "${existing}" ]]; then
-    echo "Creating ${ind} (${ccy})..."
-    bid="$(create_balance "${ccy}" "${ind}" "${desc}")"
-    echo "  created fees=${bid}"
-  else
-    bid="${existing}"
-    echo "${ind} already exists as ${bid}"
-  fi
-  if [[ -n "${CSV}" ]]; then CSV="${CSV},"; fi
-  CSV="${CSV}${ccy}=${ind}"
-done
+seed_group() {
+  local label="$1"; shift
+  local specs=("$@")
+  echo "--- ${label} ---"
+  for spec in "${specs[@]}"; do
+    IFS='|' read -r ccy ind desc <<< "${spec}"
+    existing="$(find_existing "${ind}")"
+    if [[ -z "${existing}" ]]; then
+      echo "Creating ${ind} (${ccy})..."
+      bid="$(create_balance "${ccy}" "${ind}" "${desc}")"
+      echo "  created ${ind}=${bid}"
+    else
+      bid="${existing}"
+      echo "${ind} already exists as ${bid}"
+    fi
+  done
+}
+
+seed_group "Fees revenue (V40 single-currency fee leg)" "${FEES[@]}"
+seed_group "FX suspense (V41 cross-currency cash legs)" "${FX_SUSPENSE[@]}"
 
 echo
 echo "=========================================================="
-echo "OMS_SETTLEMENT_FEES_INDICATORS_CSV='${CSV}'"
+echo "Seed complete. Fee leg targets: @Fees-{USD,EUR,GBP}"
+echo "Cross-currency cash leg suspense: @FX-Suspense-{USD,EUR,GBP}"
 echo "=========================================================="

@@ -46,8 +46,31 @@ public class LedgerSettlementOutboxRepository {
             UPDATE ledger_settlement_outbox SET posted_at = :ts WHERE id = :id
             """;
 
+    // Timeline read path: returns every leg for one execution with both timestamps so
+    // the beard-admin Detail panel can render a settlement lifecycle. created_at is
+    // the moment the leg was enqueued (effectively when OMS reached settled CAS);
+    // posted_at is when the reconciler successfully posted it to Ledger (or NULL on
+    // pending / failed). Ordered by (leg_kind, id) so cash always comes before fee.
+    private static final String FIND_BY_EXECUTION_SQL = """
+            SELECT id, execution_id, to_settlement_status, leg_kind,
+                   payload_json::text AS payload_json, created_at, posted_at
+            FROM ledger_settlement_outbox
+            WHERE execution_id = :eid
+            ORDER BY leg_kind, id
+            """;
+
     public record OutboxRow(
             long id, long executionId, String toSettlementStatus, String legKind, String payloadJson) {}
+
+    /** Timeline projection — includes timestamps so the UI can show the lifecycle. */
+    public record OutboxTimelineRow(
+            long id,
+            long executionId,
+            String toSettlementStatus,
+            String legKind,
+            String payloadJson,
+            Instant createdAt,
+            Instant postedAt) {}
 
     private static final RowMapper<OutboxRow> ROW_MAPPER =
             (rs, rowNum) ->
@@ -101,5 +124,23 @@ public class LedgerSettlementOutboxRepository {
                 new MapSqlParameterSource()
                         .addValue("id", id)
                         .addValue("ts", Timestamp.from(postedAt)));
+    }
+
+    /** Used by the settlement timeline read path (SettlementController#getTimeline). */
+    public List<OutboxTimelineRow> findByExecution(long executionId) {
+        return jdbc.query(
+                FIND_BY_EXECUTION_SQL,
+                new MapSqlParameterSource("eid", executionId),
+                (rs, rowNum) -> {
+                    Timestamp posted = rs.getTimestamp("posted_at");
+                    return new OutboxTimelineRow(
+                            rs.getLong("id"),
+                            rs.getLong("execution_id"),
+                            rs.getString("to_settlement_status"),
+                            rs.getString("leg_kind"),
+                            rs.getString("payload_json"),
+                            rs.getTimestamp("created_at").toInstant(),
+                            posted == null ? null : posted.toInstant());
+                });
     }
 }

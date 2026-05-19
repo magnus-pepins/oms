@@ -7,6 +7,7 @@ import com.balh.oms.settlement.MarkTradeFailedResult;
 import com.balh.oms.settlement.SettlementConfirmProcessor;
 import com.balh.oms.settlement.SettlementFileImportBatchRepository;
 import com.balh.oms.settlement.SettlementFileImportService;
+import com.balh.oms.settlement.SettlementTimelineService;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
@@ -74,6 +75,7 @@ public class SettlementController {
     private final SettlementExecutionsRepository settlementExecutions;
     private final SettlementFileImportService settlementFileImportService;
     private final SettlementFileImportBatchRepository settlementFileImportBatchRepository;
+    private final SettlementTimelineService timelineService;
 
     private static final int MAX_FILE_IMPORT_LIST_OFFSET = 10_000;
 
@@ -82,12 +84,14 @@ public class SettlementController {
             OmsConfig config,
             SettlementExecutionsRepository settlementExecutions,
             SettlementFileImportService settlementFileImportService,
-            SettlementFileImportBatchRepository settlementFileImportBatchRepository) {
+            SettlementFileImportBatchRepository settlementFileImportBatchRepository,
+            SettlementTimelineService timelineService) {
         this.processor = processor;
         this.config = config;
         this.settlementExecutions = settlementExecutions;
         this.settlementFileImportService = settlementFileImportService;
         this.settlementFileImportBatchRepository = settlementFileImportBatchRepository;
+        this.timelineService = timelineService;
     }
 
     /**
@@ -160,6 +164,19 @@ public class SettlementController {
                                                 r.instrumentSymbol()))
                         .toList();
         return ResponseEntity.ok(new SettlementExecutionsPageResponse(items, lim, off));
+    }
+
+    /**
+     * Settlement lifecycle for one execution (executed → matched → confirmed → settled, plus
+     * each ledger leg's enqueue + posted_at). Used by the beard-admin Detail panel to render
+     * a vertical timeline + leg list. See {@link SettlementTimelineService} for sourcing rules.
+     */
+    @GetMapping("/executions/{executionId}/timeline")
+    public ResponseEntity<SettlementTimelineResponse> getTimeline(@PathVariable long executionId) {
+        return timelineService
+                .loadTimeline(executionId)
+                .map(ResponseEntity::ok)
+                .orElse(ResponseEntity.notFound().build());
     }
 
     /** Single execution joined to order, including raw venue envelope JSON. */

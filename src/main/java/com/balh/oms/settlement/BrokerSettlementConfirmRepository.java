@@ -65,5 +65,31 @@ public class BrokerSettlementConfirmRepository {
                         .addValue("ts", Timestamp.from(at)));
     }
 
+    /**
+     * Read the (at most one) broker confirm row for an execution, including its
+     * created_at (when broker delivered confirmation → maps to OMS 'matched' phase)
+     * and applied_at (when SettlementConfirmProcessor consumed it → 'confirmed' phase).
+     * Used by the settlement timeline read path (SettlementController#getTimeline).
+     */
+    public java.util.Optional<ConfirmTimelineRow> findByExecution(long executionId) {
+        return jdbc.query(
+                "SELECT id, execution_id, created_at, applied_at "
+                        + "FROM broker_settlement_confirm WHERE execution_id = :eid",
+                new MapSqlParameterSource("eid", executionId),
+                (rs, rowNum) -> {
+                    Timestamp applied = rs.getTimestamp("applied_at");
+                    return new ConfirmTimelineRow(
+                            rs.getLong("id"),
+                            rs.getLong("execution_id"),
+                            rs.getTimestamp("created_at").toInstant(),
+                            applied == null ? null : applied.toInstant());
+                })
+                .stream()
+                .findFirst();
+    }
+
     public record PendingConfirmRow(long id, long executionId) {}
+
+    public record ConfirmTimelineRow(
+            long id, long executionId, Instant createdAt, Instant appliedAt) {}
 }

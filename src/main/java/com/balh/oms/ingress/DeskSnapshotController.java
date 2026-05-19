@@ -18,24 +18,40 @@ import java.util.Map;
 /**
  * Internal desk snapshot (bounded list). Disabled unless {@code oms.desk.snapshot-enabled=true}.
  *
- * <h2>Time windowing</h2>
+ * <h2>GTC correctness</h2>
  *
- * The endpoint takes an optional ISO-8601 instant pair {@code since} / {@code until}:
+ * <p>The snapshot is split into two SQL queries that the controller executes back-to-back:
+ *
  * <ul>
- *   <li>{@code since} narrows the lower bound. The hard floor is still {@code now - snapshotMaxAgeHours}
- *       (cap 168h / 7d in {@link OmsConfig}), so an operator asking for "yesterday" on a 24h-windowed
- *       deploy will get nothing rather than an error — surfacing the wrong shape than what they expect.
- *       Increase {@code OMS_DESK_SNAPSHOT_MAX_AGE_HOURS} on the deploy that needs longer history.</li>
- *   <li>{@code until} is exclusive and only applied when present. Useful for "yesterday" =
- *       {@code since=midnightUtc-1d, until=midnightUtc}.</li>
- *   <li>If {@code since}/{@code until} are unparseable we 400 rather than silently returning the
- *       default window — the desk UI should always send well-formed instants.</li>
+ *   <li><strong>Active orders</strong> (PENDING_NEW / NEW / WORKING / PARTIALLY_FILLED) — returned
+ *       <em>regardless of {@code received_at}</em>. A Good-Til-Cancel LIMIT placed weeks ago is
+ *       still WORKING today; date-windowing it would render the live blotter wrong. Bounded only
+ *       by {@code snapshotActiveLimit} (default 500).</li>
+ *   <li><strong>Terminal orders</strong> (FILLED / CANCELLED / REJECTED / EXPIRED) — date-windowed
+ *       using {@code since} / {@code until} (see below). Bounded by {@code limit} (default 50, cap
+ *       {@code snapshotMaxLimit}).</li>
  * </ul>
  *
- * Status filtering is intentionally NOT pushed to SQL — the snapshot is already bounded by
- * {@code limit} (max 500) and the desk UI filters client-side over an O(N) array. Pushing
- * 8-way status-IN logic down would require either binding an array or generating SQL per call
- * for no measurable win at these row counts.
+ * <p>The {@code orders} field in the response is the two lists concatenated (actives first), so
+ * existing clients that just iterate {@code orders} keep working. {@code activeCount} +
+ * {@code terminalCount} let the UI render an accurate breakdown ("237 active · 50 terminal in
+ * window"). The previous shape — a single date-windowed list — silently dropped GTC actives older
+ * than the floor, which was the bug this slice fixes.
+ *
+ * <h2>Time windowing (applies to terminals only)</h2>
+ *
+ * <ul>
+ *   <li>{@code since} narrows the lower bound. Hard floor is {@code now - snapshotMaxAgeHours}
+ *       (cap 168h / 7d in {@link OmsConfig}); "All time" history goes through the dedicated
+ *       {@link DeskOrderSearchController}.</li>
+ *   <li>{@code until} is exclusive; only applied when present. Useful for "yesterday" =
+ *       {@code since=midnightUtc-1d, until=midnightUtc}.</li>
+ *   <li>If {@code since} / {@code until} are unparseable we 400 rather than silently returning
+ *       the default window.</li>
+ * </ul>
+ *
+ * Status filtering across the active/terminal split is intentionally NOT pushed any further into
+ * SQL — the desk UI's multi-select status filter still works client-side over the combined list.
  */
 @RestController
 @RequestMapping("/internal/v1/desk/orders")
@@ -49,8 +65,18 @@ public class DeskSnapshotController {
         this.ordersRepository = ordersRepository;
     }
 
+    /**
+     * Response shape. {@code orders} = actives ++ terminals (actives first) so legacy iterators
+     * keep working; {@code activeCount} / {@code terminalCount} expose the split.
+     * {@code activeLimit} / {@code terminalLimit} echo the per-bucket caps so the UI can render
+     * truthful "showing N of cap" indicators when a bucket is at the ceiling.
+     */
     public record DeskSnapshotResponse(
             List<OrdersRepository.DeskSnapshotRow> orders,
+            int activeCount,
+            int terminalCount,
+            int activeLimit,
+            int terminalLimit,
             Instant minReceived,
             Instant maxReceivedExclusive,
             int limit) {}
@@ -64,8 +90,9 @@ public class DeskSnapshotController {
             return ResponseEntity.status(HttpStatus.FORBIDDEN)
                     .body(Map.of("error", "desk_snapshot_disabled", "message", "Set OMS_DESK_SNAPSHOT_ENABLED=true for bounded desk reads"));
         }
-        int max = omsConfig.getDesk().getSnapshotMaxLimit();
-        int lim = limitRaw == null ? Math.min(50, max) : Math.min(Math.max(1, limitRaw), max);
+        int terminalCap = omsConfig.getDesk().getSnapshotMaxLimit();
+        int activeCap = omsConfig.getDesk().getSnapshotActiveLimit();
+        int terminalLim = limitRaw == null ? Math.min(50, terminalCap) : Math.min(Math.max(1, limitRaw), terminalCap);
         int hours = omsConfig.getDesk().getSnapshotMaxAgeHours();
         Instant floor = Instant.now().minus(hours, ChronoUnit.HOURS);
 
@@ -88,8 +115,26 @@ public class DeskSnapshotController {
                     "error", "invalid_window",
                     "message", "`until` must be strictly after the effective `since`"));
         }
-        var rows = ordersRepository.findDeskSnapshot(effectiveSince, until, lim);
-        return ResponseEntity.ok(new DeskSnapshotResponse(rows, effectiveSince, until, lim));
+
+        var actives = ordersRepository.findActiveDeskSnapshot(activeCap);
+        var terminals = ordersRepository.findTerminalDeskSnapshot(effectiveSince, until, terminalLim);
+        // Concatenate actives + terminals into the legacy `orders` field. We do NOT re-sort the
+        // combined list: actives are always-present rows with no upper time bound, terminals are
+        // newest-in-window first; mixing them by received_at would visually demote a fresh active
+        // below an old terminal which is the opposite of what the operator wants.
+        var combined = new java.util.ArrayList<OrdersRepository.DeskSnapshotRow>(
+                actives.size() + terminals.size());
+        combined.addAll(actives);
+        combined.addAll(terminals);
+        return ResponseEntity.ok(new DeskSnapshotResponse(
+                combined,
+                actives.size(),
+                terminals.size(),
+                activeCap,
+                terminalLim,
+                effectiveSince,
+                until,
+                terminalLim));
     }
 
     private static Instant parseInstantOrNull(String raw) {

@@ -1453,6 +1453,18 @@ public class OmsConfig {
         private boolean snapshotEnabled = false;
         private int snapshotMaxLimit = 50;
         private int snapshotMaxAgeHours = 24;
+        // Active-orders cap on the snapshot endpoint. Independent of snapshotMaxLimit (which
+        // applies to terminals only) — actives have no age window, so the operator can be
+        // surprised by a large number of GTC LIMITs surfacing. 500 is the same hard cap as
+        // snapshotMaxLimit's ceiling; bump per-deploy if a desk has more open orders than that.
+        private int snapshotActiveLimit = 500;
+        // Historical search endpoint feature flag. Same pattern as snapshotEnabled — off by
+        // default; deploys that want operator history search opt-in via OMS_DESK_SEARCH_ENABLED.
+        private boolean searchEnabled = false;
+        // Per-page cap for the search endpoint. Default lower than snapshotMaxLimit's ceiling so
+        // a typo on the wire (limit=10000) doesn't cause unbounded result memory; the operator
+        // pages with the cursor when more rows are needed.
+        private int searchMaxLimit = 100;
 
         public boolean isSnapshotEnabled() {
             return snapshotEnabled;
@@ -1476,6 +1488,30 @@ public class OmsConfig {
 
         public void setSnapshotMaxAgeHours(int snapshotMaxAgeHours) {
             this.snapshotMaxAgeHours = Math.min(168, Math.max(1, snapshotMaxAgeHours));
+        }
+
+        public int getSnapshotActiveLimit() {
+            return snapshotActiveLimit;
+        }
+
+        public void setSnapshotActiveLimit(int snapshotActiveLimit) {
+            this.snapshotActiveLimit = Math.min(2000, Math.max(1, snapshotActiveLimit));
+        }
+
+        public boolean isSearchEnabled() {
+            return searchEnabled;
+        }
+
+        public void setSearchEnabled(boolean searchEnabled) {
+            this.searchEnabled = searchEnabled;
+        }
+
+        public int getSearchMaxLimit() {
+            return searchMaxLimit;
+        }
+
+        public void setSearchMaxLimit(int searchMaxLimit) {
+            this.searchMaxLimit = Math.min(500, Math.max(1, searchMaxLimit));
         }
     }
 

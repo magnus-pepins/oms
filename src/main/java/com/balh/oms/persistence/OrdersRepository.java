@@ -135,15 +135,32 @@ public class OrdersRepository {
             LIMIT :limit
             """;
 
-    // Optional `until` is folded into the SQL with `CAST(:max_received AS timestamptz) IS NULL`
-    // so a single prepared statement covers both the open-window (since-only) and the
-    // bounded-window (since + until — e.g. "yesterday") cases without per-call SQL string
-    // concatenation. Spring JDBC binds java.sql.Timestamp -> timestamptz when not null.
-    private static final String SELECT_DESK_SNAPSHOT_SQL = """
+    // Active snapshot: every order in a non-terminal status, regardless of received_at. This is
+    // the GTC-correctness fix — a Good-Til-Cancel LIMIT placed weeks ago is still WORKING today,
+    // and date-windowing it would render the operator blind to it on the live blotter. PENDING_NEW
+    // is included so a freshly-admitted row that hasn't finished its first apply hop is visible.
+    // Ordered newest-first so the cap, if hit, drops the oldest active rather than something the
+    // operator likely cares about.
+    private static final String SELECT_DESK_ACTIVE_SNAPSHOT_SQL = """
             SELECT id, account_id, instrument_symbol, side::text AS side, status::text AS status,
                    version, received_at, ord_type, quantity, limit_price, cum_filled_quantity
             FROM orders
-            WHERE received_at >= :min_received
+            WHERE status IN ('PENDING_NEW', 'NEW', 'WORKING', 'PARTIALLY_FILLED')
+            ORDER BY received_at DESC
+            LIMIT :limit
+            """;
+
+    // Terminal snapshot: date-windowed view of FILLED/CANCELLED/REJECTED/EXPIRED orders. The
+    // window arguments mirror the old SELECT_DESK_SNAPSHOT_SQL so the controller's existing
+    // since/until clamp logic still applies. Spring JDBC binds java.sql.Timestamp -> timestamptz
+    // when not null; `CAST(:max_received AS timestamptz) IS NULL` lets a single prepared
+    // statement serve both since-only (open upper bound) and since+until (yesterday-style) calls.
+    private static final String SELECT_DESK_TERMINAL_SNAPSHOT_SQL = """
+            SELECT id, account_id, instrument_symbol, side::text AS side, status::text AS status,
+                   version, received_at, ord_type, quantity, limit_price, cum_filled_quantity
+            FROM orders
+            WHERE status IN ('FILLED', 'CANCELLED', 'REJECTED', 'EXPIRED')
+              AND received_at >= :min_received
               AND (CAST(:max_received AS timestamptz) IS NULL OR received_at < :max_received)
             ORDER BY received_at DESC
             LIMIT :limit
@@ -315,28 +332,117 @@ public class OrdersRepository {
             BigDecimal limitPrice,
             BigDecimal cumFilledQuantity) {}
 
-    public List<DeskSnapshotRow> findDeskSnapshot(Instant minReceived, Instant maxReceivedExclusive, int limit) {
+    private static final RowMapper<DeskSnapshotRow> DESK_SNAPSHOT_ROW_MAPPER = (rs, rowNum) ->
+            new DeskSnapshotRow(
+                    (UUID) rs.getObject("id"),
+                    (UUID) rs.getObject("account_id"),
+                    rs.getString("instrument_symbol"),
+                    rs.getString("side"),
+                    rs.getString("status"),
+                    rs.getInt("version"),
+                    rs.getTimestamp("received_at").toInstant(),
+                    rs.getString("ord_type"),
+                    rs.getBigDecimal("quantity"),
+                    rs.getBigDecimal("limit_price"),
+                    rs.getBigDecimal("cum_filled_quantity"));
+
+    /**
+     * Active-orders snapshot for the trading desk blotter (GTC-correct: no age window). Returns
+     * every order in a non-terminal status (PENDING_NEW / NEW / WORKING / PARTIALLY_FILLED)
+     * regardless of {@code received_at}. Bounded by {@code limit} so a runaway desk with thousands
+     * of working orders does not consume unbounded memory in the snapshot response — the operator
+     * should escalate via the search endpoint for such cases.
+     */
+    public List<DeskSnapshotRow> findActiveDeskSnapshot(int limit) {
+        var params = new MapSqlParameterSource().addValue("limit", limit);
+        return jdbc.query(SELECT_DESK_ACTIVE_SNAPSHOT_SQL, params, DESK_SNAPSHOT_ROW_MAPPER);
+    }
+
+    /**
+     * Terminal-orders snapshot for the trading desk blotter, date-windowed. The window's lower
+     * bound is enforced by the caller (DeskSnapshotController clamps to snapshot-max-age-hours);
+     * the upper bound is optional ({@code maxReceivedExclusive == null} means "no upper bound").
+     */
+    public List<DeskSnapshotRow> findTerminalDeskSnapshot(
+            Instant minReceived, Instant maxReceivedExclusive, int limit) {
         var params = new MapSqlParameterSource()
                 .addValue("min_received", Timestamp.from(minReceived))
                 .addValue("max_received", maxReceivedExclusive == null ? null : Timestamp.from(maxReceivedExclusive))
                 .addValue("limit", limit);
-        return jdbc.query(
-                SELECT_DESK_SNAPSHOT_SQL,
-                params,
-                (rs, rowNum) ->
-                        new DeskSnapshotRow(
-                                (UUID) rs.getObject("id"),
-                                (UUID) rs.getObject("account_id"),
-                                rs.getString("instrument_symbol"),
-                                rs.getString("side"),
-                                rs.getString("status"),
-                                rs.getInt("version"),
-                                rs.getTimestamp("received_at").toInstant(),
-                                rs.getString("ord_type"),
-                                rs.getBigDecimal("quantity"),
-                                rs.getBigDecimal("limit_price"),
-                                rs.getBigDecimal("cum_filled_quantity")));
+        return jdbc.query(SELECT_DESK_TERMINAL_SNAPSHOT_SQL, params, DESK_SNAPSHOT_ROW_MAPPER);
     }
+
+    /**
+     * Operator-driven historical search. Each filter is independently optional and AND-combined.
+     * Cursor pagination keyed on the natural sort {@code (received_at DESC, id DESC)} — opaque to
+     * the client, encoded by {@link com.balh.oms.ingress.DeskOrderSearchController}.
+     *
+     * <p>{@code statusList} is bound as a Postgres {@code order_status[]} via
+     * {@code = ANY(...::order_status[])} so a single prepared statement covers 1..N status
+     * filters. Status enum values are validated against {@link OrderStatus} on the controller
+     * before reaching here.
+     *
+     * <p>If {@code orderId} is non-null, the search degenerates to a primary-key lookup — the
+     * controller short-circuits all other filters in that case.
+     */
+    public List<DeskSnapshotRow> searchOrders(SearchParams p) {
+        var params = new MapSqlParameterSource()
+                .addValue("account_id", p.accountId())
+                .addValue("symbol", p.symbol())
+                .addValue("status_list", p.statusList())
+                .addValue("side", p.side())
+                .addValue("ord_type", p.ordType())
+                .addValue("received_from", p.receivedFrom() == null ? null : Timestamp.from(p.receivedFrom()))
+                .addValue("received_to", p.receivedTo() == null ? null : Timestamp.from(p.receivedTo()))
+                .addValue("client_request_key", p.clientRequestKey())
+                .addValue("cursor_received",
+                        p.cursorReceived() == null ? null : Timestamp.from(p.cursorReceived()))
+                .addValue("cursor_id", p.cursorId())
+                .addValue("limit", p.limit());
+        return jdbc.query(SELECT_ORDERS_SEARCH_SQL, params, DESK_SNAPSHOT_ROW_MAPPER);
+    }
+
+    /**
+     * Search parameters for {@link #searchOrders(SearchParams)}. Nullable fields mean "no filter
+     * applied"; the SQL guards each one with {@code IS NULL OR ...}.
+     */
+    public record SearchParams(
+            UUID accountId,
+            String symbol,
+            String[] statusList,
+            String side,
+            String ordType,
+            Instant receivedFrom,
+            Instant receivedTo,
+            String clientRequestKey,
+            Instant cursorReceived,
+            UUID cursorId,
+            int limit) {}
+
+    // Cursor predicate: (received_at, id) < (:cursor_received, :cursor_id) is a Postgres row
+    // comparison that the planner walks efficiently when the leading column has an index in the
+    // right direction. V36 adds idx_orders_received_at_id (received_at DESC, id DESC) precisely
+    // for this. Without the cursor (first page), the predicate evaluates to TRUE via the
+    // `cursor_received IS NULL` short-circuit.
+    private static final String SELECT_ORDERS_SEARCH_SQL = """
+            SELECT id, account_id, instrument_symbol, side::text AS side, status::text AS status,
+                   version, received_at, ord_type, quantity, limit_price, cum_filled_quantity
+            FROM orders
+            WHERE (CAST(:account_id AS uuid) IS NULL OR account_id = :account_id)
+              AND (CAST(:symbol AS text) IS NULL OR instrument_symbol = :symbol)
+              AND (CAST(:status_list AS text[]) IS NULL
+                   OR status::text = ANY(CAST(:status_list AS text[])))
+              AND (CAST(:side AS text) IS NULL OR side::text = :side)
+              AND (CAST(:ord_type AS text) IS NULL OR ord_type = :ord_type)
+              AND (CAST(:received_from AS timestamptz) IS NULL OR received_at >= :received_from)
+              AND (CAST(:received_to AS timestamptz) IS NULL OR received_at < :received_to)
+              AND (CAST(:client_request_key AS text) IS NULL
+                   OR client_idempotency_key = :client_request_key)
+              AND (CAST(:cursor_received AS timestamptz) IS NULL
+                   OR (received_at, id) < (:cursor_received, CAST(:cursor_id AS uuid)))
+            ORDER BY received_at DESC, id DESC
+            LIMIT :limit
+            """;
 
     /**
      * @return {@code true} if the CAS update applied (we hold the latest version).

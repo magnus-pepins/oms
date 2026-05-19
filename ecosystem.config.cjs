@@ -222,6 +222,16 @@ const COMMON_ENV = {
   // unchanged from the operator's perspective because the desk UI defaults its
   // date filter to "Today".
   OMS_DESK_SNAPSHOT_MAX_AGE_HOURS: '168',
+  // Cap on active orders returned by the snapshot endpoint. OmsConfig default (500) is fine
+  // for the demo deploy but pinning it here makes the operational knob explicit — bump on a
+  // desk with more than 500 working orders before the snapshot starts truncating.
+  OMS_DESK_SNAPSHOT_ACTIVE_LIMIT: '500',
+  // Wed-demo: historical order search endpoint (GET /internal/v1/desk/orders/search). Off by
+  // default in OmsConfig.Desk.searchEnabled because production should typically point operator
+  // search at a read replica or a dedicated search service; flipped on here because the
+  // trading-desk UI on Pop:5310 ships the search panel and would otherwise show
+  // `desk_search_disabled` on every submit.
+  OMS_DESK_SEARCH_ENABLED: 'true',
   // Slice-4p bench applied V31 via launch-bench-stack.sh before V32 existed; this
   // PM2 stack now adds V32 alongside V31. On rebuild after we changed V31 (dropped
   // CONCURRENTLY for pgbouncer, see V31 source header), the DB checksum from the

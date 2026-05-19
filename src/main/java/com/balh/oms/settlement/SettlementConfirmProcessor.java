@@ -2,6 +2,8 @@ package com.balh.oms.settlement;
 
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.persistence.ExecutionsRepository;
+import com.balh.oms.persistence.OrderFeeSnapshot;
+import com.balh.oms.persistence.OrderFeeSnapshotRepository;
 import com.balh.oms.persistence.PositionsRepository;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -40,6 +42,7 @@ public class SettlementConfirmProcessor {
     private final ExecutionsRepository executions;
     private final PositionsRepository positions;
     private final LedgerSettlementOutboxRepository ledgerSettlementOutbox;
+    private final OrderFeeSnapshotRepository orderFeeSnapshots;
     private final ObjectMapper objectMapper;
     private final OmsConfig config;
     private final MeterRegistry meterRegistry;
@@ -51,6 +54,7 @@ public class SettlementConfirmProcessor {
             ExecutionsRepository executions,
             PositionsRepository positions,
             LedgerSettlementOutboxRepository ledgerSettlementOutbox,
+            OrderFeeSnapshotRepository orderFeeSnapshots,
             ObjectMapper objectMapper,
             OmsConfig config,
             MeterRegistry meterRegistry) {
@@ -58,6 +62,7 @@ public class SettlementConfirmProcessor {
         this.executions = executions;
         this.positions = positions;
         this.ledgerSettlementOutbox = ledgerSettlementOutbox;
+        this.orderFeeSnapshots = orderFeeSnapshots;
         this.objectMapper = objectMapper;
         this.config = config;
         this.meterRegistry = meterRegistry;
@@ -249,7 +254,35 @@ public class SettlementConfirmProcessor {
         String cashCurrency = settlementCfg.getDefaultCashCurrency();
         java.math.BigDecimal notional =
                 StockCommissionCalculator.notional(snapshot.lastQuantity(), snapshot.lastPrice());
-        java.math.BigDecimal feeAmount = StockCommissionCalculator.feeFor(schedule, notional);
+
+        // BFF-pinned commission wins over StockCommissionCalculator's default schedule.
+        // See V40 migration header for why this exists (tier / per-user override pricing
+        // computed in resolveStockFee.ts on the customer-frontend side must match the
+        // amount actually moved to @Fees-<ccy> at settlement). Snapshot absence is
+        // expected for orders accepted before the BFF was upgraded → fall back silently.
+        Optional<OrderFeeSnapshot> pinned =
+                snapshot.orderId() == null
+                        ? Optional.empty()
+                        : orderFeeSnapshots.findByOrderId(snapshot.orderId());
+        java.math.BigDecimal feeAmount;
+        String feeCurrency;
+        String feeBalanceIndicator;
+        String feeTier;
+        String feeSource;
+        if (pinned.isPresent()) {
+            OrderFeeSnapshot p = pinned.get();
+            feeAmount = p.feeAmount();
+            feeCurrency = p.feeCurrency();
+            feeBalanceIndicator = p.feeBalanceIndicator();
+            feeTier = p.feeTier();
+            feeSource = "snapshot-" + p.feeSource();
+        } else {
+            feeAmount = StockCommissionCalculator.feeFor(schedule, notional);
+            feeCurrency = schedule.currency();
+            feeBalanceIndicator = schedule.feeBalanceIndicator();
+            feeTier = "default";
+            feeSource = "default-schedule";
+        }
 
         try {
             // Cash leg payload (Phase 1: assumes cashCcy == tradeCcy and writes a single
@@ -287,8 +320,10 @@ public class SettlementConfirmProcessor {
                 fee.put("instrumentSymbol", snapshot.instrumentSymbol());
                 fee.put("market", market);
                 fee.put("feeAmount", feeAmount.toPlainString());
-                fee.put("feeCurrency", schedule.currency());
-                fee.put("feeBalanceIndicator", schedule.feeBalanceIndicator());
+                fee.put("feeCurrency", feeCurrency);
+                fee.put("feeBalanceIndicator", feeBalanceIndicator);
+                fee.put("feeTier", feeTier);
+                fee.put("feeSource", feeSource);
                 fee.put("notional", notional.toPlainString());
                 fee.put("settledAt", Instant.now().toString());
                 feeInserted = ledgerSettlementOutbox.insertIgnore(

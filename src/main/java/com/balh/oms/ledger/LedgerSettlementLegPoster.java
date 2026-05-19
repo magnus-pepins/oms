@@ -13,6 +13,7 @@ import org.springframework.web.client.RestClientResponseException;
 import java.math.BigDecimal;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Multi-leg implementation of {@link LedgerSettlementPostingClient}.
@@ -47,6 +48,16 @@ public final class LedgerSettlementLegPoster implements LedgerSettlementPostingC
     private final RestClient http;
     private final String apiKey;
     private final ObjectMapper objectMapper;
+
+    /**
+     * Cache of {@code "inv-<accountId>-<ccy>" -> balanceId} resolutions. Customer balances
+     * are created once per (account, currency) and never renamed, so caching the indicator
+     * lookup avoids a Ledger {@code GET /balances?indicator=…} round-trip on every retry of
+     * the same execution row. Bank {@code @Nostro-…} / {@code @Fees-…} indicators are
+     * resolved server-side by Ledger's own {@code IndicatorResolver} (any string starting
+     * with {@code @}); only the {@code inv-…} pattern needs this client-side resolution.
+     */
+    private final ConcurrentHashMap<String, String> customerBalanceIdCache = new ConcurrentHashMap<>();
 
     public LedgerSettlementLegPoster(RestClient http, String apiKey, ObjectMapper objectMapper) {
         if (apiKey == null || apiKey.isBlank()) {
@@ -92,7 +103,8 @@ public final class LedgerSettlementLegPoster implements LedgerSettlementPostingC
                             + "for cross-currency (got cash=" + cashCurrency + " trade=" + tradeCurrency + ")");
         }
         BigDecimal notional = bigDecimal(p, "notional");
-        String customerBalance = "inv-" + accountId + "-" + cashCurrency;
+        String customerIndicator = "inv-" + accountId + "-" + cashCurrency;
+        String customerBalance = resolveCustomerBalanceId(customerIndicator, cashCurrency);
         String nostroBalance = "@Nostro-" + tradeCurrency + "-Bank";
 
         String src, dst;
@@ -126,7 +138,8 @@ public final class LedgerSettlementLegPoster implements LedgerSettlementPostingC
         String side = required(p, "side");
         String cashCurrency = required(p, "cashCurrency");
         String tradeCurrency = required(p, "tradeCurrency");
-        String customerBalance = "inv-" + accountId + "-" + cashCurrency;
+        String customerIndicator = "inv-" + accountId + "-" + cashCurrency;
+        String customerBalance = resolveCustomerBalanceId(customerIndicator, cashCurrency);
         String fxSuspenseCash = "@FX-Suspense-" + cashCurrency;
         String fxSuspenseTrade = "@FX-Suspense-" + tradeCurrency;
         String nostro = "@Nostro-" + tradeCurrency + "-Bank";
@@ -177,7 +190,8 @@ public final class LedgerSettlementLegPoster implements LedgerSettlementPostingC
             log.debug("fee leg skipped (amount<=0) outboxId={}", outboxId);
             return;
         }
-        String customerBalance = "inv-" + accountId + "-" + feeCurrency;
+        String customerIndicator = "inv-" + accountId + "-" + feeCurrency;
+        String customerBalance = resolveCustomerBalanceId(customerIndicator, feeCurrency);
         String feeBalance = p.has("feeBalanceIndicator") && p.get("feeBalanceIndicator").isTextual()
                 ? p.get("feeBalanceIndicator").asText()
                 : "@Fees-" + feeCurrency;
@@ -249,6 +263,66 @@ public final class LedgerSettlementLegPoster implements LedgerSettlementPostingC
         } catch (Exception e) {
             throw new LedgerSettlementPostingException(
                     "ledger settlement leg=" + legLabel + " unexpected: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Resolves a customer-side balance indicator ({@code inv-<accountId>-<ccy>}) to the
+     * concrete Ledger balanceId via {@code GET /balances?indicator=…}. Required because
+     * Ledger's server-side {@code IndicatorResolver} only matches indicators that start
+     * with {@code @} (see ledger-cluster {@code shim/IndicatorResolver.java}); customer
+     * balances ride a different naming convention and would otherwise be passed through
+     * as literal balanceIds, triggering {@code BALANCE_NOT_FOUND} on the cluster apply
+     * path. Result cached because the binding is durable for the life of the account.
+     */
+    private String resolveCustomerBalanceId(String indicator, String currency)
+            throws LedgerSettlementPostingException {
+        String cached = customerBalanceIdCache.get(indicator);
+        if (cached != null) {
+            return cached;
+        }
+        try {
+            String resp = http.get()
+                    .uri(b -> b.path("/balances").queryParam("indicator", indicator).build())
+                    .header(LEDGER_KEY_HEADER, apiKey)
+                    .retrieve()
+                    .body(String.class);
+            JsonNode arr = objectMapper.readTree(resp == null ? "[]" : resp);
+            if (!arr.isArray() || arr.isEmpty()) {
+                throw new LedgerSettlementPostingException(
+                        "customer balance not found in Ledger: indicator=" + indicator
+                                + " currency=" + currency
+                                + " (customer must be funded before settlement can post)");
+            }
+            // Multiple matches are not expected (indicator + currency is unique in TS Ledger);
+            // prefer the entry whose currency matches if Ledger ever returns several.
+            String balanceId = null;
+            for (JsonNode row : arr) {
+                JsonNode rowCcy = row.get("currency");
+                JsonNode rowId = row.get("balanceId");
+                if (rowId == null || !rowId.isTextual()) continue;
+                if (rowCcy != null && rowCcy.isTextual() && currency.equalsIgnoreCase(rowCcy.asText())) {
+                    balanceId = rowId.asText();
+                    break;
+                }
+                if (balanceId == null) balanceId = rowId.asText();
+            }
+            if (balanceId == null || balanceId.isBlank()) {
+                throw new LedgerSettlementPostingException(
+                        "ledger /balances?indicator=" + indicator + " returned rows without balanceId");
+            }
+            customerBalanceIdCache.put(indicator, balanceId);
+            return balanceId;
+        } catch (LedgerSettlementPostingException e) {
+            throw e;
+        } catch (RestClientResponseException e) {
+            String b = e.getResponseBodyAsString();
+            throw new LedgerSettlementPostingException(
+                    "ledger /balances?indicator lookup HTTP " + e.getStatusCode().value()
+                            + ": " + b.substring(0, Math.min(300, b.length())));
+        } catch (Exception e) {
+            throw new LedgerSettlementPostingException(
+                    "ledger /balances?indicator lookup unexpected: " + e.getMessage(), e);
         }
     }
 

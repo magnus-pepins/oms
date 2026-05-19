@@ -15,6 +15,8 @@ import org.springframework.web.client.RestClient;
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
 import static com.github.tomakehurst.wiremock.client.WireMock.containing;
 import static com.github.tomakehurst.wiremock.client.WireMock.equalTo;
+import static com.github.tomakehurst.wiremock.client.WireMock.get;
+import static com.github.tomakehurst.wiremock.client.WireMock.getRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.post;
 import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlPathEqualTo;
@@ -44,6 +46,32 @@ class LedgerSettlementLegPosterTest {
                         .withStatus(201)
                         .withHeader("Content-Type", "application/json")
                         .withBody(OK_RESPONSE)));
+        // Default resolver stub: any indicator lookup returns a single-row response with a
+        // deterministic balanceId so the leg poster has a concrete id to send into the
+        // {@code POST /transactions}. Each test that asserts on the resolved id stubs a
+        // more specific pattern; this default keeps the resolver from 500-ing on a miss.
+        ledger.stubFor(get(urlPathEqualTo("/balances"))
+                .willReturn(aResponse()
+                        .withStatus(200)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("[{\"balanceId\":\"balance_default\",\"currency\":\"USD\"}]")));
+    }
+
+    /**
+     * Stubs the {@code GET /balances?indicator=<indicator>} resolver lookup to return a
+     * single-row response carrying {@code balanceId}. Tests use this to make the
+     * customer-side {@code source}/{@code destination} on the resulting
+     * {@code POST /transactions} predictable.
+     */
+    private void stubCustomerResolution(String indicator, String currency, String balanceId) {
+        ledger.stubFor(get(urlPathEqualTo("/balances"))
+                .withQueryParam("indicator", equalTo(indicator))
+                .willReturn(aResponse()
+                        .withStatus(200)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("[{\"balanceId\":\"" + balanceId
+                                + "\",\"currency\":\"" + currency + "\",\"indicator\":\""
+                                + indicator + "\"}]")));
     }
 
     @AfterEach
@@ -53,6 +81,8 @@ class LedgerSettlementLegPosterTest {
 
     @Test
     void buyCashSingleCurrencyDebitsCustomerCreditsNostro() throws Exception {
+        stubCustomerResolution(
+                "inv-a0000000-0000-4000-8000-000000000001-USD", "USD", "balance_cust_001_usd");
         String payload = """
                 {"schemaVersion":2,"leg":"cash","executionId":111,
                  "accountId":"a0000000-0000-4000-8000-000000000001","side":"BUY",
@@ -61,9 +91,11 @@ class LedgerSettlementLegPosterTest {
 
         poster.postSettlementOutbox(42L, 111L, "settled", LedgerSettlementOutboxRepository.LEG_CASH, payload);
 
+        ledger.verify(1, getRequestedFor(urlPathEqualTo("/balances"))
+                .withQueryParam("indicator", equalTo("inv-a0000000-0000-4000-8000-000000000001-USD")));
         ledger.verify(1, postWith()
                 .withHeader("X-Ledger-Key", equalTo("test-key"))
-                .withRequestBody(containing("\"source\":\"inv-a0000000-0000-4000-8000-000000000001-USD\""))
+                .withRequestBody(containing("\"source\":\"balance_cust_001_usd\""))
                 .withRequestBody(containing("\"destination\":\"@Nostro-USD-Bank\""))
                 .withRequestBody(containing("\"amount\":55.0"))
                 .withRequestBody(containing("\"currency\":\"USD\""))
@@ -73,6 +105,8 @@ class LedgerSettlementLegPosterTest {
 
     @Test
     void sellCashSingleCurrencyDebitsNostroCreditsCustomer() throws Exception {
+        stubCustomerResolution(
+                "inv-a0000000-0000-4000-8000-000000000002-USD", "USD", "balance_cust_002_usd");
         String payload = """
                 {"schemaVersion":2,"leg":"cash","executionId":222,
                  "accountId":"a0000000-0000-4000-8000-000000000002","side":"SELL",
@@ -83,7 +117,7 @@ class LedgerSettlementLegPosterTest {
 
         ledger.verify(1, postWith()
                 .withRequestBody(containing("\"source\":\"@Nostro-USD-Bank\""))
-                .withRequestBody(containing("\"destination\":\"inv-a0000000-0000-4000-8000-000000000002-USD\""))
+                .withRequestBody(containing("\"destination\":\"balance_cust_002_usd\""))
                 .withRequestBody(containing("\"reference\":\"settlement-7-cash\"")));
     }
 
@@ -103,6 +137,8 @@ class LedgerSettlementLegPosterTest {
 
     @Test
     void feeLegDebitsCustomerCreditsFeesRevenue() throws Exception {
+        stubCustomerResolution(
+                "inv-a0000000-0000-4000-8000-000000000001-USD", "USD", "balance_cust_001_usd");
         String payload = """
                 {"schemaVersion":2,"leg":"fee","executionId":111,
                  "accountId":"a0000000-0000-4000-8000-000000000001","side":"BUY",
@@ -112,7 +148,7 @@ class LedgerSettlementLegPosterTest {
         poster.postSettlementOutbox(99L, 111L, "settled", LedgerSettlementOutboxRepository.LEG_FEE, payload);
 
         ledger.verify(1, postWith()
-                .withRequestBody(containing("\"source\":\"inv-a0000000-0000-4000-8000-000000000001-USD\""))
+                .withRequestBody(containing("\"source\":\"balance_cust_001_usd\""))
                 .withRequestBody(containing("\"destination\":\"@Fees-USD\""))
                 .withRequestBody(containing("\"amount\":1.5"))
                 .withRequestBody(containing("\"reference\":\"settlement-99-fee\"")));
@@ -133,6 +169,8 @@ class LedgerSettlementLegPosterTest {
 
     @Test
     void cashBaseLegPostsCustomerToFxSuspenseInCashCurrency() throws Exception {
+        stubCustomerResolution(
+                "inv-a0000000-0000-4000-8000-000000000003-EUR", "EUR", "balance_cust_003_eur");
         String payload = """
                 {"schemaVersion":2,"leg":"cash-base","executionId":300,
                  "accountId":"a0000000-0000-4000-8000-000000000003","side":"BUY",
@@ -143,7 +181,7 @@ class LedgerSettlementLegPosterTest {
                 12L, 300L, "settled", LedgerSettlementOutboxRepository.LEG_CASH_BASE, payload);
 
         ledger.verify(1, postWith()
-                .withRequestBody(containing("\"source\":\"inv-a0000000-0000-4000-8000-000000000003-EUR\""))
+                .withRequestBody(containing("\"source\":\"balance_cust_003_eur\""))
                 .withRequestBody(containing("\"destination\":\"@FX-Suspense-EUR\""))
                 .withRequestBody(containing("\"amount\":46.3"))
                 .withRequestBody(containing("\"currency\":\"EUR\""))
@@ -179,6 +217,8 @@ class LedgerSettlementLegPosterTest {
     @Test
     void ledgerErrorIsWrappedSoReconcilerCanRetry() {
         ledger.resetAll();
+        stubCustomerResolution(
+                "inv-a0000000-0000-4000-8000-000000000001-USD", "USD", "balance_cust_001_usd");
         ledger.stubFor(post(urlPathEqualTo("/transactions"))
                 .willReturn(aResponse().withStatus(500).withBody("ledger down")));
         String payload = """

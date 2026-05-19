@@ -57,6 +57,7 @@ public class FxNostroSnapshotService {
     private static Map<String, Object> rowOk(LedgerBalanceReadModel m) {
         Map<String, Object> row = new LinkedHashMap<>();
         row.put("balanceId", m.balanceId());
+        row.put("indicator", m.indicator());
         row.put("availableBalance", m.availableBalance().toPlainString());
         row.put("bookedBalance", m.bookedBalance().toPlainString());
         row.put("currency", m.currency());

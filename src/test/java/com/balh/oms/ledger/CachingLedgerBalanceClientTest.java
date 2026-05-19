@@ -149,8 +149,8 @@ final class CachingLedgerBalanceClientTest {
 
     @Test
     void fetchBalanceReadModel_neverCached() throws LedgerBalanceClient.LedgerServiceException {
-        var first = new LedgerBalanceReadModel(BALANCE_A, BigDecimal.ONE, BigDecimal.ONE, "EUR", IDENTITY_A);
-        var second = new LedgerBalanceReadModel(BALANCE_A, BigDecimal.TEN, BigDecimal.TEN, "EUR", IDENTITY_A);
+        var first = new LedgerBalanceReadModel(BALANCE_A, BigDecimal.ONE, BigDecimal.ONE, "EUR", IDENTITY_A, "");
+        var second = new LedgerBalanceReadModel(BALANCE_A, BigDecimal.TEN, BigDecimal.TEN, "EUR", IDENTITY_A, "");
         when(delegate.fetchBalanceReadModel(BALANCE_A)).thenReturn(first).thenReturn(second);
 
         assertThat(cache.fetchBalanceReadModel(BALANCE_A).availableBalance()).isEqualByComparingTo("1");

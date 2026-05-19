@@ -74,8 +74,11 @@ public final class RestLedgerBalanceClient implements LedgerBalanceClient {
             JsonNode cur = root.get("currency");
             String currency = cur != null && cur.isTextual() ? cur.asText() : "";
             String identityId = readIdentityId(root);
+            JsonNode ind = root.get("indicator");
+            String indicator = ind != null && ind.isTextual() ? ind.asText() : "";
             return new LedgerBalanceReadModel(
-                    balanceId, available, booked, currency, identityId == null ? "" : identityId);
+                    balanceId, available, booked, currency,
+                    identityId == null ? "" : identityId, indicator);
         } catch (LedgerBalanceClient.LedgerServiceException e) {
             throw e;
         } catch (Exception e) {

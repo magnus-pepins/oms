@@ -197,6 +197,18 @@ oms:
       password: ${EMQX_MQTT_PASSWORD:}
       staleness-ms: ${OMS_FX_MID_STALENESS_MS:60000}
       client-id-prefix: ${OMS_FX_MID_CLIENT_ID_PREFIX:oms-fx-mid}
+    # Operator-facing event publisher: fires on every fx_hedge_actions
+    # status change so the trading-desk Treasury page can stream the
+    # audit row in real time instead of polling. Same broker as the mid
+    # subscriber by default, with a separate client id so the EMQX ACL
+    # rules can be tightened independently.
+    hedge-publisher:
+      enabled: ${OMS_FX_HEDGE_PUBLISHER_ENABLED:false}
+      broker-url: ${EMQX_MQTT_BROKER_URL:tcp://127.0.0.1:1883}
+      username: ${EMQX_MQTT_USERNAME:oms-fx-hedge}
+      password: ${EMQX_MQTT_PASSWORD:}
+      client-id-prefix: ${OMS_FX_HEDGE_CLIENT_ID_PREFIX:oms-fx-hedge}
+      topic: ${OMS_FX_HEDGE_PUBLISHER_TOPIC:fx/hedge/event}
   corporate-action:
     processor-enabled: ${OMS_CORPORATE_ACTION_PROCESSOR_ENABLED:false}
     processor-interval-ms: ${OMS_CORPORATE_ACTION_PROCESSOR_INTERVAL_MS:60000}

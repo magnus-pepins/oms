@@ -64,6 +64,7 @@ public class FxHedgeService {
     private final OmsConfig omsConfig;
     private final ObjectMapper objectMapper;
     private final ObjectProvider<RestClient> ledgerRestClient;
+    private final ObjectProvider<OmsFxHedgePublisher> hedgePublisher;
     private final Clock clock;
     private final Counter submittedCounter;
     private final Counter postedCounter;
@@ -75,6 +76,7 @@ public class FxHedgeService {
             OmsConfig omsConfig,
             ObjectMapper objectMapper,
             ObjectProvider<RestClient> ledgerRestClient,
+            ObjectProvider<OmsFxHedgePublisher> hedgePublisher,
             Clock clock,
             MeterRegistry registry) {
         this.jdbc = jdbc;
@@ -82,6 +84,7 @@ public class FxHedgeService {
         this.omsConfig = omsConfig;
         this.objectMapper = objectMapper;
         this.ledgerRestClient = ledgerRestClient;
+        this.hedgePublisher = hedgePublisher;
         this.clock = clock;
         this.submittedCounter = Counter.builder("oms.fx.hedge.submitted_total")
                 .description("Manual FX hedge submissions accepted by the OMS")
@@ -138,10 +141,14 @@ public class FxHedgeService {
         String destination = "BUY".equals(side) ? req.baseNostroId.trim() : req.quoteNostroId.trim();
 
         // Step 1: idempotent insert. If the action_key already exists, return the
-        // existing row instead of creating a duplicate.
+        // existing row instead of creating a duplicate. We still emit the event
+        // so a desk that missed the original write (subscriber lag, page reload)
+        // converges to the same state.
         Long existingId = findByActionKey(req.actionKey);
         if (existingId != null) {
-            return readById(existingId);
+            Map<String, Object> existing = readById(existingId);
+            publishHedgeEvent(existing);
+            return existing;
         }
 
         Long actionId = insertPending(req, pair, side, baseCcy, quoteCcy, baseAmount, quoteAmount,
@@ -160,7 +167,26 @@ public class FxHedgeService {
             markFailed(actionId, e.getMessage());
             failedCounter.increment();
         }
-        return readById(actionId);
+        // Step 3: publish the terminal-state row to the live event stream so
+        // the trading-desk Treasury page can stream the update instead of
+        // polling. Best-effort: failures here never throw because the audit
+        // row + Ledger txn are already durable.
+        Map<String, Object> finalRow = readById(actionId);
+        publishHedgeEvent(finalRow);
+        return finalRow;
+    }
+
+    private void publishHedgeEvent(Map<String, Object> row) {
+        if (row == null) return;
+        OmsFxHedgePublisher pub = hedgePublisher.getIfAvailable();
+        if (pub == null) return;
+        try {
+            pub.publish(row);
+        } catch (RuntimeException e) {
+            // publisher is already best-effort; double-guard so a publish bug
+            // can never poison the submit() return.
+            log.debug("[fx-hedge] event publish skipped: {}", e.getMessage());
+        }
     }
 
     private void validate(HedgeRequest req) {

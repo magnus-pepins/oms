@@ -289,6 +289,11 @@ const COMMON_ENV = {
   OMS_FX_MID_SUBSCRIBER_ENABLED: 'true',
   // Maps to Spring property oms.fx.mid-subscriber.enabled via the
   // SPRING_APPLICATION_JSON below.
+
+  // Hedge event publisher: emits fx/hedge/event on every fx_hedge_actions
+  // status change so the trading-desk Treasury page streams the audit row
+  // in real time instead of polling. Same broker as the mid subscriber.
+  OMS_FX_HEDGE_PUBLISHER_ENABLED: 'true',
 };
 
 const COMMON_PM2 = {

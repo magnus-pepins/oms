@@ -30,7 +30,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * <ul>
  *   <li>The mid source is a static seed map below (EURUSD = 1.0850 etc.). When
  *       the PB market-data subscriber lands, replace
- *       {@link #midForPair(String)} with a feed read; everything else stays.
+ *       {@link #midWithSourceForPair(String)} with a feed read; everything else stays.
  *   <li>Each call mints a {@code quoteId} and caches the quote with its
  *       expiry so a follow-up hedge or customer-side accept can be
  *       reconciled. The validity window is configurable (default 30s) — see
@@ -118,7 +118,8 @@ public class FxQuoteService {
     public Map<String, Object> quote(String pair, String tier) {
         String pairUp = pair == null ? "" : pair.toUpperCase();
         String tierLow = tier == null || tier.isBlank() ? "default" : tier.toLowerCase();
-        BigDecimal mid = midForPair(pairUp);
+        MidWithSource ms = midWithSourceForPair(pairUp);
+        BigDecimal mid = ms.mid();
 
         BigDecimal bidBps = lookupMarkupBps(pairUp, "BID", tierLow);
         BigDecimal askBps = lookupMarkupBps(pairUp, "ASK", tierLow);
@@ -139,7 +140,7 @@ public class FxQuoteService {
         body.put("ask", ask.setScale(RATE_SCALE, RoundingMode.HALF_UP).toPlainString());
         body.put("bidMarkupBps", bidBps.toPlainString());
         body.put("askMarkupBps", askBps.toPlainString());
-        body.put("source", "internal-mid-stub");
+        body.put("source", ms.source());
         body.put("capturedAt", now.toString());
         body.put("expiresAt", exp.toString());
         body.put("validityMs", validityMillis);
@@ -170,21 +171,25 @@ public class FxQuoteService {
      *
      *   1. The Phase 1.5 {@link OmsFxMidSubscriber} if it's wired in and has
      *      a fresh tick (within its staleness window). This is the live PB
-     *      mid published by marketdata-platform.
+     *      mid published by marketdata-platform — surfaced as
+     *      {@code source = "vendor-mid-live"} in the quote payload so
+     *      downstream surfaces (trading-desk treasury, beard-admin) can
+     *      visibly distinguish a live quote from the stub fallback.
      *   2. The static {@link #STUB_MIDS} table — predictable demo numbers,
-     *      and the cold-start fallback before the first tick arrives.
+     *      and the cold-start fallback before the first tick arrives
+     *      ({@code source = "internal-mid-stub"}).
      *
      * Either source still expects the pair to be configured upstream
      * (markups in {@code fx_pair_markups}, and a STUB_MIDS entry for the
      * cold-start case). An unknown pair throws — the controller maps that
      * to HTTP 400.
      */
-    private BigDecimal midForPair(String pair) {
+    private MidWithSource midWithSourceForPair(String pair) {
         if (liveMidSubscriber != null) {
             BigDecimal live = liveMidSubscriber.midFor(pair);
             if (live != null) {
                 midFromSubscriberCounter.increment();
-                return live;
+                return new MidWithSource(live, "vendor-mid-live");
             }
         }
         BigDecimal stub = STUB_MIDS.get(pair);
@@ -192,8 +197,10 @@ public class FxQuoteService {
             throw new IllegalArgumentException("no mid configured for pair " + pair);
         }
         midFromStubCounter.increment();
-        return stub;
+        return new MidWithSource(stub, "internal-mid-stub");
     }
+
+    private record MidWithSource(BigDecimal mid, String source) {}
 
     /**
      * @return the resolved markup in bps for (pair, side, tier), falling back to tier='default' when

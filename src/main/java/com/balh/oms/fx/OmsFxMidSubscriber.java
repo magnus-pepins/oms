@@ -135,7 +135,10 @@ public class OmsFxMidSubscriber implements MqttCallback {
 
             log.info("[oms-fx-mid] Connecting to MQTT broker={} clientId={}", brokerUrl, clientId);
             client.connect(opts).waitForCompletion(15_000);
-            subscribe();
+            // Subscription is driven from {@link #connectComplete} so the
+            // same path covers both initial connect and Paho-driven
+            // reconnects. Calling subscribe() here as well would double-fire
+            // on every cold start.
         } catch (MqttException e) {
             // Don't fail the application startup if the broker is briefly
             // unavailable — Paho will keep retrying. Log loudly so the failure

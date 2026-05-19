@@ -285,10 +285,8 @@ const COMMON_ENV = {
   // EMQX on EMQX_MQTT_BROKER_URL (defaults to tcp://127.0.0.1:1883) and
   // subscribes to fx/+/+/quote, replacing FxQuoteService.STUB_MIDS with live
   // PB mids. Falls back to STUB_MIDS when the subscriber is absent or stale.
-  // Default 'false' on the bench so demo numbers stay predictable until the
-  // vendor websocket account is upgraded — flip to 'true' once live ticks
-  // are flowing.
-  OMS_FX_MID_SUBSCRIBER_ENABLED: 'false',
+  // Enabled on the bench once the Massive websocket plan was active (2026-05-19).
+  OMS_FX_MID_SUBSCRIBER_ENABLED: 'true',
   // Maps to Spring property oms.fx.mid-subscriber.enabled via the
   // SPRING_APPLICATION_JSON below.
 };

@@ -136,6 +136,11 @@ dependencies {
     // NATS JetStream fanout (slice 1.5+; gated by oms.events.nats.enabled)
     implementation("io.nats:jnats:2.20.5")
 
+    // Eclipse Paho MQTT v5 client — Phase 1.5 FX mid subscriber reads the
+    // marketdata-platform fx/{B}/{Q}/quote topic to replace FxQuoteService.STUB_MIDS
+    // with live PB-mid data. Gated by OMS_FX_MID_SUBSCRIBER_ENABLED (off by default).
+    implementation("org.eclipse.paho:org.eclipse.paho.mqttv5.client:1.2.5")
+
     // QuickFIX/J — slice 4 outbound/inbound FIX wire (gated by oms.routing.backend=fix + initiator wiring)
     implementation("org.quickfixj:quickfixj-core:$quickfixjVersion")
     implementation("org.quickfixj:quickfixj-messages-fix44:$quickfixjVersion")

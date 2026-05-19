@@ -190,6 +190,13 @@ oms:
     hedge-hooks-enabled: ${OMS_FX_HEDGE_HOOKS_ENABLED:false}
     eod-flatten-enabled: ${OMS_FX_EOD_FLATTEN_ENABLED:false}
     eod-flatten-interval-ms: ${OMS_FX_EOD_FLATTEN_INTERVAL_MS:86400000}
+    mid-subscriber:
+      enabled: ${OMS_FX_MID_SUBSCRIBER_ENABLED:false}
+      broker-url: ${EMQX_MQTT_BROKER_URL:tcp://127.0.0.1:1883}
+      username: ${EMQX_MQTT_USERNAME:oms-fx-subscriber}
+      password: ${EMQX_MQTT_PASSWORD:}
+      staleness-ms: ${OMS_FX_MID_STALENESS_MS:60000}
+      client-id-prefix: ${OMS_FX_MID_CLIENT_ID_PREFIX:oms-fx-mid}
   corporate-action:
     processor-enabled: ${OMS_CORPORATE_ACTION_PROCESSOR_ENABLED:false}
     processor-interval-ms: ${OMS_CORPORATE_ACTION_PROCESSOR_INTERVAL_MS:60000}

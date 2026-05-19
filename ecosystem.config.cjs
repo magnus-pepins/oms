@@ -232,6 +232,17 @@ const COMMON_ENV = {
   // trading-desk UI on Pop:5310 ships the search panel and would otherwise show
   // `desk_search_disabled` on every submit.
   OMS_DESK_SEARCH_ENABLED: 'true',
+  // Settlement state machine auto-driver (SettlementAutoStepScheduler). Walks fresh TRADE
+  // executions through executed → matched → confirmed → settling → settled at the scheduler's
+  // cadence (default 5s), bypassing the broker-confirm queue. The simulator never sends a
+  // settlement file, so without this every fill stays at `executed` forever and the
+  // beard-admin settlement pages render an all-yellow list — un-demonstrable. MUST stay off
+  // in any environment with a real broker pipe; see SettlementAutoStepScheduler.java for the
+  // race-condition warning.
+  OMS_SETTLEMENT_AUTO_STEP_SCHEDULER_ENABLED: 'true',
+  // Cap on how old an execution can be before the auto-step scheduler ignores it (default
+  // 3600s = 1h). Bumped to 24h so we can run the demo on yesterday's fills if needed.
+  OMS_SETTLEMENT_AUTO_STEP_SCHEDULER_MAX_EXECUTION_AGE_SECONDS: '86400',
   // Slice-4p bench applied V31 via launch-bench-stack.sh before V32 existed; this
   // PM2 stack now adds V32 alongside V31. On rebuild after we changed V31 (dropped
   // CONCURRENTLY for pgbouncer, see V31 source header), the DB checksum from the
@@ -243,6 +254,43 @@ const COMMON_ENV = {
   // production deploys should re-create the schema fresh or restore from a known
   // baseline; tracked as a post-demo cleanup item.
   SPRING_FLYWAY_OUT_OF_ORDER: 'true',
+
+  // ---------------------------------------------------------------------------
+  // FX module (M3 demo)
+  // ---------------------------------------------------------------------------
+  // Master switch for every endpoint under /internal/v1/fx (quotes, mids,
+  // hedge submit, hedge recent, nostro snapshot). Set to 'false' to disable
+  // the whole FX surface; individual sub-flags below let the operator gate
+  // pieces independently.
+  OMS_FX_MODULE_ENABLED: 'true',
+  // Stub-quote endpoint (legacy GET /quotes). Real per-tier quotes via POST
+  // /quote come from fx_pair_markups (Flyway V37) regardless of this flag —
+  // kept on for the bench-stack health check.
+  OMS_FX_QUOTE_STUB_ENABLED: 'true',
+  // POST /hedge/submit + GET /hedge/recent. The Ledger transfer that backs
+  // the hedge requires oms.ledger.enabled=true (already wired by the slice-4p
+  // bench env). When false, the surface returns 404 — useful for read-only
+  // demos.
+  OMS_FX_HEDGE_HOOKS_ENABLED: 'true',
+  // Nostro snapshot endpoint + CSV of the bank's own nostro balance ids.
+  // Seeded via scripts/seed-fx-nostros.sh (issuer -> nostro pattern from
+  // ledger/scripts/seed-demo-coin.ts). Three currencies for the demo.
+  OMS_FX_NOSTRO_READ_ENABLED: 'true',
+  OMS_FX_NOSTRO_BALANCE_IDS_CSV:
+    'balance_69ca46aa-9541-4470-abc1-1fe241fcc8e5,' +
+    'balance_e3a2aa4a-ed30-48b6-8480-c4e5e0f1456f,' +
+    'balance_885efbde-3b17-41f3-b8ec-b6f9db33afe4',
+
+  // Phase 1.5 FX mid subscriber. When 'true', OmsFxMidSubscriber connects to
+  // EMQX on EMQX_MQTT_BROKER_URL (defaults to tcp://127.0.0.1:1883) and
+  // subscribes to fx/+/+/quote, replacing FxQuoteService.STUB_MIDS with live
+  // PB mids. Falls back to STUB_MIDS when the subscriber is absent or stale.
+  // Default 'false' on the bench so demo numbers stay predictable until the
+  // vendor websocket account is upgraded — flip to 'true' once live ticks
+  // are flowing.
+  OMS_FX_MID_SUBSCRIBER_ENABLED: 'false',
+  // Maps to Spring property oms.fx.mid-subscriber.enabled via the
+  // SPRING_APPLICATION_JSON below.
 };
 
 const COMMON_PM2 = {

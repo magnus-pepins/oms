@@ -289,7 +289,12 @@ public final class LedgerSettlementLegPoster implements LedgerSettlementPostingC
                     .body(String.class);
             JsonNode arr = objectMapper.readTree(resp == null ? "[]" : resp);
             if (!arr.isArray() || arr.isEmpty()) {
+                // Reason=SKIPPED_UNFUNDED_BALANCE so the reconciler can publish this as a
+                // skip rather than a failure (see oms_ledger_settlement_outbox_skipped_total).
+                // The outbox row stays unposted; once the customer is funded, the next
+                // reconciler tick succeeds.
                 throw new LedgerSettlementPostingException(
+                        LedgerSettlementPostingException.Reason.SKIPPED_UNFUNDED_BALANCE,
                         "customer balance not found in Ledger: indicator=" + indicator
                                 + " currency=" + currency
                                 + " (customer must be funded before settlement can post)");

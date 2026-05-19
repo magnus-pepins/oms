@@ -4,7 +4,9 @@ import com.balh.oms.config.OmsConfig;
 import com.balh.oms.ledger.LedgerSettlementPostingClient;
 import com.balh.oms.settlement.LedgerSettlementOutboxRepository;
 import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Tag;
 import io.micrometer.core.instrument.Timer;
+import java.util.List;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -23,6 +25,15 @@ public class LedgerSettlementOutboxReconciler {
 
     private static final String METRIC_PUBLISHED = "oms_ledger_settlement_outbox_published_total";
     private static final String METRIC_FAILED = "oms_ledger_settlement_outbox_failed_total";
+    /**
+     * Skipped (not failed) outbox posts. Tag {@code reason} mirrors
+     * {@link LedgerSettlementPostingClient.LedgerSettlementPostingException.Reason} so an SRE
+     * panel can chart "unfunded customer balances" separately from "Ledger HTTP rejected".
+     * Today the only skip reason is {@code unfunded_balance} from
+     * {@link com.balh.oms.ledger.LedgerSettlementLegPoster} when the customer's invest balance
+     * does not yet exist for the leg currency.
+     */
+    private static final String METRIC_SKIPPED = "oms_ledger_settlement_outbox_skipped_total";
     private static final String TIMER_LEDGER_SETTLEMENT_POST = "oms.ledger.settlement.outbox.post";
 
     private final LedgerSettlementOutboxRepository outbox;
@@ -72,13 +83,27 @@ public class LedgerSettlementOutboxReconciler {
                     outbox.markPosted(row.id(), Instant.now());
                     meterRegistry.counter(METRIC_PUBLISHED).increment();
                 } catch (LedgerSettlementPostingClient.LedgerSettlementPostingException e) {
-                    meterRegistry.counter(METRIC_FAILED).increment();
-                    log.warn(
-                            "ledger settlement outbox deliver failed id={} executionId={} leg={}: {}",
-                            row.id(),
-                            row.executionId(),
-                            row.legKind(),
-                            e.getMessage());
+                    if (e.reason() == LedgerSettlementPostingClient.LedgerSettlementPostingException.Reason.SKIPPED_UNFUNDED_BALANCE) {
+                        meterRegistry
+                                .counter(METRIC_SKIPPED, List.of(Tag.of("reason", "unfunded_balance")))
+                                .increment();
+                        // INFO not WARN — this is the expected demo / fresh-account path; the row
+                        // stays unposted and the next reconciler tick after funding succeeds.
+                        log.info(
+                                "ledger settlement outbox skipped id={} executionId={} leg={} reason=unfunded_balance: {}",
+                                row.id(),
+                                row.executionId(),
+                                row.legKind(),
+                                e.getMessage());
+                    } else {
+                        meterRegistry.counter(METRIC_FAILED).increment();
+                        log.warn(
+                                "ledger settlement outbox deliver failed id={} executionId={} leg={}: {}",
+                                row.id(),
+                                row.executionId(),
+                                row.legKind(),
+                                e.getMessage());
+                    }
                 } catch (RuntimeException e) {
                     meterRegistry.counter(METRIC_FAILED).increment();
                     log.warn(

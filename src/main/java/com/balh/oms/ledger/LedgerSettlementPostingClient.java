@@ -19,12 +19,41 @@ public interface LedgerSettlementPostingClient {
             throws LedgerSettlementPostingException;
 
     final class LedgerSettlementPostingException extends Exception {
+
+        /**
+         * Classifies why posting did not succeed so the reconciler can publish skips and failures
+         * as distinct counters (otherwise the demo case where customer balances aren't funded
+         * yet inflates the "failed" rate and drowns the real-failure signal). Default is
+         * {@link Reason#FAILED}; explicit {@link Reason#SKIPPED_UNFUNDED_BALANCE} is reserved
+         * for the well-known "customer balance not found in Ledger" path in
+         * {@link LedgerSettlementLegPoster}.
+         */
+        public enum Reason {
+            FAILED,
+            SKIPPED_UNFUNDED_BALANCE
+        }
+
+        private final Reason reason;
+
         public LedgerSettlementPostingException(String message) {
-            super(message);
+            this(Reason.FAILED, message, null);
         }
 
         public LedgerSettlementPostingException(String message, Throwable cause) {
+            this(Reason.FAILED, message, cause);
+        }
+
+        public LedgerSettlementPostingException(Reason reason, String message) {
+            this(reason, message, null);
+        }
+
+        public LedgerSettlementPostingException(Reason reason, String message, Throwable cause) {
             super(message, cause);
+            this.reason = reason == null ? Reason.FAILED : reason;
+        }
+
+        public Reason reason() {
+            return reason;
         }
     }
 }

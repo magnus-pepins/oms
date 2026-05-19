@@ -7,9 +7,12 @@
 #   market <SYM> [QTY]              -> MARKET order, instant FILL
 #   limit  <SYM> [QTY] [PX]         -> LIMIT order, rests WORKING until cancel/replace
 #   partial <SYM> [QTY] [PX]        -> Symbol-trigger PARTIAL: partial fill then full fill
-#   reject-prep <SYM> [QTY] [PX]    -> Symbol-trigger REJECT: place a LIMIT against the
-#                                      'REJECT' symbol; subsequent cancel/replace will fail
-#                                      with 35=9 OrderCancelReject
+#   newrej <SYM> [QTY] [PX]         -> Symbol-trigger NEWREJ: place a LIMIT against the
+#                                      'NEWREJ' symbol; broker sends ER ET=8 REJECTED so the
+#                                      order never books (status → REJECTED).
+#   cxlrej <SYM> [QTY] [PX]         -> Symbol-trigger CXLREJ (was 'reject-prep'/'REJECT'):
+#                                      place a LIMIT against the 'CXLREJ' symbol; subsequent
+#                                      cancel/replace will fail with 35=9 OrderCancelReject.
 #
 # Required env (typically from ~/.oms-bench.env):
 #   OMS_INTERNAL_API_KEY   - shared secret for /internal/v1/orders
@@ -21,7 +24,8 @@
 #   scripts/demo-place-order.sh market AAPL 1
 #   scripts/demo-place-order.sh limit  AAPL 1 150.00
 #   scripts/demo-place-order.sh partial PARTIAL 4 100.00
-#   scripts/demo-place-order.sh reject-prep REJECT 1 50.00
+#   scripts/demo-place-order.sh newrej NEWREJ 1 50.00
+#   scripts/demo-place-order.sh cxlrej CXLREJ 1 50.00
 
 set -euo pipefail
 
@@ -52,7 +56,7 @@ case "$ACTION" in
   market)
     PRICE_FIELD=""
     ;;
-  limit|partial|reject-prep)
+  limit|partial|newrej|cxlrej|reject-prep)
     : "${PX:=150.00}"
     PRICE_FIELD=",\"limitPrice\":\"${PX}\""
     ;;

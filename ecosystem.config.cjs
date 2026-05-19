@@ -213,10 +213,15 @@ const COMMON_ENV = {
   // pushing live OrderAccepted/Working/Filled events). Off by default in
   // OmsConfig.Desk.snapshotEnabled because production reads should go
   // through the dedicated read replica path; flipped on for the Wed demo so
-  // the operator UI on Pop:5310 has rows to show. Defaults: snapshotMaxLimit
-  // 50 / snapshotMaxAgeHours 24 are baked into OmsConfig and adequate for
-  // the demo.
+  // the operator UI on Pop:5310 has rows to show.
   OMS_DESK_SNAPSHOT_ENABLED: 'true',
+  // Bump the snapshot window from the OmsConfig default (24h) to 168h (7d, the
+  // OmsConfig hard cap) so the trading-desk date-range presets "Yesterday" and
+  // "Last 7d" actually return data. The endpoint still clamps any `since` older
+  // than this floor to the floor itself; the default behaviour (no `since`) is
+  // unchanged from the operator's perspective because the desk UI defaults its
+  // date filter to "Today".
+  OMS_DESK_SNAPSHOT_MAX_AGE_HOURS: '168',
   // Slice-4p bench applied V31 via launch-bench-stack.sh before V32 existed; this
   // PM2 stack now adds V32 alongside V31. On rebuild after we changed V31 (dropped
   // CONCURRENTLY for pgbouncer, see V31 source header), the DB checksum from the

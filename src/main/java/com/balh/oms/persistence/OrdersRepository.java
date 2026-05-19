@@ -135,11 +135,16 @@ public class OrdersRepository {
             LIMIT :limit
             """;
 
+    // Optional `until` is folded into the SQL with `CAST(:max_received AS timestamptz) IS NULL`
+    // so a single prepared statement covers both the open-window (since-only) and the
+    // bounded-window (since + until — e.g. "yesterday") cases without per-call SQL string
+    // concatenation. Spring JDBC binds java.sql.Timestamp -> timestamptz when not null.
     private static final String SELECT_DESK_SNAPSHOT_SQL = """
             SELECT id, account_id, instrument_symbol, side::text AS side, status::text AS status,
-                   version, received_at
+                   version, received_at, ord_type, quantity, limit_price, cum_filled_quantity
             FROM orders
             WHERE received_at >= :min_received
+              AND (CAST(:max_received AS timestamptz) IS NULL OR received_at < :max_received)
             ORDER BY received_at DESC
             LIMIT :limit
             """;
@@ -278,6 +283,25 @@ public class OrdersRepository {
     }
 
     /** Bounded recent rows for desk / attendant snapshot (internal API only). */
+    /**
+     * Wed-demo extension. Trading-desk blotter needs price + volume per row to be useful for
+     * cross-customer monitoring (operators currently have to click into each order to see
+     * the numbers). Added fields:
+     *
+     * <ul>
+     *   <li>{@code ordType} — {@code "MARKET"} / {@code "LIMIT"} (from {@code orders.ord_type}).
+     *       Lets the UI render the type chip without inferring from {@code limitPrice == null}.</li>
+     *   <li>{@code quantity} — current order quantity (post-replace if applicable).</li>
+     *   <li>{@code limitPrice} — nullable; null on a MARKET order, the working limit on LIMIT.</li>
+     *   <li>{@code cumFilledQuantity} — venue-side filled-so-far. Lets the UI show
+     *       progress (e.g. "2 / 5 filled") without a secondary fetch.</li>
+     * </ul>
+     *
+     * Average fill price intentionally omitted — it would require an aggregate join on
+     * {@code executions} per row, which would degrade the snapshot read latency under load.
+     * Operators who need it can click through to the per-order detail (separate endpoint,
+     * planned).
+     */
     public record DeskSnapshotRow(
             UUID id,
             UUID accountId,
@@ -285,11 +309,16 @@ public class OrdersRepository {
             String side,
             String status,
             int version,
-            Instant receivedAt) {}
+            Instant receivedAt,
+            String ordType,
+            BigDecimal quantity,
+            BigDecimal limitPrice,
+            BigDecimal cumFilledQuantity) {}
 
-    public List<DeskSnapshotRow> findDeskSnapshot(Instant minReceived, int limit) {
+    public List<DeskSnapshotRow> findDeskSnapshot(Instant minReceived, Instant maxReceivedExclusive, int limit) {
         var params = new MapSqlParameterSource()
                 .addValue("min_received", Timestamp.from(minReceived))
+                .addValue("max_received", maxReceivedExclusive == null ? null : Timestamp.from(maxReceivedExclusive))
                 .addValue("limit", limit);
         return jdbc.query(
                 SELECT_DESK_SNAPSHOT_SQL,
@@ -302,7 +331,11 @@ public class OrdersRepository {
                                 rs.getString("side"),
                                 rs.getString("status"),
                                 rs.getInt("version"),
-                                rs.getTimestamp("received_at").toInstant()));
+                                rs.getTimestamp("received_at").toInstant(),
+                                rs.getString("ord_type"),
+                                rs.getBigDecimal("quantity"),
+                                rs.getBigDecimal("limit_price"),
+                                rs.getBigDecimal("cum_filled_quantity")));
     }
 
     /**

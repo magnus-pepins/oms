@@ -48,21 +48,33 @@ import java.util.concurrent.atomic.AtomicReference;
  * <p>Two orthogonal signals control the synthesised reply: the standard FIX {@code OrdType}
  * (which mirrors what a real venue uses to decide if an order can fill immediately) and a
  * {@code Symbol}-based trigger for deterministic edge-case scenarios that don't have a clean
- * FIX-native trigger (split fills, cancel/replace rejects).
+ * FIX-native trigger (split fills, new-order reject, cancel/replace rejects).
+ *
+ * <p>Trigger symbols are short, ALL-CAPS, and named after the demo path they unlock — operators
+ * pattern-match on them in the blotter at a glance. The legacy single {@code "REJECT"} trigger
+ * was renamed to {@code "CXLREJ"} (Wed-demo cleanup) because the old name implied "the order
+ * itself gets rejected", when it actually rejects only cancels/modifies against the order.
+ * The new {@code "NEWREJ"} trigger is the new-order reject path.
  *
  * <table>
  *   <caption>NewOrderSingle (35=D) reply by OrdType + Symbol trigger</caption>
- *   <tr><th>Symbol = "PARTIAL"</th>
+ *   <tr><th>Symbol</th>
  *       <th>OrdType = MARKET (40=1)</th>
  *       <th>OrdType = LIMIT (40=2)</th></tr>
- *   <tr><td>partial fill (ER ET=1) then full fill (ER ET=2)</td>
+ *   <tr><td>{@code "PARTIAL"}</td>
+ *       <td>partial fill (ER ET=1) then full fill (ER ET=2)</td>
+ *       <td>partial fill (ER ET=1) then full fill (ER ET=2)</td></tr>
+ *   <tr><td>{@code "NEWREJ"}</td>
+ *       <td>broker reject (ER ET=8, OrdStatus=8) — order never books</td>
+ *       <td>broker reject (ER ET=8, OrdStatus=8) — order never books</td></tr>
+ *   <tr><td>other (incl. {@code "CXLREJ"})</td>
  *       <td>full fill (ER ET=2)</td>
  *       <td>NEW ack (ER ET=0) — order rests in book, no fill until 35=F/35=G</td></tr>
  * </table>
  *
  * <table>
  *   <caption>Cancel/replace (35=F/35=G) reply by Symbol trigger</caption>
- *   <tr><th>Inbound</th><th>Symbol = "REJECT"</th><th>Other</th></tr>
+ *   <tr><th>Inbound</th><th>Symbol = "CXLREJ"</th><th>Other</th></tr>
  *   <tr><td>35=F OrderCancelRequest</td>
  *       <td>OrderCancelReject 35=9 (CxlRejReason=1 unknown-order)</td>
  *       <td>cancel ack (ER ET=4)</td></tr>
@@ -102,11 +114,27 @@ public final class FixRoundTripAcceptorApplication implements Application {
     public static final String TRIGGER_SYMBOL_PARTIAL = "PARTIAL";
 
     /**
-     * Symbol that triggers a 35=9 OrderCancelReject on a 35=F or 35=G. Picked to be loud and
-     * obvious on the demo screen ("cancel REJECT order"). The matching customer-frontend demo
-     * fixture seeds an order against this symbol so the cancel-rejected path is one click away.
+     * Symbol that triggers a 35=9 OrderCancelReject on a 35=F or 35=G. Renamed from
+     * {@code "REJECT"} (Wed-demo cleanup) because the old name was misleading — operators
+     * intuited "the order itself is rejected" when in fact the symbol only causes the broker
+     * to reject cancels/modifies against an otherwise-normal resting order. {@code "CXLREJ"}
+     * is short and unambiguous. See {@link #TRIGGER_SYMBOL_NEWREJ} for the actual
+     * order-rejected path. The matching customer-frontend demo fixture seeds an order
+     * against this symbol so the cancel-rejected path is one click away.
      */
-    public static final String TRIGGER_SYMBOL_REJECT = "REJECT";
+    public static final String TRIGGER_SYMBOL_CXLREJ = "CXLREJ";
+
+    /**
+     * Symbol that triggers a 35=8 ExecutionReport with {@code ExecType=8 REJECTED} and
+     * {@code OrdStatus=8 REJECTED} on a 35=D, simulating a broker that refuses to book the
+     * order at all (e.g. unknown instrument, account suspended, risk-limit breach on the
+     * venue side). The full OMS pipeline already supports this — the inbound sink maps
+     * ER ET=8 to {@code EXEC_TYPE_VENUE_REJECT}, the cluster's apply path moves status to
+     * {@code REJECTED} and emits an {@code OrderRejected} domain event, and the
+     * customer-frontend's status map ({@code OrderRejected → REJECTED}) flips the order
+     * card on the next NATS push. Nothing else needs to change downstream.
+     */
+    public static final String TRIGGER_SYMBOL_NEWREJ = "NEWREJ";
 
     /** IT hook: incremented for each inbound {@code D}; used by stale-outbound IT to assert no send. */
     public static final AtomicInteger NOS_RECEIVED = new AtomicInteger(0);
@@ -188,6 +216,26 @@ public final class FixRoundTripAcceptorApplication implements Application {
         // build NOS by hand without OrdType.
         char ordType = message.isSetField(OrdType.FIELD) ? message.getChar(OrdType.FIELD) : OrdType.MARKET;
 
+        if (TRIGGER_SYMBOL_NEWREJ.equals(sym)) {
+            // Broker reject on submission. ExecType=8 REJECTED, OrdStatus=8 REJECTED. No fill,
+            // no working state — the venue refuses to book the order. {@code LeavesQty=0,
+            // CumQty=0}. The cluster maps ER ET=8 → EXEC_TYPE_VENUE_REJECT → STATUS_REJECTED.
+            // Reusing {@link #sendExecutionReport} which already wires the FIX fields; ExecType
+            // and OrdStatus are passed as their FIX char codes (REJECTED is '8' for both).
+            sendExecutionReport(sessionId, clOrdId, sym, px,
+                    /* lastQty   = */ "0",
+                    /* cumQty    = */ "0",
+                    /* leavesQty = */ "0",
+                    ExecType.REJECTED,
+                    OrdStatus.REJECTED,
+                    /* execIdSuffix = */ "rej");
+            log.info(
+                    "FIX IT acceptor sent broker-reject (ER ET=8) for clOrdId={} sym={} — NEWREJ trigger",
+                    clOrdId,
+                    sym);
+            return;
+        }
+
         if (TRIGGER_SYMBOL_PARTIAL.equals(sym)) {
             // Two ERs sharing the same ClOrdID. ExecID is distinct per ER (OMS dedupes on
             // (orderId, venueExecRef); same ExecID would collapse the second ER on the wire).
@@ -252,12 +300,12 @@ public final class FixRoundTripAcceptorApplication implements Application {
         String sym = message.isSetField(Symbol.FIELD) ? message.getString(Symbol.FIELD) : "";
         String orderQty = message.isSetField(OrderQty.FIELD) ? message.getString(OrderQty.FIELD) : "0";
 
-        if (TRIGGER_SYMBOL_REJECT.equals(sym)) {
+        if (TRIGGER_SYMBOL_CXLREJ.equals(sym)) {
             sendOrderCancelReject(sessionId, clOrdId, origClOrdId,
                     CxlRejResponseTo.ORDER_CANCEL_REQUEST,
                     CxlRejReason.UNKNOWN_ORDER,
-                    "REJECT trigger symbol — demo cancel-reject");
-            log.info("FIX IT acceptor sent OrderCancelReject for clOrdId={} (origClOrdId={}) — REJECT trigger",
+                    "CXLREJ trigger symbol — demo cancel-reject");
+            log.info("FIX IT acceptor sent OrderCancelReject for clOrdId={} (origClOrdId={}) — CXLREJ trigger",
                     clOrdId, origClOrdId);
             return;
         }
@@ -287,12 +335,12 @@ public final class FixRoundTripAcceptorApplication implements Application {
         String newOrderQty = message.getString(OrderQty.FIELD);
         String newPx = message.isSetField(Price.FIELD) ? message.getString(Price.FIELD) : "1";
 
-        if (TRIGGER_SYMBOL_REJECT.equals(sym)) {
+        if (TRIGGER_SYMBOL_CXLREJ.equals(sym)) {
             sendOrderCancelReject(sessionId, clOrdId, origClOrdId,
                     CxlRejResponseTo.ORDER_CANCEL_REPLACE_REQUEST,
                     CxlRejReason.UNKNOWN_ORDER,
-                    "REJECT trigger symbol — demo replace-reject");
-            log.info("FIX IT acceptor sent OrderCancelReject for replace clOrdId={} (origClOrdId={}) — REJECT trigger",
+                    "CXLREJ trigger symbol — demo replace-reject");
+            log.info("FIX IT acceptor sent OrderCancelReject for replace clOrdId={} (origClOrdId={}) — CXLREJ trigger",
                     clOrdId, origClOrdId);
             return;
         }

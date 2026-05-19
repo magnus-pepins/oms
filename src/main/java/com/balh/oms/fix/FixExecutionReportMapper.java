@@ -150,7 +150,26 @@ public class FixExecutionReportMapper {
         Instant venueTs = parseTransactTime(msg).orElse(Instant.now());
         int reason = msg.isSetField(CxlRejReason.FIELD) ? msg.getInt(CxlRejReason.FIELD) : 0;
         String brokerOrderId = msg.isSetField(OrderID.FIELD) ? msg.getString(OrderID.FIELD) : "unknown";
-        String venueExecRef = "ocr-" + brokerOrderId + "-" + reason;
+        // FIX 4.4 OrderCancelReject does NOT carry ExecID (tag 17) — that's only on 35=8
+        // ExecutionReport. The natural per-request unique field on a 35=9 is ClOrdID (tag 11),
+        // which is the NEW ClOrdID of the cancel/replace REQUEST that the broker is rejecting
+        // (OrigClOrdID/tag 41 carries the original order's id). Without this, every cancel-reject
+        // for the same order/reason collapses to the same {@code ocr-<brokerOrderId>-<reason>}
+        // synthesis, the executions table's UNIQUE (account_id, venue_exec_ref) silently no-ops
+        // the second insert, the projector skips the domain envelope, and the UI never sees
+        // the rejection (PENDING_CANCEL hangs until the optimistic-tag timeout fires). This bug
+        // only surfaced once the trading-desk lifecycle hook started minting a unique
+        // clientRequestKey per click — before that, the cluster's per-order RequestCancel dedupe
+        // collapsed the second click upstream and no second 35=F (let alone 35=9) ever existed.
+        // We append a hash of the cancel ClOrdID rather than the raw string because the raw can
+        // be ~120 bytes (e.g. {@code 0d44a628-…:c:td-cancel-1779185234-a3f7c1}) and our
+        // {@code venue_exec_ref} text column is bounded by upstream callers' assumptions; the hex
+        // hash keeps it short while still being collision-resistant for any one operator session.
+        String cancelClOrdId = msg.isSetField(ClOrdID.FIELD) ? msg.getString(ClOrdID.FIELD) : "";
+        String cancelClOrdIdHash = cancelClOrdId.isEmpty()
+                ? "0"
+                : Integer.toHexString(cancelClOrdId.hashCode());
+        String venueExecRef = "ocr-" + brokerOrderId + "-" + reason + "-" + cancelClOrdIdHash;
         String raw = rawOrderCancelRejectJson(msg);
         return Optional.of(new ExecutionVenueRejectCommand(orderId, venueId, venueTs, venueExecRef, raw));
     }

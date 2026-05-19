@@ -166,6 +166,88 @@ public class DomainEventEnvelopeCodec {
         return envelope("OrderRejected", order.id(), payload);
     }
 
+    /**
+     * Wed-demo addition. Emitted by the projector after a venue REPLACE ACK (ER 35=5) has been
+     * applied to {@code orders.quantity} / {@code orders.limit_price} (CAS via
+     * {@code OrdersRepository.updateReplaceWithCas}). The BFF consumer mirrors {@code newQuantity}
+     * and {@code newLimitPrice} onto {@code customer_orders.qty} / {@code customer_orders.limit_price}
+     * so the customer blotter shows the post-replace values without re-reading OMS.
+     *
+     * <p>{@code refreshed} is the post-CAS {@code orders} row (already carries the new qty/price).
+     * We pass {@code newQuantity} / {@code newLimitPrice} explicitly anyway so the envelope is
+     * self-describing — a downstream consumer that doesn't trust the {@code orders} row read
+     * (or that sees the envelope before its own read replica catches up) has enough on the wire.
+     */
+    public String orderReplaced(
+            Order refreshed,
+            int newSeq,
+            BigDecimal newQuantity,
+            BigDecimal newLimitPrice,
+            String venueId,
+            String venueExecRef) throws JsonProcessingException {
+        var payload = new OrderReplacedEvent(
+                refreshed.id(),
+                newSeq,
+                refreshed.shardId(),
+                refreshed.accountIdHash(),
+                newQuantity,
+                newLimitPrice,
+                refreshed.status().name(),
+                venueId,
+                venueExecRef,
+                Instant.now());
+        return envelope("OrderReplaced", refreshed.id(), payload);
+    }
+
+    /**
+     * Emitted by the projector after a venue 35=9 OrderCancelReject (against a 35=F cancel) has
+     * been recorded in {@code executions} ({@code exec_type=CANCEL_REJECT}). The order is
+     * unchanged on the venue and in OMS; the envelope is purely informational so downstream BFF
+     * surfaces a toast ("cancel rejected by broker") without polling.
+     *
+     * <p>{@code currentSeq} is the unchanged {@code orders.version}, not {@code version + 1} — the
+     * reject did not mutate the row. See {@link OrderCancelRejectedEvent} doc for the sequencing
+     * implication for downstream consumers.
+     */
+    public String orderCancelRejected(
+            Order order,
+            int currentSeq,
+            String venueId,
+            String venueExecRef) throws JsonProcessingException {
+        var payload = new OrderCancelRejectedEvent(
+                order.id(),
+                currentSeq,
+                order.shardId(),
+                order.accountIdHash(),
+                order.status().name(),
+                venueId,
+                venueExecRef,
+                Instant.now());
+        return envelope("OrderCancelRejected", order.id(), payload);
+    }
+
+    /**
+     * Mirror of {@link #orderCancelRejected} for a 35=9 against a prior 35=G replace. Same
+     * payload shape, distinct {@code type} tag so the BFF can route the toast text correctly
+     * ("modify rejected" vs. "cancel rejected").
+     */
+    public String orderReplaceRejected(
+            Order order,
+            int currentSeq,
+            String venueId,
+            String venueExecRef) throws JsonProcessingException {
+        var payload = new OrderReplaceRejectedEvent(
+                order.id(),
+                currentSeq,
+                order.shardId(),
+                order.accountIdHash(),
+                order.status().name(),
+                venueId,
+                venueExecRef,
+                Instant.now());
+        return envelope("OrderReplaceRejected", order.id(), payload);
+    }
+
     private String envelope(String type, UUID correlationOrderId, Object payload) throws JsonProcessingException {
         ObjectNode root = objectMapper.createObjectNode();
         root.put("schemaVersion", ENVELOPE_SCHEMA_VERSION);

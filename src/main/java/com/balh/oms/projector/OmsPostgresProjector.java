@@ -826,6 +826,9 @@ public class OmsPostgresProjector {
             case ApplyExecutionReportCommand.EXEC_TYPE_TRADE -> applyTradeProjection(ev, order);
             case ApplyExecutionReportCommand.EXEC_TYPE_CANCEL -> applyCancelProjection(ev, order);
             case ApplyExecutionReportCommand.EXEC_TYPE_VENUE_REJECT -> applyVenueRejectProjection(ev, order);
+            case ApplyExecutionReportCommand.EXEC_TYPE_REPLACE -> applyReplaceProjection(ev, order);
+            case ApplyExecutionReportCommand.EXEC_TYPE_CANCEL_REJECT -> applyCancelRejectProjection(ev, order);
+            case ApplyExecutionReportCommand.EXEC_TYPE_REPLACE_REJECT -> applyReplaceRejectProjection(ev, order);
             default -> {
                 log.warn(
                         "Projector: ExecutionAppliedEvent with unknown execTypeCode {} for order {}; skipping.",
@@ -1093,6 +1096,166 @@ public class OmsPostgresProjector {
                     envelopeCodec.orderCancelled(refreshed, newSeq, ev.venueId(), ev.venueExecRef()));
         } catch (JsonProcessingException e) {
             throw new IllegalStateException("domain event serialisation failed for order " + order.id(), e);
+        }
+        return true;
+    }
+
+    /**
+     * Wed-demo addition. Projects a venue REPLACE ACK (ER 35=5) emitted by the cluster after a
+     * 35=G we sent was accepted by the broker. The semantics, mirroring the cluster's apply path
+     * in {@link com.balh.oms.cluster.OmsAdmissionClusteredService} (search for
+     * {@code EXEC_TYPE_REPLACE}):
+     *
+     * <ul>
+     *   <li>{@code ev.lastQtyScaled()} carries the broker-authoritative <strong>new total
+     *       OrderQty</strong> (1e9 fixed-point) — <em>not</em> a fill quantity. There is no fill
+     *       on a pure replace.</li>
+     *   <li>{@code ev.lastPxScaled()} carries the new limit price (1e6 fixed-point; 0 means
+     *       market / unchanged). The cluster only overwrites the row's price when this is
+     *       {@code > 0}, so we mirror that gate here.</li>
+     *   <li>{@code ev.newCumQtyScaled()} echoes the unchanged pre-replace cumulative quantity
+     *       (cluster does not mutate cumQty on replace).</li>
+     *   <li>{@code ev.newStatusCode()} echoes the cluster's recomputed status (WORKING /
+     *       PARTIALLY_FILLED / FILLED depending on whether the new total qty leaves any quantity
+     *       to work or is already covered by prior fills).</li>
+     * </ul>
+     *
+     * <p>Projection side effects, in one transaction:
+     * <ol>
+     *   <li>{@code executions} REPLACE audit row via {@link ExecutionsRepository#tryInsertReplace};
+     *       idempotent on {@code (account_id, venue_exec_ref)} so duplicate replay is safe.</li>
+     *   <li>{@code orders} CAS on {@code version} overwrites {@code quantity} +
+     *       {@code limit_price} + {@code status}; {@code cum_filled_quantity} stays put.</li>
+     *   <li>{@code domain_event_outbox} insert of the {@link DomainEventEnvelopeCodec#orderReplaced}
+     *       envelope so the BFF consumer mirrors the new qty/price onto {@code customer_orders}
+     *       without a second OMS read.</li>
+     * </ol>
+     *
+     * <p>Duplicate-replay path: the {@code tryInsertReplace} returns empty when the
+     * {@code (account_id, venue_exec_ref)} pair already exists. We mirror the trade / cancel
+     * projection contract: return {@code false} so the caller logs at debug and advances the
+     * cursor without re-emitting the envelope.
+     */
+    private boolean applyReplaceProjection(ExecutionAppliedEvent ev, Order order) {
+        BigDecimal newQty = scaledToBigDecimal(ev.lastQtyScaled(), QUANTITY_SCALE);
+        BigDecimal newLimitPrice = ev.lastPxScaled() == 0L
+                ? order.limitPrice()
+                : scaledToBigDecimal(ev.lastPxScaled(), PRICE_SCALE);
+        BigDecimal newCum = scaledToBigDecimal(ev.newCumQtyScaled(), QUANTITY_SCALE);
+        BigDecimal leaves = newQty.subtract(newCum);
+
+        Optional<Long> insertedId = executionsRepository.tryInsertReplace(
+                order.id(),
+                order.accountId(),
+                ev.venueId(),
+                Instant.ofEpochSecond(0L, ev.venueTsNanos()),
+                ev.venueExecRef(),
+                newQty,
+                newLimitPrice,
+                leaves,
+                newCum,
+                ev.rawEnvelopeJson());
+        if (insertedId.isEmpty()) {
+            meterRegistry.counter(METRIC_EXECUTIONS_APPLIED, TAG_OUTCOME, OUTCOME_DUPLICATE).increment();
+            return false;
+        }
+        meterRegistry.counter(METRIC_EXECUTIONS_APPLIED, TAG_OUTCOME, OUTCOME_INSERTED).increment();
+
+        OrderStatus newStatus = OrderStatus.values()[ev.newStatusCode()];
+        int pgExpectedVersion = order.version();
+        boolean cas = ordersRepository.updateReplaceWithCas(
+                order.id(), pgExpectedVersion, newQty, newLimitPrice, newStatus);
+        if (!cas) {
+            log.warn(
+                    "Projector: orders CAS missed on REPLACE projection for order {} (pgExpectedVersion={}); orders row advanced beyond the projector's read.",
+                    order.id(),
+                    pgExpectedVersion);
+            return true;
+        }
+        int newSeq = pgExpectedVersion + 1;
+        Order refreshed = ordersRepository.findById(order.id()).orElse(order);
+        try {
+            domainEventOutboxRepository.insert(
+                    order.id(),
+                    envelopeCodec.orderReplaced(
+                            refreshed, newSeq, newQty, newLimitPrice, ev.venueId(), ev.venueExecRef()));
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException(
+                    "domain event serialisation failed for REPLACE of order " + order.id(), e);
+        }
+        return true;
+    }
+
+    /**
+     * Wed-demo addition. Projects a venue OrderCancelReject (ER 35=9 against a prior 35=F cancel)
+     * emitted by the cluster. The order is unchanged on the venue's books and in our cluster —
+     * status, cumQty, qty, price all stay put — so the projector only:
+     *
+     * <ol>
+     *   <li>writes a {@code CANCEL_REJECT} audit row in {@code executions}
+     *       (idempotent on {@code (account_id, venue_exec_ref)}), and</li>
+     *   <li>emits the {@code OrderCancelRejected} envelope to {@code domain_event_outbox} so the
+     *       BFF can surface a "cancel rejected by broker" toast without polling.</li>
+     * </ol>
+     *
+     * <p>No {@code orders} CAS. The cluster bumps its in-memory version (so the next ER for the
+     * same order doesn't see a stale snapshot), but the Postgres row has nothing to change; a
+     * version-only bump in Postgres would only serve to confuse downstream consumers that key off
+     * {@code (orderId, version)} for state snapshots.
+     *
+     * <p>{@code currentSeq} on the envelope is the current {@code orders.version} (not + 1) —
+     * matches {@link OrderCancelRejectedEvent} doc.
+     */
+    private boolean applyCancelRejectProjection(ExecutionAppliedEvent ev, Order order) {
+        Optional<Long> insertedId = executionsRepository.tryInsertCancelReject(
+                order.id(),
+                order.accountId(),
+                ev.venueId(),
+                Instant.ofEpochSecond(0L, ev.venueTsNanos()),
+                ev.venueExecRef(),
+                order.cumFilledQuantity(),
+                ev.rawEnvelopeJson());
+        if (insertedId.isEmpty()) {
+            meterRegistry.counter(METRIC_EXECUTIONS_APPLIED, TAG_OUTCOME, OUTCOME_DUPLICATE).increment();
+            return false;
+        }
+        meterRegistry.counter(METRIC_EXECUTIONS_APPLIED, TAG_OUTCOME, OUTCOME_INSERTED).increment();
+        try {
+            domainEventOutboxRepository.insert(
+                    order.id(),
+                    envelopeCodec.orderCancelRejected(order, order.version(), ev.venueId(), ev.venueExecRef()));
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException(
+                    "domain event serialisation failed for CANCEL_REJECT of order " + order.id(), e);
+        }
+        return true;
+    }
+
+    /**
+     * Wed-demo addition. Mirror of {@link #applyCancelRejectProjection} for a 35=9 against a prior
+     * 35=G replace. Same lifecycle: audit row + envelope, no {@code orders} mutation.
+     */
+    private boolean applyReplaceRejectProjection(ExecutionAppliedEvent ev, Order order) {
+        Optional<Long> insertedId = executionsRepository.tryInsertReplaceReject(
+                order.id(),
+                order.accountId(),
+                ev.venueId(),
+                Instant.ofEpochSecond(0L, ev.venueTsNanos()),
+                ev.venueExecRef(),
+                order.cumFilledQuantity(),
+                ev.rawEnvelopeJson());
+        if (insertedId.isEmpty()) {
+            meterRegistry.counter(METRIC_EXECUTIONS_APPLIED, TAG_OUTCOME, OUTCOME_DUPLICATE).increment();
+            return false;
+        }
+        meterRegistry.counter(METRIC_EXECUTIONS_APPLIED, TAG_OUTCOME, OUTCOME_INSERTED).increment();
+        try {
+            domainEventOutboxRepository.insert(
+                    order.id(),
+                    envelopeCodec.orderReplaceRejected(order, order.version(), ev.venueId(), ev.venueExecRef()));
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException(
+                    "domain event serialisation failed for REPLACE_REJECT of order " + order.id(), e);
         }
         return true;
     }

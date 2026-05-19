@@ -164,6 +164,15 @@ public class OrdersRepository {
              WHERE id = :id AND version = :expected_version
             """;
 
+    private static final String UPDATE_REPLACE_CAS_SQL = """
+            UPDATE orders
+               SET quantity = :new_quantity,
+                   limit_price = :new_limit_price,
+                   status = CAST(:status AS order_status),
+                   version = version + 1
+             WHERE id = :id AND version = :expected_version
+            """;
+
     public void insert(Order o) {
         int affected = jdbc.update(INSERT_SQL, params(o));
         if (affected == 0) {
@@ -338,6 +347,38 @@ public class OrdersRepository {
                 .addValue("terminal_reason", terminalReason == null ? null : terminalReason.name())
                 .addValue("terminal_at", terminalAt == null ? null : Timestamp.from(terminalAt));
         return jdbc.update(UPDATE_FILL_CAS_SQL, params) == 1;
+    }
+
+    /**
+     * Applies a venue REPLACE (broker ACK of a 35=G) with CAS on {@code version}: overwrites
+     * {@code quantity} and {@code limit_price} to the broker-authoritative replacement values,
+     * updates {@code status} (cluster recomputes WORKING vs PARTIALLY_FILLED vs FILLED depending
+     * on the new qty vs unchanged cumQty), bumps version. {@code cum_filled_quantity},
+     * {@code terminal_reason}, and {@code terminal_at} are intentionally untouched: a pure replace
+     * has no fill side-effect and never lands the order in a terminal state by itself.
+     *
+     * @param newLimitPrice pass {@code null} only on a market-order replace (rare); pass the new
+     *                      limit price on a limit-order replace. Market orders don't have a
+     *                      meaningful limit_price column, so this branch is here mostly for
+     *                      completeness — the demo only exercises limit replaces.
+     * @return {@code true} if the CAS update applied. {@code false} means another writer beat us;
+     *         the cluster's apply path has at-most-once semantics on
+     *         {@code (orderId, venueExecRef)} so a false here is the duplicate-replay path
+     *         (caller logs at debug and advances the cursor without an envelope emission).
+     */
+    public boolean updateReplaceWithCas(
+            UUID id,
+            int expectedVersion,
+            BigDecimal newQuantity,
+            BigDecimal newLimitPrice,
+            OrderStatus newStatus) {
+        var params = new MapSqlParameterSource()
+                .addValue("id", id)
+                .addValue("expected_version", expectedVersion)
+                .addValue("new_quantity", newQuantity)
+                .addValue("new_limit_price", newLimitPrice)
+                .addValue("status", newStatus.name());
+        return jdbc.update(UPDATE_REPLACE_CAS_SQL, params) == 1;
     }
 
     private MapSqlParameterSource params(Order o) {

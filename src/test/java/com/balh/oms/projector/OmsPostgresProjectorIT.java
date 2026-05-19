@@ -559,6 +559,81 @@ class OmsPostgresProjectorIT extends AbstractPostgresIntegrationTest {
     }
 
     /**
+     * Wed-demo (modify) — venue REPLACE ACK: cluster applies a REPLACE ER (ET=5) carrying the
+     * broker-authoritative new total qty and new limit price; the projector overwrites
+     * {@code orders.quantity} and {@code orders.limit_price}, bumps version, emits an
+     * {@code OrderReplaced} envelope, and writes a {@code REPLACE} audit row in {@code executions}.
+     * cumQty stays at zero (pure replace, no fill).
+     */
+    @Test
+    void clusterReplace_orderQuantityAndLimitPriceUpdatedAndOrderReplacedEnvelope() throws Exception {
+        UUID orderId = UUID.randomUUID();
+        UUID accountId = UUID.randomUUID();
+        String idemKey = "projector-it-replace-" + orderId;
+
+        testIngressClient.submitAcceptOrder(sample(orderId, accountId, idemKey), CLUSTER_SUBMIT_TIMEOUT);
+        awaitOrdersStatus(orderId, "WORKING", 1);
+
+        // sample() places qty=10, limit=150. Replace to qty=15, limit=155.
+        // QUANTITY_SCALE=1e9, PRICE_SCALE=1e6 (see AcceptOrderCommand).
+        long newQtyScaled = 15_000_000_000L;
+        long newLimitPxScaled = 155_000_000L;
+        String venueRef = "VENUE-REPLACE-" + orderId;
+        ApplyExecutionReportCommand replace = new ApplyExecutionReportCommand(
+                testIngressClient.nextCorrelationId(),
+                orderId,
+                /* lastQtyScaled = new total qty */ newQtyScaled,
+                /* lastPxScaled = new limit px */ newLimitPxScaled,
+                instantToNanos(),
+                /* msgSeqNum = */ 1,
+                ApplyExecutionReportCommand.EXEC_TYPE_REPLACE,
+                (byte) 0,
+                "VENUE",
+                venueRef,
+                "",
+                "{\"kind\":\"ExecutionReport\",\"execType\":\"REPLACE\"}");
+        testIngressClient.submitApplyExecutionReport(replace, CLUSTER_SUBMIT_TIMEOUT);
+
+        // Status stays WORKING (cumQty=0 < newQty=15), version bumps to 2.
+        awaitOrdersStatus(orderId, "WORKING", 2);
+
+        BigDecimal qty = jdbc.queryForObject(
+                "SELECT quantity FROM orders WHERE id = ?", BigDecimal.class, orderId);
+        assertThat(qty).isEqualByComparingTo("15");
+        BigDecimal limitPrice = jdbc.queryForObject(
+                "SELECT limit_price FROM orders WHERE id = ?", BigDecimal.class, orderId);
+        assertThat(limitPrice).isEqualByComparingTo("155");
+        BigDecimal cum = jdbc.queryForObject(
+                "SELECT cum_filled_quantity FROM orders WHERE id = ?", BigDecimal.class, orderId);
+        assertThat(cum).isEqualByComparingTo("0");
+
+        await().atMost(ROW_VISIBLE_TIMEOUT).pollInterval(Duration.ofMillis(50)).untilAsserted(() -> {
+            Long count = jdbc.queryForObject(
+                    "SELECT COUNT(*) FROM domain_event_outbox WHERE order_id = ?"
+                            + " AND envelope_json->>'type' = 'OrderReplaced'",
+                    Long.class,
+                    orderId);
+            assertThat(count).isEqualTo(1L);
+        });
+        // Envelope payload must carry the broker-authoritative new qty + new limit price so the
+        // BFF consumer can mirror onto customer_orders without a second OMS read.
+        String envelopeJson = jdbc.queryForObject(
+                "SELECT envelope_json::text FROM domain_event_outbox WHERE order_id = ?"
+                        + " AND envelope_json->>'type' = 'OrderReplaced'",
+                String.class,
+                orderId);
+        assertThat(envelopeJson).contains("\"newQuantity\":15");
+        assertThat(envelopeJson).contains("\"newLimitPrice\":155");
+        assertThat(envelopeJson).contains("\"newStatus\":\"WORKING\"");
+
+        Long replaceExecutions = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM executions WHERE order_id = ? AND exec_type = 'REPLACE'",
+                Long.class,
+                orderId);
+        assertThat(replaceExecutions).isEqualTo(1L);
+    }
+
+    /**
      * Slice 3e-2 — SELL fill: sell-side TRADE drains a pre-existing position and records the
      * pending-buy-vs-settled split on {@code executions} so the operator mark-failed unwind path
      * can reverse the fill exactly. The flow:

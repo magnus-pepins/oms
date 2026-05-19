@@ -103,6 +103,103 @@ public class ExecutionsRepository {
                 BigDecimal.ZERO, null, BigDecimal.ZERO, cumQuantityAfter, "REJECT", rawJson);
     }
 
+    /**
+     * Venue/broker REPLACE acknowledgement audit row. The broker sent us ER 35=5 in response to
+     * a 35=G we issued; the row records the broker-authoritative new total quantity and limit
+     * price (see {@code ApplyExecutionReportCommand.EXEC_TYPE_REPLACE} doc for the
+     * {@code lastQtyScaled}/{@code lastPxScaled} reinterpretation). {@code newQuantity} maps to
+     * {@code last_quantity}, {@code newLimitPriceOrNull} maps to {@code last_price}; cumQty after
+     * replace is unchanged ({@code cumQuantityAfter} carries the pre-replace cumulative). Leaves
+     * quantity for a replace is the new total minus the unchanged cumQty — useful when the
+     * settlement / desk side reconstructs leaves from the executions log without re-reading the
+     * orders row.
+     *
+     * <p>Idempotent on {@code (account_id, venue_exec_ref)} like the trade / cancel / reject
+     * inserts.
+     */
+    public Optional<Long> tryInsertReplace(
+            UUID orderId,
+            UUID accountId,
+            String venueId,
+            Instant venueTs,
+            String venueExecRef,
+            BigDecimal newQuantity,
+            BigDecimal newLimitPriceOrNull,
+            BigDecimal leavesQuantity,
+            BigDecimal cumQuantityAfter,
+            String rawJson) {
+        return insertReturning(
+                INSERT_TRADE_SQL,
+                orderId,
+                accountId,
+                venueId,
+                venueTs,
+                venueExecRef,
+                newQuantity,
+                newLimitPriceOrNull,
+                leavesQuantity,
+                cumQuantityAfter,
+                "REPLACE",
+                rawJson);
+    }
+
+    /**
+     * 35=9 OrderCancelReject (against a prior 35=F cancel). No state change to the order on the
+     * venue's books and none in our cluster; this row is the audit trail for "broker said no" so
+     * downstream surfaces (UI toast, ops alerts) can reconstruct the rejection without a
+     * back-channel to the venue.
+     */
+    public Optional<Long> tryInsertCancelReject(
+            UUID orderId,
+            UUID accountId,
+            String venueId,
+            Instant venueTs,
+            String venueExecRef,
+            BigDecimal cumQuantityAfter,
+            String rawJson) {
+        return insertReturning(
+                INSERT_TRADE_SQL,
+                orderId,
+                accountId,
+                venueId,
+                venueTs,
+                venueExecRef,
+                BigDecimal.ZERO,
+                null,
+                BigDecimal.ZERO,
+                cumQuantityAfter,
+                "CANCEL_REJECT",
+                rawJson);
+    }
+
+    /**
+     * 35=9 OrderCancelReject (against a prior 35=G replace). Mirrors {@link #tryInsertCancelReject}
+     * except for the exec_type discriminator; OMS distinguishes them so downstream can route the
+     * toast text correctly ("cancel rejected" vs. "modify rejected").
+     */
+    public Optional<Long> tryInsertReplaceReject(
+            UUID orderId,
+            UUID accountId,
+            String venueId,
+            Instant venueTs,
+            String venueExecRef,
+            BigDecimal cumQuantityAfter,
+            String rawJson) {
+        return insertReturning(
+                INSERT_TRADE_SQL,
+                orderId,
+                accountId,
+                venueId,
+                venueTs,
+                venueExecRef,
+                BigDecimal.ZERO,
+                null,
+                BigDecimal.ZERO,
+                cumQuantityAfter,
+                "REPLACE_REJECT",
+                rawJson);
+    }
+
     private Optional<Long> insertReturning(
             String sql,
             UUID orderId,

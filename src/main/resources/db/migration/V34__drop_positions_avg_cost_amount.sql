@@ -1,0 +1,21 @@
+-- V34: Drop unused positions.avg_cost_amount column.
+--
+-- Context: V11 created `positions.avg_cost_amount NUMERIC(28,10) NULL` in anticipation of a
+-- denormalised cost-basis projection, but no projector ever wrote it (every row is NULL today).
+-- The customer "My positions" view computes cost basis at read time via an aggregation over
+-- the `executions` table (see PositionsRepository.SELECT_BY_ACCOUNT_SQL), which is the
+-- authoritative source. Reasons we chose the read-time aggregation over closing the projector
+-- gap, documented here so the column doesn't come back by mistake:
+--
+--   1. Mark-failed unwind: the join trivially excludes failed executions via a WHERE clause.
+--      The denormalised approach has to reverse a weighted-average update, which is not
+--      directly invertible without storing per-fill avg-before-fill snapshots on `executions`
+--      and reversing them — drift-prone, and the recovery path is "run this same aggregation
+--      and overwrite the column", so the join is authoritative anyway.
+--   2. Volume is retail-shaped: O(10) fills per position lifetime, not O(1000). With
+--      `idx_executions_order_time` and the indexed `account_id`, the aggregation is microseconds.
+--
+-- This migration removes the trap of a column nobody writes and nobody trusts. Re-introducing
+-- a denormalised cost basis later would need to be tied to a proper FIFO/LIFO lot ledger and
+-- the realised-gain tax-reporting decision, not bolted onto the existing positions row.
+ALTER TABLE positions DROP COLUMN IF EXISTS avg_cost_amount;

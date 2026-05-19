@@ -31,6 +31,19 @@ public class PositionsController {
         this.positionsRepository = positionsRepository;
     }
 
+    /**
+     * Wire shape consumed by the customer-frontend BFF (and trading-desk / beard-admin).
+     *
+     * <p>{@code averageFillPrice} + {@code investedAmount} are the lifetime-BUY-weighted average
+     * fill price and the corresponding cost basis for the currently-held quantity (see the
+     * {@code SELECT_BY_ACCOUNT_SQL} javadoc in {@link com.balh.oms.persistence.PositionsRepository}
+     * for the exact semantics). Both are {@code null} when no BUY {@code TRADE} executions
+     * exist; clients should treat {@code null} as "cost basis unknown" rather than {@code 0}.
+     *
+     * <p>The legacy {@code avgCostAmount} field has been removed from the wire as of 2026-05-18
+     * (was always {@code null} — no projector ever wrote it; the V34 migration drops the column).
+     * BFF clients should rely on {@code averageFillPrice} instead.
+     */
     public record PositionResponse(
             String instrumentSymbol,
             String custodyAccountId,
@@ -38,9 +51,10 @@ public class PositionsController {
             String quantitySettled,
             String quantityPendingBuySettle,
             String quantityPendingSellSettle,
-            String avgCostAmount,
             String currency,
-            String updatedAt) {}
+            String updatedAt,
+            String averageFillPrice,
+            String investedAmount) {}
 
     public record PositionsListResponse(List<PositionResponse> items) {}
 
@@ -62,9 +76,10 @@ public class PositionsController {
                                                 r.quantityPendingSellSettle() == null
                                                         ? null
                                                         : r.quantityPendingSellSettle().toPlainString(),
-                                                r.avgCostAmount() == null ? null : r.avgCostAmount().toPlainString(),
                                                 r.currency(),
-                                                r.updatedAt() == null ? null : r.updatedAt().toString()))
+                                                r.updatedAt() == null ? null : r.updatedAt().toString(),
+                                                r.averageFillPrice() == null ? null : r.averageFillPrice().toPlainString(),
+                                                r.investedAmount() == null ? null : r.investedAmount().toPlainString()))
                         .toList();
         return ResponseEntity.ok(new PositionsListResponse(items));
     }

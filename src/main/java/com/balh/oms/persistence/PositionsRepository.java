@@ -321,14 +321,86 @@ public class PositionsRepository {
         insertHistory(accountId, sym, custodyAccountId, "SETTLEMENT_SELL_SETTLED", settleQuantity, executionId);
     }
 
+    /**
+     * Read-side projection: positions joined with a lifetime-BUY cost aggregation derived from
+     * {@code executions} so the customer "My positions" view can show a real "Invested" value.
+     *
+     * <h3>Why a join rather than a denormalised column</h3>
+     * The {@code positions} row used to have an {@code avg_cost_amount} column (V11) that no
+     * projector ever wrote, and we briefly considered closing that gap. We deliberately did not,
+     * for two reasons that bite specifically in this domain:
+     * <ol>
+     *   <li><strong>Cancellation is trivial here</strong>: a mark-failed execution simply gets
+     *       excluded by the {@code settlement_status NOT IN ('failed')} filter below. The
+     *       denormalised path would have to <em>invert</em> a weighted-average update, which
+     *       requires snapshotting the per-fill avg-before-fill onto {@code executions} and
+     *       carefully reversing it (drift-prone, and the recovery path is "run this same join
+     *       and overwrite the column" — so the join is authoritative anyway).</li>
+     *   <li><strong>Volume is retail-shaped</strong>: a position accumulates O(10) fills over its
+     *       lifetime, not O(1000). With {@code idx_executions_order_time} and the indexed
+     *       {@code account_id}, this aggregation is microseconds — well below the network /
+     *       BFF cost.</li>
+     * </ol>
+     * The V34 migration drops the now-redundant column.
+     *
+     * <h3>Cost basis semantics</h3>
+     * <ul>
+     *   <li>{@code buy_total_qty} / {@code buy_total_cost} — sum across all historical BUY
+     *       {@code TRADE} executions for the (account, symbol) <em>that are not marked-failed</em>.
+     *       All other settlement states (executed / matched / settling / settled) count: the
+     *       money is committed at TRADE time via the inflight hold, so a not-yet-settled fill is
+     *       still real cost basis from the customer's perspective. The filter intentionally uses
+     *       {@code NOT IN ('failed')} (allow-by-default) rather than an explicit allowlist so a
+     *       newly added settlement state doesn't silently get excluded from cost basis.</li>
+     *   <li>{@code avg_buy_fill_price} = {@code buy_total_cost / buy_total_qty} (lifetime
+     *       volume-weighted average BUY price). For BUY-only history this is just "what the
+     *       customer paid"; under partial sells from one lot it represents the average price of
+     *       the remaining shares (true FIFO/LIFO lot accounting is a separate follow-up tied to
+     *       the realised-gain tax-reporting decision).</li>
+     *   <li>{@code invested_amount} = {@code quantity_total * avg_buy_fill_price}. We multiply
+     *       by the live {@code quantity_total} (not by {@code buy_total_qty}) so that a fully
+     *       closed position shows {@code 0} invested rather than the historical cost of long-gone
+     *       shares. Holding 1 of 2 originally-bought shares = half the original cost.</li>
+     * </ul>
+     */
     private static final String SELECT_BY_ACCOUNT_SQL = """
-            SELECT instrument_symbol, custody_account_id,
-                   quantity_total, quantity_settled, quantity_pending_buy_settle,
-                   quantity_pending_sell_settle, avg_cost_amount, currency, updated_at
-            FROM positions
-            WHERE account_id = :account_id
-              AND quantity_total > 0
-            ORDER BY instrument_symbol
+            WITH buy_cost AS (
+                SELECT o.account_id,
+                       o.instrument_symbol,
+                       SUM(e.last_quantity)              AS buy_total_qty,
+                       SUM(e.last_quantity * e.last_price) AS buy_total_cost
+                FROM executions e
+                JOIN orders o ON o.id = e.order_id
+                WHERE o.account_id = :account_id
+                  AND o.side = 'BUY'
+                  AND e.exec_type = 'TRADE'
+                  AND e.last_price IS NOT NULL
+                  AND e.settlement_status NOT IN ('failed')
+                GROUP BY o.account_id, o.instrument_symbol
+            )
+            SELECT p.instrument_symbol,
+                   p.custody_account_id,
+                   p.quantity_total,
+                   p.quantity_settled,
+                   p.quantity_pending_buy_settle,
+                   p.quantity_pending_sell_settle,
+                   p.currency,
+                   p.updated_at,
+                   CASE
+                       WHEN bc.buy_total_qty IS NULL OR bc.buy_total_qty = 0 THEN NULL
+                       ELSE bc.buy_total_cost / bc.buy_total_qty
+                   END AS avg_buy_fill_price,
+                   CASE
+                       WHEN bc.buy_total_qty IS NULL OR bc.buy_total_qty = 0 THEN NULL
+                       ELSE p.quantity_total * (bc.buy_total_cost / bc.buy_total_qty)
+                   END AS invested_amount
+            FROM positions p
+            LEFT JOIN buy_cost bc
+                   ON bc.account_id        = p.account_id
+                  AND bc.instrument_symbol = p.instrument_symbol
+            WHERE p.account_id = :account_id
+              AND p.quantity_total > 0
+            ORDER BY p.instrument_symbol
             """;
 
     /**
@@ -337,9 +409,11 @@ public class PositionsRepository {
      * so callers cannot accidentally render zero-quantity rows). Powers the customer
      * "My positions" view; ordered by {@code instrument_symbol} for deterministic UI.
      *
-     * <p>Note: {@code avg_cost_amount} is currently always {@code null} — the V11 schema
-     * carries the column but no projector path writes it yet. Callers should treat
-     * {@code null} as "cost basis unknown" until that gap is closed.
+     * <p>Each row carries {@code averageFillPrice} and {@code investedAmount} derived from the
+     * {@code executions} table (see {@link #SELECT_BY_ACCOUNT_SQL} for the exact semantics).
+     * Both are {@code null} when no BUY {@code TRADE} executions exist (e.g. a synthetic /
+     * seed-data position, or every prior fill was marked-failed) — callers should treat
+     * {@code null} as "cost basis unknown" rather than as {@code 0}.
      */
     public List<PositionRow> findByAccountId(UUID accountId) {
         return jdbc.query(
@@ -353,9 +427,10 @@ public class PositionsRepository {
                                 rs.getBigDecimal("quantity_settled"),
                                 rs.getBigDecimal("quantity_pending_buy_settle"),
                                 rs.getBigDecimal("quantity_pending_sell_settle"),
-                                rs.getBigDecimal("avg_cost_amount"),
                                 rs.getString("currency"),
-                                rs.getTimestamp("updated_at").toInstant()));
+                                rs.getTimestamp("updated_at").toInstant(),
+                                rs.getBigDecimal("avg_buy_fill_price"),
+                                rs.getBigDecimal("invested_amount")));
     }
 
     /** Read-side row for {@link #findByAccountId(UUID)}. */
@@ -366,9 +441,10 @@ public class PositionsRepository {
             BigDecimal quantitySettled,
             BigDecimal quantityPendingBuySettle,
             BigDecimal quantityPendingSellSettle,
-            BigDecimal avgCostAmount,
             String currency,
-            java.time.Instant updatedAt) {}
+            java.time.Instant updatedAt,
+            BigDecimal averageFillPrice,
+            BigDecimal investedAmount) {}
 
     public BigDecimal findQuantityTotal(UUID accountId, String instrumentSymbol, UUID custodyAccountId) {
         String sym = instrumentSymbol == null ? "" : instrumentSymbol.trim();

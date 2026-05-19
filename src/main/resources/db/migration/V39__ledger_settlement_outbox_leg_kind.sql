@@ -9,12 +9,17 @@
 ALTER TABLE ledger_settlement_outbox
     ADD COLUMN leg_kind TEXT NOT NULL DEFAULT 'cash';
 
+-- COMMENT ON COLUMN ... IS expects a single string literal; Postgres treats
+-- adjacent string literals separated by whitespace (including newlines) as one
+-- concatenated literal per SQL standard, so the multi-line shape below is one
+-- string at parse time. `||` would be evaluated as an SQL expression, which is
+-- not allowed in COMMENT context.
 COMMENT ON COLUMN ledger_settlement_outbox.leg_kind IS
     'Independently-postable Ledger leg for one settlement transition. One of: '
-    || 'cash (single-currency customer cash → @Nostro), '
-    || 'cash-base / cash-quote (cross-currency cash via @FX-Suspense, Phase 2), '
-    || 'fee (commission → @Fees-<ccy>). '
-    || 'Combined with (execution_id, to_settlement_status) for idempotent enqueue.';
+    'cash (single-currency customer cash to @Nostro), '
+    'cash-base / cash-quote (cross-currency cash via @FX-Suspense, Phase 2), '
+    'fee (commission to @Fees-<ccy>). '
+    'Combined with (execution_id, to_settlement_status) for idempotent enqueue.';
 
 -- Replace the (execution_id, to_settlement_status) uniqueness with one that includes leg_kind.
 DROP INDEX IF EXISTS uq_ledger_settlement_outbox_execution_status;

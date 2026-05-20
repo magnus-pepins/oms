@@ -97,6 +97,7 @@ oms:
     settlement-outbox-reconciler-batch-size: ${OMS_LEDGER_SETTLEMENT_OUTBOX_RECONCILER_BATCH_SIZE:50}
     settlement-outbox-reconciler-interval-ms: ${OMS_LEDGER_SETTLEMENT_OUTBOX_RECONCILER_INTERVAL_MS:500}
     settlement-outbox-skip-after-attempts: ${OMS_LEDGER_SETTLEMENT_OUTBOX_SKIP_AFTER_ATTEMPTS:10}
+    settlement-outbox-skip-warn-throttle-ms: ${OMS_LEDGER_SETTLEMENT_OUTBOX_SKIP_WARN_THROTTLE_MS:60000}
     settlement-posting-http-path: ${OMS_LEDGER_SETTLEMENT_POSTING_HTTP_PATH:/internal/v0/settlement-outbox}
   marketdata:
     enabled: ${OMS_MARKETDATA_HTTP_ENABLED:false}

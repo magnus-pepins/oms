@@ -358,6 +358,11 @@ public class OmsConfig {
          */
         private int settlementOutboxSkipAfterAttempts = 10;
         /**
+         * Minimum interval between identical settlement-outbox WARN log lines (same reason + indicator).
+         * Suppressed repeats append a count suffix on the first line in each window.
+         */
+        private long settlementOutboxSkipWarnThrottleMs = 60_000L;
+        /**
          * Path on the Ledger HTTP base URL for settlement outbox POST (must start with {@code /} or be relative segment;
          * normalized to a leading slash). Finance must align Ledger route with this value.
          */
@@ -557,6 +562,14 @@ public class OmsConfig {
 
         public void setSettlementOutboxSkipAfterAttempts(int settlementOutboxSkipAfterAttempts) {
             this.settlementOutboxSkipAfterAttempts = Math.max(1, settlementOutboxSkipAfterAttempts);
+        }
+
+        public long getSettlementOutboxSkipWarnThrottleMs() {
+            return settlementOutboxSkipWarnThrottleMs;
+        }
+
+        public void setSettlementOutboxSkipWarnThrottleMs(long settlementOutboxSkipWarnThrottleMs) {
+            this.settlementOutboxSkipWarnThrottleMs = Math.max(1_000L, settlementOutboxSkipWarnThrottleMs);
         }
 
         public String getSettlementPostingHttpPath() {

@@ -43,6 +43,7 @@ public class LedgerSettlementOutboxReconciler {
     private final TransactionTemplate transactionTemplate;
     private final MeterRegistry meterRegistry;
     private final Timer ledgerSettlementOutboxPostTimer;
+    private final SettlementOutboxLogThrottle warnThrottle;
 
     public LedgerSettlementOutboxReconciler(
             LedgerSettlementOutboxRepository outbox,
@@ -60,6 +61,8 @@ public class LedgerSettlementOutboxReconciler {
                         .description("Ledger HTTP settlement outbox post plus markPosted in one DB txn")
                         .publishPercentileHistogram()
                         .register(meterRegistry);
+        this.warnThrottle =
+                new SettlementOutboxLogThrottle(config.getLedger().getSettlementOutboxSkipWarnThrottleMs());
     }
 
     @Scheduled(fixedDelayString = "${oms.ledger.settlement-outbox-reconciler-interval-ms:500}")
@@ -76,6 +79,7 @@ public class LedgerSettlementOutboxReconciler {
             for (LedgerSettlementOutboxRepository.OutboxRow row : rows) {
                 Timer.Sample sample = Timer.start(meterRegistry);
                 Instant attemptAt = Instant.now();
+                warnThrottle.evictIfNeeded();
                 String lastError = null;
                 LedgerSettlementPostingClient.LedgerSettlementPostingException.Reason skipReason = null;
                 try {
@@ -98,12 +102,13 @@ public class LedgerSettlementOutboxReconciler {
                         meterRegistry
                                 .counter(METRIC_SKIPPED, List.of(Tag.of("reason", "unfunded_balance")))
                                 .increment();
-                        log.info(
-                                "ledger settlement outbox skipped id={} executionId={} leg={} reason=unfunded_balance: {}",
+                        logSkipWarn(
+                                "unfunded_balance",
                                 row.id(),
                                 row.executionId(),
                                 row.legKind(),
-                                e.getMessage());
+                                e.getMessage(),
+                                attemptAt);
                     } else if (e.reason()
                             == LedgerSettlementPostingClient.LedgerSettlementPostingException.Reason
                                     .SKIPPED_INDICATOR_NOT_FOUND) {
@@ -113,20 +118,16 @@ public class LedgerSettlementOutboxReconciler {
                         meterRegistry
                                 .counter(METRIC_SKIPPED, List.of(Tag.of("reason", "indicator_not_found")))
                                 .increment();
-                        log.warn(
-                                "ledger settlement outbox skipped id={} executionId={} leg={} reason=indicator_not_found: {}",
+                        logSkipWarn(
+                                "indicator_not_found",
                                 row.id(),
                                 row.executionId(),
                                 row.legKind(),
-                                e.getMessage());
+                                e.getMessage(),
+                                attemptAt);
                     } else {
                         meterRegistry.counter(METRIC_FAILED).increment();
-                        log.warn(
-                                "ledger settlement outbox deliver failed id={} executionId={} leg={}: {}",
-                                row.id(),
-                                row.executionId(),
-                                row.legKind(),
-                                e.getMessage());
+                        logDeliverFailedWarn(row.id(), row.executionId(), row.legKind(), e.getMessage(), attemptAt);
                     }
                 } catch (RuntimeException e) {
                     lastError = e.getMessage();
@@ -164,5 +165,52 @@ public class LedgerSettlementOutboxReconciler {
                 }
             }
         });
+    }
+
+    private void logSkipWarn(
+            String reason,
+            long outboxId,
+            long executionId,
+            String legKind,
+            String message,
+            Instant now) {
+        if (!warnThrottle.shouldEmitFullWarn(reason, message, now)) {
+            return;
+        }
+        String suffix = warnThrottle.suppressedSuffix(reason, message, now);
+        if ("unfunded_balance".equals(reason)) {
+            log.info(
+                    "ledger settlement outbox skipped id={} executionId={} leg={} reason=unfunded_balance: {}{}",
+                    outboxId,
+                    executionId,
+                    legKind,
+                    message,
+                    suffix);
+        } else {
+            log.warn(
+                    "ledger settlement outbox skipped id={} executionId={} leg={} reason={}: {}{}",
+                    outboxId,
+                    executionId,
+                    legKind,
+                    reason,
+                    message,
+                    suffix);
+        }
+    }
+
+    private void logDeliverFailedWarn(
+            long outboxId, long executionId, String legKind, String message, Instant now) {
+        String reason = "deliver_failed";
+        if (!warnThrottle.shouldEmitFullWarn(reason, message, now)) {
+            return;
+        }
+        String suffix = warnThrottle.suppressedSuffix(reason, message, now);
+        log.warn(
+                "ledger settlement outbox deliver failed id={} executionId={} leg={}: {}{}",
+                outboxId,
+                executionId,
+                legKind,
+                message,
+                suffix);
     }
 }

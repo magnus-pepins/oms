@@ -1742,6 +1742,55 @@ public class OmsConfig {
          */
         private boolean stubMidsAllowed = true;
 
+        private final MarkupOverrides markupOverrides = new MarkupOverrides();
+
+        public MarkupOverrides getMarkupOverrides() {
+            return markupOverrides;
+        }
+
+        /**
+         * Tactical markup override knobs (P3.7 + P3.9). The thresholds below
+         * decide when a single trader's override is enough vs. when a second
+         * approver is required. Defaults are deliberately conservative so a
+         * fresh stack is "four-eyes for anything meaningful".
+         */
+        public static class MarkupOverrides {
+            /** Hard cap on additive_bps a single submit can carry (absolute value). */
+            private int maxAbsAdditiveBps = 200;
+            /** Hard cap on (valid_until - valid_from) per submit. */
+            private long maxDurationMs = 6L * 60L * 60L * 1000L;
+            /** Self-approve allowed only when |additive_bps| ≤ this. */
+            private int autoApproveAbsBps = 5;
+            /** Self-approve allowed only when duration ≤ this. */
+            private long autoApproveMaxDurationMs = 30L * 60L * 1000L;
+            /**
+             * When {@code true}, an override row that {@link #autoApproveAbsBps}
+             * and {@link #autoApproveMaxDurationMs} approve is written with
+             * {@code approved_at = created_at, approved_by = created_by}; when
+             * {@code false} (paranoid mode) every row needs a second identity.
+             */
+            private boolean autoApproveEnabled = true;
+
+            public int getMaxAbsAdditiveBps() { return maxAbsAdditiveBps; }
+            public void setMaxAbsAdditiveBps(int v) {
+                this.maxAbsAdditiveBps = Math.max(1, Math.min(5000, v));
+            }
+            public long getMaxDurationMs() { return maxDurationMs; }
+            public void setMaxDurationMs(long v) {
+                this.maxDurationMs = Math.max(60_000L, v);
+            }
+            public int getAutoApproveAbsBps() { return autoApproveAbsBps; }
+            public void setAutoApproveAbsBps(int v) {
+                this.autoApproveAbsBps = Math.max(0, v);
+            }
+            public long getAutoApproveMaxDurationMs() { return autoApproveMaxDurationMs; }
+            public void setAutoApproveMaxDurationMs(long v) {
+                this.autoApproveMaxDurationMs = Math.max(0L, v);
+            }
+            public boolean isAutoApproveEnabled() { return autoApproveEnabled; }
+            public void setAutoApproveEnabled(boolean v) { this.autoApproveEnabled = v; }
+        }
+
         public boolean isModuleEnabled() {
             return moduleEnabled;
         }

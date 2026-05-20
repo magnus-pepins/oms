@@ -1,17 +1,27 @@
 package com.balh.oms.fx;
 
+import com.balh.oms.config.OmsConfig;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.Test;
+import org.springframework.dao.EmptyResultDataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 
 import java.math.BigDecimal;
+import java.sql.Timestamp;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /**
  * Pure-logic tests for {@link FxMarkupOverridesService}. The cache-load SQL
@@ -30,6 +40,16 @@ class FxMarkupOverridesServiceTest {
         return new FxMarkupOverridesService(
                 mock(JdbcTemplate.class),
                 Clock.fixed(T, ZoneOffset.UTC),
+                new OmsConfig(),
+                new SimpleMeterRegistry(),
+                60_000L);
+    }
+
+    private FxMarkupOverridesService newServiceWith(JdbcTemplate jdbc) {
+        return new FxMarkupOverridesService(
+                jdbc,
+                Clock.fixed(T, ZoneOffset.UTC),
+                new OmsConfig(),
                 new SimpleMeterRegistry(),
                 60_000L);
     }
@@ -115,6 +135,197 @@ class FxMarkupOverridesServiceTest {
         svc.primeCache(List.of(row("EURUSD", "BID", "elite", "5.00")));
         // callers may pass any casing; matching is canonical
         assertThat(svc.additiveBpsFor("eurusd", "bid", "ELITE", T)).isEqualByComparingTo("5.00");
+    }
+
+    @Test
+    void shouldAutoApprove_smallBpsShortDurationApproves() {
+        OmsConfig cfg = new OmsConfig();
+        FxMarkupOverridesService.CreateRequest req = new FxMarkupOverridesService.CreateRequest(
+                "EURUSD", "BID", "elite", new BigDecimal("3.00"),
+                null, 5L * 60L * 1000L, "vol spike", "trader-a");
+        assertThat(FxMarkupOverridesService.shouldAutoApprove(req, cfg.getFx().getMarkupOverrides()))
+                .isTrue();
+    }
+
+    @Test
+    void shouldAutoApprove_bpsAboveAutoApproveLimitRequiresFourEyes() {
+        OmsConfig cfg = new OmsConfig();
+        FxMarkupOverridesService.CreateRequest req = new FxMarkupOverridesService.CreateRequest(
+                "EURUSD", "BID", "elite", new BigDecimal("20.00"),
+                null, 5L * 60L * 1000L, "vol spike", "trader-a");
+        assertThat(FxMarkupOverridesService.shouldAutoApprove(req, cfg.getFx().getMarkupOverrides()))
+                .isFalse();
+    }
+
+    @Test
+    void shouldAutoApprove_durationAboveAutoApproveLimitRequiresFourEyes() {
+        OmsConfig cfg = new OmsConfig();
+        FxMarkupOverridesService.CreateRequest req = new FxMarkupOverridesService.CreateRequest(
+                "EURUSD", "BID", "elite", new BigDecimal("3.00"),
+                null, 60L * 60L * 1000L, "long window", "trader-a");
+        assertThat(FxMarkupOverridesService.shouldAutoApprove(req, cfg.getFx().getMarkupOverrides()))
+                .isFalse();
+    }
+
+    @Test
+    void shouldAutoApprove_disabledMeansEveryRowNeedsFourEyes() {
+        OmsConfig cfg = new OmsConfig();
+        cfg.getFx().getMarkupOverrides().setAutoApproveEnabled(false);
+        FxMarkupOverridesService.CreateRequest req = new FxMarkupOverridesService.CreateRequest(
+                "EURUSD", "BID", "elite", new BigDecimal("0.01"),
+                null, 1_000L, "tiny", "trader-a");
+        assertThat(FxMarkupOverridesService.shouldAutoApprove(req, cfg.getFx().getMarkupOverrides()))
+                .isFalse();
+    }
+
+    @Test
+    void shouldAutoApprove_negativeBpsRespectsAbsoluteLimit() {
+        OmsConfig cfg = new OmsConfig();
+        FxMarkupOverridesService.CreateRequest tight = new FxMarkupOverridesService.CreateRequest(
+                "EURUSD", "BID", "elite", new BigDecimal("-3.00"),
+                null, 60_000L, "marketing window", "trader-a");
+        assertThat(FxMarkupOverridesService.shouldAutoApprove(tight, cfg.getFx().getMarkupOverrides()))
+                .isTrue();
+
+        FxMarkupOverridesService.CreateRequest wide = new FxMarkupOverridesService.CreateRequest(
+                "EURUSD", "BID", "elite", new BigDecimal("-20.00"),
+                null, 60_000L, "promo", "trader-a");
+        assertThat(FxMarkupOverridesService.shouldAutoApprove(wide, cfg.getFx().getMarkupOverrides()))
+                .isFalse();
+    }
+
+    @Test
+    void create_rejectsBpsBeyondHardCap() {
+        FxMarkupOverridesService svc = newService();
+        FxMarkupOverridesService.CreateRequest tooBig = new FxMarkupOverridesService.CreateRequest(
+                "EURUSD", "BID", "elite", new BigDecimal("99999.00"),
+                null, 60_000L, "too much", "trader-a");
+        assertThatThrownBy(() -> svc.create(tooBig))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("exceeds cap");
+    }
+
+    @Test
+    void create_rejectsDurationBeyondHardCap() {
+        FxMarkupOverridesService svc = newService();
+        FxMarkupOverridesService.CreateRequest tooLong = new FxMarkupOverridesService.CreateRequest(
+                "EURUSD", "BID", "elite", new BigDecimal("3.00"),
+                null, 365L * 24L * 60L * 60L * 1000L, "forever", "trader-a");
+        assertThatThrownBy(() -> svc.create(tooLong))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("exceeds cap");
+    }
+
+    @Test
+    void create_rejectsBlankReasonOrCreatedBy() {
+        FxMarkupOverridesService svc = newService();
+        FxMarkupOverridesService.CreateRequest blankReason = new FxMarkupOverridesService.CreateRequest(
+                "EURUSD", "BID", "elite", new BigDecimal("3.00"),
+                null, 60_000L, "   ", "trader-a");
+        assertThatThrownBy(() -> svc.create(blankReason))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("reason");
+        FxMarkupOverridesService.CreateRequest blankWho = new FxMarkupOverridesService.CreateRequest(
+                "EURUSD", "BID", "elite", new BigDecimal("3.00"),
+                null, 60_000L, "ok", "");
+        assertThatThrownBy(() -> svc.create(blankWho))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("createdBy");
+    }
+
+    @Test
+    void create_rejectsInvalidSide() {
+        FxMarkupOverridesService svc = newService();
+        FxMarkupOverridesService.CreateRequest bad = new FxMarkupOverridesService.CreateRequest(
+                "EURUSD", "BOTH", "elite", new BigDecimal("3.00"),
+                null, 60_000L, "no", "trader-a");
+        assertThatThrownBy(() -> svc.create(bad))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("side");
+    }
+
+    @Test
+    void approve_rejectsSelfApproval() {
+        JdbcTemplate jdbc = mock(JdbcTemplate.class);
+        FxMarkupOverridesService svc = newServiceWith(jdbc);
+        Map<String, Object> row = new HashMap<>();
+        row.put("created_by", "trader-a");
+        row.put("approved_at", null);
+        row.put("revoked_at", null);
+        when(jdbc.queryForMap(anyString(), eq(42L))).thenReturn(row);
+
+        assertThatThrownBy(() -> svc.approve(42L, "trader-a"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("four-eyes");
+    }
+
+    @Test
+    void approve_rejectsAlreadyApproved() {
+        JdbcTemplate jdbc = mock(JdbcTemplate.class);
+        FxMarkupOverridesService svc = newServiceWith(jdbc);
+        Map<String, Object> row = new HashMap<>();
+        row.put("created_by", "trader-a");
+        row.put("approved_at", Timestamp.from(T));
+        row.put("revoked_at", null);
+        when(jdbc.queryForMap(anyString(), eq(42L))).thenReturn(row);
+
+        assertThatThrownBy(() -> svc.approve(42L, "trader-b"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("already approved");
+    }
+
+    @Test
+    void approve_rejectsRevoked() {
+        JdbcTemplate jdbc = mock(JdbcTemplate.class);
+        FxMarkupOverridesService svc = newServiceWith(jdbc);
+        Map<String, Object> row = new HashMap<>();
+        row.put("created_by", "trader-a");
+        row.put("approved_at", null);
+        row.put("revoked_at", Timestamp.from(T));
+        when(jdbc.queryForMap(anyString(), eq(42L))).thenReturn(row);
+
+        assertThatThrownBy(() -> svc.approve(42L, "trader-b"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("revoked");
+    }
+
+    @Test
+    void approve_rejectsMissingRow() {
+        JdbcTemplate jdbc = mock(JdbcTemplate.class);
+        FxMarkupOverridesService svc = newServiceWith(jdbc);
+        when(jdbc.queryForMap(anyString(), eq(99L)))
+                .thenThrow(new EmptyResultDataAccessException(1));
+
+        assertThatThrownBy(() -> svc.approve(99L, "trader-b"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("not found");
+    }
+
+    @Test
+    void approve_writesApprovalRowAndRefreshes() {
+        JdbcTemplate jdbc = mock(JdbcTemplate.class);
+        FxMarkupOverridesService svc = newServiceWith(jdbc);
+        Map<String, Object> row = new HashMap<>();
+        row.put("created_by", "trader-a");
+        row.put("approved_at", null);
+        row.put("revoked_at", null);
+        when(jdbc.queryForMap(anyString(), eq(7L))).thenReturn(row);
+        when(jdbc.update(anyString(), any(), any(), eq(7L))).thenReturn(1);
+
+        svc.approve(7L, "trader-b");
+        // verifies both that the UPDATE returned 1 (otherwise IllegalStateException would have been thrown)
+        // and that refreshNow ran without complaint
+    }
+
+    @Test
+    void revoke_rejectsAlreadyRevokedOrMissingRow() {
+        JdbcTemplate jdbc = mock(JdbcTemplate.class);
+        FxMarkupOverridesService svc = newServiceWith(jdbc);
+        when(jdbc.update(anyString(), any(), any(), eq(7L))).thenReturn(0);
+
+        assertThatThrownBy(() -> svc.revoke(7L, "trader-b"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("already revoked");
     }
 
     @Test

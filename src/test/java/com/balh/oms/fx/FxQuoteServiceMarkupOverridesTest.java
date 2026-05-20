@@ -44,11 +44,12 @@ class FxQuoteServiceMarkupOverridesTest {
     @BeforeEach
     void setUp() {
         Clock clock = Clock.fixed(NOW, ZoneOffset.UTC);
+        OmsConfig config = new OmsConfig();
         overrides = new FxMarkupOverridesService(
-                mock(JdbcTemplate.class), clock, new SimpleMeterRegistry(), 60_000L);
+                mock(JdbcTemplate.class), clock, config, new SimpleMeterRegistry(), 60_000L);
         overrides.primeCache(List.of());
         service = new FxQuoteService(
-                jdbc, clock, new OmsConfig(), overrides, new SimpleMeterRegistry());
+                jdbc, clock, config, overrides, new SimpleMeterRegistry());
     }
 
     @Test

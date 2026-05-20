@@ -1,5 +1,6 @@
 package com.balh.oms.fx;
 
+import com.balh.oms.config.OmsConfig;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
@@ -44,7 +45,7 @@ class OmsFxCustomerQuotePublisherTest {
     void setUp() {
         clock = Clock.fixed(NOW, ZoneOffset.UTC);
         overrides = new FxMarkupOverridesService(
-                mock(JdbcTemplate.class), clock, new SimpleMeterRegistry(), 60_000L);
+                mock(JdbcTemplate.class), clock, new OmsConfig(), new SimpleMeterRegistry(), 60_000L);
         // Empty override cache by default so the existing math/waterfall
         // tests below see exactly the rate-card numbers.
         overrides.primeCache(List.of());

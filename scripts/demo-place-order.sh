@@ -13,6 +13,7 @@
 #   cxlrej <SYM> [QTY] [PX]         -> Symbol-trigger CXLREJ (was 'reject-prep'/'REJECT'):
 #                                      place a LIMIT against the 'CXLREJ' symbol; subsequent
 #                                      cancel/replace will fail with 35=9 OrderCancelReject.
+#   sell   <SYM> [QTY]              -> SELL MARKET (loopback rejects at venue — bench guard)
 #
 # Required env (typically from ~/.oms-bench.env):
 #   OMS_INTERNAL_API_KEY   - shared secret for /internal/v1/orders
@@ -55,10 +56,17 @@ KEY="demo-${ACTION}-$(date +%s)-$$"
 case "$ACTION" in
   market)
     PRICE_FIELD=""
+    SIDE="BUY"
+    ;;
+  sell)
+    PRICE_FIELD=""
+    SIDE="SELL"
+    echo "NOTE: oms-fix-loopback-acceptor rejects SELL at the venue (ER ET=8). Expect REJECTED, not FILLED." >&2
     ;;
   limit|partial|newrej|cxlrej|reject-prep)
     : "${PX:=150.00}"
     PRICE_FIELD=",\"limitPrice\":\"${PX}\""
+    SIDE="BUY"
     ;;
   *)
     usage
@@ -69,7 +77,7 @@ BODY=$(cat <<JSON
 {
   "accountId": "${ACC}",
   "clientIdempotencyKey": "${KEY}",
-  "side": "BUY",
+  "side": "${SIDE}",
   "instrumentSymbol": "${SYM}",
   "quantity": "${QTY}",
   "timeInForce": "DAY"${PRICE_FIELD}

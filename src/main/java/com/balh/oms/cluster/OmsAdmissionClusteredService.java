@@ -211,6 +211,10 @@ public class OmsAdmissionClusteredService implements ClusteredService {
     private final Counter eventsBackPressureCounterAdmitted;
     private final Timer sessionPublishTimerAccepted;
     private final Counter sessionBackPressureCounterAccepted;
+    private final Counter cancelUnknownOrderCounter;
+
+    /** Log marker when {@link #applyCancelOrder} misses {@code orderIndex} (ingress may return 410). */
+    static final String CANCEL_UNKNOWN_ORDER_LOG_MARKER = "cluster-cancel-unknown-order";
 
     /**
      * Phase 4 slice 4h — drives the {@code oms.cluster.snapshot.age_seconds} freshness gauge that
@@ -326,6 +330,11 @@ public class OmsAdmissionClusteredService implements ClusteredService {
         this.sessionBackPressureCounterAccepted = Counter.builder("oms.cluster.service.session_offer_back_pressure_total")
                 .description("Aeron back-pressure ticks (Thread.yield iterations) per session.offer for AcceptedEvent.")
                 .tag("event_kind", "accepted")
+                .register(meterRegistry);
+        this.cancelUnknownOrderCounter = Counter.builder("oms.cluster.cancel_unknown_order_total")
+                .description(
+                        "CancelOrderCommand applied with no matching orderIndex entry (silent no-op;"
+                                + " typical after journal wipe while Postgres still shows WORKING)")
                 .register(meterRegistry);
     }
 
@@ -803,7 +812,14 @@ public class OmsAdmissionClusteredService implements ClusteredService {
 
         AdmittedOrder order = orderIndex.get(cmd.orderId());
         if (order == null) {
-            // Unknown order — silently ignored. See javadoc.
+            // Unknown order — silently ignored on the wire; ingress observes via Postgres poll → 410.
+            cancelUnknownOrderCounter.increment();
+            log.warn(
+                    "{} orderId={} correlationId={} reason={}",
+                    CANCEL_UNKNOWN_ORDER_LOG_MARKER,
+                    cmd.orderId(),
+                    cmd.correlationId(),
+                    trimCancelReasonForLog(cmd.reason()));
             return;
         }
         if (isTerminal(order.statusCode())) {
@@ -833,6 +849,15 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                 new IdempotencyKey(mutated.accountId(), mutated.clientIdempotencyKey()), mutated);
 
         emitOrderCancelApplied(mutated, clusterTimestampMillis, cmd.reason());
+    }
+
+    private static String trimCancelReasonForLog(String reason) {
+        if (reason == null || reason.isEmpty()) {
+            return "";
+        }
+        final int max = 240;
+        String trimmed = reason.trim();
+        return trimmed.length() > max ? trimmed.substring(0, max) : trimmed;
     }
 
     /**

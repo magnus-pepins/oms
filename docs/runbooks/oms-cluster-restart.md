@@ -87,7 +87,9 @@ Use only when **410** confirms the cluster forgot the order and the order should
    FROM executions WHERE order_id = '<ORDER_UUID>';
    ```
 
-3. **Mark order terminal in Postgres** (preferred — audited HTTP; no cluster event):
+3. **Smoke admin paths** (non-destructive): `scripts/oms-smoke-admin-cancel-paths.sh` from `~/oms` after sourcing `~/.oms-bench.env`. Set `OMS_SMOKE_WORKING_ORDER` / `OMS_SMOKE_TERMINAL_ORDER` for full coverage.
+
+4. **Mark order terminal in Postgres** (preferred — audited HTTP; no cluster event):
 
    ```bash
    KEY=$(grep OMS_INTERNAL_API_KEY ~/.oms-bench.env | cut -d= -f2- | tr -d '"')

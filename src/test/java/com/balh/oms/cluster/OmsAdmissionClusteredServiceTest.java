@@ -10,6 +10,7 @@ import org.agrona.DirectBuffer;
 import org.agrona.ExpandableArrayBuffer;
 import org.agrona.MutableDirectBuffer;
 import org.agrona.concurrent.UnsafeBuffer;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.invocation.InvocationOnMock;
@@ -60,6 +61,7 @@ class OmsAdmissionClusteredServiceTest {
      */
     private static final int COMMAND_BUFFER_BYTES = OmsClusterWireFormat.MAX_COMMAND_BYTES;
 
+    private SimpleMeterRegistry meterRegistry;
     private OmsAdmissionClusteredService service;
     private ClientSession session;
     private List<byte[]> capturedEgress;
@@ -69,7 +71,8 @@ class OmsAdmissionClusteredServiceTest {
 
     @BeforeEach
     void setUp() {
-        service = new OmsAdmissionClusteredService();
+        meterRegistry = new SimpleMeterRegistry();
+        service = new OmsAdmissionClusteredService(meterRegistry);
 
         capturedEgress = new ArrayList<>();
         session = mock(ClientSession.class);
@@ -758,6 +761,8 @@ class OmsAdmissionClusteredServiceTest {
         assertThat(capturedAdmittedEvents).isEmpty();
         assertThat(capturedEgress).isEmpty();
         assertThat(service.admittedOrderCount()).isZero();
+        assertThat(meterRegistry.get("oms.cluster.cancel_unknown_order_total").counter().count())
+                .isEqualTo(1.0);
     }
 
     @Test

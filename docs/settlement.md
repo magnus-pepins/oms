@@ -76,9 +76,9 @@ Optional **`BrokerSettlementConfirmScheduler`** runs when **`OMS_SETTLEMENT_BROK
 
 ## Dev / loopback bench hazards
 
-Pop demo stacks use **`oms-fix-loopback-acceptor`** (`FixRoundTripAcceptorApplication`): **MARKET** orders receive an immediate synthetic **FILL** without checking **`positions`**.
+Pop demo stacks use **`oms-fix-loopback-acceptor`** (`FixRoundTripAcceptorApplication`): **MARKET** **BUY** orders receive an immediate synthetic **FILL** without checking **`positions`**.
 
-- **SELL without a prior BUY/settled position** → settlement may reach **`settling`** then fail on the position leg; OMS marks the execution **`failed`** (poison-pill / explicit position-missing path, 2026-05-20). Prefer BUY-first demos or operator **`mark-failed`** on stray SELL fills.
+- **SELL on loopback (2026-05-20):** the acceptor rejects **`Side=SELL`** at submission with ER **ET=8 REJECTED** (`SELL_REJECT_TEXT` in `FixRoundTripAcceptorApplication`) so fills never reach settlement without a position row. If a SELL fill still appears (non-loopback venue or older jar), OMS marks the execution **`failed`** via the position-missing / poison-pill path — prefer BUY-first demos.
 - **`OMS_SETTLEMENT_AUTO_STEP_SCHEDULER_ENABLED=true`** drives **`executed → settled`** without broker EOD files — must stay **off** when a real broker pipe is authoritative.
 - Unfunded **`inv-{accountId}-USD`** ledger outbox rows tombstone after **`OMS_LEDGER_SETTLEMENT_OUTBOX_SKIP_AFTER_ATTEMPTS`** (default 10) — see [settlement-ledger-posting.md](settlement-ledger-posting.md).
 

@@ -67,6 +67,9 @@ import java.util.concurrent.atomic.AtomicReference;
  *   <tr><td>{@code "NEWREJ"}</td>
  *       <td>broker reject (ER ET=8, OrdStatus=8) — order never books</td>
  *       <td>broker reject (ER ET=8, OrdStatus=8) — order never books</td></tr>
+ *   <tr><td>{@code Side=SELL} (any symbol)</td>
+ *       <td>broker reject (ER ET=8) — loopback has no position book; avoids settlement poison-pill on bench</td>
+ *       <td>same</td></tr>
  *   <tr><td>other (incl. {@code "CXLREJ"})</td>
  *       <td>full fill (ER ET=2)</td>
  *       <td>NEW ack (ER ET=0) — order rests in book, no fill until 35=F/35=G</td></tr>
@@ -136,6 +139,16 @@ public final class FixRoundTripAcceptorApplication implements Application {
      */
     public static final String TRIGGER_SYMBOL_NEWREJ = "NEWREJ";
 
+    /**
+     * Bench-only: loopback acceptor rejects {@code Side=SELL} with ER ET=8 so OMS never records a fill
+     * without a prior BUY/settled position (see {@code docs/settlement.md} dev hazards).
+     */
+    public static final String SELL_REJECT_TEXT =
+            "loopback: sell requires prior buy position (bench only)";
+
+    /** IT hook: incremented when a SELL NOS is rejected at the acceptor (no ER fill sent). */
+    public static final AtomicInteger SELL_REJECTS_SENT = new AtomicInteger(0);
+
     /** IT hook: incremented for each inbound {@code D}; used by stale-outbound IT to assert no send. */
     public static final AtomicInteger NOS_RECEIVED = new AtomicInteger(0);
 
@@ -157,6 +170,7 @@ public final class FixRoundTripAcceptorApplication implements Application {
         CANCEL_REQUESTS_RECEIVED.set(0);
         REPLACE_REQUESTS_RECEIVED.set(0);
         CANCEL_REJECTS_SENT.set(0);
+        SELL_REJECTS_SENT.set(0);
     }
 
     @Override
@@ -215,6 +229,7 @@ public final class FixRoundTripAcceptorApplication implements Application {
         // OMS always sets tag 40; default to MARKET defensively for older slice-4 tests that
         // build NOS by hand without OrdType.
         char ordType = message.isSetField(OrdType.FIELD) ? message.getChar(OrdType.FIELD) : OrdType.MARKET;
+        char side = message.isSetField(Side.FIELD) ? message.getChar(Side.FIELD) : Side.BUY;
 
         if (TRIGGER_SYMBOL_NEWREJ.equals(sym)) {
             // Broker reject on submission. ExecType=8 REJECTED, OrdStatus=8 REJECTED. No fill,
@@ -222,7 +237,7 @@ public final class FixRoundTripAcceptorApplication implements Application {
             // CumQty=0}. The cluster maps ER ET=8 → EXEC_TYPE_VENUE_REJECT → STATUS_REJECTED.
             // Reusing {@link #sendExecutionReport} which already wires the FIX fields; ExecType
             // and OrdStatus are passed as their FIX char codes (REJECTED is '8' for both).
-            sendExecutionReport(sessionId, clOrdId, sym, px,
+            sendExecutionReport(sessionId, clOrdId, sym, px, side,
                     /* lastQty   = */ "0",
                     /* cumQty    = */ "0",
                     /* leavesQty = */ "0",
@@ -236,19 +251,36 @@ public final class FixRoundTripAcceptorApplication implements Application {
             return;
         }
 
+        if (side == Side.SELL) {
+            SELL_REJECTS_SENT.incrementAndGet();
+            sendExecutionReport(sessionId, clOrdId, sym, px, side,
+                    /* lastQty   = */ "0",
+                    /* cumQty    = */ "0",
+                    /* leavesQty = */ "0",
+                    ExecType.REJECTED,
+                    OrdStatus.REJECTED,
+                    /* execIdSuffix = */ "sellrej");
+            log.warn(
+                    "FIX IT acceptor rejected SELL NOS clOrdId={} sym={} — {}",
+                    clOrdId,
+                    sym,
+                    SELL_REJECT_TEXT);
+            return;
+        }
+
         if (TRIGGER_SYMBOL_PARTIAL.equals(sym)) {
             // Two ERs sharing the same ClOrdID. ExecID is distinct per ER (OMS dedupes on
             // (orderId, venueExecRef); same ExecID would collapse the second ER on the wire).
             BigDecimal halfQty = orderQty.divide(BigDecimal.valueOf(2), 0, RoundingMode.DOWN);
             BigDecimal remaining = orderQty.subtract(halfQty);
-            sendExecutionReport(sessionId, clOrdId, sym, px,
+            sendExecutionReport(sessionId, clOrdId, sym, px, side,
                     /* lastQty   = */ halfQty.toPlainString(),
                     /* cumQty    = */ halfQty.toPlainString(),
                     /* leavesQty = */ remaining.toPlainString(),
                     ExecType.PARTIAL_FILL,
                     OrdStatus.PARTIALLY_FILLED,
                     /* execIdSuffix = */ "p1");
-            sendExecutionReport(sessionId, clOrdId, sym, px,
+            sendExecutionReport(sessionId, clOrdId, sym, px, side,
                     /* lastQty   = */ remaining.toPlainString(),
                     /* cumQty    = */ orderQty.toPlainString(),
                     /* leavesQty = */ "0",
@@ -264,7 +296,7 @@ public final class FixRoundTripAcceptorApplication implements Application {
             // explicit venue ack and walks status to WORKING. No fill is sent: the order sits
             // open at the (synthetic) venue until a 35=F or 35=G arrives. This is the standard
             // behaviour real venues exhibit when a limit price doesn't cross the inside market.
-            sendExecutionReport(sessionId, clOrdId, sym, px,
+            sendExecutionReport(sessionId, clOrdId, sym, px, side,
                     /* lastQty   = */ "0",
                     /* cumQty    = */ "0",
                     /* leavesQty = */ orderQty.toPlainString(),
@@ -279,7 +311,7 @@ public final class FixRoundTripAcceptorApplication implements Application {
             return;
         }
 
-        sendExecutionReport(sessionId, clOrdId, sym, px,
+        sendExecutionReport(sessionId, clOrdId, sym, px, side,
                 /* lastQty   = */ orderQty.toPlainString(),
                 /* cumQty    = */ orderQty.toPlainString(),
                 /* leavesQty = */ "0",
@@ -313,7 +345,7 @@ public final class FixRoundTripAcceptorApplication implements Application {
         // Cancel ack: ET=4 CANCELED, OrdStatus=4. CumQty echoes back from the original (the
         // broker would track it; for the loopback we just send 0 — the cluster's state machine
         // is the authority on cumQty already).
-        sendExecutionReport(sessionId, origClOrdId, sym, "0",
+        sendExecutionReport(sessionId, origClOrdId, sym, "0", Side.BUY,
                 /* lastQty   = */ "0",
                 /* cumQty    = */ "0",
                 /* leavesQty = */ "0",
@@ -349,7 +381,7 @@ public final class FixRoundTripAcceptorApplication implements Application {
         // the new qty/price). LeavesQty = new OrderQty, CumQty = 0. OMS's cluster state machine
         // applies the new qty/price + bumps version. Subsequent fills land on the replaced
         // contract.
-        sendExecutionReport(sessionId, origClOrdId, sym, newPx,
+        sendExecutionReport(sessionId, origClOrdId, sym, newPx, Side.BUY,
                 /* lastQty   = */ "0",
                 /* cumQty    = */ "0",
                 /* leavesQty = */ newOrderQty,
@@ -370,13 +402,14 @@ public final class FixRoundTripAcceptorApplication implements Application {
             String clOrdId,
             String sym,
             String px,
+            char side,
             String lastQty,
             String cumQty,
             String leavesQty,
             char execType,
             char ordStatus,
             String execIdSuffix) {
-        sendExecutionReport(sessionId, clOrdId, sym, px, lastQty, cumQty, leavesQty,
+        sendExecutionReport(sessionId, clOrdId, sym, px, side, lastQty, cumQty, leavesQty,
                 execType, ordStatus, execIdSuffix, /* overrideOrderQty = */ null);
     }
 
@@ -385,6 +418,7 @@ public final class FixRoundTripAcceptorApplication implements Application {
             String clOrdId,
             String sym,
             String px,
+            char side,
             String lastQty,
             String cumQty,
             String leavesQty,
@@ -401,10 +435,8 @@ public final class FixRoundTripAcceptorApplication implements Application {
         er.set(new Symbol(sym));
         er.set(new ExecType(execType));
         er.set(new OrdStatus(ordStatus));
-        // Side is required by FIX 4.4 schema even on replies; we echo BUY because every demo
-        // path is BUY-side. Production-grade acceptors would echo the original NOS's Side from
-        // an in-memory order book.
-        er.set(new Side(Side.BUY));
+        // Side is required by FIX 4.4 schema; echo the inbound NOS side (bench rejects SELL at submit).
+        er.set(new Side(side));
         er.setString(OrderQty.FIELD, overrideOrderQty != null ? overrideOrderQty : addOrZero(cumQty, leavesQty));
         er.setString(LastQty.FIELD, lastQty);
         er.setString(LeavesQty.FIELD, leavesQty);

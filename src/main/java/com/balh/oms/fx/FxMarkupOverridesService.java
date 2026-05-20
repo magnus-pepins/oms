@@ -8,17 +8,12 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.jdbc.core.PreparedStatementCreator;
-import org.springframework.jdbc.support.GeneratedKeyHolder;
-import org.springframework.jdbc.support.KeyHolder;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
-import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.sql.Statement;
 import java.sql.Timestamp;
 import java.time.Clock;
 import java.time.Duration;
@@ -239,40 +234,30 @@ public class FxMarkupOverridesService {
         String reason = req.reason().trim();
         String createdBy = req.createdBy().trim();
 
+        // Postgres' RETURN_GENERATED_KEYS path hands back the whole inserted
+        // row (every column the driver knows about), which trips
+        // KeyHolder.getKey() with "multiple keys" since it can't pick the
+        // PK on its own. Use RETURNING id + queryForObject to keep the
+        // result narrow and deterministic across DBs.
         String sql = "INSERT INTO fx_pair_markup_overrides "
                 + "(pair, side, tier, additive_bps, reason, valid_from, valid_until, "
                 + " created_by, created_at, approved_by, approved_at) "
-                + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                + "RETURNING id";
 
-        KeyHolder kh = new GeneratedKeyHolder();
+        long id;
         try {
-            jdbc.update((PreparedStatementCreator) conn -> {
-                PreparedStatement ps = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS);
-                ps.setString(1, pair);
-                ps.setString(2, side);
-                ps.setString(3, tier);
-                ps.setBigDecimal(4, req.additiveBps());
-                ps.setString(5, reason);
-                ps.setTimestamp(6, Timestamp.from(validFrom));
-                ps.setTimestamp(7, Timestamp.from(validUntil));
-                ps.setString(8, createdBy);
-                ps.setTimestamp(9, Timestamp.from(now));
-                if (autoApprove) {
-                    ps.setString(10, createdBy);
-                    ps.setTimestamp(11, Timestamp.from(now));
-                } else {
-                    ps.setNull(10, java.sql.Types.VARCHAR);
-                    ps.setNull(11, java.sql.Types.TIMESTAMP_WITH_TIMEZONE);
-                }
-                return ps;
-            }, kh);
+            Long idBoxed = jdbc.queryForObject(sql, Long.class,
+                    pair, side, tier, req.additiveBps(), reason,
+                    Timestamp.from(validFrom), Timestamp.from(validUntil),
+                    createdBy, Timestamp.from(now),
+                    autoApprove ? createdBy : null,
+                    autoApprove ? Timestamp.from(now) : null);
+            id = idBoxed == null ? -1L : idBoxed;
         } catch (DataAccessException e) {
             createRejectCounter.increment();
             throw new IllegalArgumentException("insert failed: " + e.getMostSpecificCause().getMessage(), e);
         }
-
-        Number idNum = kh.getKey();
-        long id = idNum == null ? -1L : idNum.longValue();
         createOkCounter.increment();
         // Approved rows become live immediately; pending ones still need an approve()
         // call later but the refresh is harmless either way.

@@ -93,6 +93,7 @@ public class OmsFxCustomerQuotePublisher {
     private final JdbcTemplate jdbc;
     private final Clock clock;
     private final ObjectMapper mapper;
+    private final FxMarkupOverridesService overrides;
     private final List<String> tiers;
     private final long publishTickPeriodMs;
     private final long maxMidAgeMs;
@@ -124,6 +125,7 @@ public class OmsFxCustomerQuotePublisher {
             JdbcTemplate jdbc,
             Clock clock,
             ObjectMapper mapper,
+            FxMarkupOverridesService overrides,
             MeterRegistry registry,
             @Value("${oms.fx.customer-quote-publisher.broker-url}") String brokerUrl,
             @Value("${oms.fx.customer-quote-publisher.username:}") String username,
@@ -140,6 +142,7 @@ public class OmsFxCustomerQuotePublisher {
         this.jdbc = jdbc;
         this.clock = clock;
         this.mapper = mapper;
+        this.overrides = overrides;
         this.brokerUrl = brokerUrl;
         this.username = username == null ? "" : username;
         this.password = password == null ? "" : password;
@@ -341,12 +344,36 @@ public class OmsFxCustomerQuotePublisher {
     }
 
     /**
-     * Looks up the markup for (pair, side, tier) with a default fallback —
-     * mirrors {@link FxQuoteService#lookupMarkupBps(String, String, String)}
-     * so the streaming quote and the HTTP /quote endpoint agree exactly on
+     * Looks up the effective markup for (pair, side, tier) — the rate-card
+     * value from {@link #markupCache} (with a {@code default} fallback)
+     * plus any active tactical overrides from
+     * {@link FxMarkupOverridesService}. Mirrors
+     * {@link FxQuoteService#lookupMarkupBps(String, String, String)} so
+     * the streaming quote and the HTTP /quote endpoint agree exactly on
      * the rate the customer sees vs. the rate locked at submit.
+     *
+     * <p>Override matching uses the <em>requested</em> tier, not the
+     * tier the base markup ultimately resolved to. A widening row on
+     * tier=elite applies to an elite request even when its base falls
+     * back to the tier=default row, because the operator's intent
+     * ("widen elite") is tier-scoped not row-scoped.
+     *
+     * <p>Returns {@code null} only when there is no base row at all —
+     * an override on a pair with no rate-card cannot conjure a quote
+     * out of thin air. Effective bps clamps to zero when an additive
+     * override would push the value negative, matching the
+     * {@code fx_pair_markups.markup_bps >= 0} invariant.
      */
     BigDecimal lookupMarkup(String pair, String side, String tier) {
+        BigDecimal base = lookupBaseMarkup(pair, side, tier);
+        if (base == null) return null;
+        BigDecimal additive = overrides.additiveBpsFor(pair, side, tier, clock.instant());
+        if (additive.signum() == 0) return base;
+        BigDecimal effective = base.add(additive);
+        return effective.signum() < 0 ? BigDecimal.ZERO : effective;
+    }
+
+    private BigDecimal lookupBaseMarkup(String pair, String side, String tier) {
         MarkupKey k = new MarkupKey(pair, tier, side);
         BigDecimal v = markupCache.get(k);
         if (v != null) return v;
@@ -396,7 +423,8 @@ public class OmsFxCustomerQuotePublisher {
                 markupCacheLoadedAtMs,
                 client != null && client.isConnected(),
                 publishTickPeriodMs,
-                maxMidAgeMs);
+                maxMidAgeMs,
+                overrides.status());
     }
 
     /** Composite key for the (pair, tier, side) markup lookup. */
@@ -415,6 +443,7 @@ public class OmsFxCustomerQuotePublisher {
             long markupCacheLoadedAtMs,
             boolean mqttConnected,
             long publishTickPeriodMs,
-            long maxMidAgeMs
+            long maxMidAgeMs,
+            FxMarkupOverridesService.OverridesStatus overrides
     ) {}
 }

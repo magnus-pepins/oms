@@ -100,6 +100,13 @@ public class FxQuotesController {
         body.put("mqttConnected", s.mqttConnected());
         body.put("publishTickPeriodMs", s.publishTickPeriodMs());
         body.put("maxMidAgeMs", s.maxMidAgeMs());
+        FxMarkupOverridesService.OverridesStatus o = s.overrides();
+        Map<String, Object> overridesBody = new LinkedHashMap<>();
+        overridesBody.put("cachedRowCount", o.cachedRowCount());
+        overridesBody.put("activeCount", o.activeCount());
+        overridesBody.put("nextExpiryEpochMs", o.nextExpiryEpochMs());
+        overridesBody.put("cacheLoadedAtMs", o.cacheLoadedAtMs());
+        body.put("overrides", overridesBody);
         return ResponseEntity.ok(body);
     }
 

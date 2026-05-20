@@ -128,6 +128,7 @@ public class FxQuoteService {
     private final JdbcTemplate jdbc;
     private final Clock clock;
     private final OmsConfig omsConfig;
+    private final FxMarkupOverridesService overrides;
     private final Counter quotesCounter;
     private final Counter quoteMissesCounter;
     private final Counter midFromSubscriberCounter;
@@ -143,10 +144,12 @@ public class FxQuoteService {
     @Autowired(required = false)
     private OmsFxMidSubscriber liveMidSubscriber;
 
-    public FxQuoteService(JdbcTemplate jdbc, Clock clock, OmsConfig omsConfig, MeterRegistry registry) {
+    public FxQuoteService(JdbcTemplate jdbc, Clock clock, OmsConfig omsConfig,
+                          FxMarkupOverridesService overrides, MeterRegistry registry) {
         this.jdbc = jdbc;
         this.clock = clock;
         this.omsConfig = omsConfig;
+        this.overrides = overrides;
         this.quotesCounter = Counter.builder("oms.fx.quote.issued_total")
                 .description("FX quotes issued by FxQuoteService")
                 .register(registry);
@@ -313,10 +316,26 @@ public class FxQuoteService {
     }
 
     /**
-     * @return the resolved markup in bps for (pair, side, tier), falling back to tier='default' when
-     *         the requested tier has no row. Throws if both queries miss.
+     * @return the effective markup in bps for (pair, side, tier) — the
+     *         rate-card row from {@code fx_pair_markups} (with the
+     *         tier=default waterfall) plus any active tactical overrides
+     *         from {@link FxMarkupOverridesService}. Mirrors
+     *         {@link OmsFxCustomerQuotePublisher#lookupMarkup} so the
+     *         streamed display rate and the locked submit-time rate
+     *         compute the same number.
+     * @throws IllegalStateException when neither the tier row nor the
+     *         default row exists. Overrides do not invent a quote on a
+     *         pair without a rate-card.
      */
-    private BigDecimal lookupMarkupBps(String pair, String side, String tier) {
+    BigDecimal lookupMarkupBps(String pair, String side, String tier) {
+        BigDecimal base = lookupBaseMarkupBps(pair, side, tier);
+        BigDecimal additive = overrides.additiveBpsFor(pair, side, tier, clock.instant());
+        if (additive.signum() == 0) return base;
+        BigDecimal effective = base.add(additive);
+        return effective.signum() < 0 ? BigDecimal.ZERO : effective;
+    }
+
+    private BigDecimal lookupBaseMarkupBps(String pair, String side, String tier) {
         String sql = "SELECT markup_bps FROM fx_pair_markups "
                 + "WHERE pair = ? AND side = ? AND tier = ? AND is_active = TRUE LIMIT 1";
         try {

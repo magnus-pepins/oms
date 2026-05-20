@@ -205,6 +205,12 @@ oms:
     # RISK_FX_QUOTE_EXPIRED (HTTP 422) on a miss/expired hit. Off by default —
     # single-currency orders carry no quoteId, so this is a no-op for them.
     accept-use-quoter-enabled: ${OMS_FX_ACCEPT_USE_QUOTER_ENABLED:false}
+    # §8.4 cash-hold integrity tolerance for the recall guard. After a
+    # successful recall, OMS recomputes expected_cash from the locked rate
+    # and rejects when the BFF-supplied cashHoldAmount drifts by more than
+    # this many basis points (5 bps = 0.05% — absorbs BFF float rounding,
+    # flags tampering or BFF bugs).
+    accept-quote-tolerance-bps: ${OMS_FX_ACCEPT_QUOTE_TOLERANCE_BPS:5}
     mid-subscriber:
       enabled: ${OMS_FX_MID_SUBSCRIBER_ENABLED:false}
       broker-url: ${EMQX_MQTT_BROKER_URL:tcp://127.0.0.1:1883}

@@ -484,6 +484,53 @@ public class OrderIngressService {
                     RejectCode.RISK_FX_QUOTE_EXPIRED, "fx_quote_expired",
                     "FX quote " + req.fxQuoteId() + " missing or expired");
         }
+        // §8.4 integrity check (defense-in-depth). When the BFF supplied a
+        // cashHoldAmount paired with the quoteId, recompute the expected
+        // source-ccy amount from the recalled rate and reject if the
+        // BFF-supplied drifts by more than the configured tolerance. This
+        // closes the "trusted BFF sends quoteId=valid + cashHoldAmount=1.00"
+        // class of bug/tampering. SELL orders carry no cashHoldAmount
+        // (share reservation, not funds hold) and short-circuit here.
+        if (req.cashHoldAmount() != null) {
+            BigDecimal rate = (req.side() == Side.BUY) ? cached.bid() : cached.ask();
+            if (rate == null || rate.signum() <= 0
+                    || req.quantity() == null || req.limitPrice() == null) {
+                // Quote shape is broken (shouldn't happen — FxQuoteService
+                // always populates bid+ask), but reject defensively rather
+                // than silently accepting an unverifiable hold.
+                throw new FxQuoteLockException(HttpStatus.UNPROCESSABLE_ENTITY,
+                        RejectCode.RISK_FX_QUOTE_EXPIRED, "fx_quote_unverifiable",
+                        "FX quote " + req.fxQuoteId() + " has no usable rate for "
+                                + req.side() + " integrity check");
+            }
+            BigDecimal expected = req.quantity()
+                    .multiply(req.limitPrice())
+                    .divide(rate, 10, java.math.RoundingMode.HALF_UP);
+            BigDecimal provided = req.cashHoldAmount();
+            BigDecimal drift = expected.subtract(provided).abs();
+            // tolerance = expected × bps / 10_000. Computed at high precision
+            // then rounded down so the check is strictly tighter than the
+            // operator's configured bound (better false-reject than false-pass
+            // when the operator has explicitly tightened the bound).
+            int bps = config.getFx().getAcceptQuoteToleranceBps();
+            BigDecimal tolerance = expected
+                    .multiply(BigDecimal.valueOf(bps))
+                    .divide(BigDecimal.valueOf(10_000), 10, java.math.RoundingMode.DOWN);
+            if (drift.compareTo(tolerance) > 0) {
+                log.warn("[fx-accept-lock] cashHoldAmount integrity fail orderId={} side={} "
+                                + "quoteId={} pair={} rate={} expected={} provided={} drift={} tolerance={} bps={}",
+                        /* orderId not yet minted; use idem key */ req.clientIdempotencyKey(),
+                        req.side(), req.fxQuoteId(), cached.pair(),
+                        rate.toPlainString(), expected.toPlainString(),
+                        provided.toPlainString(), drift.toPlainString(),
+                        tolerance.toPlainString(), bps);
+                throw new FxQuoteLockException(HttpStatus.UNPROCESSABLE_ENTITY,
+                        RejectCode.RISK_FX_QUOTE_EXPIRED, "fx_cash_amount_mismatch",
+                        "cashHoldAmount " + provided.toPlainString()
+                                + " drifts from locked rate (expected " + expected.toPlainString()
+                                + " ± " + tolerance.toPlainString() + " at " + bps + " bps)");
+            }
+        }
     }
 
     private void maybePlaceBuyLedgerInflightHold(Order order, CreateOrderRequest req) {

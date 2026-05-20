@@ -262,6 +262,45 @@ public class FxQuoteService {
     private record MidWithSource(BigDecimal mid, String source) {}
 
     /**
+     * Read-only listing of the active {@code fx_pair_markups} grid for
+     * operator surfaces (beard-admin FX Markups page). Returns one row per
+     * (pair, side, tier) tuple with the markup in bps + description, ordered
+     * by pair / tier / side for stable rendering. Filters are inclusive (all
+     * null/blank = no filter); the description column is the operator's
+     * intent string, useful for audit trails.
+     *
+     * <p>Read-only by design: writes still go through SQL today (operators
+     * use Flyway migrations + ad-hoc {@code UPDATE} from the OMS DB shell).
+     * A v1.5 follow-up can wrap this with a four-eyes editor flow once we
+     * have the audit trail story decided. See plans/oms-multi-currency-invest-accounts.md
+     * §8.9 "deferred to v1.5".
+     *
+     * @param pairFilter optional pair to filter on (case-insensitive), or null for all
+     * @param tierFilter optional tier to filter on (case-insensitive), or null for all
+     */
+    public List<Map<String, Object>> listMarkups(String pairFilter, String tierFilter) {
+        StringBuilder sql = new StringBuilder(
+                "SELECT pair, side, tier, markup_bps, description, is_active, updated_at "
+                        + "FROM fx_pair_markups WHERE is_active = TRUE");
+        java.util.List<Object> args = new java.util.ArrayList<>();
+        if (pairFilter != null && !pairFilter.isBlank()) {
+            sql.append(" AND UPPER(pair) = ?");
+            args.add(pairFilter.toUpperCase());
+        }
+        if (tierFilter != null && !tierFilter.isBlank()) {
+            sql.append(" AND LOWER(tier) = ?");
+            args.add(tierFilter.toLowerCase());
+        }
+        sql.append(" ORDER BY pair ASC, tier ASC, side ASC");
+        try {
+            return jdbc.queryForList(sql.toString(), args.toArray());
+        } catch (DataAccessException e) {
+            log.warn("[fx-quote] listMarkups failed pair={} tier={}", pairFilter, tierFilter, e);
+            return List.of();
+        }
+    }
+
+    /**
      * @return the resolved markup in bps for (pair, side, tier), falling back to tier='default' when
      *         the requested tier has no row. Throws if both queries miss.
      */

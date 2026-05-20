@@ -1684,6 +1684,22 @@ public class OmsConfig {
          * and so this is also a no-op for them.
          */
         private boolean acceptUseQuoterEnabled = false;
+        /**
+         * §8.4 cash-hold integrity tolerance, expressed in basis points of
+         * the expected source-ccy amount. After a successful quote recall,
+         * the accept path recomputes {@code expected_cash = (qty *
+         * limitPrice) / lockedRate(side)} and rejects with
+         * {@code RISK_FX_QUOTE_EXPIRED} when {@code abs(provided - expected)
+         * / expected > tolerance_bps / 10_000}.
+         *
+         * <p>Default 5 bps (0.05%) absorbs the TypeScript Number → Java
+         * BigDecimal rounding drift the BFF picks up when computing
+         * {@code (qty * limitPrice) / rate} at six-decimal precision
+         * (FX_CASH_AMOUNT_SCALE = 1e-6), while still flagging a BFF that
+         * sends a hold ≥0.05% off the locked rate (= operator-visible
+         * tampering or a bug worth catching).
+         */
+        private int acceptQuoteToleranceBps = 5;
 
         public boolean isModuleEnabled() {
             return moduleEnabled;
@@ -1773,6 +1789,18 @@ public class OmsConfig {
 
         public void setAcceptUseQuoterEnabled(boolean acceptUseQuoterEnabled) {
             this.acceptUseQuoterEnabled = acceptUseQuoterEnabled;
+        }
+
+        public int getAcceptQuoteToleranceBps() {
+            return acceptQuoteToleranceBps;
+        }
+
+        public void setAcceptQuoteToleranceBps(int acceptQuoteToleranceBps) {
+            // Clamp into a sane range so a fat-fingered config can't disable
+            // the check entirely (<=0 would pass everything) nor reject the
+            // entire flow (>10000 = >100% would still reject everything but
+            // semantically meaningless). 5000 bps = 50% is the upper bound.
+            this.acceptQuoteToleranceBps = Math.min(5000, Math.max(0, acceptQuoteToleranceBps));
         }
     }
 

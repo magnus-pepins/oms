@@ -7,6 +7,7 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.time.Clock;
@@ -68,6 +69,33 @@ public class FxQuotesController {
     }
 
     public record QuoteRequest(String pair, String tier) {}
+
+    /**
+     * Read-only list of the active {@code fx_pair_markups} grid powering the
+     * beard-admin FX Markups operator page. Filters (pair, tier) are
+     * optional and case-insensitive; both null returns the full grid. The
+     * response is a flat array of rows so the UI can group on the client
+     * side. See {@link FxQuoteService#listMarkups} for the SQL.
+     *
+     * <p>Read-only for v1 — the surface is intentionally a view-only audit
+     * pane. Writes still go through Flyway / SQL; an editor follow-up is
+     * planned for v1.5 (plans/oms-multi-currency-invest-accounts.md §8.9).
+     */
+    @GetMapping("/markups")
+    public ResponseEntity<Map<String, Object>> markups(
+            @RequestParam(value = "pair", required = false) String pair,
+            @RequestParam(value = "tier", required = false) String tier) {
+        var fx = omsConfig.getFx();
+        if (!fx.isModuleEnabled()) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "fx_module_disabled"));
+        }
+        List<Map<String, Object>> rows = quoteService.listMarkups(pair, tier);
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("asOf", clock.instant().toString());
+        body.put("count", rows.size());
+        body.put("rows", rows);
+        return ResponseEntity.ok(body);
+    }
 
     @PostMapping("/quote")
     public ResponseEntity<Map<String, Object>> quote(@RequestBody QuoteRequest body) {

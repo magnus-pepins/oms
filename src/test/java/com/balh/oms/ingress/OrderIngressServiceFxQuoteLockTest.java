@@ -156,7 +156,10 @@ class OrderIngressServiceFxQuoteLockTest {
                 "q_ok", "EURUSD", "basic",
                 new BigDecimal("1.0820"), new BigDecimal("1.0880"), new BigDecimal("1.0850"),
                 now, now.plusSeconds(30)));
-        CreateOrderRequest req = buildRequest("q_ok", new BigDecimal("92.17"));
+        // No cashHoldAmount on this request → integrity check short-circuits.
+        // limitPrice is null (MARKET BUY without ref price) so the request
+        // doesn't trigger any inflight-hold path either.
+        CreateOrderRequest req = buildRequest("q_ok", /* cashHoldAmount = */ null);
 
         OrderIngressService.IngressResult res = service.persistAccepted(req);
 
@@ -164,6 +167,77 @@ class OrderIngressServiceFxQuoteLockTest {
         assertThat(res.order().instrumentSymbol()).isEqualTo("AAPL");
         verify(fxSvc, times(1)).recall("q_ok");
         verify(cluster, times(1)).submitAcceptOrder(any(AcceptOrderCommand.class), any(Duration.class));
+    }
+
+    @Test
+    void flagOn_recallHit_integrityCheckPasses_withinTolerance() throws Exception {
+        // qty=10 px=100 USD / bid=1.0820 EURUSD = 924.21441… EUR (10 dp)
+        // Provide 924.214 (off by 0.0004 EUR ≈ 0.04 bps) → within default 5 bps tolerance.
+        config.getFx().setAcceptUseQuoterEnabled(true);
+        Instant now = Instant.now();
+        when(fxSvc.recall("q_ok")).thenReturn(new FxQuoteService.CachedQuote(
+                "q_ok", "EURUSD", "basic",
+                new BigDecimal("1.0820"), new BigDecimal("1.0880"), new BigDecimal("1.0850"),
+                now, now.plusSeconds(30)));
+        CreateOrderRequest req = buildRequestFull("q_ok",
+                /* limitPrice = */ new BigDecimal("100"),
+                /* cashHoldAmount = */ new BigDecimal("924.214"));
+
+        OrderIngressService.IngressResult res = service.persistAccepted(req);
+
+        assertThat(res.created()).isTrue();
+        verify(fxSvc, times(1)).recall("q_ok");
+    }
+
+    @Test
+    void flagOn_recallHit_integrityCheckFails_outsideTolerance() {
+        // qty=10 px=100 / bid=1.0820 = 924.21441… expected.
+        // Provide 100 EUR (BFF bug or tampering) → drift ≈ 89% → reject.
+        config.getFx().setAcceptUseQuoterEnabled(true);
+        Instant now = Instant.now();
+        when(fxSvc.recall("q_tamper")).thenReturn(new FxQuoteService.CachedQuote(
+                "q_tamper", "EURUSD", "basic",
+                new BigDecimal("1.0820"), new BigDecimal("1.0880"), new BigDecimal("1.0850"),
+                now, now.plusSeconds(30)));
+        CreateOrderRequest req = buildRequestFull("q_tamper",
+                new BigDecimal("100"),
+                /* cashHoldAmount = */ new BigDecimal("100.00"));
+
+        assertThatThrownBy(() -> service.persistAccepted(req))
+                .isInstanceOfSatisfying(FxQuoteLockException.class, ex -> {
+                    assertThat(ex.getHttpStatus()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
+                    assertThat(ex.getRejectCode()).isEqualTo(RejectCode.RISK_FX_QUOTE_EXPIRED);
+                    assertThat(ex.getErrorCode()).isEqualTo("fx_cash_amount_mismatch");
+                    assertThat(ex.getMessage()).contains("drifts");
+                });
+    }
+
+    @Test
+    void flagOn_integrityCheck_usesAskForSell() {
+        // SELL with cashHoldAmount triggers the integrity check using the ASK
+        // side (= what customer would actually receive in EUR proceeds at
+        // settlement). qty=10 px=100 / ask=1.0880 = 919.117647 EUR expected;
+        // provide 100 → drift ≈ 89% → reject with fx_cash_amount_mismatch.
+        // (In practice SELL trades won't carry cashHoldAmount — share
+        // reservation, not funds hold — but the math + reject still apply
+        // if a BFF mis-wires the side.)
+        config.getFx().setAcceptUseQuoterEnabled(true);
+        Instant now = Instant.now();
+        when(fxSvc.recall("q_sell")).thenReturn(new FxQuoteService.CachedQuote(
+                "q_sell", "EURUSD", "basic",
+                new BigDecimal("1.0820"), new BigDecimal("1.0880"), new BigDecimal("1.0850"),
+                now, now.plusSeconds(30)));
+        CreateOrderRequest req = new CreateOrderRequest(
+                UUID.fromString("00000000-0000-4000-8000-000000000111"),
+                "idem-sell-tampered", Side.SELL, "AAPL", new BigDecimal("10"),
+                new BigDecimal("100"), "DAY", "LIMIT", null, null,
+                "q_sell", new BigDecimal("100.00"));
+
+        assertThatThrownBy(() -> service.persistAccepted(req))
+                .isInstanceOfSatisfying(FxQuoteLockException.class, ex -> {
+                    assertThat(ex.getErrorCode()).isEqualTo("fx_cash_amount_mismatch");
+                    assertThat(ex.getMessage()).contains("919.117");
+                });
     }
 
     @Test
@@ -236,6 +310,28 @@ class OrderIngressServiceFxQuoteLockTest {
                 /* limitPrice = */ null,
                 "DAY",
                 /* orderType = */ null,
+                /* ledgerBalanceId = */ null,
+                /* ledgerIdentityId = */ null,
+                fxQuoteId,
+                cashHoldAmount);
+    }
+
+    /**
+     * Variant with limitPrice populated so the §8.4 integrity check has the
+     * notional (qty × limitPrice) it needs to recompute expected_cash off the
+     * recalled rate.
+     */
+    private static CreateOrderRequest buildRequestFull(
+            String fxQuoteId, BigDecimal limitPrice, BigDecimal cashHoldAmount) {
+        return new CreateOrderRequest(
+                UUID.fromString("00000000-0000-4000-8000-000000000111"),
+                "idem-" + (fxQuoteId == null ? "single" : fxQuoteId),
+                Side.BUY,
+                "AAPL",
+                new BigDecimal("10"),
+                limitPrice,
+                "DAY",
+                /* orderType = */ "LIMIT",
                 /* ledgerBalanceId = */ null,
                 /* ledgerIdentityId = */ null,
                 fxQuoteId,

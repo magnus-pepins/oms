@@ -25,6 +25,7 @@ import java.math.RoundingMode;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
@@ -229,7 +230,7 @@ public class OmsFxCustomerQuotePublisher {
         try {
             String sql = "SELECT pair, side, tier, markup_bps FROM fx_pair_markups "
                     + "WHERE is_active = TRUE AND tier = ANY(?)";
-            String[] tierArr = tiers.toArray(new String[0]);
+            String[] tierArr = markupLoadTiers().toArray(new String[0]);
             Map<MarkupKey, BigDecimal> next = new HashMap<>();
             jdbc.query(sql, ps -> ps.setArray(1, ps.getConnection().createArrayOf("text", tierArr)), rs -> {
                 String pair = rs.getString("pair");
@@ -353,6 +354,25 @@ public class OmsFxCustomerQuotePublisher {
             return markupCache.get(new MarkupKey(pair, "default", side));
         }
         return null;
+    }
+
+    /**
+     * Tiers loaded into {@link #markupCache} on refresh.
+     *
+     * <p>Always includes {@code default} on top of the configured publish
+     * tiers so {@link #lookupMarkup} can waterfall to the {@code default}
+     * row when an exotic pair (e.g. {@code USDMXN}, {@code EURAUD}) only
+     * has a {@code default} markup in {@code fx_pair_markups}. Without this,
+     * the streaming publisher would silently skip every non-major pair —
+     * even though {@link FxQuoteService#lookupMarkupBps} (HTTP /quote path)
+     * resolves them correctly via its own DB-side waterfall.
+     */
+    List<String> markupLoadTiers() {
+        List<String> result = new ArrayList<>(tiers);
+        if (!result.contains("default")) {
+            result.add("default");
+        }
+        return Collections.unmodifiableList(result);
     }
 
     /** Package-private for unit tests. */

@@ -113,6 +113,26 @@ class OmsFxCustomerQuotePublisherTest {
     }
 
     @Test
+    void markupLoadTiers_alwaysIncludesDefault() {
+        // refreshMarkups() uses this set to build the SQL `tier = ANY(?)` array.
+        // `default` must be present so the lookupMarkup() waterfall has data
+        // for pairs that only carry tier='default' rows (USDMXN, EURAUD, ...).
+        assertThat(publisher.markupLoadTiers()).contains("basic", "elite", "default");
+    }
+
+    @Test
+    void markupLoadTiers_doesNotDuplicateDefaultWhenAlreadyConfigured() {
+        OmsFxCustomerQuotePublisher withDefault = new OmsFxCustomerQuotePublisher(
+                midSubscriber, jdbc, Clock.fixed(Instant.parse("2026-05-20T12:00:00Z"), ZoneOffset.UTC),
+                new ObjectMapper(), new SimpleMeterRegistry(),
+                "tcp://localhost:1883", "", "", "test-prefix",
+                "basic,default,elite",
+                1000L, 30_000L, 60_000L,
+                "fx/{base}/{quote}/customer/{tier}/quote", true, 0);
+        assertThat(withDefault.markupLoadTiers()).containsExactly("basic", "default", "elite");
+    }
+
+    @Test
     void status_reflectsConfiguredTiersAndCacheSize() {
         publisher.primeMarkupCache(Map.of(
                 new OmsFxCustomerQuotePublisher.MarkupKey("EURUSD", "basic", "BID"), new BigDecimal("20.00"),

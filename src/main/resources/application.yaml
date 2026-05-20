@@ -89,6 +89,14 @@ oms:
     inflight-coalescer-queue-capacity: ${OMS_LEDGER_INFLIGHT_COALESCER_QUEUE_CAPACITY:1000}
     inflight-coalescer-submit-timeout-ms: ${OMS_LEDGER_INFLIGHT_COALESCER_SUBMIT_TIMEOUT_MS:2000}
     inflight-hold-destination-balance-id: ${OMS_LEDGER_INFLIGHT_HOLD_DESTINATION_BALANCE_ID:}
+    # §8.4 cross-currency: per-source-ccy dest override map. Spring relaxed
+    # binding turns OMS_LEDGER_INFLIGHT_HOLD_DESTINATION_BALANCE_ID_BY_CURRENCY_USD=balance_x
+    # into {USD: balance_x}. Empty by default — single-currency stacks need
+    # no change. Plans/oms-multi-currency-invest-accounts.md §8.4.
+    inflight-hold-destination-balance-id-by-currency:
+      USD: ${OMS_LEDGER_INFLIGHT_HOLD_DESTINATION_BALANCE_ID_BY_CURRENCY_USD:}
+      EUR: ${OMS_LEDGER_INFLIGHT_HOLD_DESTINATION_BALANCE_ID_BY_CURRENCY_EUR:}
+      GBP: ${OMS_LEDGER_INFLIGHT_HOLD_DESTINATION_BALANCE_ID_BY_CURRENCY_GBP:}
     inflight-reservation-currency: ${OMS_LEDGER_INFLIGHT_RESERVATION_CURRENCY:EUR}
     inflight-reservation-precision: ${OMS_LEDGER_INFLIGHT_RESERVATION_PRECISION:100}
     settlement-outbox-enabled: ${OMS_LEDGER_SETTLEMENT_OUTBOX_ENABLED:false}

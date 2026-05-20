@@ -14,6 +14,9 @@ import org.springframework.web.client.RestClientException;
 
 import java.io.IOException;
 import java.math.BigDecimal;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -54,7 +57,26 @@ public final class RestLedgerInflightReservationClient implements LedgerInflight
     private final RestClient http;
     private final String apiKey;
     private final ObjectMapper objectMapper;
-    private final String destinationBalanceId;
+    private final String defaultDestinationBalanceId;
+    /**
+     * Per-source-currency destination override map (uppercase ISO ccy → balance_id).
+     * Plans/oms-multi-currency-invest-accounts.md §8.4: a EUR-funded customer
+     * buying a USD instrument needs the EUR inflight hold to land on a EUR
+     * destination, not the legacy USD nostro. Empty map = pure single-currency
+     * behaviour (the old {@code defaultDestinationBalanceId} is always used).
+     *
+     * <p>Lookups are case-insensitive on key — Spring relaxed binding can
+     * deliver keys as {@code "eur"} or {@code "EUR"} depending on whether the
+     * value came from YAML or an env var; we normalise on read and on
+     * primeBalanceCurrencyCache writes.
+     */
+    private final Map<String, String> destinationBalanceIdByCurrency;
+    /**
+     * One-shot per-currency warn switch so a missing dest doesn't spam the
+     * log on every hold. Keyed by uppercase ccy; presence means "already
+     * warned about this currency once".
+     */
+    private final ConcurrentHashMap<String, Boolean> warnedMissingDest = new ConcurrentHashMap<>();
     private final String defaultCurrency;
     private final int precision;
     /**
@@ -65,6 +87,11 @@ public final class RestLedgerInflightReservationClient implements LedgerInflight
      */
     private final ConcurrentHashMap<String, String> balanceCurrencyCache = new ConcurrentHashMap<>();
 
+    /**
+     * Legacy single-currency constructor — preserved so call-sites and tests
+     * that don't care about cross-currency holds keep compiling. Equivalent
+     * to passing {@link Collections#emptyMap()} for the override map.
+     */
     public RestLedgerInflightReservationClient(
             RestClient http,
             String apiKey,
@@ -72,12 +99,47 @@ public final class RestLedgerInflightReservationClient implements LedgerInflight
             String destinationBalanceId,
             String currency,
             int precision) {
+        this(http, apiKey, objectMapper, destinationBalanceId,
+                Collections.emptyMap(), currency, precision);
+    }
+
+    /**
+     * Cross-currency-aware constructor. {@code destinationBalanceIdByCurrency} is
+     * defensively copied and uppercased on the way in; later mutations to the
+     * supplied map are not observed (Spring's bound map is mutable but we don't
+     * want stale-thread issues if anyone reaches in).
+     */
+    public RestLedgerInflightReservationClient(
+            RestClient http,
+            String apiKey,
+            ObjectMapper objectMapper,
+            String destinationBalanceId,
+            Map<String, String> destinationBalanceIdByCurrency,
+            String currency,
+            int precision) {
         this.http = http;
         this.apiKey = apiKey;
         this.objectMapper = objectMapper;
-        this.destinationBalanceId = destinationBalanceId;
+        this.defaultDestinationBalanceId = destinationBalanceId;
+        this.destinationBalanceIdByCurrency =
+                normaliseDestMap(destinationBalanceIdByCurrency);
         this.defaultCurrency = currency;
         this.precision = precision;
+    }
+
+    private static Map<String, String> normaliseDestMap(Map<String, String> src) {
+        if (src == null || src.isEmpty()) {
+            return Collections.emptyMap();
+        }
+        Map<String, String> out = new LinkedHashMap<>();
+        for (Map.Entry<String, String> e : src.entrySet()) {
+            if (e.getKey() == null || e.getValue() == null) continue;
+            String k = e.getKey().trim();
+            String v = e.getValue().trim();
+            if (k.isEmpty() || v.isEmpty()) continue;
+            out.put(k.toUpperCase(), v);
+        }
+        return Collections.unmodifiableMap(out);
     }
 
     @Override
@@ -88,9 +150,10 @@ public final class RestLedgerInflightReservationClient implements LedgerInflight
         }
         BigDecimal notional = holdAmount;
         String currency = resolveBalanceCurrency(sourceBalanceId);
+        String destination = resolveDestinationBalanceId(currency);
         ObjectNode body = objectMapper.createObjectNode();
         body.put("source", sourceBalanceId);
-        body.put("destination", destinationBalanceId);
+        body.put("destination", destination);
         body.put("amount", notional.doubleValue());
         body.put("currency", currency);
         body.put("reference", REFERENCE_PREFIX + orderId);
@@ -222,6 +285,43 @@ public final class RestLedgerInflightReservationClient implements LedgerInflight
     /** Package-private accessor for tests. */
     String defaultCurrency() {
         return defaultCurrency;
+    }
+
+    /**
+     * Picks the inflight-hold destination balance for the resolved source currency.
+     * Returns the per-currency override when one is configured; otherwise the legacy
+     * {@link #defaultDestinationBalanceId}. Logs a single warn per currency the first
+     * time the override map misses a currency the stack is actively trading — operators
+     * get one signal that they have a currency configured at the FX-quote / customer-
+     * balance level but not at the inflight-hold level, without log spam on every order.
+     *
+     * <p>The fallback (rather than throw) is intentional: an already-accepted BUY
+     * shouldn't be cancelled because of a config gap on the inflight destination — the
+     * Ledger will surface the real {@code CURRENCY_MISMATCH} 4xx on the
+     * {@code POST /transactions} below if the default is wrong for this currency, and
+     * that surfaces in the same monitored failure path as today.
+     *
+     * <p>Package-private for tests.
+     */
+    String resolveDestinationBalanceId(String currency) {
+        if (currency == null || currency.isBlank() || destinationBalanceIdByCurrency.isEmpty()) {
+            return defaultDestinationBalanceId;
+        }
+        String hit = destinationBalanceIdByCurrency.get(currency.trim().toUpperCase());
+        if (hit != null && !hit.isBlank()) {
+            return hit;
+        }
+        if (warnedMissingDest.putIfAbsent(currency.trim().toUpperCase(), Boolean.TRUE) == null) {
+            log.warn("[ledger-inflight] no inflight-hold destination configured for currency={}; falling back to default destinationBalanceId={}. " +
+                    "Cross-currency holds in this currency will fail at Ledger with CURRENCY_MISMATCH unless the default happens to match.",
+                    currency, defaultDestinationBalanceId);
+        }
+        return defaultDestinationBalanceId;
+    }
+
+    /** Package-private accessor for tests. */
+    String defaultDestinationBalanceId() {
+        return defaultDestinationBalanceId;
     }
 
     private String extractTransactionId(String responseBody, UUID orderId) {

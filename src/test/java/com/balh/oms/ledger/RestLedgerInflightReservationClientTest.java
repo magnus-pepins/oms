@@ -121,6 +121,109 @@ class RestLedgerInflightReservationClientTest {
         assertThat(ccy).isEqualTo("GBP");
     }
 
+    // -----------------------------------------------------------------
+    // §8.4 per-currency destination override (cross-currency BUY hold).
+    // -----------------------------------------------------------------
+
+    @Test
+    void resolveDestinationBalanceId_returnsDefault_whenOverrideMapEmpty() {
+        // Default constructor used by setUp(): empty override map → always
+        // returns the legacy default. Single-currency stacks must keep
+        // working unchanged.
+        assertThat(client.resolveDestinationBalanceId("USD")).isEqualTo("balance_destination");
+        assertThat(client.resolveDestinationBalanceId("EUR")).isEqualTo("balance_destination");
+        assertThat(client.resolveDestinationBalanceId(null)).isEqualTo("balance_destination");
+    }
+
+    @Test
+    void resolveDestinationBalanceId_picksPerCurrencyEntry() {
+        RestLedgerInflightReservationClient c = new RestLedgerInflightReservationClient(
+                RestClient.builder().baseUrl(wireMock.baseUrl()).build(),
+                "test-key",
+                objectMapper,
+                "balance_default_usd",
+                java.util.Map.of("EUR", "balance_eur_nostro", "GBP", "balance_gbp_nostro"),
+                "USD",
+                100);
+        assertThat(c.resolveDestinationBalanceId("USD")).isEqualTo("balance_default_usd");
+        assertThat(c.resolveDestinationBalanceId("EUR")).isEqualTo("balance_eur_nostro");
+        assertThat(c.resolveDestinationBalanceId("GBP")).isEqualTo("balance_gbp_nostro");
+    }
+
+    @Test
+    void resolveDestinationBalanceId_isCaseInsensitive() {
+        // Spring relaxed binding can deliver keys lower- or upper-case.
+        RestLedgerInflightReservationClient c = new RestLedgerInflightReservationClient(
+                RestClient.builder().baseUrl(wireMock.baseUrl()).build(),
+                "test-key",
+                objectMapper,
+                "balance_default",
+                java.util.Map.of("eur", "balance_eur"),  // lowercase key
+                "USD",
+                100);
+        assertThat(c.resolveDestinationBalanceId("EUR")).isEqualTo("balance_eur");
+        assertThat(c.resolveDestinationBalanceId("eur")).isEqualTo("balance_eur");
+    }
+
+    @Test
+    void resolveDestinationBalanceId_fallsBackToDefault_andWarnsOnce() {
+        // Override map exists but doesn't cover this currency — fallback
+        // path with a one-shot warn (verified via the package-private
+        // putIfAbsent: a second call returns the same dest without
+        // re-warning, but we can't easily inspect log here, so just
+        // assert behaviour stays consistent).
+        RestLedgerInflightReservationClient c = new RestLedgerInflightReservationClient(
+                RestClient.builder().baseUrl(wireMock.baseUrl()).build(),
+                "test-key",
+                objectMapper,
+                "balance_default",
+                java.util.Map.of("EUR", "balance_eur"),
+                "USD",
+                100);
+        assertThat(c.resolveDestinationBalanceId("BRL")).isEqualTo("balance_default");
+        assertThat(c.resolveDestinationBalanceId("BRL")).isEqualTo("balance_default");
+    }
+
+    @Test
+    void resolveDestinationBalanceId_ignoresEmptyEntries() {
+        // Operators wiring via env may leave optional currencies set to
+        // an empty string; the normalisation step must drop those rather
+        // than route holds to ""-destination (Ledger 400 with confusing
+        // error). Same for null keys.
+        java.util.Map<String, String> raw = new java.util.LinkedHashMap<>();
+        raw.put("USD", "balance_usd_real");
+        raw.put("EUR", "");          // empty value — drop
+        raw.put("", "balance_orphan"); // empty key — drop
+        raw.put("GBP", "   ");        // whitespace value — drop
+        RestLedgerInflightReservationClient c = new RestLedgerInflightReservationClient(
+                RestClient.builder().baseUrl(wireMock.baseUrl()).build(),
+                "test-key",
+                objectMapper,
+                "balance_default",
+                raw,
+                "USD",
+                100);
+        assertThat(c.resolveDestinationBalanceId("USD")).isEqualTo("balance_usd_real");
+        assertThat(c.resolveDestinationBalanceId("EUR")).isEqualTo("balance_default");
+        assertThat(c.resolveDestinationBalanceId("GBP")).isEqualTo("balance_default");
+    }
+
+    @Test
+    void legacyConstructor_isEquivalentToEmptyOverrideMap() {
+        // Belt-and-braces: the existing 6-arg constructor used by tests +
+        // any out-of-tree code keeps the old single-currency semantics.
+        RestLedgerInflightReservationClient c = new RestLedgerInflightReservationClient(
+                RestClient.builder().baseUrl(wireMock.baseUrl()).build(),
+                "test-key",
+                objectMapper,
+                "balance_legacy",
+                "USD",
+                100);
+        assertThat(c.resolveDestinationBalanceId("USD")).isEqualTo("balance_legacy");
+        assertThat(c.resolveDestinationBalanceId("EUR")).isEqualTo("balance_legacy");
+        assertThat(c.defaultDestinationBalanceId()).isEqualTo("balance_legacy");
+    }
+
     @Test
     void doesNotCache_404OrTransientFailure() {
         // First call: 404 (real problem). Second call: 200 (resolved).

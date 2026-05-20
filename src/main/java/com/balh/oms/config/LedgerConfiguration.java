@@ -102,11 +102,15 @@ public class LedgerConfiguration {
         if (currency == null || currency.isBlank()) {
             throw new IllegalStateException("oms.ledger.inflight-reservation-currency must not be empty");
         }
+        // §8.4 per-currency dest override: empty map = legacy single-currency behaviour.
+        // Operators populate via {@code oms.ledger.inflight-hold-destination-balance-id-by-currency.<CCY>}
+        // or {@code OMS_LEDGER_INFLIGHT_HOLD_DESTINATION_BALANCE_ID_BY_CURRENCY_<CCY>=balance_x}.
         return new RestLedgerInflightReservationClient(
                 omsLedgerRestClient,
                 key,
                 objectMapper,
                 dest.trim(),
+                ledger.getInflightHoldDestinationBalanceIdByCurrency(),
                 currency.trim(),
                 prec);
     }

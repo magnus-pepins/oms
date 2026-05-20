@@ -199,8 +199,33 @@ public class OmsConfig {
         /**
          * Ledger {@code balance_id} that receives the customer leg of the inflight hold
          * (bank-side suspense / OMS hold account). Required when {@link #inflightReservationEnabled} is true.
+         *
+         * <p>This is the legacy single-currency destination. When the BUY source balance
+         * is in a currency that has an entry in {@link #inflightHoldDestinationBalanceIdByCurrency},
+         * that per-currency entry wins and this field becomes the fallback (used for any
+         * currency that doesn't yet have a dedicated nostro/hold account provisioned).
+         * Operators keeping a single-currency stack continue setting only this field and
+         * the per-currency map stays empty.
          */
         private String inflightHoldDestinationBalanceId = "";
+        /**
+         * Per-source-currency override map (uppercase ISO ccy → Ledger {@code balance_id}).
+         * Spring binds this from {@code oms.ledger.inflight-hold-destination-balance-id-by-currency.USD=balance_xxx}
+         * or environment {@code OMS_LEDGER_INFLIGHT_HOLD_DESTINATION_BALANCE_ID_BY_CURRENCY_USD=balance_xxx}.
+         *
+         * <p>{@link com.balh.oms.ledger.RestLedgerInflightReservationClient} consults this map
+         * by the *resolved* source-balance currency (already pulled from Ledger). A missing
+         * entry falls back to {@link #inflightHoldDestinationBalanceId} and emits a warn log
+         * the first time it hits — so a misconfigured stack still attempts the hold instead
+         * of refusing the order outright, and the Ledger will surface the real mismatch.
+         *
+         * <p>Plans/oms-multi-currency-invest-accounts.md §8.4. Unblocks the cross-currency
+         * BUY path (e.g. EUR-funded customer buying a USD instrument) which would
+         * otherwise be cancelled at accept with {@code CURRENCY_MISMATCH} on the Ledger
+         * {@code POST /transactions} call.
+         */
+        private final java.util.Map<String, String> inflightHoldDestinationBalanceIdByCurrency =
+                new java.util.LinkedHashMap<>();
         /** ISO currency code for the inflight hold (major unit in {@code amount}). */
         private String inflightReservationCurrency = "EUR";
         /** Ledger amount scaling (e.g. 100 = cents). */
@@ -435,6 +460,15 @@ public class OmsConfig {
         public void setInflightReservationEnabled(boolean v) { this.inflightReservationEnabled = v; }
         public String getInflightHoldDestinationBalanceId() { return inflightHoldDestinationBalanceId; }
         public void setInflightHoldDestinationBalanceId(String v) { this.inflightHoldDestinationBalanceId = v; }
+        /**
+         * Returns the mutable per-currency dest map. Spring populates this map directly
+         * (relaxed binding handles upper/lower case keys); we normalise to uppercase
+         * inside {@link com.balh.oms.ledger.RestLedgerInflightReservationClient} so a
+         * yaml entry like {@code eur: balance_x} works the same as {@code EUR: balance_x}.
+         */
+        public java.util.Map<String, String> getInflightHoldDestinationBalanceIdByCurrency() {
+            return inflightHoldDestinationBalanceIdByCurrency;
+        }
         public String getInflightReservationCurrency() { return inflightReservationCurrency; }
         public void setInflightReservationCurrency(String v) { this.inflightReservationCurrency = v; }
         public int getInflightReservationPrecision() { return inflightReservationPrecision; }

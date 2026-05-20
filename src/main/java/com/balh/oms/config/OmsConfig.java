@@ -1669,6 +1669,21 @@ public class OmsConfig {
         private boolean hedgeHooksEnabled = false;
         private boolean eodFlattenEnabled = false;
         private long eodFlattenIntervalMs = 86_400_000L;
+        /**
+         * §8.4 quote-lock at order accept. When {@code true}, the ingress
+         * pipeline recalls {@code CreateOrderRequest.fxQuoteId} via
+         * {@link com.balh.oms.fx.FxQuoteService#recall(String)} and rejects
+         * with {@code RISK_FX_QUOTE_EXPIRED} when the quote is missing or
+         * has expired. The BFF mints the id from
+         * {@code POST /internal/v1/fx/quote} so the rate the customer was
+         * shown pre-confirm is the rate that's honoured at hold time.
+         *
+         * <p>Default off so a stack without the BFF-side quoteId plumb (or
+         * a stack on Phase 1.x without {@code FxQuoteService}) keeps
+         * working — single-currency orders never carry a quoteId regardless
+         * and so this is also a no-op for them.
+         */
+        private boolean acceptUseQuoterEnabled = false;
 
         public boolean isModuleEnabled() {
             return moduleEnabled;
@@ -1750,6 +1765,14 @@ public class OmsConfig {
 
         public void setEodFlattenIntervalMs(long eodFlattenIntervalMs) {
             this.eodFlattenIntervalMs = Math.max(60_000L, eodFlattenIntervalMs);
+        }
+
+        public boolean isAcceptUseQuoterEnabled() {
+            return acceptUseQuoterEnabled;
+        }
+
+        public void setAcceptUseQuoterEnabled(boolean acceptUseQuoterEnabled) {
+            this.acceptUseQuoterEnabled = acceptUseQuoterEnabled;
         }
     }
 

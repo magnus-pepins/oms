@@ -8,7 +8,9 @@ import com.balh.oms.config.OmsConfig;
 import com.balh.oms.config.OmsProfiles;
 import com.balh.oms.domain.Order;
 import com.balh.oms.domain.OrderStatus;
+import com.balh.oms.domain.RejectCode;
 import com.balh.oms.domain.ShardKey;
+import com.balh.oms.fx.FxQuoteService;
 import com.balh.oms.observability.PiiHash;
 import com.balh.oms.observability.metrics.OmsPipelineMetrics;
 import com.balh.oms.persistence.OrdersRepository;
@@ -101,6 +103,14 @@ public class OrderIngressService {
     private final ObjectProvider<LedgerInflightReservationClient> ledgerInflightReservation;
     private final ObjectProvider<LedgerInflightCoalescer> ledgerInflightCoalescer;
     private final ObjectProvider<LedgerBalanceClient> ledgerBalanceClient;
+    /**
+     * §8.4 quote-lock recall on the accept path. Optional: only present when
+     * the FX module is on the classpath ({@code oms.fx.module-enabled=true} +
+     * the {@link FxQuoteService} bean is wired). Guarded with
+     * {@link ObjectProvider} so non-FX deployments (e.g. early single-currency
+     * stacks) still construct cleanly.
+     */
+    private final ObjectProvider<FxQuoteService> fxQuoteService;
     private final MeterRegistry meterRegistry;
     private final OrderControlAdmission orderControlAdmission;
     /**
@@ -119,6 +129,7 @@ public class OrderIngressService {
             ObjectProvider<LedgerInflightReservationClient> ledgerInflightReservation,
             ObjectProvider<LedgerInflightCoalescer> ledgerInflightCoalescer,
             ObjectProvider<LedgerBalanceClient> ledgerBalanceClient,
+            ObjectProvider<FxQuoteService> fxQuoteService,
             MeterRegistry meterRegistry,
             OrderControlAdmission orderControlAdmission,
             OmsClusterShardRouter clusterShardRouter) {
@@ -128,6 +139,7 @@ public class OrderIngressService {
         this.ledgerInflightReservation = ledgerInflightReservation;
         this.ledgerInflightCoalescer = ledgerInflightCoalescer;
         this.ledgerBalanceClient = ledgerBalanceClient;
+        this.fxQuoteService = fxQuoteService;
         this.meterRegistry = meterRegistry;
         this.orderControlAdmission = orderControlAdmission;
         this.clusterShardRouter = clusterShardRouter;
@@ -210,9 +222,11 @@ public class OrderIngressService {
         try {
             // Pre-cluster phase: HTTP / cluster work that must NOT hold a Hikari connection.
             //   1. Ledger balance/identity verify (HTTP; pulled out of tx in C-2).
-            //   2. Aeron cluster admit (CompletableFuture wait; pulled out of tx in D-1).
-            // Both can fail and short-circuit before any Postgres conn is acquired.
+            //   2. FX quote-lock recall (§8.4; in-memory map lookup, opt-in).
+            //   3. Aeron cluster admit (CompletableFuture wait; pulled out of tx in D-1).
+            // All can fail and short-circuit before any Postgres conn is acquired.
             maybeVerifyLedgerBalanceBinding(req);
+            maybeRecallFxQuoteOrReject(req);
 
             UUID id = UUID.randomUUID();
             Instant now = Instant.now();
@@ -251,7 +265,7 @@ public class OrderIngressService {
             // projector's recordLedgerInflightOutboxIfNeeded materialises the outbox row
             // from the cluster's authoritative OrderAdmittedEvent. No Postgres I/O on the
             // hot path for the BUY-async branch.
-            maybePlaceBuyLedgerInflightHold(order);
+            maybePlaceBuyLedgerInflightHold(order, req);
 
             OmsPipelineMetrics.finishIngressAccept(meterRegistry, ingressSample, "created");
             return new IngressResult(order, true);
@@ -430,7 +444,49 @@ public class OrderIngressService {
         }
     }
 
-    private void maybePlaceBuyLedgerInflightHold(Order order) {
+    /**
+     * §8.4 quote-lock recall. When the operator has enabled
+     * {@code oms.fx.accept-use-quoter.enabled} AND the request carries an
+     * {@code fxQuoteId}, look the quote up in the in-memory cache:
+     *   * miss / expired → reject with {@code RISK_FX_QUOTE_EXPIRED} (HTTP 422).
+     *   * hit            → no-op here; the caller's {@code cashHoldAmount}
+     *                      (already validated to be {@code > 0} in
+     *                      {@link CreateOrderRequest}) carries the locked rate
+     *                      into the inflight hold downstream.
+     *
+     * <p>When the flag is off OR the request carries no {@code fxQuoteId}
+     * (= single-currency order), this method is a no-op so the legacy path
+     * stays byte-identical.
+     */
+    private void maybeRecallFxQuoteOrReject(CreateOrderRequest req) {
+        if (!config.getFx().isAcceptUseQuoterEnabled()) {
+            return;
+        }
+        if (req.fxQuoteId() == null) {
+            return;
+        }
+        FxQuoteService svc = fxQuoteService.getIfAvailable();
+        if (svc == null) {
+            // Operator turned the flag on but the bean isn't wired — that's a
+            // misconfiguration, not a customer error. Surface as 500 so it's
+            // visible in the deploy logs rather than masquerading as a stale
+            // quote (which would tell the customer to refresh — they can't
+            // fix this).
+            log.warn("[fx-accept-lock] oms.fx.accept-use-quoter.enabled=true but no FxQuoteService bean; "
+                    + "treating as stale quote so the BFF gets a clear reject signal");
+            throw new FxQuoteLockException(HttpStatus.INTERNAL_SERVER_ERROR,
+                    RejectCode.RISK_FX_QUOTE_EXPIRED, "fx_quoter_not_wired",
+                    "FX quote-lock enabled but FxQuoteService is not on the classpath");
+        }
+        FxQuoteService.CachedQuote cached = svc.recall(req.fxQuoteId());
+        if (cached == null) {
+            throw new FxQuoteLockException(HttpStatus.UNPROCESSABLE_ENTITY,
+                    RejectCode.RISK_FX_QUOTE_EXPIRED, "fx_quote_expired",
+                    "FX quote " + req.fxQuoteId() + " missing or expired");
+        }
+    }
+
+    private void maybePlaceBuyLedgerInflightHold(Order order, CreateOrderRequest req) {
         if (!config.getLedger().isInflightReservationEnabled()) {
             return;
         }
@@ -443,7 +499,15 @@ public class OrderIngressService {
         if (!BuyFundsRequirement.hasBuyFundingPrice(order)) {
             return;
         }
-        java.util.Optional<BigDecimal> holdAmount = BuyFundsRequirement.requiredBuyFunds(order, config);
+        // §8.4 quote-lock — when the BFF computed the cross-currency hold in
+        // source-balance ccy off a locked quote, prefer that value over the
+        // single-ccy {@link BuyFundsRequirement} math (which treats limitPrice
+        // as same-ccy as the balance and would post the USD-magnitude to an
+        // EUR balance). Single-currency orders carry {@code cashHoldAmount=null}
+        // and fall through to the legacy sizer, byte-identical to pre-§8.
+        java.util.Optional<BigDecimal> holdAmount = (req.cashHoldAmount() != null)
+                ? java.util.Optional.of(req.cashHoldAmount())
+                : BuyFundsRequirement.requiredBuyFunds(order, config);
         if (holdAmount.isEmpty()) {
             return;
         }

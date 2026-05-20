@@ -26,6 +26,22 @@ public class OmsExceptionHandler {
         return ResponseEntity.status(ex.getHttpStatus()).body(body);
     }
 
+    /**
+     * §8.4 quote-lock reject path. The {@code rejectCode} is the canonical
+     * {@link RejectCode} value (e.g. {@code RISK_FX_QUOTE_EXPIRED}) so the
+     * BFF + Ops Console can branch on it directly; {@code errorCode} stays
+     * a short slug ("fx_quote_expired") for logging / metrics tagging.
+     */
+    @ExceptionHandler(FxQuoteLockException.class)
+    public ResponseEntity<ApiErrorResponse> handleFxQuoteLock(FxQuoteLockException ex) {
+        var body = new ApiErrorResponse(
+                ex.getRejectCode().name(),
+                ex.getErrorCode(),
+                List.of(new ApiErrorResponse.FieldViolation("fxQuoteId", ex.getMessage()))
+        );
+        return ResponseEntity.status(ex.getHttpStatus()).body(body);
+    }
+
     @ExceptionHandler(ClusterAdmissionException.class)
     public ResponseEntity<ApiErrorResponse> handleClusterAdmission(ClusterAdmissionException ex) {
         var body = new ApiErrorResponse(

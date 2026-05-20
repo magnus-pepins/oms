@@ -39,12 +39,34 @@ public record CreateOrderRequest(
          * Required when {@link #ledgerBalanceId} is set: Ledger {@code identity_id} that must
          * own that balance (OMS verifies via Ledger GET). BFF injects this after its own check.
          */
-        @Size(max = 256) String ledgerIdentityId
+        @Size(max = 256) String ledgerIdentityId,
+        /**
+         * Optional FX quote id (§8.4 quote-lock flow). When non-null AND
+         * {@code oms.fx.accept-use-quoter.enabled=true}, the OMS accept path
+         * recalls the cached quote via {@code FxQuoteService.recall} and rejects
+         * with {@code RISK_FX_QUOTE_EXPIRED} when the quote is missing or
+         * expired. The BFF mints the id from {@code POST /internal/v1/fx/quote}
+         * and forwards it on every cross-currency order. Single-currency orders
+         * leave this null and the recall is skipped.
+         */
+        @Size(max = 64) String fxQuoteId,
+        /**
+         * Optional cash hold amount in <em>source-balance currency</em>
+         * (§8.4 quote-lock flow). Required iff {@link #fxQuoteId} is set —
+         * computed by the BFF as {@code (qty * limitPrice) / fxRate_locked}
+         * so OMS does not need to know the FX pair or the rate side, only
+         * how much to hold from the customer's source ledger balance. When
+         * null, the inflight hold sizer falls back to
+         * {@code BuyFundsRequirement.requiredBuyFunds(...)} (single-currency
+         * legacy path). Must be {@code > 0} when present.
+         */
+        @Positive BigDecimal cashHoldAmount
 ) {
     public CreateOrderRequest {
         ledgerBalanceId = blankToNull(ledgerBalanceId);
         ledgerIdentityId = blankToNull(ledgerIdentityId);
         orderType = blankToNull(orderType);
+        fxQuoteId = blankToNull(fxQuoteId);
     }
 
     /**
@@ -64,7 +86,29 @@ public record CreateOrderRequest(
             String ledgerBalanceId,
             String ledgerIdentityId) {
         this(accountId, clientIdempotencyKey, side, instrumentSymbol, quantity, limitPrice,
-                timeInForce, /* orderType = */ null, ledgerBalanceId, ledgerIdentityId);
+                timeInForce, /* orderType = */ null, ledgerBalanceId, ledgerIdentityId,
+                /* fxQuoteId = */ null, /* cashHoldAmount = */ null);
+    }
+
+    /**
+     * Pre-§8 (no FX-quote lock) canonical constructor. Used by paths that
+     * already plumb {@code orderType} but predate the quote-lock fields.
+     * Defers to the full canonical constructor with both new fields nulled.
+     */
+    public CreateOrderRequest(
+            UUID accountId,
+            String clientIdempotencyKey,
+            Side side,
+            String instrumentSymbol,
+            BigDecimal quantity,
+            BigDecimal limitPrice,
+            String timeInForce,
+            String orderType,
+            String ledgerBalanceId,
+            String ledgerIdentityId) {
+        this(accountId, clientIdempotencyKey, side, instrumentSymbol, quantity, limitPrice,
+                timeInForce, orderType, ledgerBalanceId, ledgerIdentityId,
+                /* fxQuoteId = */ null, /* cashHoldAmount = */ null);
     }
 
     @AssertTrue(message = "ledgerIdentityId is required when ledgerBalanceId is set and must be omitted otherwise")
@@ -87,6 +131,19 @@ public record CreateOrderRequest(
             return true;
         }
         return limitPrice != null && limitPrice.signum() > 0;
+    }
+
+    /**
+     * §8.4 quote-lock pairing: {@link #cashHoldAmount} only carries meaning
+     * paired with a {@link #fxQuoteId} (so the recall can validate the rate
+     * the BFF used to compute it). A {@code fxQuoteId} on its own is
+     * tolerated for forward-compat (e.g. SELL-side flows that don't need a
+     * BUY hold) — but a {@code cashHoldAmount} on its own is a
+     * mis-configured BFF and we reject the shape at ingress.
+     */
+    @AssertTrue(message = "cashHoldAmount must be paired with fxQuoteId")
+    public boolean isFxQuoteLockShapeValid() {
+        return cashHoldAmount == null || fxQuoteId != null;
     }
 
     /**

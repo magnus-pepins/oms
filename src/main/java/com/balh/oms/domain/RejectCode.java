@@ -42,5 +42,25 @@ public enum RejectCode {
     /** Limit price / quote not aligned to instrument tick grid when tick check is enabled (slice 8). */
     RISK_TICK_SIZE_VIOLATION,
     /** Straight-through processing / venue session gate failed (slice 8). */
-    RISK_STP_GATE
+    RISK_STP_GATE,
+    /**
+     * Trade currency differs from source-balance currency and the source balance
+     * has {@code auto_fx_enabled=false} (or no eligible balance was passed by the
+     * BFF picker). See plans/oms-multi-currency-invest-accounts.md §8.6.
+     */
+    RISK_FX_REQUIRED,
+    /**
+     * Order arrived with a {@code quoteId} that {@code FxQuoteService.recall}
+     * returns null/expired. The BFF should normally surface this earlier as a
+     * "refresh and reconfirm" prompt; OMS emits this only for genuinely stale
+     * submits.
+     */
+    RISK_FX_QUOTE_EXPIRED,
+    /**
+     * Vendor mid feed older than the configured staleness window at quote or
+     * accept time. Loud signal that {@code OmsFxMidSubscriber} stopped seeing
+     * ticks; the operator should investigate before approving cross-currency
+     * trades.
+     */
+    RISK_FX_STALE_QUOTE
 }

@@ -295,6 +295,16 @@ const COMMON_ENV = {
   // in real time instead of polling. Same broker as the mid subscriber.
   OMS_FX_HEDGE_PUBLISHER_ENABLED: 'true',
 
+  // §8.4 quote-lock at order accept. When 'true', OrderIngressService recalls
+  // CreateOrderRequest.fxQuoteId via FxQuoteService.recall() and rejects with
+  // RISK_FX_QUOTE_EXPIRED (HTTP 422) on a miss/expired hit. Pairs with the
+  // BFF-side OMS_FX_ACCEPT_USE_QUOTER=true so the customer-frontend mints
+  // the lock pre-OMS-POST. Single-currency orders never carry a quoteId,
+  // so flipping this is a no-op for them — only cross-currency BUYs (e.g.
+  // EUR-funded customer buying USD AAPL) hit the recall path. Maps to
+  // Spring property oms.fx.accept-use-quoter.enabled via SPRING_APPLICATION_JSON.
+  OMS_FX_ACCEPT_USE_QUOTER_ENABLED: process.env.OMS_FX_ACCEPT_USE_QUOTER_ENABLED || 'true',
+
   // ---------------------------------------------------------------------------
   // Settlement → Ledger money movement (Phase 1 multi-leg outbox — V39)
   // ---------------------------------------------------------------------------

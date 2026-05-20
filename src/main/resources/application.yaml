@@ -200,6 +200,11 @@ oms:
     hedge-hooks-enabled: ${OMS_FX_HEDGE_HOOKS_ENABLED:false}
     eod-flatten-enabled: ${OMS_FX_EOD_FLATTEN_ENABLED:false}
     eod-flatten-interval-ms: ${OMS_FX_EOD_FLATTEN_INTERVAL_MS:86400000}
+    # §8.4 quote-lock at order accept. When 'true', OrderIngressService recalls
+    # CreateOrderRequest.fxQuoteId via FxQuoteService.recall() and rejects with
+    # RISK_FX_QUOTE_EXPIRED (HTTP 422) on a miss/expired hit. Off by default —
+    # single-currency orders carry no quoteId, so this is a no-op for them.
+    accept-use-quoter-enabled: ${OMS_FX_ACCEPT_USE_QUOTER_ENABLED:false}
     mid-subscriber:
       enabled: ${OMS_FX_MID_SUBSCRIBER_ENABLED:false}
       broker-url: ${EMQX_MQTT_BROKER_URL:tcp://127.0.0.1:1883}

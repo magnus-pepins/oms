@@ -8,12 +8,15 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.dao.DataAccessException;
+import org.springframework.dao.EmptyResultDataAccessException;
 import org.springframework.http.HttpStatus;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.sql.Timestamp;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -133,6 +136,11 @@ public class FxQuoteService {
     private final Counter quoteMissesCounter;
     private final Counter midFromSubscriberCounter;
     private final Counter midFromStubCounter;
+    private final Counter recallHitMemCounter;
+    private final Counter recallHitDbCounter;
+    private final Counter recallMissCounter;
+    private final Counter recallExpiredCounter;
+    private final Counter persistFailCounter;
     private final Map<String, CachedQuote> cache = new ConcurrentHashMap<>();
     private volatile long validityMillis = DEFAULT_VALIDITY_MS;
 
@@ -163,6 +171,22 @@ public class FxQuoteService {
         this.midFromStubCounter = Counter.builder("oms.fx.quote.mid_source_total")
                 .tag("source", "stub")
                 .description("FX quotes whose mid came from STUB_MIDS (subscriber stale/absent)")
+                .register(registry);
+        this.recallHitMemCounter = Counter.builder("oms.fx.quote.recall_total")
+                .tag("outcome", "hit_mem")
+                .description("FxQuoteService.recall outcomes")
+                .register(registry);
+        this.recallHitDbCounter = Counter.builder("oms.fx.quote.recall_total")
+                .tag("outcome", "hit_db")
+                .register(registry);
+        this.recallMissCounter = Counter.builder("oms.fx.quote.recall_total")
+                .tag("outcome", "miss")
+                .register(registry);
+        this.recallExpiredCounter = Counter.builder("oms.fx.quote.recall_total")
+                .tag("outcome", "expired")
+                .register(registry);
+        this.persistFailCounter = Counter.builder("oms.fx.quote.persist_fail_total")
+                .description("FxQuoteService failed to write the cached quote to fx_quote_cache; recall after a restart will miss for these quotes")
                 .register(registry);
     }
 
@@ -212,25 +236,124 @@ public class FxQuoteService {
         body.put("expiresAt", exp.toString());
         body.put("validityMs", validityMillis);
 
-        cache.put(quoteId, new CachedQuote(quoteId, pairUp, tierLow, bid, ask, mid, now, exp));
+        CachedQuote cached = new CachedQuote(quoteId, pairUp, tierLow, bid, ask, mid, now, exp);
+        cache.put(quoteId, cached);
+        persistQuote(cached);
         quotesCounter.increment();
         purgeExpired(now);
         return body;
     }
 
     /**
-     * Recall a previously issued quote (for hedge submission), returning null when
-     * not found or already expired.
+     * Recall a previously issued quote (for hedge submission or order
+     * accept), returning null when not found or already expired.
+     *
+     * <p>Read path is in-process first, then a single PK lookup in
+     * {@code fx_quote_cache} (P4.1) so a quote minted before an OMS
+     * restart still recalls after.
      */
     public CachedQuote recall(String quoteId) {
         if (quoteId == null || quoteId.isBlank()) return null;
+        Instant now = clock.instant();
         CachedQuote q = cache.get(quoteId);
-        if (q == null) return null;
-        if (clock.instant().isAfter(q.expiresAt)) {
-            cache.remove(quoteId);
+        if (q != null) {
+            if (now.isAfter(q.expiresAt)) {
+                cache.remove(quoteId);
+                deleteQuote(quoteId);
+                recallExpiredCounter.increment();
+                return null;
+            }
+            recallHitMemCounter.increment();
+            return q;
+        }
+        CachedQuote fromDb = loadQuote(quoteId);
+        if (fromDb == null) {
+            recallMissCounter.increment();
             return null;
         }
-        return q;
+        if (now.isAfter(fromDb.expiresAt)) {
+            deleteQuote(quoteId);
+            recallExpiredCounter.increment();
+            return null;
+        }
+        // Hot-path the row so a repeat recall stays in memory.
+        cache.put(quoteId, fromDb);
+        recallHitDbCounter.increment();
+        return fromDb;
+    }
+
+    private void persistQuote(CachedQuote q) {
+        try {
+            jdbc.update(
+                    "INSERT INTO fx_quote_cache "
+                            + "(quote_id, pair, tier, bid, ask, mid, captured_at, expires_at) "
+                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                            + "ON CONFLICT (quote_id) DO NOTHING",
+                    q.quoteId, q.pair, q.tier, q.bid, q.ask, q.mid,
+                    Timestamp.from(q.capturedAt), Timestamp.from(q.expiresAt));
+        } catch (DataAccessException e) {
+            persistFailCounter.increment();
+            // A persistence failure is not fatal — the in-memory cache still
+            // serves recalls in the same JVM. The only loss is restart
+            // survival for this one quote. Logged at warn so an ops-console
+            // alert can surface a Postgres-write-failure incident.
+            log.warn("[fx-quote] persist failed quoteId={} pair={} tier={}: {}",
+                    q.quoteId, q.pair, q.tier, e.getMostSpecificCause().getMessage());
+        }
+    }
+
+    private CachedQuote loadQuote(String quoteId) {
+        try {
+            return jdbc.queryForObject(
+                    "SELECT quote_id, pair, tier, bid, ask, mid, captured_at, expires_at "
+                            + "FROM fx_quote_cache WHERE quote_id = ?",
+                    (rs, rowNum) -> new CachedQuote(
+                            rs.getString("quote_id"),
+                            rs.getString("pair"),
+                            rs.getString("tier"),
+                            rs.getBigDecimal("bid"),
+                            rs.getBigDecimal("ask"),
+                            rs.getBigDecimal("mid"),
+                            rs.getTimestamp("captured_at").toInstant(),
+                            rs.getTimestamp("expires_at").toInstant()),
+                    quoteId);
+        } catch (EmptyResultDataAccessException e) {
+            return null;
+        } catch (DataAccessException e) {
+            log.warn("[fx-quote] load failed quoteId={}: {}",
+                    quoteId, e.getMostSpecificCause().getMessage());
+            return null;
+        }
+    }
+
+    private void deleteQuote(String quoteId) {
+        try {
+            jdbc.update("DELETE FROM fx_quote_cache WHERE quote_id = ?", quoteId);
+        } catch (DataAccessException e) {
+            // Stale row left behind; the purge sweep will catch it next tick.
+            log.debug("[fx-quote] delete failed quoteId={}: {}",
+                    quoteId, e.getMostSpecificCause().getMessage());
+        }
+    }
+
+    /**
+     * Purge expired rows from {@code fx_quote_cache}. Runs every minute by
+     * default — quote lifetimes are short (~30s), so a minute of skew is
+     * acceptable and keeps the table tiny without competing with
+     * higher-priority writes.
+     */
+    @Scheduled(fixedDelayString = "${oms.fx.quote-cache.purge-interval-ms:60000}",
+            initialDelayString = "${oms.fx.quote-cache.purge-interval-ms:60000}")
+    public void purgePersistedExpired() {
+        try {
+            int n = jdbc.update("DELETE FROM fx_quote_cache WHERE expires_at < ?",
+                    Timestamp.from(clock.instant()));
+            if (n > 0) {
+                log.debug("[fx-quote] purged {} expired persisted quotes", n);
+            }
+        } catch (DataAccessException e) {
+            log.warn("[fx-quote] purge failed: {}", e.getMostSpecificCause().getMessage());
+        }
     }
 
     /**
@@ -361,6 +484,11 @@ public class FxQuoteService {
                 bps.divide(new BigDecimal("10000"), 10, RoundingMode.HALF_UP)
                         .multiply(new BigDecimal(direction)));
         return mid.multiply(factor);
+    }
+
+    /** Package-private test hook — seeds the in-memory cache directly. */
+    void primeCacheForTest(String quoteId, CachedQuote q) {
+        cache.put(quoteId, q);
     }
 
     private void purgeExpired(Instant now) {

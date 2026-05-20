@@ -305,6 +305,9 @@ const COMMON_ENV = {
   // Spring property oms.fx.accept-use-quoter.enabled via SPRING_APPLICATION_JSON.
   OMS_FX_ACCEPT_USE_QUOTER_ENABLED: process.env.OMS_FX_ACCEPT_USE_QUOTER_ENABLED || 'true',
 
+  // §8.3 — production stacks set false so stale vendor mids reject instead of STUB_MIDS.
+  OMS_FX_STUB_MIDS_ALLOWED: process.env.OMS_FX_STUB_MIDS_ALLOWED || 'true',
+
   // ---------------------------------------------------------------------------
   // Settlement → Ledger money movement (Phase 1 multi-leg outbox — V39)
   // ---------------------------------------------------------------------------
@@ -383,6 +386,9 @@ const apps = [
       SPRING_PROFILES_ACTIVE: 'oms-postgres-projector',
       OMS_POSTGRES_PROJECTOR_AERON_DIR: AERON_MEDIA_DRIVER,
       OMS_LEDGER_SETTLEMENT_OUTBOX_RECONCILER_ENABLED: 'true',
+      // §8.3 — tier MQTT publisher runs on this role ONLY (single instance).
+      OMS_FX_CUSTOMER_QUOTE_PUBLISHER_ENABLED: 'true',
+      OMS_FX_CUSTOMER_QUOTE_PUBLISHER_TIERS: 'basic,premium,elite,admin,business',
     },
     ...COMMON_PM2,
   },

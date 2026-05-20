@@ -42,6 +42,17 @@ public class OmsExceptionHandler {
         return ResponseEntity.status(ex.getHttpStatus()).body(body);
     }
 
+    /** §8.6 — vendor mid stale/absent when stub mids are disabled in production. */
+    @ExceptionHandler(com.balh.oms.fx.FxQuoteStaleException.class)
+    public ResponseEntity<ApiErrorResponse> handleFxQuoteStale(com.balh.oms.fx.FxQuoteStaleException ex) {
+        var body = new ApiErrorResponse(
+                ex.getRejectCode().name(),
+                ex.getErrorCode(),
+                List.of(new ApiErrorResponse.FieldViolation("pair", ex.getMessage()))
+        );
+        return ResponseEntity.status(ex.getHttpStatus()).body(body);
+    }
+
     @ExceptionHandler(ClusterAdmissionException.class)
     public ResponseEntity<ApiErrorResponse> handleClusterAdmission(ClusterAdmissionException ex) {
         var body = new ApiErrorResponse(

@@ -1,6 +1,7 @@
 package com.balh.oms.fx;
 
 import com.balh.oms.config.OmsConfig;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -28,11 +29,17 @@ public class FxQuotesController {
     private final OmsConfig omsConfig;
     private final Clock clock;
     private final FxQuoteService quoteService;
+    private final ObjectProvider<OmsFxCustomerQuotePublisher> customerQuotePublisher;
 
-    public FxQuotesController(OmsConfig omsConfig, Clock clock, FxQuoteService quoteService) {
+    public FxQuotesController(
+            OmsConfig omsConfig,
+            Clock clock,
+            FxQuoteService quoteService,
+            ObjectProvider<OmsFxCustomerQuotePublisher> customerQuotePublisher) {
         this.omsConfig = omsConfig;
         this.clock = clock;
         this.quoteService = quoteService;
+        this.customerQuotePublisher = customerQuotePublisher;
     }
 
     /** Legacy stub kept until the trading-desk migrates to {@code POST /quote}. */
@@ -65,6 +72,34 @@ public class FxQuotesController {
         Map<String, String> mids = new LinkedHashMap<>();
         quoteService.stubMids().forEach((k, v) -> mids.put(k, v.toPlainString()));
         body.put("mids", mids);
+        return ResponseEntity.ok(body);
+    }
+
+    /**
+     * Ops/diagnostic surface for {@link OmsFxCustomerQuotePublisher}.
+     * Returns {@code enabled=false} when the publisher bean is not wired.
+     */
+    @GetMapping("/customer-quote/status")
+    public ResponseEntity<Map<String, Object>> customerQuoteStatus() {
+        var fx = omsConfig.getFx();
+        if (!fx.isModuleEnabled()) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "fx_module_disabled"));
+        }
+        OmsFxCustomerQuotePublisher pub = customerQuotePublisher.getIfAvailable();
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("asOf", clock.instant().toString());
+        if (pub == null) {
+            body.put("enabled", false);
+            return ResponseEntity.ok(body);
+        }
+        OmsFxCustomerQuotePublisher.PublisherStatus s = pub.status();
+        body.put("enabled", true);
+        body.put("tiers", s.tiers());
+        body.put("markupCacheSize", s.markupCacheSize());
+        body.put("markupCacheLoadedAtMs", s.markupCacheLoadedAtMs());
+        body.put("mqttConnected", s.mqttConnected());
+        body.put("publishTickPeriodMs", s.publishTickPeriodMs());
+        body.put("maxMidAgeMs", s.maxMidAgeMs());
         return ResponseEntity.ok(body);
     }
 
@@ -108,6 +143,8 @@ public class FxQuotesController {
         }
         try {
             return ResponseEntity.ok(quoteService.quote(body.pair(), body.tier()));
+        } catch (FxQuoteStaleException e) {
+            throw e;
         } catch (IllegalArgumentException e) {
             return ResponseEntity.badRequest().body(Map.of("error", "no_mid", "message", e.getMessage()));
         } catch (IllegalStateException e) {

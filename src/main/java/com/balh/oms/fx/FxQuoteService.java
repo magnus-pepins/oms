@@ -1,11 +1,14 @@
 package com.balh.oms.fx;
 
+import com.balh.oms.config.OmsConfig;
+import com.balh.oms.domain.RejectCode;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.dao.DataAccessException;
+import org.springframework.http.HttpStatus;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 
@@ -124,6 +127,7 @@ public class FxQuoteService {
 
     private final JdbcTemplate jdbc;
     private final Clock clock;
+    private final OmsConfig omsConfig;
     private final Counter quotesCounter;
     private final Counter quoteMissesCounter;
     private final Counter midFromSubscriberCounter;
@@ -139,9 +143,10 @@ public class FxQuoteService {
     @Autowired(required = false)
     private OmsFxMidSubscriber liveMidSubscriber;
 
-    public FxQuoteService(JdbcTemplate jdbc, Clock clock, MeterRegistry registry) {
+    public FxQuoteService(JdbcTemplate jdbc, Clock clock, OmsConfig omsConfig, MeterRegistry registry) {
         this.jdbc = jdbc;
         this.clock = clock;
+        this.omsConfig = omsConfig;
         this.quotesCounter = Counter.builder("oms.fx.quote.issued_total")
                 .description("FX quotes issued by FxQuoteService")
                 .register(registry);
@@ -250,6 +255,13 @@ public class FxQuoteService {
                 midFromSubscriberCounter.increment();
                 return new MidWithSource(live, "vendor-mid-live");
             }
+        }
+        if (!omsConfig.getFx().isStubMidsAllowed()) {
+            throw new FxQuoteStaleException(
+                    HttpStatus.UNPROCESSABLE_ENTITY,
+                    RejectCode.RISK_FX_STALE_QUOTE,
+                    "fx_mid_stale",
+                    "vendor mid stale or absent for pair " + pair);
         }
         BigDecimal stub = STUB_MIDS.get(pair);
         if (stub == null) {

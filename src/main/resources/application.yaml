@@ -226,6 +226,21 @@ oms:
       password: ${EMQX_MQTT_PASSWORD:}
       staleness-ms: ${OMS_FX_MID_STALENESS_MS:60000}
       client-id-prefix: ${OMS_FX_MID_CLIENT_ID_PREFIX:oms-fx-mid}
+    # §8.3 — when false, FxQuoteService rejects with RISK_FX_STALE_QUOTE instead of STUB_MIDS.
+    stub-mids-allowed: ${OMS_FX_STUB_MIDS_ALLOWED:true}
+    # §8.3 — OMS-tier MQTT display stream. Enable on ONE JVM only (oms-postgres-projector).
+    customer-quote-publisher:
+      enabled: ${OMS_FX_CUSTOMER_QUOTE_PUBLISHER_ENABLED:false}
+      broker-url: ${EMQX_MQTT_BROKER_URL:tcp://127.0.0.1:1883}
+      username: ${EMQX_MQTT_CUSTOMER_QUOTE_USERNAME:${EMQX_MQTT_USERNAME:oms-fx-customer-quote}}
+      password: ${EMQX_MQTT_PASSWORD:}
+      client-id-prefix: ${OMS_FX_CUSTOMER_QUOTE_CLIENT_ID_PREFIX:oms-fx-customer-quote}
+      tiers: ${OMS_FX_CUSTOMER_QUOTE_PUBLISHER_TIERS:basic,premium,elite,admin,business}
+      tick-period-ms: ${OMS_FX_CUSTOMER_QUOTE_TICK_PERIOD_MS:1000}
+      max-mid-age-ms: ${OMS_FX_CUSTOMER_QUOTE_MAX_MID_AGE_MS:30000}
+      markup-refresh-ms: ${OMS_FX_CUSTOMER_QUOTE_MARKUP_REFRESH_MS:60000}
+      retained: ${OMS_FX_CUSTOMER_QUOTE_RETAINED:true}
+      qos: ${OMS_FX_CUSTOMER_QUOTE_QOS:0}
     # Operator-facing event publisher: fires on every fx_hedge_actions
     # status change so the trading-desk Treasury page can stream the
     # audit row in real time instead of polling. Same broker as the mid

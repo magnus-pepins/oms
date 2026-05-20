@@ -1734,6 +1734,13 @@ public class OmsConfig {
          * tampering or a bug worth catching).
          */
         private int acceptQuoteToleranceBps = 5;
+        /**
+         * When {@code false} and the mid subscriber is enabled but has no fresh
+         * tick for a pair, {@link com.balh.oms.fx.FxQuoteService} rejects with
+         * {@code RISK_FX_STALE_QUOTE} instead of falling back to {@code STUB_MIDS}.
+         * Production stacks should set {@code OMS_FX_STUB_MIDS_ALLOWED=false}.
+         */
+        private boolean stubMidsAllowed = true;
 
         public boolean isModuleEnabled() {
             return moduleEnabled;
@@ -1835,6 +1842,14 @@ public class OmsConfig {
             // entire flow (>10000 = >100% would still reject everything but
             // semantically meaningless). 5000 bps = 50% is the upper bound.
             this.acceptQuoteToleranceBps = Math.min(5000, Math.max(0, acceptQuoteToleranceBps));
+        }
+
+        public boolean isStubMidsAllowed() {
+            return stubMidsAllowed;
+        }
+
+        public void setStubMidsAllowed(boolean stubMidsAllowed) {
+            this.stubMidsAllowed = stubMidsAllowed;
         }
     }
 

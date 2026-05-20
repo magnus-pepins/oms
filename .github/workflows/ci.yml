@@ -71,6 +71,8 @@ jobs:
           # Ryuk sidecar occasionally fails to start on GitHub-hosted runners; disabling is a
           # documented Testcontainers trade-off for CI (containers still stop with the JVM).
           TESTCONTAINERS_RYUK_DISABLED: true
+          # GHA postgres service above — SettlementPipelineIntegrationTest and other
+          # AbstractPostgresIntegrationTest suites use this URL (no Testcontainers Postgres).
           OMS_CI_JDBC_URL: jdbc:postgresql://127.0.0.1:5432/oms
           OMS_CI_JDBC_USER: oms
           OMS_CI_JDBC_PASSWORD: oms

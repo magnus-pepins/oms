@@ -20,6 +20,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.verifyNoInteractions;
 
 @ExtendWith(MockitoExtension.class)
 class SettlementAutoStepSchedulerTest {
@@ -39,6 +40,29 @@ class SettlementAutoStepSchedulerTest {
         scheduler =
                 new SettlementAutoStepScheduler(
                         config, processor, executionsRepository, executions, new SimpleMeterRegistry());
+    }
+
+    @Test
+    void tick_disabled_doesNotQueryRepository() {
+        config.getSettlement().setAutoStepSchedulerEnabled(false);
+
+        scheduler.tick();
+
+        verifyNoInteractions(executionsRepository);
+        verifyNoInteractions(processor);
+    }
+
+    @Test
+    void tick_passesConfiguredMaxExecutionAgeToRepository() {
+        config.getSettlement().setAutoStepSchedulerMaxExecutionAgeSeconds(1800);
+        config.getSettlement().setAutoStepSchedulerMaxAdvanceFailures(7);
+        config.getSettlement().setAutoStepSchedulerBatchSize(15);
+        when(executionsRepository.findNonTerminalTradeIds(1800L, 7, 15)).thenReturn(List.of());
+
+        scheduler.tick();
+
+        verify(executionsRepository).findNonTerminalTradeIds(1800L, 7, 15);
+        verifyNoInteractions(processor);
     }
 
     @Test

@@ -76,6 +76,7 @@ public class FxMarkupOverridesService {
 
     private volatile List<OverrideRow> cache = Collections.emptyList();
     private volatile long cacheLoadedAtMs;
+    private volatile OverridesChangePropagator changePropagator = OverridesChangePropagator.NOOP;
 
     public FxMarkupOverridesService(
             JdbcTemplate jdbc,
@@ -102,6 +103,16 @@ public class FxMarkupOverridesService {
         if (effective != refreshMs) {
             log.warn("[fx-mk-ovr] refresh-ms {} below floor; clamped to {}", refreshMs, effective);
         }
+    }
+
+    /**
+     * Setter-wired by {@link FxMarkupOverridesNatsInvalidationBus} when
+     * NATS is enabled. Tests and single-JVM dev leave the default
+     * {@link OverridesChangePropagator#NOOP} so the existing local
+     * {@link #refreshNow()} fully covers the write path.
+     */
+    public void setChangePropagator(OverridesChangePropagator p) {
+        this.changePropagator = p == null ? OverridesChangePropagator.NOOP : p;
     }
 
     @Scheduled(
@@ -262,6 +273,7 @@ public class FxMarkupOverridesService {
         // Approved rows become live immediately; pending ones still need an approve()
         // call later but the refresh is harmless either way.
         refreshNow();
+        changePropagator.localChanged("create", id);
         log.info("[fx-mk-ovr] create id={} pair={} side={} tier={} bps={} dur_ms={} by={} approved={}",
                 id, pair, side, tier, req.additiveBps().toPlainString(), req.durationMs(),
                 createdBy, autoApprove);
@@ -338,6 +350,7 @@ public class FxMarkupOverridesService {
         if (n == 0) throw new IllegalStateException("override " + id + " not approvable");
         approveCounter.increment();
         refreshNow();
+        changePropagator.localChanged("approve", id);
         log.info("[fx-mk-ovr] approve id={} by={}", id, trimmed);
     }
 
@@ -360,6 +373,7 @@ public class FxMarkupOverridesService {
         }
         revokeCounter.increment();
         refreshNow();
+        changePropagator.localChanged("revoke", id);
         log.info("[fx-mk-ovr] revoke id={} by={}", id, revokedBy.trim());
     }
 

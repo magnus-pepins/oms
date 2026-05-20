@@ -329,6 +329,57 @@ class FxMarkupOverridesServiceTest {
     }
 
     @Test
+    void writePaths_firePropagatorWithActionAndId() {
+        // Pins the contract that FxMarkupOverridesNatsInvalidationBus relies on:
+        // every successful create/approve/revoke fires localChanged so remote
+        // JVMs invalidate their cache without waiting for the scheduled refresh.
+        JdbcTemplate jdbc = mock(JdbcTemplate.class);
+        FxMarkupOverridesService svc = newServiceWith(jdbc);
+        OverridesChangePropagator propagator = mock(OverridesChangePropagator.class);
+        svc.setChangePropagator(propagator);
+
+        // create — small bps, short duration → auto-approve, INSERT returns id 11
+        when(jdbc.queryForObject(anyString(), eq(Long.class),
+                any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(11L);
+        FxMarkupOverridesService.CreateRequest req = new FxMarkupOverridesService.CreateRequest(
+                "EURUSD", "BID", "elite", new BigDecimal("3.00"),
+                null, 60_000L, "vol spike", "trader-a");
+        svc.create(req);
+
+        // approve — different operator passes four-eyes, UPDATE returns 1
+        Map<String, Object> pendingRow = new HashMap<>();
+        pendingRow.put("created_by", "trader-a");
+        pendingRow.put("approved_at", null);
+        pendingRow.put("revoked_at", null);
+        when(jdbc.queryForMap(anyString(), eq(11L))).thenReturn(pendingRow);
+        when(jdbc.update(anyString(), any(), any(), eq(11L))).thenReturn(1);
+        svc.approve(11L, "trader-b");
+
+        // revoke — UPDATE returns 1
+        when(jdbc.update(anyString(), any(), any(), eq(11L))).thenReturn(1);
+        svc.revoke(11L, "trader-b");
+
+        org.mockito.Mockito.verify(propagator).localChanged("create", 11L);
+        org.mockito.Mockito.verify(propagator).localChanged("approve", 11L);
+        org.mockito.Mockito.verify(propagator).localChanged("revoke", 11L);
+    }
+
+    @Test
+    void setChangePropagator_nullResetsToNoop() {
+        // Operator concern: PreDestroy on the bus calls setChangePropagator(NOOP)
+        // so a write that arrives mid-shutdown does not NPE. Pass null and
+        // confirm a subsequent write still completes.
+        JdbcTemplate jdbc = mock(JdbcTemplate.class);
+        FxMarkupOverridesService svc = newServiceWith(jdbc);
+        svc.setChangePropagator(mock(OverridesChangePropagator.class));
+        svc.setChangePropagator(null);
+        when(jdbc.update(anyString(), any(), any(), eq(8L))).thenReturn(1);
+        // should not throw
+        svc.revoke(8L, "trader-b");
+    }
+
+    @Test
     void status_countsActiveAndReportsNextExpiry() {
         FxMarkupOverridesService svc = newService();
         FxMarkupOverridesService.OverrideRow active1 = new FxMarkupOverridesService.OverrideRow(

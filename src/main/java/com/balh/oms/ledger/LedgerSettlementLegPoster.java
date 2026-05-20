@@ -45,6 +45,9 @@ public final class LedgerSettlementLegPoster implements LedgerSettlementPostingC
 
     private static final String LEDGER_KEY_HEADER = "X-Ledger-Key";
 
+    /** Legacy stock-fee snapshots used bare {@code @Platform-Revenue} for USD (Bug H). */
+    private static final String LEGACY_PLATFORM_REVENUE_INDICATOR = "@Platform-Revenue";
+
     private final RestClient http;
     private final String apiKey;
     private final ObjectMapper objectMapper;
@@ -192,9 +195,11 @@ public final class LedgerSettlementLegPoster implements LedgerSettlementPostingC
         }
         String customerIndicator = "inv-" + accountId + "-" + feeCurrency;
         String customerBalance = resolveCustomerBalanceId(customerIndicator, feeCurrency);
-        String feeBalance = p.has("feeBalanceIndicator") && p.get("feeBalanceIndicator").isTextual()
-                ? p.get("feeBalanceIndicator").asText()
-                : "@Fees-" + feeCurrency;
+        String feeBalance = normalizeFeeBalanceIndicator(
+                p.has("feeBalanceIndicator") && p.get("feeBalanceIndicator").isTextual()
+                        ? p.get("feeBalanceIndicator").asText()
+                        : "@Fees-" + feeCurrency,
+                feeCurrency);
 
         Map<String, Object> body = legBody(
                 customerBalance, feeBalance, feeAmount, feeCurrency,
@@ -255,9 +260,15 @@ public final class LedgerSettlementLegPoster implements LedgerSettlementPostingC
             log.info("ledger settlement leg posted outboxId={} leg={} txn={}", outboxId, legLabel, txnId);
         } catch (RestClientResponseException e) {
             String b = e.getResponseBodyAsString();
+            int status = e.getStatusCode().value();
+            String snippet = b.substring(0, Math.min(300, b.length()));
+            if (status == 404 && isIndicatorNotFoundBody(b)) {
+                throw new LedgerSettlementPostingException(
+                        LedgerSettlementPostingException.Reason.SKIPPED_INDICATOR_NOT_FOUND,
+                        "ledger settlement leg=" + legLabel + " HTTP 404: " + snippet);
+            }
             throw new LedgerSettlementPostingException(
-                    "ledger settlement leg=" + legLabel + " HTTP " + e.getStatusCode().value() + ": "
-                            + b.substring(0, Math.min(300, b.length())));
+                    "ledger settlement leg=" + legLabel + " HTTP " + status + ": " + snippet);
         } catch (LedgerSettlementPostingException e) {
             throw e;
         } catch (Exception e) {
@@ -322,9 +333,15 @@ public final class LedgerSettlementLegPoster implements LedgerSettlementPostingC
             throw e;
         } catch (RestClientResponseException e) {
             String b = e.getResponseBodyAsString();
+            int status = e.getStatusCode().value();
+            String snippet = b.substring(0, Math.min(300, b.length()));
+            if (status == 404) {
+                throw new LedgerSettlementPostingException(
+                        LedgerSettlementPostingException.Reason.SKIPPED_INDICATOR_NOT_FOUND,
+                        "ledger /balances?indicator lookup HTTP 404: " + snippet);
+            }
             throw new LedgerSettlementPostingException(
-                    "ledger /balances?indicator lookup HTTP " + e.getStatusCode().value()
-                            + ": " + b.substring(0, Math.min(300, b.length())));
+                    "ledger /balances?indicator lookup HTTP " + status + ": " + snippet);
         } catch (Exception e) {
             throw new LedgerSettlementPostingException(
                     "ledger /balances?indicator lookup unexpected: " + e.getMessage(), e);
@@ -350,5 +367,34 @@ public final class LedgerSettlementLegPoster implements LedgerSettlementPostingC
             throw new LedgerSettlementPostingException(
                     "settlement payload field not a number: " + field + "=" + s);
         }
+    }
+
+    /**
+     * Adopt {@code @Platform-Revenue-<CCY>} on the wire while historical outbox rows still
+     * carry bare {@code @Platform-Revenue} (Bug H).
+     */
+    static String normalizeFeeBalanceIndicator(String indicator, String feeCurrency) {
+        if (indicator == null || indicator.isBlank()) {
+            return "@Fees-" + feeCurrency;
+        }
+        String trimmed = indicator.trim();
+        if (LEGACY_PLATFORM_REVENUE_INDICATOR.equals(trimmed)
+                && feeCurrency != null
+                && !feeCurrency.isBlank()) {
+            return LEGACY_PLATFORM_REVENUE_INDICATOR + "-" + feeCurrency.trim().toUpperCase();
+        }
+        return trimmed;
+    }
+
+    /**
+     * Ledger shim 404 bodies for missing {@code @…} indicators include {@code NOT_FOUND} and
+     * {@code indicator=} (see {@code IndicatorResolver} / {@code BalanceController}).
+     */
+    private static boolean isIndicatorNotFoundBody(String body) {
+        if (body == null || body.isBlank()) {
+            return false;
+        }
+        String lower = body.toLowerCase();
+        return lower.contains("not_found") || lower.contains("balance not found");
     }
 }

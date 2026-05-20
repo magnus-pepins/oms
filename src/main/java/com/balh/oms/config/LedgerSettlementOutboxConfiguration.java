@@ -15,6 +15,12 @@ import org.springframework.transaction.PlatformTransactionManager;
 /**
  * Wires {@link LedgerSettlementPostingClient} when Ledger HTTP is enabled and settlement outbox delivery is on.
  */
+/**
+ * <p>Deploy only on {@code oms-postgres-projector}: set
+ * {@code OMS_LEDGER_SETTLEMENT_OUTBOX_RECONCILER_ENABLED=true} there and {@code false} on
+ * ingress / fix-egress (see {@code ecosystem.config.cjs}). There is no Spring
+ * {@code @Profile} gate here so integration tests can enable the reconciler via properties.
+ */
 @Configuration
 @ConditionalOnProperty(
         prefix = "oms.ledger",

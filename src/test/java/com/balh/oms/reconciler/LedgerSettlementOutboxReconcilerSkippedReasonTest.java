@@ -81,7 +81,7 @@ class LedgerSettlementOutboxReconcilerSkippedReasonTest {
 
         when(outbox.lockUnpostedOlderThan(any(Instant.class), eq(BATCH_SIZE)))
                 .thenReturn(List.of(new LedgerSettlementOutboxRepository.OutboxRow(
-                        OUTBOX_ID, EXECUTION_ID, STATUS, LEG, PAYLOAD)));
+                        OUTBOX_ID, EXECUTION_ID, STATUS, LEG, PAYLOAD, 0)));
 
         reconciler = new LedgerSettlementOutboxReconciler(
                 outbox, postingClient, config, transactionManager, meterRegistry);
@@ -101,6 +101,22 @@ class LedgerSettlementOutboxReconcilerSkippedReasonTest {
         assertThat(counterTotal(METRIC_FAILED)).isZero();
         assertThat(counterTotal(METRIC_PUBLISHED)).isZero();
         verify(outbox, never()).markPosted(anyLong(), any(Instant.class));
+    }
+
+    @Test
+    void indicatorNotFoundIncrementsSkippedCounterAndRecordsAttempt() throws Exception {
+        doThrow(new LedgerSettlementPostingException(
+                        Reason.SKIPPED_INDICATOR_NOT_FOUND,
+                        "ledger settlement leg=fee HTTP 404: Balance not found: indicator=@Platform-Revenue"))
+                .when(postingClient)
+                .postSettlementOutbox(eq(OUTBOX_ID), eq(EXECUTION_ID), eq(STATUS), eq(LEG), eq(PAYLOAD));
+
+        reconciler.runOnce();
+
+        assertThat(skippedCount("indicator_not_found")).isEqualTo(1.0);
+        assertThat(counterTotal(METRIC_FAILED)).isZero();
+        verify(outbox, never()).markPosted(anyLong(), any(Instant.class));
+        verify(outbox).recordAttempt(eq(OUTBOX_ID), any(Instant.class), org.mockito.ArgumentMatchers.contains("404"));
     }
 
     @Test
@@ -131,11 +147,29 @@ class LedgerSettlementOutboxReconcilerSkippedReasonTest {
     }
 
     @Test
+    void skippableReasonTombstonesAfterConfiguredAttempts() throws Exception {
+        config.getLedger().setSettlementOutboxSkipAfterAttempts(2);
+        when(outbox.lockUnpostedOlderThan(any(Instant.class), eq(BATCH_SIZE)))
+                .thenReturn(List.of(new LedgerSettlementOutboxRepository.OutboxRow(
+                        OUTBOX_ID, EXECUTION_ID, STATUS, LEG, PAYLOAD, 1)));
+        doThrow(new LedgerSettlementPostingException(
+                        Reason.SKIPPED_UNFUNDED_BALANCE, "customer balance not found"))
+                .when(postingClient)
+                .postSettlementOutbox(eq(OUTBOX_ID), eq(EXECUTION_ID), eq(STATUS), eq(LEG), eq(PAYLOAD));
+
+        reconciler.runOnce();
+
+        verify(outbox).markSkipped(eq(OUTBOX_ID), any(Instant.class), eq("unfunded_balance"));
+        verify(outbox, never()).markPosted(anyLong(), any(Instant.class));
+    }
+
+    @Test
     void successfulPostMarksPostedAndIncrementsPublished() throws Exception {
         // postSettlementOutbox returns normally → markPosted + published++.
         reconciler.runOnce();
 
         verify(outbox).markPosted(eq(OUTBOX_ID), any(Instant.class));
+        verify(outbox).recordAttempt(eq(OUTBOX_ID), any(Instant.class), eq(null));
         assertThat(counterTotal(METRIC_PUBLISHED)).isEqualTo(1.0);
         assertThat(counterTotal(METRIC_FAILED)).isZero();
         assertThat(skippedCount("unfunded_balance")).isZero();

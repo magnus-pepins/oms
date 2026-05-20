@@ -96,6 +96,7 @@ oms:
     settlement-outbox-reconciler-age-ms: ${OMS_LEDGER_SETTLEMENT_OUTBOX_RECONCILER_AGE_MS:2000}
     settlement-outbox-reconciler-batch-size: ${OMS_LEDGER_SETTLEMENT_OUTBOX_RECONCILER_BATCH_SIZE:50}
     settlement-outbox-reconciler-interval-ms: ${OMS_LEDGER_SETTLEMENT_OUTBOX_RECONCILER_INTERVAL_MS:500}
+    settlement-outbox-skip-after-attempts: ${OMS_LEDGER_SETTLEMENT_OUTBOX_SKIP_AFTER_ATTEMPTS:10}
     settlement-posting-http-path: ${OMS_LEDGER_SETTLEMENT_POSTING_HTTP_PATH:/internal/v0/settlement-outbox}
   marketdata:
     enabled: ${OMS_MARKETDATA_HTTP_ENABLED:false}
@@ -158,6 +159,7 @@ oms:
     auto-step-scheduler-interval-ms: ${OMS_SETTLEMENT_AUTO_STEP_SCHEDULER_INTERVAL_MS:5000}
     auto-step-scheduler-batch-size: ${OMS_SETTLEMENT_AUTO_STEP_SCHEDULER_BATCH_SIZE:50}
     auto-step-scheduler-max-execution-age-seconds: ${OMS_SETTLEMENT_AUTO_STEP_SCHEDULER_MAX_EXECUTION_AGE_SECONDS:3600}
+    auto-step-scheduler-max-advance-failures: ${OMS_SETTLEMENT_AUTO_STEP_SCHEDULER_MAX_ADVANCE_FAILURES:5}
     file-import-max-bytes: ${OMS_SETTLEMENT_FILE_IMPORT_MAX_BYTES:10000000}
     file-import-max-rows: ${OMS_SETTLEMENT_FILE_IMPORT_MAX_ROWS:10000}
     file-import-register-slice-size: ${OMS_SETTLEMENT_FILE_IMPORT_REGISTER_SLICE_SIZE:50}

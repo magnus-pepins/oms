@@ -30,7 +30,13 @@ public interface LedgerSettlementPostingClient {
          */
         public enum Reason {
             FAILED,
-            SKIPPED_UNFUNDED_BALANCE
+            /** Customer {@code inv-…} balance missing in Ledger (empty GET /balances?indicator=…). */
+            SKIPPED_UNFUNDED_BALANCE,
+            /**
+             * Ledger shim returned HTTP 404 for an {@code @…} indicator on {@code POST /transactions}
+             * (platform bucket not provisioned). Row stays unposted until an operator creates the balance.
+             */
+            SKIPPED_INDICATOR_NOT_FOUND
         }
 
         private final Reason reason;

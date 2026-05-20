@@ -317,7 +317,9 @@ const COMMON_ENV = {
   // Off in production until the cross-currency leg + custody legs land
   // (Phase 2 / Phase 3 of plans/oms-fix-gateway-and-settlement.md §11.6).
   OMS_LEDGER_SETTLEMENT_OUTBOX_ENABLED: 'true',
-  OMS_LEDGER_SETTLEMENT_OUTBOX_RECONCILER_ENABLED: 'true',
+  // Reconciler runs on oms-postgres-projector only (see LedgerSettlementOutboxConfiguration
+  // @Profile). Keeping this false in COMMON_ENV avoids three JVMs ticking the same rows.
+  OMS_LEDGER_SETTLEMENT_OUTBOX_RECONCILER_ENABLED: 'false',
 };
 
 const COMMON_PM2 = {
@@ -370,6 +372,7 @@ const apps = [
       ...COMMON_ENV,
       SPRING_PROFILES_ACTIVE: 'oms-postgres-projector',
       OMS_POSTGRES_PROJECTOR_AERON_DIR: AERON_MEDIA_DRIVER,
+      OMS_LEDGER_SETTLEMENT_OUTBOX_RECONCILER_ENABLED: 'true',
     },
     ...COMMON_PM2,
   },

@@ -50,6 +50,7 @@ public class SettlementExecutionsRepository {
                     SELECT id FROM executions
                     WHERE exec_type = 'TRADE'
                       AND settlement_status NOT IN ('settled', 'failed')
+                      AND settlement_auto_step_failures < :max_advance_failures
                       AND created_at >= NOW() - make_interval(secs => :max_age_seconds)
                     ORDER BY created_at
                     LIMIT :lim
@@ -62,9 +63,10 @@ public class SettlementExecutionsRepository {
      * the transitions live. The {@code maxAgeSeconds} bound stops the scheduler from picking up
      * stale rows from prior runs / replays.
      */
-    public List<Long> findNonTerminalTradeIds(long maxAgeSeconds, int limit) {
+    public List<Long> findNonTerminalTradeIds(long maxAgeSeconds, int maxAdvanceFailures, int limit) {
         var params = new MapSqlParameterSource()
                 .addValue("max_age_seconds", maxAgeSeconds)
+                .addValue("max_advance_failures", Math.max(1, maxAdvanceFailures))
                 .addValue("lim", limit);
         return jdbc.query(FIND_NON_TERMINAL_TRADE_IDS_SQL, params, (rs, rowNum) -> rs.getLong("id"));
     }

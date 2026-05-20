@@ -198,21 +198,20 @@ public class SettlementConfirmProcessor {
 
     private void applyTransition(SettlementExecutionRow snapshot, String cur, String next) {
         if ("settled".equals(next)) {
-            UUID custody = UUID.fromString(config.getSettlement().getDefaultCustodyAccountId());
-            if ("BUY".equalsIgnoreCase(snapshot.side())) {
-                positions.recordBuySettled(
-                        snapshot.accountId(),
-                        snapshot.instrumentSymbol(),
-                        custody,
-                        snapshot.lastQuantity(),
-                        snapshot.executionId());
-            } else if ("SELL".equalsIgnoreCase(snapshot.side())) {
-                positions.recordSellSettled(
-                        snapshot.accountId(),
-                        snapshot.instrumentSymbol(),
-                        custody,
-                        snapshot.lastQuantity(),
-                        snapshot.executionId());
+            try {
+                applyPositionSettleLeg(snapshot);
+            } catch (IllegalStateException e) {
+                if (isMissingPositionSettleFailure(e)) {
+                    log.warn(
+                            "settlement position leg missing; marking trade failed executionId={} side={} symbol={}: {}",
+                            snapshot.executionId(),
+                            snapshot.side(),
+                            snapshot.instrumentSymbol(),
+                            e.getMessage());
+                    markTradeFailed(snapshot.executionId());
+                    return;
+                }
+                throw e;
             }
         }
         int n = executions.updateSettlementStatusIf(snapshot.executionId(), cur, next);
@@ -239,6 +238,30 @@ public class SettlementConfirmProcessor {
      * {@link com.balh.oms.config.OmsConfig.Settlement#getDefaultInstrumentMarket()}.
      * Once an instrument reference table lands we'll look it up by symbol.
      */
+    private void applyPositionSettleLeg(SettlementExecutionRow snapshot) {
+        UUID custody = UUID.fromString(config.getSettlement().getDefaultCustodyAccountId());
+        if ("BUY".equalsIgnoreCase(snapshot.side())) {
+            positions.recordBuySettled(
+                    snapshot.accountId(),
+                    snapshot.instrumentSymbol(),
+                    custody,
+                    snapshot.lastQuantity(),
+                    snapshot.executionId());
+        } else if ("SELL".equalsIgnoreCase(snapshot.side())) {
+            positions.recordSellSettled(
+                    snapshot.accountId(),
+                    snapshot.instrumentSymbol(),
+                    custody,
+                    snapshot.lastQuantity(),
+                    snapshot.executionId());
+        }
+    }
+
+    private static boolean isMissingPositionSettleFailure(IllegalStateException e) {
+        String msg = e.getMessage();
+        return msg != null && msg.contains("settle expected 1 position row, got 0");
+    }
+
     private void enqueueSettlementLegs(SettlementExecutionRow snapshot) {
         if (snapshot.lastPrice() == null) {
             log.warn(

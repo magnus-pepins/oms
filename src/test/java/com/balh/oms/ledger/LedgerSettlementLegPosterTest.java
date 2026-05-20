@@ -155,6 +155,23 @@ class LedgerSettlementLegPosterTest {
     }
 
     @Test
+    void feeLegNormalizesLegacyPlatformRevenueIndicator() throws Exception {
+        stubCustomerResolution(
+                "inv-a0000000-0000-4000-8000-000000000001-USD", "USD", "balance_cust_001_usd");
+        String payload = """
+                {"schemaVersion":2,"leg":"fee","executionId":112,
+                 "accountId":"a0000000-0000-4000-8000-000000000001","side":"BUY",
+                 "instrumentSymbol":"AAPL","market":"US","feeAmount":"0.15","feeCurrency":"USD",
+                 "feeBalanceIndicator":"@Platform-Revenue","notional":"50.00"}""";
+
+        poster.postSettlementOutbox(100L, 112L, "settled", LedgerSettlementOutboxRepository.LEG_FEE, payload);
+
+        ledger.verify(1, postWith()
+                .withRequestBody(containing("\"destination\":\"@Platform-Revenue-USD\""))
+                .withRequestBody(containing("\"reference\":\"settlement-100-fee\"")));
+    }
+
+    @Test
     void feeLegSkippedWhenAmountIsZero() throws Exception {
         String payload = """
                 {"schemaVersion":2,"leg":"fee","executionId":1,
@@ -212,6 +229,30 @@ class LedgerSettlementLegPosterTest {
         assertThatThrownBy(() -> poster.postSettlementOutbox(1, 1, "settled", "weird", "{}"))
                 .isInstanceOf(LedgerSettlementPostingException.class)
                 .hasMessageContaining("unknown legKind");
+    }
+
+    @Test
+    void ledger404IndicatorNotFoundMapsToSkippedReason() {
+        ledger.resetAll();
+        stubCustomerResolution(
+                "inv-a0000000-0000-4000-8000-000000000001-USD", "USD", "balance_cust_001_usd");
+        ledger.stubFor(post(urlPathEqualTo("/transactions"))
+                .willReturn(aResponse()
+                        .withStatus(404)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody(
+                                "{\"error\":\"Balance not found: indicator=@Platform-Revenue, currency=USD\",\"code\":\"NOT_FOUND\"}")));
+        String payload = """
+                {"schemaVersion":2,"leg":"fee","executionId":92,
+                 "accountId":"a0000000-0000-4000-8000-000000000001","side":"BUY",
+                 "feeCurrency":"USD","feeAmount":"0.15","feeBalanceIndicator":"@Platform-Revenue"}""";
+
+        assertThatThrownBy(() ->
+                        poster.postSettlementOutbox(
+                                42, 92, "settled", LedgerSettlementOutboxRepository.LEG_FEE, payload))
+                .isInstanceOf(LedgerSettlementPostingException.class)
+                .satisfies(ex -> assertThat(((LedgerSettlementPostingException) ex).reason())
+                        .isEqualTo(LedgerSettlementPostingException.Reason.SKIPPED_INDICATOR_NOT_FOUND));
     }
 
     @Test

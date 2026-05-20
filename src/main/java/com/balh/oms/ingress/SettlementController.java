@@ -4,6 +4,7 @@ import com.balh.oms.config.OmsConfig;
 import com.balh.oms.persistence.SettlementExecutionsRepository;
 import com.balh.oms.settlement.BrokerFixtureRow;
 import com.balh.oms.settlement.MarkTradeFailedResult;
+import com.balh.oms.settlement.LedgerSettlementOutboxRepository;
 import com.balh.oms.settlement.SettlementConfirmProcessor;
 import com.balh.oms.settlement.SettlementFileImportBatchRepository;
 import com.balh.oms.settlement.SettlementFileImportService;
@@ -79,19 +80,51 @@ public class SettlementController {
 
     private static final int MAX_FILE_IMPORT_LIST_OFFSET = 10_000;
 
+    /** Default min {@code attempts} for {@code GET …/outbox/stuck} (rows below this are omitted). */
+    private static final int STUCK_OUTBOX_MIN_ATTEMPTS_DEFAULT = 3;
+
+    private static final int STUCK_OUTBOX_LIST_MAX_LIMIT = 200;
+
+    public record StuckOutboxListResponse(
+            List<LedgerSettlementOutboxRepository.StuckOutboxRow> items, int minAttempts, int limit) {}
+
+    private final LedgerSettlementOutboxRepository ledgerSettlementOutbox;
+
     public SettlementController(
             SettlementConfirmProcessor processor,
             OmsConfig config,
             SettlementExecutionsRepository settlementExecutions,
             SettlementFileImportService settlementFileImportService,
             SettlementFileImportBatchRepository settlementFileImportBatchRepository,
-            SettlementTimelineService timelineService) {
+            SettlementTimelineService timelineService,
+            LedgerSettlementOutboxRepository ledgerSettlementOutbox) {
         this.processor = processor;
         this.config = config;
         this.settlementExecutions = settlementExecutions;
         this.settlementFileImportService = settlementFileImportService;
         this.settlementFileImportBatchRepository = settlementFileImportBatchRepository;
         this.timelineService = timelineService;
+        this.ledgerSettlementOutbox = ledgerSettlementOutbox;
+    }
+
+    /**
+     * Unposted ledger settlement legs with repeated delivery failures — for beard-admin ops
+     * without grepping pm2 logs. Requires {@code attempts >= minAttempts} (default 3).
+     */
+    @GetMapping("/outbox/stuck")
+    public ResponseEntity<StuckOutboxListResponse> listStuckOutbox(
+            @RequestParam(name = "minAttempts", required = false) Integer minAttempts,
+            @RequestParam(required = false) Integer limit) {
+        int min = minAttempts == null ? STUCK_OUTBOX_MIN_ATTEMPTS_DEFAULT : minAttempts;
+        if (min < 1) {
+            return ResponseEntity.badRequest().build();
+        }
+        int lim = limit == null ? 50 : limit;
+        if (lim < 1 || lim > STUCK_OUTBOX_LIST_MAX_LIMIT) {
+            return ResponseEntity.badRequest().build();
+        }
+        var rows = ledgerSettlementOutbox.findStuckUnposted(min, lim);
+        return ResponseEntity.ok(new StuckOutboxListResponse(rows, min, lim));
     }
 
     /**

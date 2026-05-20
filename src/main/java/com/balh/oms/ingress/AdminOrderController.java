@@ -4,6 +4,8 @@ import com.balh.oms.cluster.CancelOrderCommand;
 import com.balh.oms.cluster.OmsClusterIngressClient;
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.config.OmsProfiles;
+import com.balh.oms.domain.Order;
+import com.balh.oms.domain.OrderStatus;
 import com.balh.oms.persistence.OrdersRepository;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -20,7 +22,9 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.TimeoutException;
 
@@ -60,6 +64,27 @@ import java.util.concurrent.TimeoutException;
  * Already-terminal orders are a silent no-op in the cluster — the controller's 409 pre-check
  * just gives the operator a faster, more honest error response.
  *
+ * <h2>Cluster-forgot-order observation</h2>
+ *
+ * <p>The cluster's {@link com.balh.oms.cluster.OmsAdmissionClusteredService#applyCancelOrder
+ * applyCancelOrder} silently returns if its in-memory {@code orderIndex} does not contain the
+ * target order id — the original intent was "ignore duplicate cancels for terminal orders that
+ * have already been evicted from the index". The corner case that breaks the operator's mental
+ * model is when the Postgres {@code orders} row exists in a non-terminal state but the cluster
+ * has lost the in-memory mapping (typical cause: cluster journal wipe + replay that did not
+ * restore the order, e.g. after a slice deploy that truncated the journal). The controller
+ * used to return {@code 202 Accepted} in that case, and the operator was left believing the
+ * cancel was queued when in fact nothing was going to happen.
+ *
+ * <p>Fix: after the cluster submit returns OK, poll the orders row for up to
+ * {@link OmsConfig.Admin#getCancelObservationTimeoutMs()} ms (default 2000) for a version bump
+ * combined with a terminal status — that pair uniquely identifies "projector applied an
+ * {@link com.balh.oms.cluster.OrderCancelAppliedEvent} for our submit (or for an earlier one
+ * we lost the race with — either way, the operator-visible state is correct)". If the
+ * deadline passes without an observed bump, return {@code 410 Gone} with
+ * {@code cluster_forgot_order} so the caller knows the cluster swallowed it and manual
+ * Postgres cleanup is required.
+ *
  * <h2>Production caveat</h2>
  *
  * <p>The broker still believes the order is open. If the venue later fills it the inbound ER
@@ -98,11 +123,22 @@ public class AdminOrderController {
      */
     public static final String REASON_PREFIX = "admin-force-cancel: ";
 
+    /**
+     * Audit marker in logs for {@link #forceMarkCancelledPostgresOnly(UUID, ForceCancelRequestBody)}.
+     * Does not write to {@code orders.terminal_reason} (reject_code enum); forensic trail is log + metric.
+     */
+    public static final String POSTGRES_ONLY_CANCEL_LOG_MARKER = "admin-postgres-only-cancel";
+
     private final OmsConfig config;
     private final OmsClusterIngressClient cluster;
     private final OrdersRepository orders;
     private final Counter requestedCounter;
     private final Counter alreadyTerminalCounter;
+    private final Counter clusterForgotCounter;
+    private final Counter appliedCounter;
+    private final Counter postgresOnlyAppliedCounter;
+    private final Counter postgresOnlySkippedCounter;
+    private final Counter postgresOnlyConflictCounter;
 
     public AdminOrderController(
             OmsConfig config,
@@ -118,6 +154,24 @@ public class AdminOrderController {
         this.alreadyTerminalCounter = Counter.builder("oms_orders_admin_force_cancel_skipped_total")
                 .description("Admin force-cancel requests skipped because order is already terminal")
                 .register(meterRegistry);
+        this.clusterForgotCounter = Counter.builder("oms_orders_admin_force_cancel_cluster_forgot_total")
+                .description("Admin force-cancel requests where the cluster accepted the command but produced no apply event within the observation timeout (orderIndex miss, likely post-journal-wipe)")
+                .register(meterRegistry);
+        this.appliedCounter = Counter.builder("oms_orders_admin_force_cancel_applied_total")
+                .description("Admin force-cancel requests where the projector observed the cancel apply within the observation timeout")
+                .register(meterRegistry);
+        this.postgresOnlyAppliedCounter =
+                Counter.builder("oms_orders_admin_force_mark_cancelled_postgres_applied_total")
+                        .description("Postgres-only admin cancels (journal-loss hygiene; no cluster event)")
+                        .register(meterRegistry);
+        this.postgresOnlySkippedCounter =
+                Counter.builder("oms_orders_admin_force_mark_cancelled_postgres_skipped_total")
+                        .description("Postgres-only admin cancel skipped (already terminal)")
+                        .register(meterRegistry);
+        this.postgresOnlyConflictCounter =
+                Counter.builder("oms_orders_admin_force_mark_cancelled_postgres_conflict_total")
+                        .description("Postgres-only admin cancel CAS lost (concurrent writer)")
+                        .register(meterRegistry);
     }
 
     public record ForceCancelRequestBody(String reason) {}
@@ -141,6 +195,10 @@ public class AdminOrderController {
                             "error", "order_already_terminal",
                             "orderStatus", order.status().name()));
         }
+        // Captured before the cluster submit so the post-submit observation loop can detect a
+        // version bump produced by the projector applying our cancel (or any other writer's
+        // cancel that won the race — operator-visible outcome is the same in both cases).
+        int versionAtSubmit = order.version();
 
         String rawReason = body == null ? null : body.reason();
         String reason = REASON_PREFIX + trimToMax(rawReason, MAX_REASON_LEN);
@@ -170,13 +228,138 @@ public class AdminOrderController {
         }
         requestedCounter.increment();
         log.info(
-                "admin force-cancel submitted orderId={} status={} correlationId={} reason={}",
-                orderId, order.status().name(), correlationId, reason);
-        return ResponseEntity.accepted()
-                .body(new AdminResponse(
-                        "force_cancel_requested",
-                        order.status().name(),
-                        "Force-cancel submitted to cluster; projector will flip status to CANCELLED."));
+                "admin force-cancel submitted orderId={} status={} version={} correlationId={} reason={}",
+                orderId, order.status().name(), versionAtSubmit, correlationId, reason);
+
+        Optional<Order> applied = pollForCancelApplied(orderId, versionAtSubmit);
+        if (applied.isPresent()) {
+            appliedCounter.increment();
+            Order observed = applied.get();
+            log.info(
+                    "admin force-cancel applied orderId={} status={} version={} correlationId={}",
+                    orderId, observed.status().name(), observed.version(), correlationId);
+            return ResponseEntity.ok(new AdminResponse(
+                    "force_cancel_applied",
+                    observed.status().name(),
+                    "Cluster applied cancel; projector wrote status=" + observed.status().name() + "."));
+        }
+
+        // Cluster received the submit, but the projector never observed an apply event. The
+        // canonical cause is OmsAdmissionClusteredService.applyCancelOrder silently no-op'ing
+        // because the in-memory orderIndex did not contain this orderId (typically after a
+        // cluster journal wipe + replay that did not restore the order). 410 Gone communicates
+        // "the cluster knows nothing about this order; the Postgres row is orphaned from the
+        // cluster's perspective" — operator needs out-of-band Postgres cleanup.
+        clusterForgotCounter.increment();
+        long observationTimeoutMs = config.getAdmin().getCancelObservationTimeoutMs();
+        log.warn(
+                "admin force-cancel: cluster swallowed command — no apply event observed within {} ms"
+                        + " orderId={} status={} version={} correlationId={}."
+                        + " Cluster orderIndex likely missing this order (post-journal-wipe?);"
+                        + " operator must update Postgres orders row directly to mark it terminal.",
+                observationTimeoutMs, orderId, order.status().name(), versionAtSubmit, correlationId);
+        return ResponseEntity.status(HttpStatus.GONE).body(Map.of(
+                "error", "cluster_forgot_order",
+                "orderStatus", order.status().name(),
+                "observationTimeoutMs", observationTimeoutMs,
+                "message",
+                "Cluster accepted the command but produced no cancel-applied event within "
+                        + observationTimeoutMs
+                        + " ms. The cluster has likely lost this order from its in-memory state"
+                        + " (e.g. after a journal wipe). The Postgres orders row is orphaned —"
+                        + " manual cleanup required."));
+    }
+
+    /**
+     * Postgres-only terminal transition for orders the cluster no longer knows about (typical:
+     * journal wipe). Does <strong>not</strong> submit a {@link CancelOrderCommand} and does
+     * <strong>not</strong> enqueue {@code domain_event_outbox} — UIs may need refresh; broker
+     * may still believe the order is open on a real venue.
+     *
+     * <p>Prefer {@link #forceCancel(UUID, ForceCancelRequestBody)} first; use this endpoint when
+     * that returns {@code 410 Gone} {@code cluster_forgot_order}.
+     */
+    @PostMapping("/force-mark-cancelled-postgres-only")
+    public ResponseEntity<?> forceMarkCancelledPostgresOnly(
+            @PathVariable UUID orderId,
+            @Valid @RequestBody(required = false) ForceCancelRequestBody body) {
+
+        var orderOpt = orders.findById(orderId);
+        if (orderOpt.isEmpty()) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "order_not_found"));
+        }
+        var order = orderOpt.get();
+        if (order.status().isTerminal()) {
+            postgresOnlySkippedCounter.increment();
+            return ResponseEntity.status(HttpStatus.CONFLICT)
+                    .body(Map.of(
+                            "error", "order_already_terminal",
+                            "orderStatus", order.status().name()));
+        }
+
+        String operatorNote = body == null ? null : body.reason();
+        Instant terminalAt = Instant.now();
+        boolean applied =
+                orders.updateWithCas(orderId, order.version(), OrderStatus.CANCELLED, null, null, terminalAt);
+        if (!applied) {
+            postgresOnlyConflictCounter.increment();
+            log.warn(
+                    "{} CAS lost orderId={} expectedVersion={} status={} operatorNote={}",
+                    POSTGRES_ONLY_CANCEL_LOG_MARKER,
+                    orderId,
+                    order.version(),
+                    order.status().name(),
+                    trimToMax(operatorNote, MAX_REASON_LEN));
+            return ResponseEntity.status(HttpStatus.CONFLICT)
+                    .body(Map.of("error", "version_conflict", "orderStatus", order.status().name()));
+        }
+
+        postgresOnlyAppliedCounter.increment();
+        var updated = orders.findById(orderId).orElse(order);
+        log.warn(
+                "{} applied orderId={} priorStatus={} priorVersion={} newStatus={} newVersion={} terminalAt={} operatorNote={}"
+                        + " — Postgres mirror only; cluster and domain_event_outbox unchanged",
+                POSTGRES_ONLY_CANCEL_LOG_MARKER,
+                orderId,
+                order.status().name(),
+                order.version(),
+                updated.status().name(),
+                updated.version(),
+                terminalAt,
+                trimToMax(operatorNote, MAX_REASON_LEN));
+        return ResponseEntity.ok(new AdminResponse(
+                "postgres_cancel_applied",
+                updated.status().name(),
+                "Orders row marked CANCELLED in Postgres only. Cluster state and NATS fanout unchanged."
+                        + " Follow broker out-of-band cancel on real venues if applicable."));
+    }
+
+    /**
+     * Polls the orders row for up to {@link OmsConfig.Admin#getCancelObservationTimeoutMs()} ms
+     * waiting for the projector to apply a cancel event — detected by a version bump and a
+     * terminal status. Returns the observed order when seen, or empty if the deadline passes.
+     */
+    private Optional<Order> pollForCancelApplied(UUID orderId, int versionAtSubmit) {
+        long timeoutMs = config.getAdmin().getCancelObservationTimeoutMs();
+        long pollMs = config.getAdmin().getCancelObservationPollIntervalMs();
+        long deadlineNanos = System.nanoTime() + Duration.ofMillis(timeoutMs).toNanos();
+        while (true) {
+            var current = orders.findById(orderId);
+            if (current.isPresent()
+                    && current.get().version() > versionAtSubmit
+                    && current.get().status().isTerminal()) {
+                return current;
+            }
+            if (System.nanoTime() >= deadlineNanos) {
+                return Optional.empty();
+            }
+            try {
+                Thread.sleep(pollMs);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return Optional.empty();
+            }
+        }
     }
 
     private static String trimToMax(String value, int max) {

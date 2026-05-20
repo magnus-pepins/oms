@@ -18,6 +18,9 @@ import java.time.temporal.ChronoUnit;
 /**
  * Drains {@code ledger_settlement_outbox} to Ledger HTTP after {@link com.balh.oms.settlement.SettlementConfirmProcessor}
  * enqueues rows (gated by {@code oms.ledger.settlement-outbox-reconciler-enabled}).
+ *
+ * <p>Deploy with {@code OMS_LEDGER_SETTLEMENT_OUTBOX_RECONCILER_ENABLED=true} on a single JVM
+ * (intended: {@code oms-postgres-projector}) so ticks do not race across ingress / fix-egress replicas.
  */
 public class LedgerSettlementOutboxReconciler {
 
@@ -28,12 +31,10 @@ public class LedgerSettlementOutboxReconciler {
     /**
      * Skipped (not failed) outbox posts. Tag {@code reason} mirrors
      * {@link LedgerSettlementPostingClient.LedgerSettlementPostingException.Reason} so an SRE
-     * panel can chart "unfunded customer balances" separately from "Ledger HTTP rejected".
-     * Today the only skip reason is {@code unfunded_balance} from
-     * {@link com.balh.oms.ledger.LedgerSettlementLegPoster} when the customer's invest balance
-     * does not yet exist for the leg currency.
+     * panel can chart operator-actionable skips separately from infra failures.
      */
     private static final String METRIC_SKIPPED = "oms_ledger_settlement_outbox_skipped_total";
+    private static final String METRIC_SKIP_TOMBSTONE = "oms_ledger_settlement_outbox_skip_tombstoned_total";
     private static final String TIMER_LEDGER_SETTLEMENT_POST = "oms.ledger.settlement.outbox.post";
 
     private final LedgerSettlementOutboxRepository outbox;
@@ -71,8 +72,12 @@ public class LedgerSettlementOutboxReconciler {
             Instant olderThan =
                     Instant.now().minus(ledger.getSettlementOutboxReconcilerAgeMs(), ChronoUnit.MILLIS);
             var rows = outbox.lockUnpostedOlderThan(olderThan, ledger.getSettlementOutboxReconcilerBatchSize());
+            int skipAfterAttempts = ledger.getSettlementOutboxSkipAfterAttempts();
             for (LedgerSettlementOutboxRepository.OutboxRow row : rows) {
                 Timer.Sample sample = Timer.start(meterRegistry);
+                Instant attemptAt = Instant.now();
+                String lastError = null;
+                LedgerSettlementPostingClient.LedgerSettlementPostingException.Reason skipReason = null;
                 try {
                     postingClient.postSettlementOutbox(
                             row.id(),
@@ -83,14 +88,33 @@ public class LedgerSettlementOutboxReconciler {
                     outbox.markPosted(row.id(), Instant.now());
                     meterRegistry.counter(METRIC_PUBLISHED).increment();
                 } catch (LedgerSettlementPostingClient.LedgerSettlementPostingException e) {
-                    if (e.reason() == LedgerSettlementPostingClient.LedgerSettlementPostingException.Reason.SKIPPED_UNFUNDED_BALANCE) {
+                    lastError = e.getMessage();
+                    if (e.reason()
+                            == LedgerSettlementPostingClient.LedgerSettlementPostingException.Reason
+                                    .SKIPPED_UNFUNDED_BALANCE) {
+                        skipReason =
+                                LedgerSettlementPostingClient.LedgerSettlementPostingException.Reason
+                                        .SKIPPED_UNFUNDED_BALANCE;
                         meterRegistry
                                 .counter(METRIC_SKIPPED, List.of(Tag.of("reason", "unfunded_balance")))
                                 .increment();
-                        // INFO not WARN — this is the expected demo / fresh-account path; the row
-                        // stays unposted and the next reconciler tick after funding succeeds.
                         log.info(
                                 "ledger settlement outbox skipped id={} executionId={} leg={} reason=unfunded_balance: {}",
+                                row.id(),
+                                row.executionId(),
+                                row.legKind(),
+                                e.getMessage());
+                    } else if (e.reason()
+                            == LedgerSettlementPostingClient.LedgerSettlementPostingException.Reason
+                                    .SKIPPED_INDICATOR_NOT_FOUND) {
+                        skipReason =
+                                LedgerSettlementPostingClient.LedgerSettlementPostingException.Reason
+                                        .SKIPPED_INDICATOR_NOT_FOUND;
+                        meterRegistry
+                                .counter(METRIC_SKIPPED, List.of(Tag.of("reason", "indicator_not_found")))
+                                .increment();
+                        log.warn(
+                                "ledger settlement outbox skipped id={} executionId={} leg={} reason=indicator_not_found: {}",
                                 row.id(),
                                 row.executionId(),
                                 row.legKind(),
@@ -105,6 +129,7 @@ public class LedgerSettlementOutboxReconciler {
                                 e.getMessage());
                     }
                 } catch (RuntimeException e) {
+                    lastError = e.getMessage();
                     meterRegistry.counter(METRIC_FAILED).increment();
                     log.warn(
                             "ledger settlement outbox deliver failed id={} executionId={} leg={}",
@@ -113,6 +138,28 @@ public class LedgerSettlementOutboxReconciler {
                             row.legKind(),
                             e);
                 } finally {
+                    outbox.recordAttempt(row.id(), attemptAt, lastError);
+                    if (skipReason != null && row.attempts() + 1 >= skipAfterAttempts) {
+                        String tombstoneReason =
+                                skipReason == LedgerSettlementPostingClient.LedgerSettlementPostingException.Reason
+                                                .SKIPPED_UNFUNDED_BALANCE
+                                        ? "unfunded_balance"
+                                        : "indicator_not_found";
+                        if (outbox.markSkipped(row.id(), attemptAt, tombstoneReason) == 1) {
+                            meterRegistry
+                                    .counter(
+                                            METRIC_SKIP_TOMBSTONE,
+                                            List.of(Tag.of("reason", tombstoneReason)))
+                                    .increment();
+                            log.warn(
+                                    "ledger settlement outbox tombstoned id={} executionId={} leg={} attempts={} reason={}",
+                                    row.id(),
+                                    row.executionId(),
+                                    row.legKind(),
+                                    row.attempts() + 1,
+                                    tombstoneReason);
+                        }
+                    }
                     sample.stop(ledgerSettlementOutboxPostTimer);
                 }
             }

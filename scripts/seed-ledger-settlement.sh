@@ -36,6 +36,12 @@ FX_SUSPENSE=(
   "GBP|@FX-Suspense-GBP|FX cross-currency settlement suspense GBP (demo)"
 )
 
+# Stock commission platform revenue (Bug H: @Platform-Revenue-<CCY>, not bare @Platform-Revenue).
+PLATFORM_REVENUE=(
+  "USD|@Platform-Revenue-USD|Platform stock commission revenue USD (demo)"
+  "EUR|@Platform-Revenue-EUR|Platform stock commission revenue EUR (demo)"
+)
+
 curl_ledger() {
   curl -sS -H "X-Ledger-Key: ${LEDGER_KEY}" -H 'Content-Type: application/json' "$@"
 }
@@ -73,9 +79,11 @@ seed_group() {
 
 seed_group "Fees revenue (V40 single-currency fee leg)" "${FEES[@]}"
 seed_group "FX suspense (V41 cross-currency cash legs)" "${FX_SUSPENSE[@]}"
+seed_group "Platform revenue (stock commission fee leg)" "${PLATFORM_REVENUE[@]}"
 
 echo
 echo "=========================================================="
 echo "Seed complete. Fee leg targets: @Fees-{USD,EUR,GBP}"
 echo "Cross-currency cash leg suspense: @FX-Suspense-{USD,EUR,GBP}"
+echo "Platform revenue (stock): @Platform-Revenue-{USD,EUR}"
 echo "=========================================================="

@@ -337,6 +337,49 @@ public class ExecutionsRepository {
                 FAIL_TRADE_SETTLEMENT_SQL, new MapSqlParameterSource("id", executionId));
     }
 
+    private static final String INCREMENT_AUTO_STEP_FAILURES_SQL = """
+            UPDATE executions
+            SET settlement_auto_step_failures = settlement_auto_step_failures + 1,
+                settlement_auto_step_last_failure_at = :ts,
+                settlement_auto_step_last_error = :err
+            WHERE id = :id
+              AND exec_type = CAST('TRADE' AS execution_exec_type)
+            RETURNING settlement_auto_step_failures
+            """;
+
+    private static final String CLEAR_AUTO_STEP_FAILURES_SQL = """
+            UPDATE executions
+            SET settlement_auto_step_failures = 0,
+                settlement_auto_step_last_failure_at = NULL,
+                settlement_auto_step_last_error = NULL
+            WHERE id = :id
+            """;
+
+    /**
+     * Records one {@link com.balh.oms.settlement.SettlementAutoStepScheduler} advance failure.
+     *
+     * @return new failure count after increment, or empty if the execution id is missing / not TRADE
+     */
+    public Optional<Integer> recordSettlementAutoStepFailure(long executionId, String errorText) {
+        String err = errorText;
+        if (err != null && err.length() > 500) {
+            err = err.substring(0, 500);
+        }
+        List<Integer> counts = jdbc.query(
+                INCREMENT_AUTO_STEP_FAILURES_SQL,
+                new MapSqlParameterSource()
+                        .addValue("id", executionId)
+                        .addValue("ts", java.sql.Timestamp.from(java.time.Instant.now()))
+                        .addValue("err", err),
+                (rs, rowNum) -> rs.getInt("settlement_auto_step_failures"));
+        return counts.isEmpty() ? Optional.empty() : Optional.of(counts.getFirst());
+    }
+
+    /** Clears auto-step failure state after a successful advance. */
+    public void clearSettlementAutoStepFailures(long executionId) {
+        jdbc.update(CLEAR_AUTO_STEP_FAILURES_SQL, new MapSqlParameterSource("id", executionId));
+    }
+
     private static final String UPDATE_SELL_FILL_POSITION_SPLIT_SQL = """
             UPDATE executions SET
                 sell_position_from_pending_buy = :from_pb,

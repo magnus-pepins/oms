@@ -33,17 +33,44 @@ public class LedgerSettlementOutboxRepository {
             """;
 
     private static final String LOCK_UNPOSTED_SQL = """
-            SELECT id, execution_id, to_settlement_status, leg_kind, payload_json::text AS payload_json
+            SELECT id, execution_id, to_settlement_status, leg_kind, payload_json::text AS payload_json,
+                   attempts
             FROM ledger_settlement_outbox
             WHERE posted_at IS NULL
+              AND skipped_at IS NULL
               AND created_at <= :older_than
             ORDER BY id
             LIMIT :lim
             FOR UPDATE SKIP LOCKED
             """;
 
+    private static final String MARK_SKIPPED_SQL = """
+            UPDATE ledger_settlement_outbox
+            SET skipped_at = :ts, skip_reason = :reason
+            WHERE id = :id AND posted_at IS NULL AND skipped_at IS NULL
+            """;
+
     private static final String MARK_POSTED_SQL = """
             UPDATE ledger_settlement_outbox SET posted_at = :ts WHERE id = :id
+            """;
+
+    private static final String RECORD_ATTEMPT_SQL = """
+            UPDATE ledger_settlement_outbox
+            SET attempts = attempts + 1,
+                last_error_text = :err,
+                last_attempt_at = :ts
+            WHERE id = :id
+            """;
+
+    private static final String FIND_STUCK_UNPOSTED_SQL = """
+            SELECT id, execution_id, to_settlement_status, leg_kind,
+                   payload_json::text AS payload_json, created_at, posted_at,
+                   attempts, last_error_text, last_attempt_at
+            FROM ledger_settlement_outbox
+            WHERE posted_at IS NULL
+              AND attempts >= :min_attempts
+            ORDER BY last_attempt_at DESC NULLS LAST, id DESC
+            LIMIT :lim
             """;
 
     // Timeline read path: returns every leg for one execution with both timestamps so
@@ -60,7 +87,12 @@ public class LedgerSettlementOutboxRepository {
             """;
 
     public record OutboxRow(
-            long id, long executionId, String toSettlementStatus, String legKind, String payloadJson) {}
+            long id,
+            long executionId,
+            String toSettlementStatus,
+            String legKind,
+            String payloadJson,
+            int attempts) {}
 
     /** Timeline projection — includes timestamps so the UI can show the lifecycle. */
     public record OutboxTimelineRow(
@@ -72,6 +104,18 @@ public class LedgerSettlementOutboxRepository {
             Instant createdAt,
             Instant postedAt) {}
 
+    /** Ops read path — unposted rows with delivery attempt history (beard-admin stuck-outbox panel). */
+    public record StuckOutboxRow(
+            long id,
+            long executionId,
+            String toSettlementStatus,
+            String legKind,
+            String payloadJson,
+            Instant createdAt,
+            int attempts,
+            String lastErrorTextOrNull,
+            Instant lastAttemptAtOrNull) {}
+
     private static final RowMapper<OutboxRow> ROW_MAPPER =
             (rs, rowNum) ->
                     new OutboxRow(
@@ -79,7 +123,8 @@ public class LedgerSettlementOutboxRepository {
                             rs.getLong("execution_id"),
                             rs.getString("to_settlement_status"),
                             rs.getString("leg_kind"),
-                            rs.getString("payload_json"));
+                            rs.getString("payload_json"),
+                            rs.getInt("attempts"));
 
     private final NamedParameterJdbcTemplate jdbc;
 
@@ -125,6 +170,65 @@ public class LedgerSettlementOutboxRepository {
                         .addValue("id", id)
                         .addValue("ts", Timestamp.from(postedAt)));
     }
+
+    /**
+     * Records one reconciler delivery attempt. {@code errorText} is truncated to fit the column;
+     * pass {@code null} on success (attempt still counted for stuck-row visibility).
+     */
+    /**
+     * Tombstones an unpostable row so {@link com.balh.oms.reconciler.LedgerSettlementOutboxReconciler}
+     * stops selecting it. Does not set {@code posted_at} (no Ledger delivery occurred).
+     */
+    public int markSkipped(long id, Instant skippedAt, String reason) {
+        String r = reason;
+        if (r != null && r.length() > 200) {
+            r = r.substring(0, 200);
+        }
+        return jdbc.update(
+                MARK_SKIPPED_SQL,
+                new MapSqlParameterSource()
+                        .addValue("id", id)
+                        .addValue("ts", Timestamp.from(skippedAt))
+                        .addValue("reason", r));
+    }
+
+    public void recordAttempt(long id, Instant attemptedAt, String errorText) {
+        String err = errorText;
+        if (err != null && err.length() > LAST_ERROR_TEXT_MAX_CHARS) {
+            err = err.substring(0, LAST_ERROR_TEXT_MAX_CHARS);
+        }
+        jdbc.update(
+                RECORD_ATTEMPT_SQL,
+                new MapSqlParameterSource()
+                        .addValue("id", id)
+                        .addValue("ts", Timestamp.from(attemptedAt))
+                        .addValue("err", err));
+    }
+
+    /** Unposted rows with at least {@code minAttempts} delivery tries, newest attempt first. */
+    public List<StuckOutboxRow> findStuckUnposted(int minAttempts, int limit) {
+        return jdbc.query(
+                FIND_STUCK_UNPOSTED_SQL,
+                new MapSqlParameterSource()
+                        .addValue("min_attempts", Math.max(1, minAttempts))
+                        .addValue("lim", Math.max(1, limit)),
+                (rs, rowNum) -> {
+                    Timestamp lastAttempt = rs.getTimestamp("last_attempt_at");
+                    return new StuckOutboxRow(
+                            rs.getLong("id"),
+                            rs.getLong("execution_id"),
+                            rs.getString("to_settlement_status"),
+                            rs.getString("leg_kind"),
+                            rs.getString("payload_json"),
+                            rs.getTimestamp("created_at").toInstant(),
+                            rs.getInt("attempts"),
+                            rs.getString("last_error_text"),
+                            lastAttempt == null ? null : lastAttempt.toInstant());
+                });
+    }
+
+    /** Truncation bound for {@code last_error_text} (matches Flyway column intent). */
+    public static final int LAST_ERROR_TEXT_MAX_CHARS = 2000;
 
     /** Used by the settlement timeline read path (SettlementController#getTimeline). */
     public List<OutboxTimelineRow> findByExecution(long executionId) {

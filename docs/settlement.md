@@ -74,6 +74,16 @@ Optional **`BrokerSettlementConfirmScheduler`** runs when **`OMS_SETTLEMENT_BROK
 
 `src/test/resources/settlement/broker-confirm-request.template.json` — template JSON with placeholder **`-1`** in **`executionIds`** (replaced in IT with a real **`executions.id`**).
 
+## Dev / loopback bench hazards
+
+Pop demo stacks use **`oms-fix-loopback-acceptor`** (`FixRoundTripAcceptorApplication`): **MARKET** orders receive an immediate synthetic **FILL** without checking **`positions`**.
+
+- **SELL without a prior BUY/settled position** → settlement may reach **`settling`** then fail on the position leg; OMS marks the execution **`failed`** (poison-pill / explicit position-missing path, 2026-05-20). Prefer BUY-first demos or operator **`mark-failed`** on stray SELL fills.
+- **`OMS_SETTLEMENT_AUTO_STEP_SCHEDULER_ENABLED=true`** drives **`executed → settled`** without broker EOD files — must stay **off** when a real broker pipe is authoritative.
+- Unfunded **`inv-{accountId}-USD`** ledger outbox rows tombstone after **`OMS_LEDGER_SETTLEMENT_OUTBOX_SKIP_AFTER_ATTEMPTS`** (default 10) — see [settlement-ledger-posting.md](settlement-ledger-posting.md).
+
+Cluster journal wipes orphan Postgres **WORKING** orders — recovery: [runbooks/oms-cluster-restart.md](runbooks/oms-cluster-restart.md).
+
 ## Related configuration
 
 See [configuration.md](configuration.md) — **Settlement / positions (slice 6)**.

@@ -1,6 +1,7 @@
 package com.balh.oms.settlement;
 
 import com.balh.oms.config.OmsConfig;
+import com.balh.oms.persistence.ExecutionsRepository;
 import com.balh.oms.persistence.SettlementExecutionsRepository;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -44,25 +45,32 @@ public class SettlementAutoStepScheduler {
     private static final String METRIC_TICKS = "oms.settlement.auto_step_scheduler.ticks_total";
     private static final String METRIC_TRANSITIONS = "oms.settlement.auto_step_scheduler.transitions_total";
     private static final String METRIC_FAILURES = "oms.settlement.auto_step_scheduler.failures_total";
+    private static final String METRIC_POISON_PILL = "oms.settlement.auto_step_scheduler.poison_pill_total";
 
     private final OmsConfig config;
     private final SettlementConfirmProcessor processor;
     private final SettlementExecutionsRepository executionsRepository;
+    private final ExecutionsRepository executions;
     private final Counter ticksCounter;
     private final Counter transitionsCounter;
     private final Counter failuresCounter;
+
+    private final Counter poisonPillCounter;
 
     public SettlementAutoStepScheduler(
             OmsConfig config,
             SettlementConfirmProcessor processor,
             SettlementExecutionsRepository executionsRepository,
+            ExecutionsRepository executions,
             MeterRegistry meterRegistry) {
         this.config = config;
         this.processor = processor;
         this.executionsRepository = executionsRepository;
+        this.executions = executions;
         this.ticksCounter = meterRegistry.counter(METRIC_TICKS);
         this.transitionsCounter = meterRegistry.counter(METRIC_TRANSITIONS);
         this.failuresCounter = meterRegistry.counter(METRIC_FAILURES);
+        this.poisonPillCounter = meterRegistry.counter(METRIC_POISON_PILL);
     }
 
     @Scheduled(fixedDelayString = "${oms.settlement.auto-step-scheduler-interval-ms:5000}")
@@ -85,6 +93,7 @@ public class SettlementAutoStepScheduler {
         try {
             ids = executionsRepository.findNonTerminalTradeIds(
                     settlement.getAutoStepSchedulerMaxExecutionAgeSeconds(),
+                    settlement.getAutoStepSchedulerMaxAdvanceFailures(),
                     settlement.getAutoStepSchedulerBatchSize());
         } catch (Exception e) {
             log.warn("auto-step scheduler: failed to query non-terminal executions", e);
@@ -101,6 +110,7 @@ public class SettlementAutoStepScheduler {
                     // Row vanished between query and apply (race); benign.
                     continue;
                 }
+                executions.clearSettlementAutoStepFailures(id);
                 transitionsCounter.increment();
                 if (log.isDebugEnabled()) {
                     log.debug("auto-step scheduler: executionId={} -> {}", id, next);
@@ -111,8 +121,26 @@ public class SettlementAutoStepScheduler {
                 log.warn("auto-step scheduler: non-TRADE execution slipped through filter, id={}", id);
                 failuresCounter.increment();
             } catch (Exception e) {
-                log.warn("auto-step scheduler: advance failed for executionId={}", id, e);
                 failuresCounter.increment();
+                int maxFailures = settlement.getAutoStepSchedulerMaxAdvanceFailures();
+                var failureCount =
+                        executions.recordSettlementAutoStepFailure(id, e.getMessage()).orElse(0);
+                if (failureCount >= maxFailures) {
+                    MarkTradeFailedResult r = processor.markTradeFailed(id);
+                    poisonPillCounter.increment();
+                    log.warn(
+                            "auto-step scheduler: poison pill executionId={} failures={} markTradeFailed={}",
+                            id,
+                            failureCount,
+                            r);
+                } else {
+                    log.warn(
+                            "auto-step scheduler: advance failed for executionId={} failures={}/{}",
+                            id,
+                            failureCount,
+                            maxFailures,
+                            e);
+                }
             }
         }
     }

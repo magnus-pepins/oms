@@ -137,6 +137,53 @@ class SettlementPipelineIntegrationTest extends AbstractPostgresIntegrationTest 
     }
 
     @Test
+    void advanceOneStep_sellWithoutPositionRow_marksFailed() {
+        UUID orderId = UUID.randomUUID();
+        UUID accountId = UUID.randomUUID();
+        jdbc.update(
+                """
+                        INSERT INTO orders (
+                          id, account_id, client_idempotency_key, shard_id, version,
+                          status, side, instrument_symbol, quantity, limit_price, time_in_force,
+                          received_at, accepted_at, account_id_hash, ledger_balance_id, cum_filled_quantity
+                        ) VALUES (
+                          ?, ?, ?, 0, 2, 'FILLED', 'SELL', 'NVDA', 1, 100, 'DAY',
+                          NOW(), NOW(), 'h', NULL, 1
+                        )
+                        """,
+                orderId,
+                accountId,
+                "settle-sell-nopos-" + orderId);
+        jdbc.update(
+                """
+                        INSERT INTO executions (
+                          order_id, account_id, venue_id, venue_ts, venue_exec_ref,
+                          last_quantity, last_price, leaves_quantity, cum_quantity_after,
+                          exec_type, settlement_status, raw_envelope_json
+                        ) VALUES (
+                          ?, ?, 'SIM', NOW(), ?,
+                          1, 100, 0, 1,
+                          CAST('TRADE' AS execution_exec_type),
+                          CAST('settling' AS execution_settlement_status),
+                          CAST('{}' AS JSONB)
+                        )
+                        """,
+                orderId,
+                accountId,
+                "vref-sell-nopos-" + orderId);
+        long exId = jdbc.queryForObject(
+                "SELECT id FROM executions WHERE order_id = ? ORDER BY id DESC LIMIT 1", Long.class, orderId);
+
+        String next = processor.advanceOneSettlementStep(exId);
+        assertThat(next).isEqualTo("failed");
+        assertThat(jdbc.queryForObject(
+                        "SELECT settlement_status::text FROM executions WHERE id = ?",
+                        String.class,
+                        exId))
+                .isEqualTo("failed");
+    }
+
+    @Test
     void brokerConfirmDrain_clearsSellPendingSettleAndAppendsHistory() {
         SellSeed seed = seedFilledSellOrderWithExecution();
         processor.registerAndDrain(List.of(seed.executionId()), 20, 20);

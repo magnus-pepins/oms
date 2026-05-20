@@ -41,6 +41,7 @@ public class OmsConfig {
     private final Fx fx = new Fx();
     private final Otel otel = new Otel();
     private final Cluster cluster = new Cluster();
+    private final Admin admin = new Admin();
 
     public Http getHttp() { return http; }
     public Grpc getGrpc() { return grpc; }
@@ -60,6 +61,54 @@ public class OmsConfig {
     public Fx getFx() { return fx; }
     public Otel getOtel() { return otel; }
     public Cluster getCluster() { return cluster; }
+    public Admin getAdmin() { return admin; }
+
+    /**
+     * Knobs for the internal admin surface ({@link com.balh.oms.ingress.AdminOrderController}).
+     *
+     * <p>Today this is just the cancel-observation timing for the force-cancel endpoint. The
+     * polling loop watches the orders row for the projector to land the cluster-emitted
+     * {@code OrderCancelAppliedEvent}; if no version bump + terminal status is observed within
+     * the timeout the endpoint returns {@code 410 Gone} with {@code cluster_forgot_order}.
+     * That status code is the operator-visible signal that the cluster swallowed the command
+     * silently (typically: in-memory {@code orderIndex} no longer contains the order — e.g.
+     * after a journal wipe and replay that didn't restore it), and manual Postgres cleanup
+     * is needed.
+     */
+    public static class Admin {
+        // The 50ms floor keeps the poll cheap; the 100ms timeout floor protects against
+        // accidentally disabling the observation (e.g. setting it to 0 in a config typo).
+        private static final long MIN_TIMEOUT_MS = 100L;
+        private static final long MIN_POLL_INTERVAL_MS = 5L;
+
+        /**
+         * How long to wait after the cluster submit returns OK for the projector to write the
+         * cancel-applied event to Postgres (visible as a version bump + terminal status on
+         * the orders row).
+         *
+         * <p>Default {@code 2000} ms: comfortably above the steady-state projector lag of
+         * 50–200 ms while still snappy enough for an interactive operator on the trading-desk
+         * console. Tune up if the deployment routinely sees longer projector lag under load.
+         */
+        private long cancelObservationTimeoutMs = 2000L;
+
+        /**
+         * Polling cadence for the cancel-observation loop. Tight enough that a happy-path
+         * response feels immediate ({@code orders.findById} is a primary-key lookup); not so
+         * tight that we burn cycles on negative polls when the cluster is going to forget the
+         * order anyway.
+         */
+        private long cancelObservationPollIntervalMs = 50L;
+
+        public long getCancelObservationTimeoutMs() { return cancelObservationTimeoutMs; }
+        public void setCancelObservationTimeoutMs(long v) {
+            this.cancelObservationTimeoutMs = Math.max(MIN_TIMEOUT_MS, v);
+        }
+        public long getCancelObservationPollIntervalMs() { return cancelObservationPollIntervalMs; }
+        public void setCancelObservationPollIntervalMs(long v) {
+            this.cancelObservationPollIntervalMs = Math.max(MIN_POLL_INTERVAL_MS, v);
+        }
+    }
 
     public static class Http {
         private String internalApiKey = "";
@@ -303,6 +352,12 @@ public class OmsConfig {
         private int settlementOutboxReconcilerBatchSize = 50;
         private long settlementOutboxReconcilerIntervalMs = 500L;
         /**
+         * After this many delivery attempts with a skippable reason ({@code SKIPPED_UNFUNDED_BALANCE},
+         * {@code SKIPPED_INDICATOR_NOT_FOUND}), the reconciler tombstones the row ({@code skipped_at}) so it
+         * is no longer locked every tick.
+         */
+        private int settlementOutboxSkipAfterAttempts = 10;
+        /**
          * Path on the Ledger HTTP base URL for settlement outbox POST (must start with {@code /} or be relative segment;
          * normalized to a leading slash). Finance must align Ledger route with this value.
          */
@@ -494,6 +549,14 @@ public class OmsConfig {
 
         public void setSettlementOutboxReconcilerIntervalMs(long settlementOutboxReconcilerIntervalMs) {
             this.settlementOutboxReconcilerIntervalMs = Math.max(100L, settlementOutboxReconcilerIntervalMs);
+        }
+
+        public int getSettlementOutboxSkipAfterAttempts() {
+            return settlementOutboxSkipAfterAttempts;
+        }
+
+        public void setSettlementOutboxSkipAfterAttempts(int settlementOutboxSkipAfterAttempts) {
+            this.settlementOutboxSkipAfterAttempts = Math.max(1, settlementOutboxSkipAfterAttempts);
         }
 
         public String getSettlementPostingHttpPath() {
@@ -1246,6 +1309,12 @@ public class OmsConfig {
          * Stops the scheduler from churning over stale rows from prior runs. Default 1h.
          */
         private long autoStepSchedulerMaxExecutionAgeSeconds = 3600L;
+        /**
+         * After this many consecutive {@link com.balh.oms.settlement.SettlementAutoStepScheduler} advance
+         * failures, the scheduler calls {@link com.balh.oms.settlement.SettlementConfirmProcessor#markTradeFailed}
+         * once and stops selecting the execution until an operator resets it.
+         */
+        private int autoStepSchedulerMaxAdvanceFailures = 5;
 
         public String getDefaultCustodyAccountId() {
             return defaultCustodyAccountId;
@@ -1479,6 +1548,14 @@ public class OmsConfig {
 
         public void setAutoStepSchedulerMaxExecutionAgeSeconds(long autoStepSchedulerMaxExecutionAgeSeconds) {
             this.autoStepSchedulerMaxExecutionAgeSeconds = Math.max(1L, autoStepSchedulerMaxExecutionAgeSeconds);
+        }
+
+        public int getAutoStepSchedulerMaxAdvanceFailures() {
+            return autoStepSchedulerMaxAdvanceFailures;
+        }
+
+        public void setAutoStepSchedulerMaxAdvanceFailures(int autoStepSchedulerMaxAdvanceFailures) {
+            this.autoStepSchedulerMaxAdvanceFailures = Math.max(1, autoStepSchedulerMaxAdvanceFailures);
         }
     }
 

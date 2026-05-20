@@ -143,12 +143,28 @@ public class ControlRiskEvaluator {
             return Optional.of(RejectCode.RISK_FAT_FINGER_SIZE);
         }
         BigDecimal maxNotional = risk.getMaxOrderNotional();
-        if (maxNotional.compareTo(BigDecimal.ZERO) > 0
-                && order.limitPrice() != null
-                && order.quantity() != null) {
-            BigDecimal notional = order.quantity().multiply(order.limitPrice());
-            if (notional.compareTo(maxNotional) > 0) {
+        if (maxNotional.compareTo(BigDecimal.ZERO) > 0 && order.quantity() != null) {
+            Optional<BigDecimal> notional =
+                    order.side() == Side.BUY
+                            ? BuyFundsRequirement.buyReferencePrice(order)
+                                    .map(px -> order.quantity().multiply(px))
+                            : order.limitPrice() != null
+                                    ? Optional.of(order.quantity().multiply(order.limitPrice()))
+                                    : Optional.empty();
+            if (notional.isPresent() && notional.get().compareTo(maxNotional) > 0) {
                 return Optional.of(RejectCode.RISK_NOTIONAL_CAP);
+            }
+        }
+        if (risk.isSellPositionCheckEnabled()
+                && order.side() == Side.SELL
+                && order.quantity() != null
+                && order.quantity().signum() > 0) {
+            UUID custody = UUID.fromString(omsConfig.getSettlement().getDefaultCustodyAccountId());
+            BigDecimal held =
+                    positionsRepository.findQuantityTotal(
+                            order.accountId(), order.instrumentSymbol(), custody);
+            if (held.compareTo(order.quantity()) < 0) {
+                return Optional.of(RejectCode.RISK_INSUFFICIENT_POSITION);
             }
         }
         if (risk.isMaxAggregatePositionQuantityCheckEnabled()

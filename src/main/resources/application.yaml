@@ -138,6 +138,7 @@ oms:
     fix-route-send-enabled-check-enabled: ${OMS_RISK_FIX_ROUTE_SEND_ENABLED_CHECK_ENABLED:false}
     max-aggregate-position-quantity-check-enabled: ${OMS_RISK_MAX_AGGREGATE_POSITION_QUANTITY_CHECK_ENABLED:false}
     max-aggregate-position-quantity: ${OMS_RISK_MAX_AGGREGATE_POSITION_QUANTITY:0}
+    sell-position-check-enabled: ${OMS_RISK_SELL_POSITION_CHECK_ENABLED:true}
   routing:
     # noop | fix (fix: QuickFIX/J initiator when oms.fix.auto-start=true — see docs/fix-out.md).
     # The legacy `simulated` backend was removed in Phase 3 slice 3g-2 of the Aeron Cluster substrate plan.

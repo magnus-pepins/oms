@@ -18,17 +18,31 @@ import java.util.UUID;
 public interface LedgerInflightReservationClient {
 
     /**
-     * Moves notional {@code quantity * limitPrice} from {@code sourceBalanceId} to the configured
-     * hold destination balance as an inflight transaction.
+     * Places an inflight debit for {@code holdAmount} (notional + fee) from {@code sourceBalanceId}
+     * to the configured hold destination balance.
      *
      * @param orderId        used for idempotent {@code reference} ({@code oms:order:{uuid}})
      * @param sourceBalanceId customer cash balance (Ledger {@code balance_id})
+     * @param holdAmount     positive total cash to reserve (notional + estimated commission)
      * @return Ledger {@code transactionId} (e.g. {@code "txn_<uuid>"}) parsed from the
      *     response, or {@code null} when the implementation does not surface it (test stubs;
      *     legacy callers should treat null as "lifecycle commit/void not available for this hold").
      */
-    String placeBuyNotionalHold(UUID orderId, String sourceBalanceId, BigDecimal quantity, BigDecimal limitPrice)
+    String placeBuyFundsHold(UUID orderId, String sourceBalanceId, BigDecimal holdAmount)
             throws LedgerReservationException;
+
+    /**
+     * @deprecated use {@link #placeBuyFundsHold}; retained for tests that only size notional.
+     */
+    @Deprecated
+    default String placeBuyNotionalHold(
+            UUID orderId, String sourceBalanceId, BigDecimal quantity, BigDecimal limitPrice)
+            throws LedgerReservationException {
+        if (quantity == null || limitPrice == null) {
+            throw new LedgerReservationException("quantity and limitPrice required for notional hold");
+        }
+        return placeBuyFundsHold(orderId, sourceBalanceId, quantity.multiply(limitPrice));
+    }
 
     final class LedgerReservationException extends Exception {
         public LedgerReservationException(String message) {

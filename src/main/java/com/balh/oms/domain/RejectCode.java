@@ -33,6 +33,8 @@ public enum RejectCode {
     RISK_SYMBOL_HALT,
     /** Reserved for concentration / position limit checks (slice 5 catalogue). */
     RISK_CONCENTRATION_LIMIT,
+    /** SELL quantity exceeds {@code positions.quantity_total} for account+symbol+custody. */
+    RISK_INSUFFICIENT_POSITION,
     /** Reserved for session / calendar gates (slice 5 catalogue). */
     RISK_MARKET_SESSION_CLOSED,
     /** Sanctions / PEP cache stale or screening failed when execution-time re-check is enabled (slice 8). */

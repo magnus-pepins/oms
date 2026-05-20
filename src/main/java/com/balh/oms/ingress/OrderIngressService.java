@@ -12,6 +12,7 @@ import com.balh.oms.domain.ShardKey;
 import com.balh.oms.observability.PiiHash;
 import com.balh.oms.observability.metrics.OmsPipelineMetrics;
 import com.balh.oms.persistence.OrdersRepository;
+import com.balh.oms.risk.BuyFundsRequirement;
 import com.balh.oms.tailer.OrderControlAdmission;
 import com.balh.oms.domain.Side;
 import com.balh.oms.ledger.LedgerBalanceClient;
@@ -439,7 +440,11 @@ public class OrderIngressService {
         if (order.ledgerBalanceId() == null || order.ledgerBalanceId().isBlank()) {
             return;
         }
-        if (order.limitPrice() == null) {
+        if (!BuyFundsRequirement.hasBuyFundingPrice(order)) {
+            return;
+        }
+        java.util.Optional<BigDecimal> holdAmount = BuyFundsRequirement.requiredBuyFunds(order, config);
+        if (holdAmount.isEmpty()) {
             return;
         }
         // Slice 4q: coalescer takes priority when enabled — both async-outbox (4p) and
@@ -449,7 +454,7 @@ public class OrderIngressService {
         if (config.getLedger().isInflightCoalescerEnabled()) {
             LedgerInflightCoalescer coalescer = ledgerInflightCoalescer.getIfAvailable();
             if (coalescer != null) {
-                placeBuyLedgerInflightHoldThroughCoalescer(order, coalescer);
+                placeBuyLedgerInflightHoldThroughCoalescer(order, coalescer, holdAmount.get());
                 return;
             }
             // Coalescer flag on but bean missing (mis-wiring): fall through to async/sync paths
@@ -479,7 +484,7 @@ public class OrderIngressService {
             // LedgerInflightOutboxReconciler.runOnce(), where it does have an outbox row to
             // update. If sync mode needs lifecycle reconciliation later, add a sync-side
             // outbox INSERT here that stashes the returned txn id.
-            client.placeBuyNotionalHold(order.id(), order.ledgerBalanceId(), order.quantity(), order.limitPrice());
+            client.placeBuyFundsHold(order.id(), order.ledgerBalanceId(), holdAmount.get());
             sample.stop(Timer.builder(METRIC_LEDGER_INFLIGHT_HOLD)
                     .description("Ledger sync inflight hold HTTP call at order accept")
                     .tag("result", "success")
@@ -495,12 +500,13 @@ public class OrderIngressService {
         }
     }
 
-    private void placeBuyLedgerInflightHoldThroughCoalescer(Order order, LedgerInflightCoalescer coalescer) {
+    private void placeBuyLedgerInflightHoldThroughCoalescer(
+            Order order, LedgerInflightCoalescer coalescer, BigDecimal holdAmount) {
         Timer.Sample sample = Timer.start(meterRegistry);
         long timeoutMs = config.getLedger().getInflightCoalescerSubmitTimeoutMs();
         CompletableFuture<Void> ack;
         try {
-            ack = coalescer.submit(order.id(), order.ledgerBalanceId(), order.quantity(), order.limitPrice());
+            ack = coalescer.submit(order.id(), order.ledgerBalanceId(), holdAmount);
         } catch (IllegalStateException e) {
             sample.stop(Timer.builder(METRIC_LEDGER_INFLIGHT_HOLD)
                     .description("Ledger inflight coalescer hold at order accept")

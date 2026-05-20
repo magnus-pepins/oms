@@ -78,6 +78,29 @@ public record CreateOrderRequest(
     }
 
     /**
+     * BUY orders bound to a Ledger balance must carry a positive {@link #limitPrice} (strict limit
+     * or MARKET reference / cap) so buying-power and inflight holds can be sized.
+     */
+    @AssertTrue(message = "limitPrice must be positive when ledgerBalanceId is set on a BUY order")
+    public boolean isBuyLedgerFundingShapeValid() {
+        if (ledgerBalanceId == null || side != Side.BUY) {
+            return true;
+        }
+        return limitPrice != null && limitPrice.signum() > 0;
+    }
+
+    /**
+     * Explicit LIMIT orders require a positive {@link #limitPrice}.
+     */
+    @AssertTrue(message = "limitPrice is required and must be positive for LIMIT orders")
+    public boolean isLimitOrderPriceShapeValid() {
+        if (!"LIMIT".equals(resolvedOrderType())) {
+            return true;
+        }
+        return limitPrice != null && limitPrice.signum() > 0;
+    }
+
+    /**
      * Canonical resolution of the requested order type, encapsulating the back-compat rule:
      * if the caller did not pass {@code orderType} explicitly, infer {@code LIMIT} when
      * {@link #limitPrice} is set and {@code MARKET} otherwise. New callers (the customer-FE

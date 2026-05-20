@@ -104,8 +104,8 @@ class LedgerInflightCoalescerTest {
 
         UUID a = UUID.randomUUID();
         UUID b = UUID.randomUUID();
-        CompletableFuture<Void> fa = coalescer.submit(a, "src-a", new BigDecimal("3"), new BigDecimal("11.10"));
-        CompletableFuture<Void> fb = coalescer.submit(b, "src-b", new BigDecimal("5"), new BigDecimal("9.99"));
+        CompletableFuture<Void> fa = coalescer.submit(a, "src-a", new BigDecimal("33.30"));
+        CompletableFuture<Void> fb = coalescer.submit(b, "src-b", new BigDecimal("49.95"));
 
         fa.get(2, TimeUnit.SECONDS);
         fb.get(2, TimeUnit.SECONDS);
@@ -133,8 +133,8 @@ class LedgerInflightCoalescerTest {
 
         UUID a = UUID.randomUUID();
         UUID b = UUID.randomUUID();
-        CompletableFuture<Void> fa = coalescer.submit(a, "src-a", new BigDecimal("1"), new BigDecimal("1"));
-        CompletableFuture<Void> fb = coalescer.submit(b, "src-b", new BigDecimal("2"), new BigDecimal("2"));
+        CompletableFuture<Void> fa = coalescer.submit(a, "src-a", new BigDecimal("1"));
+        CompletableFuture<Void> fb = coalescer.submit(b, "src-b", new BigDecimal("2"));
 
         fa.get(2, TimeUnit.SECONDS);
         fb.get(2, TimeUnit.SECONDS);
@@ -158,8 +158,8 @@ class LedgerInflightCoalescerTest {
         coalescer = newCoalescer(dispatcher);
         coalescer.start();
 
-        CompletableFuture<Void> fLucky = coalescer.submit(lucky, "src-1", new BigDecimal("1"), new BigDecimal("1"));
-        CompletableFuture<Void> fUnlucky = coalescer.submit(unlucky, "src-2", new BigDecimal("1"), new BigDecimal("1"));
+        CompletableFuture<Void> fLucky = coalescer.submit(lucky, "src-1", new BigDecimal("1"));
+        CompletableFuture<Void> fUnlucky = coalescer.submit(unlucky, "src-2", new BigDecimal("1"));
 
         fLucky.get(2, TimeUnit.SECONDS);
         fUnlucky.get(2, TimeUnit.SECONDS);
@@ -185,7 +185,7 @@ class LedgerInflightCoalescerTest {
         coalescer.start();
 
         UUID a = UUID.randomUUID();
-        CompletableFuture<Void> fa = coalescer.submit(a, "src-a", new BigDecimal("1"), new BigDecimal("1"));
+        CompletableFuture<Void> fa = coalescer.submit(a, "src-a", new BigDecimal("1"));
 
         assertThatThrownBy(() -> fa.get(2, TimeUnit.SECONDS))
                 .isInstanceOf(ExecutionException.class)
@@ -227,7 +227,7 @@ class LedgerInflightCoalescerTest {
         for (int i = 0; i < 5; i++) {
             UUID id = UUID.randomUUID();
             orderIds.add(id);
-            futures.add(coalescer.submit(id, "src-" + i, new BigDecimal("1"), new BigDecimal("1")));
+            futures.add(coalescer.submit(id, "src-" + i, new BigDecimal("1")));
         }
         // Wait until at least one batch entered the dispatcher (so the queue contains the
         // remaining items the drain has to handle).
@@ -274,7 +274,7 @@ class LedgerInflightCoalescerTest {
     void submitWhenNotRunning_throwsIllegalState() {
         coalescer = newCoalescer(items -> new LedgerInflightBulkDispatcher.Result(0, 0, Set.of()));
         // Don't call start().
-        assertThatThrownBy(() -> coalescer.submit(UUID.randomUUID(), "src", new BigDecimal("1"), new BigDecimal("1")))
+        assertThatThrownBy(() -> coalescer.submit(UUID.randomUUID(), "src", new BigDecimal("1")))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("not running");
     }
@@ -303,7 +303,7 @@ class LedgerInflightCoalescerTest {
             int submitted = 0;
             try {
                 for (int i = 0; i < 200; i++) {
-                    coalescer.submit(UUID.randomUUID(), "src", new BigDecimal("1"), new BigDecimal("1"));
+                    coalescer.submit(UUID.randomUUID(), "src", new BigDecimal("1"));
                     submitted++;
                 }
             } catch (IllegalStateException ise) {

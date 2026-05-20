@@ -10,10 +10,12 @@ import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
+import java.util.Optional;
 
 /**
  * Slice-1.5 BUY buying-power gate: compares Ledger {@code availableBalance} to
- * {@code quantity * limitPrice} when {@code oms.ledger.enabled} and a balance id is present.
+ * notional + estimated commission ({@link BuyFundsRequirement}) when {@code oms.ledger.enabled}
+ * and a balance id is present. BUY orders without a positive reference/limit price reject.
  */
 @Component
 public class BuyingPowerAdmission {
@@ -61,10 +63,11 @@ public class BuyingPowerAdmission {
         if (order.ledgerBalanceId() == null || order.ledgerBalanceId().isBlank()) {
             return Outcome.PROCEED;
         }
-        if (order.limitPrice() == null) {
-            return Outcome.PROCEED;
+        Optional<java.math.BigDecimal> requiredOpt = BuyFundsRequirement.requiredBuyFunds(order, config);
+        if (requiredOpt.isEmpty()) {
+            return Outcome.REJECT_INSUFFICIENT;
         }
-        BigDecimal required = order.quantity().multiply(order.limitPrice());
+        BigDecimal required = requiredOpt.get();
         try {
             BigDecimal available = client.fetchAvailableBalance(order.ledgerBalanceId());
             if (available.compareTo(required) < 0) {

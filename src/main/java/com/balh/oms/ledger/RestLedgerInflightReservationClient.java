@@ -53,12 +53,12 @@ public final class RestLedgerInflightReservationClient implements LedgerInflight
     }
 
     @Override
-    public String placeBuyNotionalHold(UUID orderId, String sourceBalanceId, BigDecimal quantity, BigDecimal limitPrice)
+    public String placeBuyFundsHold(UUID orderId, String sourceBalanceId, BigDecimal holdAmount)
             throws LedgerReservationException {
-        BigDecimal notional = quantity.multiply(limitPrice);
-        if (notional.compareTo(BigDecimal.ZERO) <= 0) {
-            throw new LedgerReservationException("inflight hold notional must be positive");
+        if (holdAmount == null || holdAmount.compareTo(BigDecimal.ZERO) <= 0) {
+            throw new LedgerReservationException("inflight hold amount must be positive");
         }
+        BigDecimal notional = holdAmount;
         ObjectNode body = objectMapper.createObjectNode();
         body.put("source", sourceBalanceId);
         body.put("destination", destinationBalanceId);

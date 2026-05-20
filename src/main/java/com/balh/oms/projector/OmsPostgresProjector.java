@@ -25,6 +25,7 @@ import com.balh.oms.observability.metrics.OmsPipelineMetrics;
 import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.persistence.PositionsRepository;
 import com.balh.oms.persistence.SellFillPositionSplit;
+import com.balh.oms.risk.BuyFundsRequirement;
 import com.balh.oms.returnpath.ExecutionTradeCommand;
 import com.balh.oms.returnpath.MarketContextVenueEvidence;
 import com.balh.oms.tailer.OrderControlAdmission;
@@ -710,11 +711,39 @@ public class OmsPostgresProjector {
                 .divide(BigDecimal.valueOf(AcceptOrderCommand.QUANTITY_SCALE), 10, RoundingMode.UNNECESSARY);
         BigDecimal limitPrice = BigDecimal.valueOf(ev.limitPriceScaledOrZero())
                 .divide(BigDecimal.valueOf(AcceptOrderCommand.PRICE_SCALE), 10, RoundingMode.UNNECESSARY);
+        Order holdSizing =
+                new Order(
+                        ev.orderId(),
+                        UUID.fromString(ev.accountId()),
+                        ev.clientIdempotencyKey(),
+                        ev.shardId(),
+                        ev.version(),
+                        OrderStatus.NEW,
+                        null,
+                        Side.BUY,
+                        ev.instrumentSymbol(),
+                        quantity,
+                        limitPrice,
+                        AcceptOrderCommand.timeInForceName(ev.timeInForceCode()),
+                        Instant.ofEpochSecond(0, ev.clientTimestampNanos()),
+                        Instant.ofEpochMilli(ev.acceptedAtMillis()),
+                        null,
+                        ev.accountIdHash(),
+                        ev.ledgerBalanceIdOrNull(),
+                        BigDecimal.ZERO,
+                        AcceptOrderCommand.ordTypeName(ev.ordTypeCode()));
+        Optional<BigDecimal> holdAmount = BuyFundsRequirement.requiredBuyFunds(holdSizing, config);
+        if (holdAmount.isEmpty()) {
+            return;
+        }
+        Optional<BigDecimal> feeAmount = BuyFundsRequirement.estimatedFee(holdSizing, config);
 
         var node = objectMapper.createObjectNode();
         node.put("ledgerBalanceId", ev.ledgerBalanceIdOrNull());
         node.put("quantity", quantity.toPlainString());
         node.put("limitPrice", limitPrice.toPlainString());
+        node.put("holdAmount", holdAmount.get().toPlainString());
+        feeAmount.ifPresent(f -> node.put("feeAmount", f.toPlainString()));
         String payload;
         try {
             payload = objectMapper.writeValueAsString(node);
@@ -1008,6 +1037,15 @@ public class OmsPostgresProjector {
         UUID custody = UUID.fromString(config.getSettlement().getDefaultCustodyAccountId());
         Optional<SellFillPositionSplit> sellSplit =
                 positionsRepository.recordTradeFill(order, insertedId.get(), lastQty, custody);
+        if (order.side() == Side.SELL && sellSplit.isEmpty()) {
+            throw new IllegalStateException(
+                    "SELL trade fill did not update positions (insufficient quantity) orderId="
+                            + order.id()
+                            + " executionId="
+                            + insertedId.get()
+                            + " fillQty="
+                            + lastQty);
+        }
         sellSplit.ifPresent(split -> executionsRepository.updateSellFillPositionSplit(insertedId.get(), split));
 
         OrderStatus newStatus = OrderStatus.values()[ev.newStatusCode()];

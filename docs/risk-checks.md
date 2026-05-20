@@ -18,6 +18,9 @@ the optional Ledger buying-power gate and the WORKING CAS.
 | **Notional cap** | `RISK_NOTIONAL_CAP` | `OMS_RISK_MAX_ORDER_NOTIONAL` | `0` disables. Uses `quantity × limit_price` when both present. |
 | **FIX route send gate** | `RISK_MARKET_SESSION_CLOSED` | `OMS_RISK_FIX_ROUTE_SEND_ENABLED_CHECK_ENABLED` | When **`OMS_ROUTING_BACKEND=fix`**, rejects if **`fix_route_state.send_enabled`** is false for **`OMS_FIX_ROUTE_KEY`** (reserved enum value reused as session/route gate). |
 | **Aggregate position (BUY)** | `RISK_CONCENTRATION_LIMIT` | `OMS_RISK_MAX_AGGREGATE_POSITION_QUANTITY_CHECK_ENABLED`, `OMS_RISK_MAX_AGGREGATE_POSITION_QUANTITY` | Compares **`positions.quantity_total`** (default custody from **`OMS_SETTLEMENT_DEFAULT_CUSTODY_ACCOUNT_ID`**) + order quantity for **BUY** only; `0` max disables even when check is on. Stub until finance defines true portfolio limits. |
+| **SELL position (available qty)** | `RISK_INSUFFICIENT_POSITION` | `OMS_RISK_SELL_POSITION_CHECK_ENABLED` (default **`true`**) | **SELL** at control: `positions.quantity_total` must be ≥ order quantity (default custody). |
+| **BUY buying power (Ledger)** | `RISK_BUYING_POWER` | `oms.ledger.enabled` + balance id on order | Compares **`availableBalance`** to **notional + estimated commission** (`BuyFundsRequirement`, same default schedule as settlement). **BUY** with balance binding but no positive reference/limit price fails at ingress validation and at buying-power (cannot size funds). |
+| **BUY inflight hold** | *(Ledger HTTP, not a reject code)* | `oms.ledger.inflight-*` | Async/sync/coalescer paths reserve **`holdAmount`** (notional + fee) via `ledger_inflight_outbox` payload; MARKET BUY requires reference cap in `limitPrice`. |
 
 Every **PASS** or **REJECT** outcome records one row in **`control_decisions`** (Flyway `V5`); rows are queryable via **`GET /internal/v1/control-decisions`** for ops audit tooling. Each successful insert increments **`oms_control_decisions_recorded_total`** (Micrometer; tags **`outcome`** = `PASS` \| `REJECT`, **`reject_code`** = enum name or **`NONE`** when the DB row has `NULL` reject code).
 
@@ -38,7 +41,8 @@ All **`control_decisions`** rows written in production originate from **`Control
 | `RISK_STALE_QUEUE` | `StaleJobGuard` / `ControlTailer` when job age exceeds `OMS_CONTROL_MAX_JOB_AGE_MS` | Active |
 | `RISK_DUPLICATE` | *Not emitted:* ingress duplicate idempotency key returns HTTP 200 with existing order (`OrdersController`) | Reserved (enum only) |
 | `RISK_KILL_SWITCH` | `ControlRiskEvaluator` when Postgres `oms_runtime_flags.global_halt` | Active |
-| `RISK_BUYING_POWER` | `BuyingPowerAdmission` / `ControlTailer` | Active |
+| `RISK_BUYING_POWER` | `BuyingPowerAdmission` / `ControlTailer` (notional + fee; rejects when funding price missing) | Active |
+| `RISK_INSUFFICIENT_POSITION` | SELL position check in `ControlRiskEvaluator` | Active |
 | `RISK_INVALID_INSTRUMENT` | Allowlist in `ControlRiskEvaluator` | Active |
 | `RISK_INSTRUMENT_NOT_ALLOWED` | Tradability list in `ControlRiskEvaluator` | Active |
 | `RISK_FAT_FINGER_PRICE` / `RISK_FAT_FINGER_SIZE` | `ControlRiskEvaluator` | Active |

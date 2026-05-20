@@ -666,6 +666,11 @@ public class OmsConfig {
         private boolean maxAggregatePositionQuantityCheckEnabled = false;
         /** Max position quantity per account+symbol+custody (default omnibus); {@code 0} disables even when check enabled. */
         private java.math.BigDecimal maxAggregatePositionQuantity = java.math.BigDecimal.ZERO;
+        /**
+         * When {@code true}, SELL orders reject at control when {@code positions.quantity_total}
+         * is below order quantity ({@link com.balh.oms.domain.RejectCode#RISK_INSUFFICIENT_POSITION}).
+         */
+        private boolean sellPositionCheckEnabled = true;
 
         public boolean isInstrumentAllowlistEnabled() { return instrumentAllowlistEnabled; }
         public void setInstrumentAllowlistEnabled(boolean v) { this.instrumentAllowlistEnabled = v; }
@@ -834,6 +839,14 @@ public class OmsConfig {
                     maxAggregatePositionQuantity == null
                             ? java.math.BigDecimal.ZERO
                             : maxAggregatePositionQuantity.max(java.math.BigDecimal.ZERO);
+        }
+
+        public boolean isSellPositionCheckEnabled() {
+            return sellPositionCheckEnabled;
+        }
+
+        public void setSellPositionCheckEnabled(boolean sellPositionCheckEnabled) {
+            this.sellPositionCheckEnabled = sellPositionCheckEnabled;
         }
 
         /** Uppercased symbols from {@link #allowedInstrumentSymbols}, comma-separated. */

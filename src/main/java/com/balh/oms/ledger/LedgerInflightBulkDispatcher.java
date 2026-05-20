@@ -37,7 +37,7 @@ public interface LedgerInflightBulkDispatcher {
      */
     Result dispatch(List<HoldItem> items) throws LedgerInflightBulkException;
 
-    record HoldItem(UUID orderId, String sourceBalanceId, BigDecimal quantity, BigDecimal limitPrice) {}
+    record HoldItem(UUID orderId, String sourceBalanceId, BigDecimal holdAmount) {}
 
     record Result(int requested, int succeeded, Set<UUID> failedOrderIds) {
         public Result {

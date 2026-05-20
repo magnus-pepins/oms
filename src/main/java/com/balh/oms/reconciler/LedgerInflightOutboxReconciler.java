@@ -77,21 +77,32 @@ public class LedgerInflightOutboxReconciler {
                 try {
                     JsonNode root = objectMapper.readTree(row.payloadJson());
                     String balanceId = root.path("ledgerBalanceId").asText("").trim();
-                    String qtyText = root.path("quantity").asText("").trim();
-                    String limitText = root.path("limitPrice").asText("").trim();
-                    if (balanceId.isEmpty() || qtyText.isEmpty() || limitText.isEmpty()) {
+                    String holdText = root.path("holdAmount").asText("").trim();
+                    BigDecimal holdAmount = null;
+                    if (!holdText.isEmpty()) {
+                        holdAmount = new BigDecimal(holdText);
+                    } else {
+                        String qtyText = root.path("quantity").asText("").trim();
+                        String limitText = root.path("limitPrice").asText("").trim();
+                        if (!balanceId.isEmpty() && !qtyText.isEmpty() && !limitText.isEmpty()) {
+                            holdAmount = new BigDecimal(qtyText).multiply(new BigDecimal(limitText));
+                            String feeText = root.path("feeAmount").asText("").trim();
+                            if (!feeText.isEmpty()) {
+                                holdAmount = holdAmount.add(new BigDecimal(feeText));
+                            }
+                        }
+                    }
+                    if (balanceId.isEmpty() || holdAmount == null || holdAmount.signum() <= 0) {
                         meterRegistry.counter(METRIC_OUTBOX_FAILED).increment();
                         outbox.markFailed(row.id(), "invalid_payload_json", Instant.now());
                         log.warn("Ledger inflight outbox id={} orderId={} has invalid payload", row.id(), row.orderId());
                         continue;
                     }
-                    BigDecimal quantity = new BigDecimal(qtyText);
-                    BigDecimal limitPrice = new BigDecimal(limitText);
                     UUID orderId = row.orderId();
                     Timer.Sample sample = Timer.start(meterRegistry);
                     String ledgerTxnId;
                     try {
-                        ledgerTxnId = client.placeBuyNotionalHold(orderId, balanceId, quantity, limitPrice);
+                        ledgerTxnId = client.placeBuyFundsHold(orderId, balanceId, holdAmount);
                         sample.stop(Timer.builder(METRIC_LEDGER_INFLIGHT_HOLD)
                                 .description("Ledger sync inflight hold HTTP call (sync path or outbox reconciler)")
                                 .tag("result", "success")

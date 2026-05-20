@@ -37,7 +37,8 @@ class BuyingPowerAdmissionTest {
         OmsConfig cfg = new OmsConfig();
         cfg.getLedger().setEnabled(true);
         LedgerBalanceClient client = mock(LedgerBalanceClient.class);
-        when(client.fetchAvailableBalance("balance_x")).thenReturn(new BigDecimal("10.00"));
+        // 3 × 5.00 notional = 15.00; US default fee min $1 → required 16.00
+        when(client.fetchAvailableBalance("balance_x")).thenReturn(new BigDecimal("15.99"));
         @SuppressWarnings("unchecked")
         ObjectProvider<LedgerBalanceClient> ledger = mock(ObjectProvider.class);
         when(ledger.getIfAvailable()).thenReturn(client);
@@ -52,7 +53,7 @@ class BuyingPowerAdmissionTest {
         OmsConfig cfg = new OmsConfig();
         cfg.getLedger().setEnabled(true);
         LedgerBalanceClient client = mock(LedgerBalanceClient.class);
-        when(client.fetchAvailableBalance("balance_x")).thenReturn(new BigDecimal("100.00"));
+        when(client.fetchAvailableBalance("balance_x")).thenReturn(new BigDecimal("110.00"));
         @SuppressWarnings("unchecked")
         ObjectProvider<LedgerBalanceClient> ledger = mock(ObjectProvider.class);
         when(ledger.getIfAvailable()).thenReturn(client);
@@ -93,6 +94,20 @@ class BuyingPowerAdmissionTest {
                 BigDecimal.ZERO);
         assertThat(admission.evaluate(sell)).isEqualTo(BuyingPowerAdmission.Outcome.PROCEED);
         assertThat(registry.counter("oms_buying_power_sell_ledger_skip_total").count()).isEqualTo(1.0);
+    }
+
+    @Test
+    void buyWithoutFundingPriceRejects() {
+        OmsConfig cfg = new OmsConfig();
+        cfg.getLedger().setEnabled(true);
+        LedgerBalanceClient client = mock(LedgerBalanceClient.class);
+        @SuppressWarnings("unchecked")
+        ObjectProvider<LedgerBalanceClient> ledger = mock(ObjectProvider.class);
+        when(ledger.getIfAvailable()).thenReturn(client);
+
+        BuyingPowerAdmission admission = new BuyingPowerAdmission(cfg, ledger, new SimpleMeterRegistry());
+        Order order = buyOrder("balance_x", new BigDecimal("1"), null);
+        assertThat(admission.evaluate(order)).isEqualTo(BuyingPowerAdmission.Outcome.REJECT_INSUFFICIENT);
     }
 
     private static Order buyOrder(String ledgerBalanceId, BigDecimal qty, BigDecimal limit) {

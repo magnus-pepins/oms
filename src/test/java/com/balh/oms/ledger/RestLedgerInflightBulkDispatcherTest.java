@@ -108,6 +108,6 @@ class RestLedgerInflightBulkDispatcherTest {
     }
 
     private static HoldItem item(UUID orderId) {
-        return new HoldItem(orderId, "src", new BigDecimal("1"), new BigDecimal("1"));
+        return new HoldItem(orderId, "src", new BigDecimal("1"));
     }
 }

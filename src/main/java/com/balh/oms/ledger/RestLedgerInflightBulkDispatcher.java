@@ -68,15 +68,15 @@ public final class RestLedgerInflightBulkDispatcher implements LedgerInflightBul
         body.put("atomic", false);
         ArrayNode txns = body.putArray("transactions");
         for (HoldItem item : items) {
-            BigDecimal notional = item.quantity().multiply(item.limitPrice());
-            if (notional.compareTo(BigDecimal.ZERO) <= 0) {
+            BigDecimal holdAmount = item.holdAmount();
+            if (holdAmount.compareTo(BigDecimal.ZERO) <= 0) {
                 throw new LedgerInflightBulkException(
-                        "inflight hold notional must be positive (orderId=" + item.orderId() + ")");
+                        "inflight hold amount must be positive (orderId=" + item.orderId() + ")");
             }
             ObjectNode t = txns.addObject();
             t.put("source", item.sourceBalanceId());
             t.put("destination", destinationBalanceId);
-            t.put("amount", notional.doubleValue());
+            t.put("amount", holdAmount.doubleValue());
             t.put("currency", currency);
             t.put("reference", REFERENCE_PREFIX + item.orderId());
             t.put("description", "OMS buy intent hold (bulk)");

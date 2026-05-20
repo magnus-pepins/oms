@@ -138,13 +138,13 @@ public final class LedgerInflightCoalescer {
      * running. The caller (ingress thread) translates that to 503, matching the cluster
      * back-pressure contract.
      */
-    public CompletableFuture<Void> submit(UUID orderId, String sourceBalanceId, BigDecimal quantity, BigDecimal limitPrice) {
+    public CompletableFuture<Void> submit(UUID orderId, String sourceBalanceId, BigDecimal holdAmount) {
         if (!running.get()) {
             meterRegistry.counter(METRIC_SUBMITTED_TOTAL, "outcome", "stopped").increment();
             throw new IllegalStateException("ledger inflight coalescer is not running");
         }
         CompletableFuture<Void> future = new CompletableFuture<>();
-        PendingHold pending = new PendingHold(orderId, sourceBalanceId, quantity, limitPrice, future, System.nanoTime());
+        PendingHold pending = new PendingHold(orderId, sourceBalanceId, holdAmount, future, System.nanoTime());
         if (!queue.offer(pending)) {
             meterRegistry.counter(METRIC_SUBMITTED_TOTAL, "outcome", "queue_full").increment();
             throw new IllegalStateException("ledger inflight coalescer queue is full");
@@ -256,8 +256,7 @@ public final class LedgerInflightCoalescer {
         Timer.Sample sample = Timer.start(meterRegistry);
         List<LedgerInflightBulkDispatcher.HoldItem> items = new ArrayList<>(batch.size());
         for (PendingHold p : batch) {
-            items.add(new LedgerInflightBulkDispatcher.HoldItem(
-                    p.orderId(), p.sourceBalanceId(), p.quantity(), p.limitPrice()));
+            items.add(new LedgerInflightBulkDispatcher.HoldItem(p.orderId(), p.sourceBalanceId(), p.holdAmount()));
         }
         try {
             LedgerInflightBulkDispatcher.Result result = dispatcher.dispatch(items);
@@ -339,8 +338,7 @@ public final class LedgerInflightCoalescer {
     private String serializeOutboxPayload(PendingHold pending) throws JsonProcessingException {
         ObjectNode node = objectMapper.createObjectNode();
         node.put("ledgerBalanceId", pending.sourceBalanceId());
-        node.put("quantity", pending.quantity().toPlainString());
-        node.put("limitPrice", pending.limitPrice().toPlainString());
+        node.put("holdAmount", pending.holdAmount().toPlainString());
         return objectMapper.writeValueAsString(node);
     }
 
@@ -356,8 +354,7 @@ public final class LedgerInflightCoalescer {
     private record PendingHold(
             UUID orderId,
             String sourceBalanceId,
-            BigDecimal quantity,
-            BigDecimal limitPrice,
+            BigDecimal holdAmount,
             CompletableFuture<Void> future,
             long submittedAtNanos) {}
 }

@@ -187,7 +187,29 @@ public class OmsFxCustomerQuotePublisher {
         this.missingMarkupCounter = Counter.builder("oms_fx_customer_quote_missing_markup_total")
                 .description("Skipped customer quote publish because no markup row matched (pair, side, tier)")
                 .register(registry);
+
+        // Gauges that mirror the timestamps surfaced on
+        // /internal/v1/fx/customer-quote/status so Prometheus can alert on
+        // staleness (e.g. {@code time() - oms_fx_customer_quote_last_publish_at_ms/1000 > 180}).
+        // Lambda-backed so the registry pulls the latest value at scrape time
+        // instead of us having to call {@code .set(...)} on every tick.
+        io.micrometer.core.instrument.Gauge.builder(
+                        "oms_fx_customer_quote_last_publish_at_ms",
+                        this,
+                        OmsFxCustomerQuotePublisher::lastSuccessfulPublishAtMsGauge)
+                .description("Wall-clock millis of the most recent successful customer-tier MQTT publish")
+                .register(registry);
+        io.micrometer.core.instrument.Gauge.builder(
+                        "oms_fx_customer_quote_last_stale_mid_skip_at_ms",
+                        this,
+                        OmsFxCustomerQuotePublisher::lastStaleMidSkipAtMsGauge)
+                .description("Wall-clock millis of the most recent publish-tick skip caused by stale vendor mids")
+                .register(registry);
     }
+
+    /** Lambda-friendly accessors for the Micrometer gauges. */
+    private double lastSuccessfulPublishAtMsGauge() { return lastSuccessfulPublishAtMs; }
+    private double lastStaleMidSkipAtMsGauge() { return lastStaleMidSkipAtMs; }
 
     private static List<String> parseTiers(String csv) {
         if (csv == null || csv.isBlank()) return List.of("basic", "elite");

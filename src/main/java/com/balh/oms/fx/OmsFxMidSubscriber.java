@@ -126,7 +126,19 @@ public class OmsFxMidSubscriber implements MqttCallback {
         this.parseErrorsCounter = Counter.builder("oms.fx.mid_subscriber.parse_errors_total")
                 .description("FX BBO ticks that failed to parse as valid bid/ask")
                 .register(registry);
+
+        // Pull-style gauge for ops alerting: detect "upstream vendor feed is
+        // dark even though the subscriber bean and MQTT session are healthy"
+        // (e.g. {@code time() - oms_fx_mid_subscriber_last_tick_at_ms/1000 > 60}).
+        io.micrometer.core.instrument.Gauge.builder(
+                        "oms_fx_mid_subscriber_last_tick_at_ms",
+                        this,
+                        OmsFxMidSubscriber::lastTickAtMsGauge)
+                .description("Wall-clock millis of the most recent successfully-parsed FX BBO tick (any pair)")
+                .register(registry);
     }
+
+    private double lastTickAtMsGauge() { return lastTickAtMs; }
 
     @PostConstruct
     public void start() {

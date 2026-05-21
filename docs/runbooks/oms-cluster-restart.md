@@ -56,6 +56,57 @@ Postgres can show a **WORKING** order while the cluster **no longer has that ord
 
 ---
 
+## Zombie cluster-node after restart (`active Mark file detected`)
+
+**Symptom:** `pm2 list` shows `oms-cluster-node` `online` with a recent PID, but every Spring Boot role (`oms-ingress`, `oms-postgres-projector`, `oms-fix-egress`) is in a crash-loop with one or both of:
+
+- `io.aeron.exceptions.DriverTimeoutException: FATAL - no driver heartbeat detected`
+- `OMS cluster client failed to connect within 30000ms`
+
+Trading-desk Treasury page shows `HTTP 502` with the Cloudflare error HTML on every panel that hits `oms-ingress` (8088).
+
+**Diagnosis (one command):**
+
+```bash
+tail -30 ~/oms/logs/oms-cluster-node-combined.log | grep -E "(active Mark file|started; awaiting)"
+```
+
+If the most recent matching line is `active Mark file detected` (from `org.agrona.MarkFile.mapNewOrExistingMarkFile`, originating in `io.aeron.archive.ArchiveMarkFile` or `io.aeron.cluster.ConsensusModule`) and NOT a later `OMS cluster-node started; awaiting shutdown signal`, the cluster-node `main()` crashed during `ClusteredMediaDriver.launch()`.
+
+**Why the JVM is still alive** (pre-2026-05-21 builds): the Prometheus metrics exporter binds port 8089 BEFORE `ClusteredMediaDriver.launch()` runs. The JDK `HttpServer` it uses starts a non-daemon dispatch thread. When `launch()` throws, `main()` exits with the exception but that dispatch thread keeps the JVM alive — so `pm2` sees a healthy PID and never auto-restarts.
+
+**Why the mark file looked "active":** Aeron's `ArchiveMarkFile` / `ClusterMarkFile` store a heartbeat timestamp; the file is treated as "owned by a live process" until that timestamp is older than the liveness window (~20s for the archive). A fast PM2 restart (`pm2 restart oms-cluster-node`) starts the new JVM before the old timestamp has aged out, so the new JVM throws on startup.
+
+**Recovery (manual):**
+
+```bash
+export PATH="$HOME/.nvm/versions/node/v24.14.1/bin:$PATH"
+pm2 stop oms-ingress oms-postgres-projector oms-fix-egress
+pm2 stop oms-cluster-node
+# Wait for all PIDs to die (PM2 reports `stopped`); takes ≤ 30s due to kill_timeout.
+# DO NOT delete any files under ~/oms/build/aeron-cluster — letting the mark-file
+# timestamp age out is the safe recovery; deletion costs admission history (see
+# "Journal wipe" below).
+sleep 30
+pm2 start oms-cluster-node
+# Tail until you see "OmsAdmissionClusteredService role change -> LEADER"
+sleep 12
+pm2 start oms-postgres-projector
+sleep 5
+pm2 start oms-fix-egress oms-ingress
+```
+
+Verify with `curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8088/internal/v1/fx/nostro/snapshot` — expect 401 (auth required, not 502 or connection refused).
+
+**Why this should not happen again from 2026-05-21 builds:**
+
+- `OmsClusterNodeBootstrap.main()` now wraps `ClusteredMediaDriver.launch()` + downstream launches in a try/catch that closes the metrics exporter and calls `System.exit(1)` on any failure. PM2 sees a real crash and applies `restart_delay` + `max_restarts`.
+- `oms-cluster-node` `max_restarts` was bumped from 10 → 30 (≈155s of retries at 5s `restart_delay`), comfortably outliving Aeron's ~20s mark-file liveness window so the retry loop self-recovers without operator action.
+
+If you still see this on a 2026-05-21+ build, capture `~/oms/logs/oms-cluster-node-combined.log` and `~/oms/build/aeron-cluster/archive/archive-*-error.log` before recovery and attach to the post-mortem.
+
+---
+
 ## Journal wipe / truncate (dev only — causes orphans)
 
 **Typical mistake:** `rm -rf ~/oms/build/aeron-cluster` (or deleting consensus-module / archive dirs) to “fix” Aeron lock files or after a bad deploy. That **deletes admission history**. Postgres rows from before the wipe are **not** automatically cancelled.

@@ -166,33 +166,72 @@ public final class OmsClusterNodeBootstrap {
         // Slice 4b: stand the metrics exporter up first so OmsAdmissionClusteredService can register
         // its snapshot meters into a registry that is already serving /metrics. Order on shutdown is the
         // reverse: container -> events recording -> media driver -> metrics exporter.
+        //
+        // 2026-05-21 zombie-JVM hardening: the JDK HttpServer that backs this exporter starts a
+        // non-daemon dispatch thread on `start()` (see jdk.httpserver). If a later step in this
+        // bootstrap throws (e.g. ClusteredMediaDriver.launch() seeing a stale ArchiveMarkFile right
+        // after a fast PM2 restart), main() exits but the dispatch thread keeps the JVM alive at
+        // PID level. PM2 then reports the cluster-node as "online" forever, never auto-restarts,
+        // and every cluster client (ingress / projector / fix-egress) hangs on
+        // DriverTimeoutException. The try/catch below guarantees ANY bootstrap failure tears the
+        // exporter down and calls System.exit(1) so PM2 sees a real crash and applies its
+        // restart_delay / max_restarts loop — which lets the Aeron mark-file liveness window
+        // (~20s) age out across attempts and recover unattended.
         OmsClusterNodeMetricsExporter metricsExporter =
                 new OmsClusterNodeMetricsExporter(OmsClusterNodeMetricsExporter.resolveMetricsPortFromEnv());
 
-        ClusteredMediaDriver clusteredMediaDriver = ClusteredMediaDriver.launch(
-                buildMediaDriverContext(paths),
-                buildArchiveContext(paths),
-                buildConsensusModuleContext(paths, memberId, clusterMembers));
+        ClusteredMediaDriver clusteredMediaDriver = null;
+        EventsRecordingHandle eventsRecording = null;
+        ClusteredServiceContainer container = null;
+        try {
+            clusteredMediaDriver = ClusteredMediaDriver.launch(
+                    buildMediaDriverContext(paths),
+                    buildArchiveContext(paths),
+                    buildConsensusModuleContext(paths, memberId, clusterMembers));
 
-        // Register Archive recording for the projector event stream BEFORE launching the service container.
-        // The cluster service's onStart will then create the publication on EVENTS_CHANNEL/EVENTS_STREAM_ID
-        // and the already-started recording captures it from byte 0 — which is what makes the projector's
-        // cursor a stable monotonic position into a continuous recording.
-        EventsRecordingHandle eventsRecording = startEventsRecording(paths);
+            // Register Archive recording for the projector event stream BEFORE launching the service container.
+            // The cluster service's onStart will then create the publication on EVENTS_CHANNEL/EVENTS_STREAM_ID
+            // and the already-started recording captures it from byte 0 — which is what makes the projector's
+            // cursor a stable monotonic position into a continuous recording.
+            eventsRecording = startEventsRecording(paths);
 
-        ClusteredServiceContainer container = ClusteredServiceContainer.launch(
-                buildServiceContainerContext(paths, new OmsAdmissionClusteredService(metricsExporter.meterRegistry())));
+            container = ClusteredServiceContainer.launch(
+                    buildServiceContainerContext(
+                            paths, new OmsAdmissionClusteredService(metricsExporter.meterRegistry())));
+        } catch (Throwable bootstrapFailure) {
+            log.error(
+                    "OMS cluster-node bootstrap failed; closing partial state and forcing JVM exit",
+                    bootstrapFailure);
+            CloseHelper.quietClose(container);
+            CloseHelper.quietClose(eventsRecording);
+            CloseHelper.quietClose(clusteredMediaDriver);
+            try {
+                metricsExporter.close();
+            } catch (Exception suppressed) {
+                log.warn("error closing cluster-node metrics exporter during failed bootstrap", suppressed);
+            }
+            // Force exit even if the JDK HttpServer dispatch thread is still alive. Anything other
+            // than System.exit(1) here keeps the JVM as a zombie that PM2 cannot distinguish from a
+            // healthy process.
+            System.exit(1);
+            return;
+        }
 
+        // Effectively-final references for the shutdown hook (the try-block locals may have been
+        // reassigned during recovery).
+        final ClusteredMediaDriver driverRef = clusteredMediaDriver;
+        final EventsRecordingHandle eventsRef = eventsRecording;
+        final ClusteredServiceContainer containerRef = container;
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             log.info("OMS cluster-node received shutdown signal");
             try {
-                container.close();
+                containerRef.close();
             } catch (Exception e) {
                 log.warn("error closing cluster service container", e);
             }
-            CloseHelper.quietClose(eventsRecording);
+            CloseHelper.quietClose(eventsRef);
             try {
-                clusteredMediaDriver.close();
+                driverRef.close();
             } catch (Exception e) {
                 log.warn("error closing clustered media driver", e);
             }

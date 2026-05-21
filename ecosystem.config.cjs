@@ -371,6 +371,16 @@ const apps = [
       // three roles below DO boot Spring and DO consume SPRING_PROFILES_ACTIVE.
     },
     ...COMMON_PM2,
+    // 2026-05-21 zombie-JVM hardening: with OmsClusterNodeBootstrap now
+    // System.exit(1)ing on any bootstrap failure (e.g. Aeron "active Mark file
+    // detected" right after a fast PM2 restart), PM2 sees a real crash and applies
+    // restart_delay + max_restarts. The default max_restarts: 10 (5s delay) covers
+    // ~55s of retries. Aeron's MarkFile liveness window is ~20s, so 10 attempts
+    // would usually suffice; we bump to 30 (≈ 155s of attempts) so that even a
+    // slow JVM warm-up still outlasts the window — critical because once PM2
+    // gives up, the entire OMS cluster (projector / fix-egress / ingress) is
+    // unrecoverable without manual intervention.
+    max_restarts: 30,
   },
   {
     name: 'oms-postgres-projector',

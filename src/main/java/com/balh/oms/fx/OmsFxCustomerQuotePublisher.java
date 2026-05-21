@@ -29,6 +29,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -468,6 +469,113 @@ public class OmsFxCustomerQuotePublisher {
                 lastStaleMidSkipAtMs,
                 overrides.status());
     }
+
+    /**
+     * Snapshot of what the publisher <em>would</em> emit on its next tick,
+     * for the trading-desk "Live tier quotes" panel (plan A1 in
+     * plans/fx-treasury-auto-hedger-and-publisher-controls.md).
+     *
+     * <p>Mirrors {@link #publishOne}'s computation exactly — same
+     * {@link #lookupMarkup} call (rate-card + active tactical overrides),
+     * same {@link #applyMarkup} math, same {@code RATE_SCALE} display
+     * scale — so the rendered grid agrees with the next MQTT publish
+     * within one tick. Does <strong>not</strong> publish, mint a
+     * {@code quoteId}, or touch the database. Safe to poll at the
+     * publisher tick rate.
+     *
+     * <p>Stale pairs (mid age &gt; {@link #maxMidAgeMs}) are included
+     * with {@code stale=true} so the operator sees the same skip the
+     * publisher would do; without that, a vendor-feed gap silently
+     * deletes rows from the panel.
+     */
+    public GridSnapshot previewQuoteGrid() {
+        Map<String, OmsFxMidSubscriber.MidSample> snapshot = midSubscriber.snapshot();
+        long nowMs = clock.millis();
+        List<PairRow> rows = new ArrayList<>(snapshot.size());
+        for (Map.Entry<String, OmsFxMidSubscriber.MidSample> e : snapshot.entrySet()) {
+            String pair = e.getKey();
+            OmsFxMidSubscriber.MidSample sample = e.getValue();
+            if (sample == null || pair == null || pair.length() < 6) continue;
+            long age = nowMs - sample.capturedAtMs();
+            boolean stale = age > maxMidAgeMs;
+            String base = pair.substring(0, 3);
+            String quote = pair.substring(3, 6);
+            BigDecimal mid = sample.mid();
+            Map<String, TierQuote> tierMap = new LinkedHashMap<>(tiers.size());
+            Instant nowInstant = Instant.ofEpochMilli(nowMs);
+            for (String tier : tiers) {
+                BigDecimal bidBps = lookupMarkup(pair, "BID", tier);
+                BigDecimal askBps = lookupMarkup(pair, "ASK", tier);
+                if (bidBps == null || askBps == null) {
+                    tierMap.put(tier, new TierQuote(null, null, null, null, null, null));
+                    continue;
+                }
+                BigDecimal bid = applyMarkup(mid, bidBps, -1).setScale(RATE_SCALE, RoundingMode.HALF_UP);
+                BigDecimal ask = applyMarkup(mid, askBps, +1).setScale(RATE_SCALE, RoundingMode.HALF_UP);
+                BigDecimal additiveBid = overrides.additiveBpsFor(pair, "BID", tier, nowInstant);
+                BigDecimal additiveAsk = overrides.additiveBpsFor(pair, "ASK", tier, nowInstant);
+                BigDecimal additive = additiveBid.add(additiveAsk);
+                Boolean overrideApplied = additive.signum() != 0 ? Boolean.TRUE : Boolean.FALSE;
+                tierMap.put(tier, new TierQuote(
+                        bid.toPlainString(),
+                        ask.toPlainString(),
+                        bidBps.toPlainString(),
+                        askBps.toPlainString(),
+                        additive.toPlainString(),
+                        overrideApplied));
+            }
+            rows.add(new PairRow(
+                    pair, base, quote,
+                    mid.setScale(RATE_SCALE, RoundingMode.HALF_UP).toPlainString(),
+                    sample.capturedAt().toString(),
+                    age,
+                    stale,
+                    tierMap));
+        }
+        rows.sort((a, b) -> a.pair().compareTo(b.pair()));
+        return new GridSnapshot(
+                tiers,
+                publishTickPeriodMs,
+                maxMidAgeMs,
+                client != null && client.isConnected(),
+                rows);
+    }
+
+    /** Container for {@link #previewQuoteGrid}. */
+    public record GridSnapshot(
+            List<String> tiers,
+            long publishTickPeriodMs,
+            long maxMidAgeMs,
+            boolean mqttConnected,
+            List<PairRow> rows) {}
+
+    /** One pair across all configured tiers (publisher view). */
+    public record PairRow(
+            String pair,
+            String base,
+            String quote,
+            String mid,
+            String midCapturedAt,
+            long midAgeMs,
+            boolean stale,
+            Map<String, TierQuote> tiers) {}
+
+    /**
+     * Single tier cell. Strings (not BigDecimal) because the JSON the
+     * controller wraps this in already serialises {@code mid/bid/ask} as
+     * plain strings to preserve scale; keeping the same type here avoids
+     * a Jackson scale-loss surprise.
+     *
+     * <p>All fields are nullable: a missing markup row yields a row of
+     * nulls so the UI can render "—" without a separate "missing" flag.
+     */
+    public record TierQuote(
+            String bid,
+            String ask,
+            String bidMarkupBps,
+            String askMarkupBps,
+            String additiveBps,
+            Boolean overrideApplied) {}
 
     /** Composite key for the (pair, tier, side) markup lookup. */
     record MarkupKey(String pair, String tier, String side) {

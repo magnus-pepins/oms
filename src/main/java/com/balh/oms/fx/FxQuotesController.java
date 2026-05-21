@@ -128,6 +128,46 @@ public class FxQuotesController {
         return ResponseEntity.ok(body);
     }
 
+    /**
+     * Live "what is the publisher emitting right now?" grid for the
+     * trading-desk FX Publisher panel (plan A1 in
+     * plans/fx-treasury-auto-hedger-and-publisher-controls.md).
+     *
+     * <p>This is the desk operator's view of the per-tier output stream:
+     * every pair × every configured tier with bid/ask + markup bps +
+     * active override delta + mid age. Computed synchronously from the
+     * same code path as {@link OmsFxCustomerQuotePublisher#publishOne}
+     * (see {@link OmsFxCustomerQuotePublisher#previewQuoteGrid}) so it
+     * agrees with the next MQTT tick to within {@code publishTickPeriodMs}.
+     *
+     * <p>Read-only; no quote minted, no DB write. Safe to poll at the
+     * publisher tick rate.
+     */
+    @GetMapping("/customer-quote/snapshot")
+    public ResponseEntity<Map<String, Object>> customerQuoteSnapshot() {
+        var fx = omsConfig.getFx();
+        if (!fx.isModuleEnabled()) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "fx_module_disabled"));
+        }
+        OmsFxCustomerQuotePublisher pub = customerQuotePublisher.getIfAvailable();
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("asOf", clock.instant().toString());
+        if (pub == null) {
+            body.put("enabled", false);
+            body.put("rows", List.of());
+            return ResponseEntity.ok(body);
+        }
+        OmsFxCustomerQuotePublisher.GridSnapshot g = pub.previewQuoteGrid();
+        body.put("enabled", true);
+        body.put("tiers", g.tiers());
+        body.put("publishTickPeriodMs", g.publishTickPeriodMs());
+        body.put("maxMidAgeMs", g.maxMidAgeMs());
+        body.put("mqttConnected", g.mqttConnected());
+        body.put("count", g.rows().size());
+        body.put("rows", g.rows());
+        return ResponseEntity.ok(body);
+    }
+
     public record QuoteRequest(String pair, String tier) {}
 
     /**

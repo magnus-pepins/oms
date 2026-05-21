@@ -21,6 +21,7 @@ import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /**
  * Pure-logic tests for {@link OmsFxCustomerQuotePublisher}.
@@ -208,6 +209,108 @@ class OmsFxCustomerQuotePublisherTest {
         assertThat(s.overrides().cachedRowCount()).isEqualTo(1);
         assertThat(s.overrides().activeCount()).isEqualTo(1);
         assertThat(s.overrides().nextExpiryEpochMs()).isEqualTo(NOW.plusSeconds(60).toEpochMilli());
+    }
+
+    @Test
+    void previewQuoteGrid_buildsRowsFromMidSnapshotAcrossConfiguredTiers() {
+        // EURUSD has a per-tier rate card (basic 20 / elite 10). GBPUSD only has
+        // a `default` rate card — both rows should appear because the publisher
+        // waterfalls tier=elite to tier=default for GBPUSD. This is the same
+        // surface the trading-desk "Live tier quotes" panel renders (plan A1).
+        Map<OmsFxCustomerQuotePublisher.MarkupKey, BigDecimal> cache = new HashMap<>();
+        cache.put(new OmsFxCustomerQuotePublisher.MarkupKey("EURUSD", "basic", "BID"), new BigDecimal("20.00"));
+        cache.put(new OmsFxCustomerQuotePublisher.MarkupKey("EURUSD", "basic", "ASK"), new BigDecimal("20.00"));
+        cache.put(new OmsFxCustomerQuotePublisher.MarkupKey("EURUSD", "elite", "BID"), new BigDecimal("10.00"));
+        cache.put(new OmsFxCustomerQuotePublisher.MarkupKey("EURUSD", "elite", "ASK"), new BigDecimal("10.00"));
+        cache.put(new OmsFxCustomerQuotePublisher.MarkupKey("GBPUSD", "default", "BID"), new BigDecimal("35.00"));
+        cache.put(new OmsFxCustomerQuotePublisher.MarkupKey("GBPUSD", "default", "ASK"), new BigDecimal("35.00"));
+        publisher.primeMarkupCache(cache);
+
+        long fresh = NOW.toEpochMilli() - 500;
+        when(midSubscriber.snapshot()).thenReturn(Map.of(
+                "EURUSD", new OmsFxMidSubscriber.MidSample(new BigDecimal("1.0850"), fresh),
+                "GBPUSD", new OmsFxMidSubscriber.MidSample(new BigDecimal("1.2500"), fresh)));
+
+        OmsFxCustomerQuotePublisher.GridSnapshot g = publisher.previewQuoteGrid();
+
+        assertThat(g.rows()).hasSize(2);
+        assertThat(g.rows().get(0).pair()).isEqualTo("EURUSD");
+        assertThat(g.rows().get(1).pair()).isEqualTo("GBPUSD");
+        assertThat(g.mqttConnected()).isFalse(); // no broker in unit test
+        assertThat(g.tiers()).containsExactly("basic", "elite");
+
+        OmsFxCustomerQuotePublisher.PairRow eurusd = g.rows().get(0);
+        assertThat(eurusd.stale()).isFalse();
+        assertThat(eurusd.tiers().get("basic").bidMarkupBps()).isEqualTo("20.00");
+        assertThat(eurusd.tiers().get("elite").bidMarkupBps()).isEqualTo("10.00");
+        assertThat(eurusd.tiers().get("basic").overrideApplied()).isFalse();
+        // Quotes match the standalone applyMarkup math (20 bps × 1.0850).
+        assertThat(new BigDecimal(eurusd.tiers().get("basic").bid()))
+                .isEqualByComparingTo("1.08283000");
+        assertThat(new BigDecimal(eurusd.tiers().get("basic").ask()))
+                .isEqualByComparingTo("1.08717000");
+    }
+
+    @Test
+    void previewQuoteGrid_flagsStaleMidsButStillReturnsThem() {
+        // The vendor publisher silent-stall failure mode (P6 observability): we
+        // want the operator to see the stale row, not have it disappear from
+        // the panel, otherwise a gap is invisible.
+        Map<OmsFxCustomerQuotePublisher.MarkupKey, BigDecimal> cache = new HashMap<>();
+        cache.put(new OmsFxCustomerQuotePublisher.MarkupKey("EURUSD", "basic", "BID"), new BigDecimal("20.00"));
+        cache.put(new OmsFxCustomerQuotePublisher.MarkupKey("EURUSD", "basic", "ASK"), new BigDecimal("20.00"));
+        publisher.primeMarkupCache(cache);
+
+        long stale = NOW.toEpochMilli() - 60_000L; // older than maxMidAgeMs=30_000
+        when(midSubscriber.snapshot()).thenReturn(Map.of(
+                "EURUSD", new OmsFxMidSubscriber.MidSample(new BigDecimal("1.0850"), stale)));
+
+        OmsFxCustomerQuotePublisher.GridSnapshot g = publisher.previewQuoteGrid();
+        assertThat(g.rows()).hasSize(1);
+        assertThat(g.rows().get(0).stale()).isTrue();
+        assertThat(g.rows().get(0).midAgeMs()).isGreaterThanOrEqualTo(30_000L);
+        // Markup still resolved; the UI decides whether to grey out a stale row.
+        assertThat(g.rows().get(0).tiers().get("basic").bid()).isNotNull();
+    }
+
+    @Test
+    void previewQuoteGrid_marksOverrideAppliedWhenAdditiveNonZero() {
+        Map<OmsFxCustomerQuotePublisher.MarkupKey, BigDecimal> cache = new HashMap<>();
+        cache.put(new OmsFxCustomerQuotePublisher.MarkupKey("EURUSD", "elite", "BID"), new BigDecimal("10.00"));
+        cache.put(new OmsFxCustomerQuotePublisher.MarkupKey("EURUSD", "elite", "ASK"), new BigDecimal("10.00"));
+        publisher.primeMarkupCache(cache);
+        overrides.primeCache(List.of(new FxMarkupOverridesService.OverrideRow(
+                "EURUSD", "BID", "elite", new BigDecimal("5.00"),
+                NOW.minusSeconds(60), NOW.plusSeconds(60))));
+
+        when(midSubscriber.snapshot()).thenReturn(Map.of(
+                "EURUSD", new OmsFxMidSubscriber.MidSample(new BigDecimal("1.0850"), NOW.toEpochMilli() - 500)));
+
+        OmsFxCustomerQuotePublisher.GridSnapshot g = publisher.previewQuoteGrid();
+        OmsFxCustomerQuotePublisher.TierQuote elite = g.rows().get(0).tiers().get("elite");
+        assertThat(elite.overrideApplied()).isTrue();
+        // BID picks up the +5 bps override; ASK is untouched.
+        assertThat(elite.bidMarkupBps()).isEqualTo("15.00");
+        assertThat(elite.askMarkupBps()).isEqualTo("10.00");
+    }
+
+    @Test
+    void previewQuoteGrid_emitsNullCellWhenTierHasNoBaseMarkup() {
+        // Publisher is configured for tiers={basic,elite} but the cache only
+        // carries `basic` — the elite column should render as a null cell
+        // (UI shows "—") instead of being silently dropped.
+        Map<OmsFxCustomerQuotePublisher.MarkupKey, BigDecimal> cache = new HashMap<>();
+        cache.put(new OmsFxCustomerQuotePublisher.MarkupKey("EURUSD", "basic", "BID"), new BigDecimal("20.00"));
+        cache.put(new OmsFxCustomerQuotePublisher.MarkupKey("EURUSD", "basic", "ASK"), new BigDecimal("20.00"));
+        publisher.primeMarkupCache(cache);
+
+        when(midSubscriber.snapshot()).thenReturn(Map.of(
+                "EURUSD", new OmsFxMidSubscriber.MidSample(new BigDecimal("1.0850"), NOW.toEpochMilli() - 500)));
+
+        OmsFxCustomerQuotePublisher.GridSnapshot g = publisher.previewQuoteGrid();
+        OmsFxCustomerQuotePublisher.TierQuote elite = g.rows().get(0).tiers().get("elite");
+        assertThat(elite.bid()).isNull();
+        assertThat(elite.ask()).isNull();
     }
 
     @Test

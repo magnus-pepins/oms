@@ -105,7 +105,7 @@ class LedgerInflightCoalescerIntegrationTest extends AbstractPostgresIntegration
                         .withHeader("Content-Type", "application/json")
                         .withBody("{\"availableBalance\":\"999\",\"identityId\":\"ident-coalescer-it\"}")));
         ledgerWireMock.stubFor(post(urlPathEqualTo("/transactions/bulk"))
-                .withHeader("X-Ledger-Key", equalTo("it-key"))
+                .withHeader("Authorization", equalTo("Bearer it-key"))
                 .willReturn(aResponse()
                         .withStatus(201)
                         .withHeader("Content-Type", "application/json")

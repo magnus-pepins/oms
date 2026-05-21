@@ -43,7 +43,8 @@ public final class RestLedgerInflightReservationClient implements LedgerInflight
 
     private static final Logger log = LoggerFactory.getLogger(RestLedgerInflightReservationClient.class);
 
-    private static final String LEDGER_KEY_HEADER = "X-Ledger-Key";
+    private static final String AUTHORIZATION_HEADER = "Authorization";
+    private static final String BEARER_PREFIX = "Bearer ";
     private static final String REFERENCE_PREFIX = "oms:order:";
     /**
      * Wed-demo: JSON field name on the Ledger {@code POST /transactions} response carrying the
@@ -164,7 +165,7 @@ public final class RestLedgerInflightReservationClient implements LedgerInflight
         try {
             ResponseEntity<String> response = http.post()
                     .uri("/transactions")
-                    .header(LEDGER_KEY_HEADER, apiKey)
+                    .header(AUTHORIZATION_HEADER, BEARER_PREFIX + apiKey)
                     .contentType(MediaType.APPLICATION_JSON)
                     .body(body)
                     .retrieve()
@@ -229,7 +230,7 @@ public final class RestLedgerInflightReservationClient implements LedgerInflight
                             .path("/balances/{id}")
                             .queryParam("with_queued", false)
                             .build(balanceId))
-                    .header(LEDGER_KEY_HEADER, apiKey)
+                    .header(AUTHORIZATION_HEADER, BEARER_PREFIX + apiKey)
                     .retrieve()
                     .toEntity(String.class);
             if (!response.getStatusCode().is2xxSuccessful()) {

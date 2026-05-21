@@ -11,7 +11,14 @@ import org.springframework.web.client.RestClientException;
 import java.math.BigDecimal;
 
 /**
- * GET {@code /balances/{id}} with {@code X-Ledger-Key}.
+ * GET {@code /balances/{id}} with {@code Authorization: Bearer <token>}.
+ *
+ * <p>Header scheme switched from {@code X-Ledger-Key} to standard Bearer on
+ * 2026-05-21 to match the {@code ledger-cluster-rest-shim} auth cutover
+ * (the TS Ledger was retired on 2026-05-17; see
+ * {@code ledger-cluster/src/main/java/com/balh/ledger/shim/auth/LedgerShimBearerAuthFilter.java}
+ * and {@code application-ledger-rest-shim.yaml}). Token value still lives in
+ * {@code oms.ledger.api-key} (env {@code OMS_LEDGER_API_KEY}).
  *
  * <p>Sends {@code with_queued=true} only when the caller actually needs queued debit/credit
  * amounts ({@link #fetchAvailableBalance(String)}, {@link #fetchBalanceReadModel(String)}).
@@ -32,7 +39,8 @@ import java.math.BigDecimal;
  */
 public final class RestLedgerBalanceClient implements LedgerBalanceClient {
 
-    private static final String LEDGER_KEY_HEADER = "X-Ledger-Key";
+    private static final String AUTHORIZATION_HEADER = "Authorization";
+    private static final String BEARER_PREFIX = "Bearer ";
 
     private final RestClient http;
     private final String apiKey;
@@ -114,7 +122,7 @@ public final class RestLedgerBalanceClient implements LedgerBalanceClient {
                             .path("/balances/{id}")
                             .queryParam("with_queued", withQueued)
                             .build(balanceId))
-                    .header(LEDGER_KEY_HEADER, apiKey)
+                    .header(AUTHORIZATION_HEADER, BEARER_PREFIX + apiKey)
                     .retrieve()
                     .toEntity(String.class);
             if (!response.getStatusCode().is2xxSuccessful()) {

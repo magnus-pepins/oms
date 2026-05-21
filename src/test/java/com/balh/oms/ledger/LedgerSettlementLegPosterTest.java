@@ -94,7 +94,7 @@ class LedgerSettlementLegPosterTest {
         ledger.verify(1, getRequestedFor(urlPathEqualTo("/balances"))
                 .withQueryParam("indicator", equalTo("inv-a0000000-0000-4000-8000-000000000001-USD")));
         ledger.verify(1, postWith()
-                .withHeader("X-Ledger-Key", equalTo("test-key"))
+                .withHeader("Authorization", equalTo("Bearer test-key"))
                 .withRequestBody(containing("\"source\":\"balance_cust_001_usd\""))
                 .withRequestBody(containing("\"destination\":\"@Nostro-USD-Bank\""))
                 .withRequestBody(containing("\"amount\":55.0"))

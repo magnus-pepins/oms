@@ -354,7 +354,7 @@ public class FxHedgeService {
             String resp = http.post()
                     .uri("/transactions")
                     .contentType(MediaType.APPLICATION_JSON)
-                    .header("X-Ledger-Key", apiKey)
+                    .header("Authorization", "Bearer " + apiKey)
                     .body(body)
                     .retrieve()
                     .body(String.class);

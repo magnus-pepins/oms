@@ -13,7 +13,8 @@ import org.springframework.web.client.RestClientException;
  */
 public final class RestLedgerSettlementPostingClient implements LedgerSettlementPostingClient {
 
-    private static final String LEDGER_KEY_HEADER = "X-Ledger-Key";
+    private static final String AUTHORIZATION_HEADER = "Authorization";
+    private static final String BEARER_PREFIX = "Bearer ";
 
     private final RestClient http;
     private final String apiKey;
@@ -51,7 +52,7 @@ public final class RestLedgerSettlementPostingClient implements LedgerSettlement
         try {
             ResponseEntity<String> response = http.post()
                     .uri(httpPath)
-                    .header(LEDGER_KEY_HEADER, apiKey)
+                    .header(AUTHORIZATION_HEADER, BEARER_PREFIX + apiKey)
                     .contentType(MediaType.APPLICATION_JSON)
                     .body(body)
                     .retrieve()

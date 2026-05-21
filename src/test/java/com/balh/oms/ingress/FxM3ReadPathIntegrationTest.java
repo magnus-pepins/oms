@@ -115,7 +115,7 @@ class FxM3ReadPathIntegrationTest extends AbstractPostgresIntegrationTest {
     void nostroSnapshotReadsLedgerBalances() {
         ledgerWireMock.stubFor(get(urlPathEqualTo("/balances/bal_nostro_it"))
                 .withQueryParam("with_queued", equalTo("true"))
-                .withHeader("X-Ledger-Key", equalTo("fx-m3-ledger-key"))
+                .withHeader("Authorization", equalTo("Bearer fx-m3-ledger-key"))
                 .willReturn(aResponse()
                         .withHeader("Content-Type", "application/json")
                         .withBody(

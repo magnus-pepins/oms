@@ -31,7 +31,8 @@ import java.util.regex.Pattern;
  */
 public final class RestLedgerInflightBulkDispatcher implements LedgerInflightBulkDispatcher {
 
-    private static final String LEDGER_KEY_HEADER = "X-Ledger-Key";
+    private static final String AUTHORIZATION_HEADER = "Authorization";
+    private static final String BEARER_PREFIX = "Bearer ";
     private static final String REFERENCE_PREFIX = "oms:order:";
     private static final Pattern ORDER_ID_PATTERN =
             Pattern.compile("oms:order:([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})");
@@ -87,7 +88,7 @@ public final class RestLedgerInflightBulkDispatcher implements LedgerInflightBul
         try {
             response = http.post()
                     .uri("/transactions/bulk")
-                    .header(LEDGER_KEY_HEADER, apiKey)
+                    .header(AUTHORIZATION_HEADER, BEARER_PREFIX + apiKey)
                     .contentType(MediaType.APPLICATION_JSON)
                     .body(body)
                     .retrieve()

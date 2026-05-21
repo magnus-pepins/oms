@@ -96,7 +96,7 @@ class LedgerInflightOutboxIntegrationTest extends AbstractPostgresIntegrationTes
                         .withHeader("Content-Type", "application/json")
                         .withBody("{\"availableBalance\":\"999\",\"identityId\":\"ident-async-it\"}")));
         ledgerWireMock.stubFor(post(urlPathEqualTo("/transactions"))
-                .withHeader("X-Ledger-Key", equalTo("it-key"))
+                .withHeader("Authorization", equalTo("Bearer it-key"))
                 .willReturn(aResponse()
                         .withStatus(201)
                         .withHeader("Content-Type", "application/json")

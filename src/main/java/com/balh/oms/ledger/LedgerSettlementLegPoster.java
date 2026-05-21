@@ -43,7 +43,8 @@ public final class LedgerSettlementLegPoster implements LedgerSettlementPostingC
 
     private static final Logger log = LoggerFactory.getLogger(LedgerSettlementLegPoster.class);
 
-    private static final String LEDGER_KEY_HEADER = "X-Ledger-Key";
+    private static final String AUTHORIZATION_HEADER = "Authorization";
+    private static final String BEARER_PREFIX = "Bearer ";
 
     /** Legacy stock-fee snapshots used bare {@code @Platform-Revenue} for USD (Bug H). */
     private static final String LEGACY_PLATFORM_REVENUE_INDICATOR = "@Platform-Revenue";
@@ -245,7 +246,7 @@ public final class LedgerSettlementLegPoster implements LedgerSettlementPostingC
             String resp = http.post()
                     .uri("/transactions")
                     .contentType(MediaType.APPLICATION_JSON)
-                    .header(LEDGER_KEY_HEADER, apiKey)
+                    .header(AUTHORIZATION_HEADER, BEARER_PREFIX + apiKey)
                     .body(body)
                     .retrieve()
                     .body(String.class);
@@ -295,7 +296,7 @@ public final class LedgerSettlementLegPoster implements LedgerSettlementPostingC
         try {
             String resp = http.get()
                     .uri(b -> b.path("/balances").queryParam("indicator", indicator).build())
-                    .header(LEDGER_KEY_HEADER, apiKey)
+                    .header(AUTHORIZATION_HEADER, BEARER_PREFIX + apiKey)
                     .retrieve()
                     .body(String.class);
             JsonNode arr = objectMapper.readTree(resp == null ? "[]" : resp);

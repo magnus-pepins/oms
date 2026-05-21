@@ -230,7 +230,7 @@ Phase 3 of [`oms-aeron-cluster-substrate`](../../system-documentation/plans/oms-
 |----------------------------------|-------------------------|-------------------------------------------------------------------------|
 | `OMS_LEDGER_ENABLED`             | `false`                 | When true, wires `RestLedgerBalanceClient` and enables the BUY buying-power gate in `OmsAdmissionClusteredService` (the cluster admission service). |
 | `OMS_LEDGER_BASE_URL`          | `http://localhost:5001` | Ledger HTTP root (routes mounted at `/`, e.g. `/balances/{id}`).        |
-| `OMS_LEDGER_API_KEY`           | (empty)                 | Value for `X-Ledger-Key` on balance reads. Required when enabled.         |
+| `OMS_LEDGER_API_KEY`           | (empty)                 | Token used as `Authorization: Bearer <value>` on Ledger HTTP calls (balance reads, settlement post, inflight reservations, hedge submission). Switched from `X-Ledger-Key` on the 2026-05-17 `ledger-cluster-rest-shim` cutover. Required when enabled. |
 | `OMS_LEDGER_CONNECT_TIMEOUT_MS`  | `2000`                  | HTTP connect timeout for Ledger calls.                                  |
 | `OMS_LEDGER_READ_TIMEOUT_MS`     | `5000`                  | HTTP read timeout for Ledger calls.                                      |
 | `OMS_LEDGER_INFLIGHT_RESERVATION_ENABLED` | `false`          | When true, OMS places a Ledger BUY inflight hold at order accept (idempotent `reference` `oms:order:{uuid}`). Requires `OMS_LEDGER_INFLIGHT_HOLD_DESTINATION_BALANCE_ID`. |

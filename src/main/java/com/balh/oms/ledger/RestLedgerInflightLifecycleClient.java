@@ -24,7 +24,8 @@ import java.util.Objects;
  */
 public final class RestLedgerInflightLifecycleClient implements LedgerInflightLifecycleClient {
 
-    private static final String LEDGER_KEY_HEADER = "X-Ledger-Key";
+    private static final String AUTHORIZATION_HEADER = "Authorization";
+    private static final String BEARER_PREFIX = "Bearer ";
     private static final String INFLIGHT_PATH = "/transactions/inflight/{txID}";
     static final String ACTION_COMMIT = "commit";
     static final String ACTION_VOID = "void";
@@ -58,7 +59,7 @@ public final class RestLedgerInflightLifecycleClient implements LedgerInflightLi
         try {
             ResponseEntity<String> response = http.put()
                     .uri(INFLIGHT_PATH, ledgerTxnId)
-                    .header(LEDGER_KEY_HEADER, apiKey)
+                    .header(AUTHORIZATION_HEADER, BEARER_PREFIX + apiKey)
                     .contentType(MediaType.APPLICATION_JSON)
                     .body(body)
                     .retrieve()

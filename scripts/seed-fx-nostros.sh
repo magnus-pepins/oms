@@ -47,7 +47,7 @@ SUSPENSE=(
 )
 
 curl_ledger() {
-  curl -sS -H "X-Ledger-Key: ${LEDGER_KEY}" -H 'Content-Type: application/json' "$@"
+  curl -sS -H "Authorization: Bearer ${LEDGER_KEY}" -H 'Content-Type: application/json' "$@"
 }
 
 find_existing() {

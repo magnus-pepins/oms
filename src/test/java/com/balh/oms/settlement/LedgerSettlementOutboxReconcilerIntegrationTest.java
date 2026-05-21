@@ -77,7 +77,7 @@ class LedgerSettlementOutboxReconcilerIntegrationTest extends AbstractPostgresIn
     @Test
     void reconcilerPostsCashAndFeeLegsToLedgerAndMarksBothPosted() {
         ledgerWireMock.stubFor(post(urlPathEqualTo("/transactions"))
-                .withHeader("X-Ledger-Key", equalTo("it-key"))
+                .withHeader("Authorization", equalTo("Bearer it-key"))
                 .willReturn(aResponse()
                         .withStatus(201)
                         .withHeader("Content-Type", "application/json")
@@ -122,7 +122,7 @@ class LedgerSettlementOutboxReconcilerIntegrationTest extends AbstractPostgresIn
     @Test
     void reconcilerLeavesPostedAtNullWhenLedgerReturnsError() {
         ledgerWireMock.stubFor(post(urlPathEqualTo("/transactions"))
-                .withHeader("X-Ledger-Key", equalTo("it-key"))
+                .withHeader("Authorization", equalTo("Bearer it-key"))
                 .willReturn(aResponse().withStatus(503).withBody("unavailable")));
 
         long exId = insertFilledBuyExecution();

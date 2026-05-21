@@ -118,6 +118,22 @@ public class OmsFxCustomerQuotePublisher {
     /** Set of pairs we've already logged a "no markup, skipping" warning for — keeps logs quiet. */
     private final Set<String> warnedMissingPairs = ConcurrentHashMap.newKeySet();
 
+    /**
+     * Wall-clock millis of the most recent successful MQTT publish (any pair/tier).
+     * Zero before the publisher has ever published. Read by {@link #status()} so
+     * the ops endpoint can surface "publisher is alive but starving" — the silent
+     * stall mode where the bean is up and MQTT is connected but no fresh ticks
+     * are arriving from the upstream vendor feed (see plans/fx-tier-quotes-production.md).
+     */
+    private volatile long lastSuccessfulPublishAtMs;
+    /**
+     * Wall-clock millis of the most recent tick where we found <em>some</em>
+     * mid in the snapshot but skipped publishing because every pair was older
+     * than {@link #maxMidAgeMs}. This is the canary for "upstream went dark";
+     * during steady state it stays well behind {@link #lastSuccessfulPublishAtMs}.
+     */
+    private volatile long lastStaleMidSkipAtMs;
+
     private volatile MqttAsyncClient client;
 
     public OmsFxCustomerQuotePublisher(
@@ -283,6 +299,7 @@ public class OmsFxCustomerQuotePublisher {
             long age = nowMs - sample.capturedAtMs();
             if (age > maxMidAgeMs) {
                 staleMidCounter.increment();
+                lastStaleMidSkipAtMs = nowMs;
                 continue;
             }
             for (String tier : tiers) {
@@ -336,6 +353,7 @@ public class OmsFxCustomerQuotePublisher {
             msg.setRetained(retained);
             c.publish(topic, msg);
             publishOkCounter.increment();
+            lastSuccessfulPublishAtMs = clock.millis();
         } catch (Exception ex) {
             publishFailCounter.increment();
             log.debug("[oms-fx-cust-pub] publish failed pair={} tier={} topic={}: {}",
@@ -424,6 +442,8 @@ public class OmsFxCustomerQuotePublisher {
                 client != null && client.isConnected(),
                 publishTickPeriodMs,
                 maxMidAgeMs,
+                lastSuccessfulPublishAtMs,
+                lastStaleMidSkipAtMs,
                 overrides.status());
     }
 
@@ -436,7 +456,17 @@ public class OmsFxCustomerQuotePublisher {
         }
     }
 
-    /** Returned by {@link #status()} for ops/diagnostic surfaces. */
+    /**
+     * Returned by {@link #status()} for ops/diagnostic surfaces.
+     *
+     * <p>{@code lastSuccessfulPublishAtMs} and {@code lastStaleMidSkipAtMs} are
+     * the operator's "is this publisher actually doing work?" signal. A live
+     * publisher should show {@code lastSuccessfulPublishAtMs} within
+     * {@code publishTickPeriodMs * a few} of now; if it stops moving while
+     * {@code mqttConnected=true} the upstream vendor mid feed has gone dark
+     * and OMS is skipping every tick (see {@code OmsFxMidSubscriber.status()}
+     * for the corresponding upstream-side timestamp).
+     */
     public record PublisherStatus(
             List<String> tiers,
             int markupCacheSize,
@@ -444,6 +474,8 @@ public class OmsFxCustomerQuotePublisher {
             boolean mqttConnected,
             long publishTickPeriodMs,
             long maxMidAgeMs,
+            long lastSuccessfulPublishAtMs,
+            long lastStaleMidSkipAtMs,
             FxMarkupOverridesService.OverridesStatus overrides
     ) {}
 }

@@ -95,6 +95,15 @@ public class OmsFxMidSubscriber implements MqttCallback {
     private final long stalenessMillis;
     private final String clientIdPrefix;
 
+    /**
+     * Wall-clock millis of the most recent successfully-parsed tick from
+     * <em>any</em> pair. Surfaces in {@link #status()} so the customer-quote
+     * publisher's status endpoint can distinguish "OMS is connected to EMQX
+     * but the upstream vendor feed has gone dark" from "OMS lost its
+     * subscription". Zero before the first tick.
+     */
+    private volatile long lastTickAtMs;
+
     private MqttAsyncClient client;
 
     public OmsFxMidSubscriber(
@@ -182,6 +191,30 @@ public class OmsFxMidSubscriber implements MqttCallback {
         return Map.copyOf(mids);
     }
 
+    /**
+     * Ops/diagnostic status, surfaced via the customer-quote status endpoint
+     * so operators can see whether the silent-publisher case is upstream-side
+     * (vendor feed dark — {@link SubscriberStatus#lastTickAtMs()} not moving)
+     * or downstream-side (OMS publisher not running). The pair count comes
+     * from {@link #snapshot()} so it tracks added/removed pairs without an
+     * extra counter.
+     */
+    public SubscriberStatus status() {
+        return new SubscriberStatus(
+                client != null && client.isConnected(),
+                mids.size(),
+                lastTickAtMs,
+                stalenessMillis);
+    }
+
+    /** Returned by {@link #status()} for ops/diagnostic surfaces. */
+    public record SubscriberStatus(
+            boolean mqttConnected,
+            int pairsKnown,
+            long lastTickAtMs,
+            long stalenessMs
+    ) {}
+
     @Override
     public void messageArrived(String topic, MqttMessage message) {
         String[] parts = topic.split("/");
@@ -209,7 +242,9 @@ public class OmsFxMidSubscriber implements MqttCallback {
                 parseErrorsCounter.increment();
                 return;
             }
-            mids.put(pair, new MidSample(mid, clock.millis()));
+            long nowMs = clock.millis();
+            mids.put(pair, new MidSample(mid, nowMs));
+            lastTickAtMs = nowMs;
             ticksCounter.increment();
         } catch (Exception e) {
             parseErrorsCounter.increment();

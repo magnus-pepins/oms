@@ -30,16 +30,19 @@ public class FxQuotesController {
     private final Clock clock;
     private final FxQuoteService quoteService;
     private final ObjectProvider<OmsFxCustomerQuotePublisher> customerQuotePublisher;
+    private final ObjectProvider<OmsFxMidSubscriber> midSubscriber;
 
     public FxQuotesController(
             OmsConfig omsConfig,
             Clock clock,
             FxQuoteService quoteService,
-            ObjectProvider<OmsFxCustomerQuotePublisher> customerQuotePublisher) {
+            ObjectProvider<OmsFxCustomerQuotePublisher> customerQuotePublisher,
+            ObjectProvider<OmsFxMidSubscriber> midSubscriber) {
         this.omsConfig = omsConfig;
         this.clock = clock;
         this.quoteService = quoteService;
         this.customerQuotePublisher = customerQuotePublisher;
+        this.midSubscriber = midSubscriber;
     }
 
     /** Legacy stub kept until the trading-desk migrates to {@code POST /quote}. */
@@ -100,6 +103,21 @@ public class FxQuotesController {
         body.put("mqttConnected", s.mqttConnected());
         body.put("publishTickPeriodMs", s.publishTickPeriodMs());
         body.put("maxMidAgeMs", s.maxMidAgeMs());
+        body.put("lastSuccessfulPublishAtMs", s.lastSuccessfulPublishAtMs());
+        body.put("lastStaleMidSkipAtMs", s.lastStaleMidSkipAtMs());
+        OmsFxMidSubscriber sub = midSubscriber.getIfAvailable();
+        Map<String, Object> upstreamBody = new LinkedHashMap<>();
+        if (sub == null) {
+            upstreamBody.put("enabled", false);
+        } else {
+            OmsFxMidSubscriber.SubscriberStatus ss = sub.status();
+            upstreamBody.put("enabled", true);
+            upstreamBody.put("mqttConnected", ss.mqttConnected());
+            upstreamBody.put("pairsKnown", ss.pairsKnown());
+            upstreamBody.put("lastTickAtMs", ss.lastTickAtMs());
+            upstreamBody.put("stalenessMs", ss.stalenessMs());
+        }
+        body.put("upstream", upstreamBody);
         FxMarkupOverridesService.OverridesStatus o = s.overrides();
         Map<String, Object> overridesBody = new LinkedHashMap<>();
         overridesBody.put("cachedRowCount", o.cachedRowCount());

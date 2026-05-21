@@ -1744,6 +1744,7 @@ public class OmsConfig {
 
         private final MarkupOverrides markupOverrides = new MarkupOverrides();
         private final TierKills tierKills = new TierKills();
+        private final AutoHedger autoHedger = new AutoHedger();
 
         public MarkupOverrides getMarkupOverrides() {
             return markupOverrides;
@@ -1751,6 +1752,10 @@ public class OmsConfig {
 
         public TierKills getTierKills() {
             return tierKills;
+        }
+
+        public AutoHedger getAutoHedger() {
+            return autoHedger;
         }
 
         /**
@@ -1828,6 +1833,58 @@ public class OmsConfig {
             }
             public boolean isAutoApproveEnabled() { return autoApproveEnabled; }
             public void setAutoApproveEnabled(boolean v) { this.autoApproveEnabled = v; }
+        }
+
+        /**
+         * FxAutoHedger engine knobs (plan B1). Defaults are deliberately
+         * conservative: engine off (no scheduled tick), short eval
+         * interval when on, auto-fire kill-switch separate from the
+         * per-currency mode column so operators have a global
+         * panic-stop independent of any row in {@code fx_hedger_policy}.
+         */
+        public static class AutoHedger {
+            /**
+             * Master enable for the scheduled engine. When false, the
+             * bean is still wired but the {@code @Scheduled} loop
+             * no-ops. Lets us deploy the migration + service without
+             * any drift evaluation until operators are ready.
+             */
+            private boolean engineEnabled = false;
+            /** Eval cadence in ms. Default 15s, matches plan B1 inputs section. */
+            private long evalIntervalMs = 15_000L;
+            /** Tier the engine quotes against — must match a tier in fx_pair_markups (V53 seeds 'desk'). */
+            private String pricingTier = "desk";
+            /**
+             * Global auto-fire kill-switch. Even rows in
+             * {@code fx_hedger_policy} with {@code mode='auto'} only
+             * write a recommendation when this flag is {@code false}.
+             * Plan B1.3 (auto-mode hook) flips this to {@code true}
+             * after a week of advisory-mode evidence. Until then the
+             * scheduler exercises every code path except the
+             * {@code FxHedgeService.submit} call.
+             */
+            private boolean autoFireEnabled = false;
+            /** Submitter string stamped on auto-fired hedge rows (plan decision 2). */
+            private String autoFireSubmitter = "fx-auto-hedger";
+            /** Cache refresh cadence for the policy table. */
+            private long policyRefreshMs = 60_000L;
+
+            public boolean isEngineEnabled() { return engineEnabled; }
+            public void setEngineEnabled(boolean v) { this.engineEnabled = v; }
+            public long getEvalIntervalMs() { return evalIntervalMs; }
+            public void setEvalIntervalMs(long v) { this.evalIntervalMs = Math.max(1_000L, v); }
+            public String getPricingTier() { return pricingTier; }
+            public void setPricingTier(String v) {
+                this.pricingTier = (v == null || v.isBlank()) ? "desk" : v.trim().toLowerCase();
+            }
+            public boolean isAutoFireEnabled() { return autoFireEnabled; }
+            public void setAutoFireEnabled(boolean v) { this.autoFireEnabled = v; }
+            public String getAutoFireSubmitter() { return autoFireSubmitter; }
+            public void setAutoFireSubmitter(String v) {
+                this.autoFireSubmitter = (v == null || v.isBlank()) ? "fx-auto-hedger" : v.trim();
+            }
+            public long getPolicyRefreshMs() { return policyRefreshMs; }
+            public void setPolicyRefreshMs(long v) { this.policyRefreshMs = Math.max(5_000L, v); }
         }
 
         public boolean isModuleEnabled() {

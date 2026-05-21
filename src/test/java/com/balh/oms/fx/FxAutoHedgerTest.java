@@ -2,6 +2,7 @@ package com.balh.oms.fx;
 
 import com.balh.oms.config.OmsConfig;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -47,6 +48,7 @@ class FxAutoHedgerTest {
     private FxQuoteService quoteService;
     private ObjectProvider<FxHedgeService> hedgeProvider;
     private FxHedgeService hedgeService;
+    private MeterRegistry meterRegistry;
     private FxAutoHedger engine;
 
     @BeforeEach
@@ -69,6 +71,7 @@ class FxAutoHedgerTest {
         when(provider.getIfAvailable()).thenReturn(hedgeService);
         hedgeProvider = provider;
 
+        meterRegistry = new SimpleMeterRegistry();
         engine = new FxAutoHedger(
                 jdbc,
                 Clock.fixed(T, ZoneOffset.UTC),
@@ -78,7 +81,7 @@ class FxAutoHedgerTest {
                 quoteService,
                 hedgeProvider,
                 new ObjectMapper(),
-                new SimpleMeterRegistry());
+                meterRegistry);
     }
 
     private FxAutoHedgerPolicyService.PolicyRow policyRow(String currency, String mode, String pairRoute, BigDecimal target) {
@@ -228,6 +231,23 @@ class FxAutoHedgerTest {
     }
 
     @Test
+    void engineStatusGauges_reflectConfigOnEveryTick() {
+        omsConfig.getFx().getAutoHedger().setEngineEnabled(true);
+        omsConfig.getFx().getAutoHedger().setAutoFireEnabled(true);
+        when(policy.listAll()).thenReturn(List.of());
+        primeBalance("USD", "1");
+        engine.tickInternal();
+        assertThat(meterRegistry.find("oms_fx_auto_hedger_engine_enabled").gauge().value()).isEqualTo(1.0);
+        assertThat(meterRegistry.find("oms_fx_auto_hedger_auto_fire_enabled").gauge().value()).isEqualTo(1.0);
+
+        omsConfig.getFx().getAutoHedger().setEngineEnabled(false);
+        omsConfig.getFx().getAutoHedger().setAutoFireEnabled(false);
+        engine.tickInternal();
+        assertThat(meterRegistry.find("oms_fx_auto_hedger_engine_enabled").gauge().value()).isEqualTo(0.0);
+        assertThat(meterRegistry.find("oms_fx_auto_hedger_auto_fire_enabled").gauge().value()).isEqualTo(0.0);
+    }
+
+    @Test
     void quoteCurrencySide_usesPairMidToSizeBaseAmount() {
         // Currency is the QUOTE of the pair (SEK is quote of EURSEK).
         // drift=+200k SEK → BUY EUR (give up SEK), size = 200k / mid.
@@ -248,5 +268,13 @@ class FxAutoHedgerTest {
         //   2) midRateOrNull for max_per_action cap conversion to base ccy
         //   3) actual quote for the recommendation row
         verify(quoteService, times(3)).quote("EURSEK", "desk");
+
+        // Cap counter increments when max_per_action capped the drift sizing.
+        // max_per_action = 100k SEK; mid = 11.525 → capInBase = 8676.78… EUR.
+        // |drift| = 200k SEK → baseAmount before cap = 17_354.45 EUR > cap.
+        var cap = meterRegistry.find("oms_fx_auto_hedger_recommendation_capped_total")
+                .tag("currency", "SEK").counter();
+        assertThat(cap).isNotNull();
+        assertThat(cap.count()).isEqualTo(1.0);
     }
 }

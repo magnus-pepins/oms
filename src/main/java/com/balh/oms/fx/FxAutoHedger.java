@@ -83,11 +83,29 @@ public class FxAutoHedger {
     private final Counter belowThresholdCounter;
     private final Counter cooldownSkipCounter;
     private final Counter engineDisabledTickCounter;
+    /**
+     * Engine status gauges. Lift the two config flags onto the metrics
+     * surface so Grafana can render an on/off pill without hitting the
+     * controller. Useful for the {@code FxAutoHedgerStalled} alert to
+     * cross-reference with operator intent ("engine was supposed to be
+     * on") without pulling config.
+     */
+    private final AtomicReference<Double> engineEnabledGauge = new AtomicReference<>(0.0);
+    private final AtomicReference<Double> autoFireEnabledGauge = new AtomicReference<>(0.0);
 
     /** Per-currency drift gauge value (current - target). Updated every tick, even when engine is disabled. */
     private final Map<String, AtomicReference<Double>> driftValues = new ConcurrentHashMap<>();
     /** Per-currency latest-balance gauge value. */
     private final Map<String, AtomicReference<Double>> balanceValues = new ConcurrentHashMap<>();
+    /**
+     * Per-currency "capped" counter — incremented when the recommended
+     * base amount was reduced by {@code max_per_action} because drift
+     * exceeded the per-action cap. Sustained increments on one currency
+     * mean the policy's cap is too low to ever close the gap; operator
+     * must widen {@code max_per_action} or accept the standing exposure.
+     * Drives the {@code FxAutoHedgerCurrencyAtPolicyMax} alert.
+     */
+    private final Map<String, Counter> cappedCounters = new ConcurrentHashMap<>();
     /** Last-fire epoch ms per currency to enforce cooldown. */
     private final Map<String, Long> lastFireMs = new ConcurrentHashMap<>();
     /** Last tick result for diagnostics endpoint. */
@@ -127,6 +145,12 @@ public class FxAutoHedger {
                 .register(registry);
         this.engineDisabledTickCounter = Counter.builder("oms_fx_auto_hedger_engine_disabled_tick_total")
                 .register(registry);
+        Gauge.builder("oms_fx_auto_hedger_engine_enabled", engineEnabledGauge, AtomicReference::get)
+                .description("1 when oms.fx.auto-hedger.engine-enabled is true on this JVM, 0 otherwise")
+                .register(registry);
+        Gauge.builder("oms_fx_auto_hedger_auto_fire_enabled", autoFireEnabledGauge, AtomicReference::get)
+                .description("1 when the global auto-fire kill-switch is armed, 0 otherwise")
+                .register(registry);
     }
 
     @Scheduled(
@@ -145,6 +169,8 @@ public class FxAutoHedger {
     TickStatus tickInternal() {
         ticksCounter.increment();
         OmsConfig.Fx.AutoHedger cfg = omsConfig.getFx().getAutoHedger();
+        engineEnabledGauge.set(cfg.isEngineEnabled() ? 1.0 : 0.0);
+        autoFireEnabledGauge.set(cfg.isAutoFireEnabled() ? 1.0 : 0.0);
         if (!omsConfig.getFx().isModuleEnabled()) {
             engineDisabledTickCounter.increment();
             TickStatus s = new TickStatus(clock.instant(), false, "fx_module_disabled", List.of());
@@ -245,6 +271,7 @@ public class FxAutoHedger {
         }
         if (capInBase != null && baseAmount.compareTo(capInBase) > 0) {
             baseAmount = capInBase;
+            cappedCounters.computeIfAbsent(r.currency(), this::newCappedCounter).increment();
         }
 
         // Mint a fresh quote at the desk pricing tier. We do this even
@@ -400,6 +427,13 @@ public class FxAutoHedger {
         } catch (DataAccessException e) {
             log.warn("[fx-auto-hedger] link auto-fire failed actionKey={}: {}", actionKey, e.getMessage());
         }
+    }
+
+    private Counter newCappedCounter(String currency) {
+        return Counter.builder("oms_fx_auto_hedger_recommendation_capped_total")
+                .tag("currency", currency)
+                .description("Recommendations where base_amount was reduced by max_per_action")
+                .register(registry);
     }
 
     private void updateGauges(String currency, BigDecimal current, BigDecimal target) {

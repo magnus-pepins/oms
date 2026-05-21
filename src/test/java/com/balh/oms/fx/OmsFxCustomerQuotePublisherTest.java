@@ -40,6 +40,7 @@ class OmsFxCustomerQuotePublisherTest {
     private static final Instant NOW = Instant.parse("2026-05-20T12:00:00Z");
     private Clock clock;
     private FxMarkupOverridesService overrides;
+    private FxTierKillsService tierKills;
     private OmsFxCustomerQuotePublisher publisher;
 
     @BeforeEach
@@ -50,12 +51,17 @@ class OmsFxCustomerQuotePublisherTest {
         // Empty override cache by default so the existing math/waterfall
         // tests below see exactly the rate-card numbers.
         overrides.primeCache(List.of());
+        tierKills = new FxTierKillsService(
+                mock(JdbcTemplate.class), clock, new OmsConfig(), new SimpleMeterRegistry(), 60_000L);
+        // No active kills by default — every (pair, tier) publishes.
+        tierKills.primeCache(List.of());
         publisher = new OmsFxCustomerQuotePublisher(
                 midSubscriber,
                 jdbc,
                 clock,
                 new ObjectMapper(),
                 overrides,
+                tierKills,
                 new SimpleMeterRegistry(),
                 "tcp://localhost:1883",
                 "",
@@ -136,7 +142,7 @@ class OmsFxCustomerQuotePublisherTest {
     void markupLoadTiers_doesNotDuplicateDefaultWhenAlreadyConfigured() {
         OmsFxCustomerQuotePublisher withDefault = new OmsFxCustomerQuotePublisher(
                 midSubscriber, jdbc, Clock.fixed(Instant.parse("2026-05-20T12:00:00Z"), ZoneOffset.UTC),
-                new ObjectMapper(), overrides, new SimpleMeterRegistry(),
+                new ObjectMapper(), overrides, tierKills, new SimpleMeterRegistry(),
                 "tcp://localhost:1883", "", "", "test-prefix",
                 "basic,default,elite",
                 1000L, 30_000L, 60_000L,
@@ -311,6 +317,83 @@ class OmsFxCustomerQuotePublisherTest {
         OmsFxCustomerQuotePublisher.TierQuote elite = g.rows().get(0).tiers().get("elite");
         assertThat(elite.bid()).isNull();
         assertThat(elite.ask()).isNull();
+    }
+
+    @Test
+    void previewQuoteGrid_flagsKilledTierCellsAndStillShowsPriceForOperatorContext() {
+        // A kill stops the MQTT publish for that (pair, tier), but the
+        // snapshot must still show what the price *would* be — operator
+        // needs to see the price they're hiding from customers, so they
+        // can sanity-check the kill before approving / revoking.
+        Map<OmsFxCustomerQuotePublisher.MarkupKey, BigDecimal> cache = new HashMap<>();
+        cache.put(new OmsFxCustomerQuotePublisher.MarkupKey("EURUSD", "basic", "BID"), new BigDecimal("20.00"));
+        cache.put(new OmsFxCustomerQuotePublisher.MarkupKey("EURUSD", "basic", "ASK"), new BigDecimal("20.00"));
+        cache.put(new OmsFxCustomerQuotePublisher.MarkupKey("EURUSD", "elite", "BID"), new BigDecimal("10.00"));
+        cache.put(new OmsFxCustomerQuotePublisher.MarkupKey("EURUSD", "elite", "ASK"), new BigDecimal("10.00"));
+        publisher.primeMarkupCache(cache);
+        // Wildcard-pair kill on elite: covers EURUSD/elite by matching tier
+        // only, exercises the matcher's null-pair branch.
+        tierKills.primeCache(List.of(new FxTierKillsService.KillRow(
+                null, "elite", NOW.minusSeconds(60), NOW.plusSeconds(60))));
+
+        when(midSubscriber.snapshot()).thenReturn(Map.of(
+                "EURUSD", new OmsFxMidSubscriber.MidSample(new BigDecimal("1.0850"), NOW.toEpochMilli() - 500)));
+
+        OmsFxCustomerQuotePublisher.GridSnapshot g = publisher.previewQuoteGrid();
+        OmsFxCustomerQuotePublisher.PairRow row = g.rows().get(0);
+        OmsFxCustomerQuotePublisher.TierQuote basic = row.tiers().get("basic");
+        OmsFxCustomerQuotePublisher.TierQuote elite = row.tiers().get("elite");
+
+        assertThat(basic.killed()).isFalse();
+        assertThat(basic.bid()).isNotNull(); // basic still publishes
+
+        assertThat(elite.killed()).isTrue();
+        assertThat(elite.bid()).isNotNull();  // price still computed
+        assertThat(elite.bidMarkupBps()).isEqualTo("10.00"); // markup unchanged
+    }
+
+    @Test
+    void previewQuoteGrid_scopedPairKillOnlyAffectsThatPair() {
+        // Pair-scoped kill: EURUSD/elite killed, GBPUSD/elite untouched.
+        Map<OmsFxCustomerQuotePublisher.MarkupKey, BigDecimal> cache = new HashMap<>();
+        cache.put(new OmsFxCustomerQuotePublisher.MarkupKey("EURUSD", "elite", "BID"), new BigDecimal("10.00"));
+        cache.put(new OmsFxCustomerQuotePublisher.MarkupKey("EURUSD", "elite", "ASK"), new BigDecimal("10.00"));
+        cache.put(new OmsFxCustomerQuotePublisher.MarkupKey("GBPUSD", "elite", "BID"), new BigDecimal("12.00"));
+        cache.put(new OmsFxCustomerQuotePublisher.MarkupKey("GBPUSD", "elite", "ASK"), new BigDecimal("12.00"));
+        publisher.primeMarkupCache(cache);
+        tierKills.primeCache(List.of(new FxTierKillsService.KillRow(
+                "EURUSD", "elite", NOW.minusSeconds(60), NOW.plusSeconds(60))));
+
+        when(midSubscriber.snapshot()).thenReturn(Map.of(
+                "EURUSD", new OmsFxMidSubscriber.MidSample(new BigDecimal("1.0850"), NOW.toEpochMilli() - 500),
+                "GBPUSD", new OmsFxMidSubscriber.MidSample(new BigDecimal("1.2500"), NOW.toEpochMilli() - 500)));
+
+        OmsFxCustomerQuotePublisher.GridSnapshot g = publisher.previewQuoteGrid();
+        OmsFxCustomerQuotePublisher.PairRow eurusd = g.rows().stream()
+                .filter(r -> r.pair().equals("EURUSD")).findFirst().orElseThrow();
+        OmsFxCustomerQuotePublisher.PairRow gbpusd = g.rows().stream()
+                .filter(r -> r.pair().equals("GBPUSD")).findFirst().orElseThrow();
+
+        assertThat(eurusd.tiers().get("elite").killed()).isTrue();
+        assertThat(gbpusd.tiers().get("elite").killed()).isFalse();
+    }
+
+    @Test
+    void previewQuoteGrid_expiredKillDoesNotApply() {
+        // A kill row whose validUntil is in the past must NOT show as killed
+        // (matches the matchesWindow contract used by the publisher).
+        Map<OmsFxCustomerQuotePublisher.MarkupKey, BigDecimal> cache = new HashMap<>();
+        cache.put(new OmsFxCustomerQuotePublisher.MarkupKey("EURUSD", "basic", "BID"), new BigDecimal("20.00"));
+        cache.put(new OmsFxCustomerQuotePublisher.MarkupKey("EURUSD", "basic", "ASK"), new BigDecimal("20.00"));
+        publisher.primeMarkupCache(cache);
+        tierKills.primeCache(List.of(new FxTierKillsService.KillRow(
+                "EURUSD", "basic", NOW.minusSeconds(120), NOW.minusSeconds(60))));
+
+        when(midSubscriber.snapshot()).thenReturn(Map.of(
+                "EURUSD", new OmsFxMidSubscriber.MidSample(new BigDecimal("1.0850"), NOW.toEpochMilli() - 500)));
+
+        OmsFxCustomerQuotePublisher.GridSnapshot g = publisher.previewQuoteGrid();
+        assertThat(g.rows().get(0).tiers().get("basic").killed()).isFalse();
     }
 
     @Test

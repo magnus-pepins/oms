@@ -51,6 +51,7 @@ class FxQuoteServicePersistenceTest {
     @Mock JdbcTemplate jdbc;
 
     private FxMarkupOverridesService overrides;
+    private FxTierKillsService tierKills;
     private FxQuoteService service;
 
     @BeforeEach
@@ -60,7 +61,10 @@ class FxQuoteServicePersistenceTest {
         overrides = new FxMarkupOverridesService(
                 mock(JdbcTemplate.class), clock, config, new SimpleMeterRegistry(), 60_000L);
         overrides.primeCache(java.util.List.of());
-        service = new FxQuoteService(jdbc, clock, config, overrides, new SimpleMeterRegistry());
+        tierKills = new FxTierKillsService(
+                mock(JdbcTemplate.class), clock, config, new SimpleMeterRegistry(), 60_000L);
+        tierKills.primeCache(java.util.List.of());
+        service = new FxQuoteService(jdbc, clock, config, overrides, tierKills, new SimpleMeterRegistry());
     }
 
     @Test

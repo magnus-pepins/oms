@@ -95,6 +95,7 @@ public class OmsFxCustomerQuotePublisher {
     private final Clock clock;
     private final ObjectMapper mapper;
     private final FxMarkupOverridesService overrides;
+    private final FxTierKillsService tierKills;
     private final List<String> tiers;
     private final long publishTickPeriodMs;
     private final long maxMidAgeMs;
@@ -111,6 +112,7 @@ public class OmsFxCustomerQuotePublisher {
     private final Counter publishFailCounter;
     private final Counter staleMidCounter;
     private final Counter missingMarkupCounter;
+    private final Counter tierKillSkipCounter;
 
     /** (pair, tier, side) → markup_bps. Refreshed in {@link #refreshMarkups()}. */
     private volatile Map<MarkupKey, BigDecimal> markupCache = Collections.emptyMap();
@@ -143,6 +145,7 @@ public class OmsFxCustomerQuotePublisher {
             Clock clock,
             ObjectMapper mapper,
             FxMarkupOverridesService overrides,
+            FxTierKillsService tierKills,
             MeterRegistry registry,
             @Value("${oms.fx.customer-quote-publisher.broker-url}") String brokerUrl,
             @Value("${oms.fx.customer-quote-publisher.username:}") String username,
@@ -160,6 +163,7 @@ public class OmsFxCustomerQuotePublisher {
         this.clock = clock;
         this.mapper = mapper;
         this.overrides = overrides;
+        this.tierKills = tierKills;
         this.brokerUrl = brokerUrl;
         this.username = username == null ? "" : username;
         this.password = password == null ? "" : password;
@@ -187,6 +191,9 @@ public class OmsFxCustomerQuotePublisher {
                 .register(registry);
         this.missingMarkupCounter = Counter.builder("oms_fx_customer_quote_missing_markup_total")
                 .description("Skipped customer quote publish because no markup row matched (pair, side, tier)")
+                .register(registry);
+        this.tierKillSkipCounter = Counter.builder("oms_fx_customer_quote_tier_kill_skip_total")
+                .description("Skipped customer quote publish because a tier kill row covers (pair, tier)")
                 .register(registry);
 
         // Gauges that mirror the timestamps surfaced on
@@ -326,6 +333,10 @@ public class OmsFxCustomerQuotePublisher {
                 continue;
             }
             for (String tier : tiers) {
+                if (tierKills.isKilled(pair, tier, nowInstant)) {
+                    tierKillSkipCounter.increment();
+                    continue;
+                }
                 publishOne(c, pair, tier, sample, nowInstant);
             }
         }
@@ -467,7 +478,8 @@ public class OmsFxCustomerQuotePublisher {
                 maxMidAgeMs,
                 lastSuccessfulPublishAtMs,
                 lastStaleMidSkipAtMs,
-                overrides.status());
+                overrides.status(),
+                tierKills.status());
     }
 
     /**
@@ -504,10 +516,11 @@ public class OmsFxCustomerQuotePublisher {
             Map<String, TierQuote> tierMap = new LinkedHashMap<>(tiers.size());
             Instant nowInstant = Instant.ofEpochMilli(nowMs);
             for (String tier : tiers) {
+                boolean killed = tierKills.isKilled(pair, tier, nowInstant);
                 BigDecimal bidBps = lookupMarkup(pair, "BID", tier);
                 BigDecimal askBps = lookupMarkup(pair, "ASK", tier);
                 if (bidBps == null || askBps == null) {
-                    tierMap.put(tier, new TierQuote(null, null, null, null, null, null));
+                    tierMap.put(tier, new TierQuote(null, null, null, null, null, null, killed));
                     continue;
                 }
                 BigDecimal bid = applyMarkup(mid, bidBps, -1).setScale(RATE_SCALE, RoundingMode.HALF_UP);
@@ -522,7 +535,8 @@ public class OmsFxCustomerQuotePublisher {
                         bidBps.toPlainString(),
                         askBps.toPlainString(),
                         additive.toPlainString(),
-                        overrideApplied));
+                        overrideApplied,
+                        killed));
             }
             rows.add(new PairRow(
                     pair, base, quote,
@@ -575,7 +589,8 @@ public class OmsFxCustomerQuotePublisher {
             String bidMarkupBps,
             String askMarkupBps,
             String additiveBps,
-            Boolean overrideApplied) {}
+            Boolean overrideApplied,
+            boolean killed) {}
 
     /** Composite key for the (pair, tier, side) markup lookup. */
     record MarkupKey(String pair, String tier, String side) {
@@ -606,6 +621,7 @@ public class OmsFxCustomerQuotePublisher {
             long maxMidAgeMs,
             long lastSuccessfulPublishAtMs,
             long lastStaleMidSkipAtMs,
-            FxMarkupOverridesService.OverridesStatus overrides
+            FxMarkupOverridesService.OverridesStatus overrides,
+            FxTierKillsService.KillsStatus tierKills
     ) {}
 }

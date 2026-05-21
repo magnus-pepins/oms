@@ -132,6 +132,7 @@ public class FxQuoteService {
     private final Clock clock;
     private final OmsConfig omsConfig;
     private final FxMarkupOverridesService overrides;
+    private final FxTierKillsService tierKills;
     private final Counter quotesCounter;
     private final Counter quoteMissesCounter;
     private final Counter midFromSubscriberCounter;
@@ -141,6 +142,7 @@ public class FxQuoteService {
     private final Counter recallMissCounter;
     private final Counter recallExpiredCounter;
     private final Counter persistFailCounter;
+    private final Counter tierKillRejectCounter;
     private final Map<String, CachedQuote> cache = new ConcurrentHashMap<>();
     private volatile long validityMillis = DEFAULT_VALIDITY_MS;
 
@@ -153,11 +155,14 @@ public class FxQuoteService {
     private OmsFxMidSubscriber liveMidSubscriber;
 
     public FxQuoteService(JdbcTemplate jdbc, Clock clock, OmsConfig omsConfig,
-                          FxMarkupOverridesService overrides, MeterRegistry registry) {
+                          FxMarkupOverridesService overrides,
+                          FxTierKillsService tierKills,
+                          MeterRegistry registry) {
         this.jdbc = jdbc;
         this.clock = clock;
         this.omsConfig = omsConfig;
         this.overrides = overrides;
+        this.tierKills = tierKills;
         this.quotesCounter = Counter.builder("oms.fx.quote.issued_total")
                 .description("FX quotes issued by FxQuoteService")
                 .register(registry);
@@ -188,6 +193,9 @@ public class FxQuoteService {
         this.persistFailCounter = Counter.builder("oms.fx.quote.persist_fail_total")
                 .description("FxQuoteService failed to write the cached quote to fx_quote_cache; recall after a restart will miss for these quotes")
                 .register(registry);
+        this.tierKillRejectCounter = Counter.builder("oms.fx.quote.tier_kill_reject_total")
+                .description("FX quote requests refused because fx_pair_tier_kills covers (pair, tier)")
+                .register(registry);
     }
 
     public void setValidityMillis(long ms) {
@@ -209,6 +217,15 @@ public class FxQuoteService {
     public Map<String, Object> quote(String pair, String tier) {
         String pairUp = pair == null ? "" : pair.toUpperCase();
         String tierLow = tier == null || tier.isBlank() ? "default" : tier.toLowerCase();
+        Instant nowForKill = clock.instant();
+        if (tierKills.isKilled(pairUp, tierLow, nowForKill)) {
+            tierKillRejectCounter.increment();
+            throw new FxQuoteStaleException(
+                    HttpStatus.UNPROCESSABLE_ENTITY,
+                    RejectCode.RISK_FX_TIER_KILLED,
+                    "fx_tier_killed",
+                    "tier " + tierLow + " is currently killed for pair " + pairUp);
+        }
         MidWithSource ms = midWithSourceForPair(pairUp);
         BigDecimal mid = ms.mid();
 

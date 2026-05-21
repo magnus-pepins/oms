@@ -1743,9 +1743,14 @@ public class OmsConfig {
         private boolean stubMidsAllowed = true;
 
         private final MarkupOverrides markupOverrides = new MarkupOverrides();
+        private final TierKills tierKills = new TierKills();
 
         public MarkupOverrides getMarkupOverrides() {
             return markupOverrides;
+        }
+
+        public TierKills getTierKills() {
+            return tierKills;
         }
 
         /**
@@ -1783,6 +1788,40 @@ public class OmsConfig {
             public void setAutoApproveAbsBps(int v) {
                 this.autoApproveAbsBps = Math.max(0, v);
             }
+            public long getAutoApproveMaxDurationMs() { return autoApproveMaxDurationMs; }
+            public void setAutoApproveMaxDurationMs(long v) {
+                this.autoApproveMaxDurationMs = Math.max(0L, v);
+            }
+            public boolean isAutoApproveEnabled() { return autoApproveEnabled; }
+            public void setAutoApproveEnabled(boolean v) { this.autoApproveEnabled = v; }
+        }
+
+        /**
+         * Per-tier kill-switch knobs (plan A2). A kill removes one
+         * (pair, tier) — or every pair for a tier when {@code pair = null}
+         * — from the customer-quote publisher's output until the row's
+         * window closes or the row is revoked. Defaults sit slightly
+         * tighter than {@link MarkupOverrides} because a kill is a
+         * blunter instrument: a wildcard kill (no pair scope) always
+         * requires a second approver regardless of duration.
+         */
+        public static class TierKills {
+            /** Hard cap on (valid_until - valid_from) per submit. */
+            private long maxDurationMs = 6L * 60L * 60L * 1000L;
+            /** Self-approve allowed only when duration ≤ this AND pair is scoped (non-null). */
+            private long autoApproveMaxDurationMs = 30L * 60L * 1000L;
+            /**
+             * When {@code true}, scoped-pair kill rows whose duration is
+             * within {@link #autoApproveMaxDurationMs} are written with
+             * {@code approved_at = created_at, approved_by = created_by};
+             * wildcard kills (pair=NULL) still need a second identity
+             * regardless of this flag. When {@code false}, every kill
+             * goes through four-eyes.
+             */
+            private boolean autoApproveEnabled = true;
+
+            public long getMaxDurationMs() { return maxDurationMs; }
+            public void setMaxDurationMs(long v) { this.maxDurationMs = Math.max(60_000L, v); }
             public long getAutoApproveMaxDurationMs() { return autoApproveMaxDurationMs; }
             public void setAutoApproveMaxDurationMs(long v) {
                 this.autoApproveMaxDurationMs = Math.max(0L, v);

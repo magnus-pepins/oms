@@ -62,5 +62,15 @@ public enum RejectCode {
      * ticks; the operator should investigate before approving cross-currency
      * trades.
      */
-    RISK_FX_STALE_QUOTE
+    RISK_FX_STALE_QUOTE,
+    /**
+     * Operator has an active row in {@code fx_pair_tier_kills} covering
+     * the requested (pair, tier). The streaming customer-quote publisher
+     * stops emitting that combination, and the HTTP {@code /fx/quote}
+     * path refuses to mint so the BFF cannot route around the kill.
+     * BFF should surface "this rate is not available right now" rather
+     * than auto-retry — kills are tactical and short-lived. Plan A2 in
+     * {@code system-documentation/plans/fx-treasury-auto-hedger-and-publisher-controls.md}.
+     */
+    RISK_FX_TIER_KILLED
 }

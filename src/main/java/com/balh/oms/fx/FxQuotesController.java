@@ -125,6 +125,13 @@ public class FxQuotesController {
         overridesBody.put("nextExpiryEpochMs", o.nextExpiryEpochMs());
         overridesBody.put("cacheLoadedAtMs", o.cacheLoadedAtMs());
         body.put("overrides", overridesBody);
+        FxTierKillsService.KillsStatus k = s.tierKills();
+        Map<String, Object> killsBody = new LinkedHashMap<>();
+        killsBody.put("cachedRowCount", k.cachedRowCount());
+        killsBody.put("activeCount", k.activeCount());
+        killsBody.put("nextExpiryEpochMs", k.nextExpiryEpochMs());
+        killsBody.put("cacheLoadedAtMs", k.cacheLoadedAtMs());
+        body.put("tierKills", killsBody);
         return ResponseEntity.ok(body);
     }
 

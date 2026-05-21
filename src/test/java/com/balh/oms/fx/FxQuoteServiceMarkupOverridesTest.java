@@ -16,6 +16,7 @@ import java.time.ZoneOffset;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -39,6 +40,7 @@ class FxQuoteServiceMarkupOverridesTest {
     @Mock JdbcTemplate jdbc;
 
     private FxMarkupOverridesService overrides;
+    private FxTierKillsService tierKills;
     private FxQuoteService service;
 
     @BeforeEach
@@ -48,8 +50,11 @@ class FxQuoteServiceMarkupOverridesTest {
         overrides = new FxMarkupOverridesService(
                 mock(JdbcTemplate.class), clock, config, new SimpleMeterRegistry(), 60_000L);
         overrides.primeCache(List.of());
+        tierKills = new FxTierKillsService(
+                mock(JdbcTemplate.class), clock, config, new SimpleMeterRegistry(), 60_000L);
+        tierKills.primeCache(List.of());
         service = new FxQuoteService(
-                jdbc, clock, config, overrides, new SimpleMeterRegistry());
+                jdbc, clock, config, overrides, tierKills, new SimpleMeterRegistry());
     }
 
     @Test
@@ -104,5 +109,23 @@ class FxQuoteServiceMarkupOverridesTest {
                         NOW.minusSeconds(60), NOW.plusSeconds(60))));
 
         assertThat(service.lookupMarkupBps("EURUSD", "BID", "elite")).isEqualByComparingTo("17.00");
+    }
+
+    @Test
+    void quote_rejectsWithFxTierKilledWhenKillActive() {
+        // The kill must short-circuit BEFORE mid lookup so even a stale
+        // mid + a kill returns the kill code (more actionable for the BFF
+        // than a stale-mid error that distracts from the actual cause).
+        tierKills.primeCache(List.of(new FxTierKillsService.KillRow(
+                "EURUSD", "elite", NOW.minusSeconds(60), NOW.plusSeconds(60))));
+
+        assertThatThrownBy(() -> service.quote("EURUSD", "elite"))
+                .isInstanceOf(FxQuoteStaleException.class)
+                .satisfies(ex -> {
+                    FxQuoteStaleException e = (FxQuoteStaleException) ex;
+                    assertThat(e.getRejectCode())
+                            .isEqualTo(com.balh.oms.domain.RejectCode.RISK_FX_TIER_KILLED);
+                    assertThat(e.getErrorCode()).isEqualTo("fx_tier_killed");
+                });
     }
 }

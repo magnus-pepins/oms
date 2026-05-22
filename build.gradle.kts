@@ -188,6 +188,9 @@ protobuf {
     }
 }
 
+// Phase 4 recovery gate (plans/oms-cluster-recovery-and-hardening.md §6):
+//   ./gradlew test --tests com.balh.oms.recovery.OmsClusterRecoveryIT
+// Run on PRs touching OmsAdmissionClusteredService, OmsClusterNodeBootstrap, cluster/snapshot/*.
 tasks.withType<Test> {
     useJUnitPlatform()
     jvmArgs(lowLatencyJvmModuleOpens)

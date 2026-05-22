@@ -262,6 +262,9 @@ public class OmsAdmissionClusteredService implements ClusteredService {
     /** Set in {@link #onStart} when Aeron supplies a snapshot image to load. */
     private boolean snapshotLoadedOnStart;
 
+    /** Monotonic count of successful {@link #onTakeSnapshot} invocations (recovery IT). */
+    private long snapshotTakenCount;
+
     private io.aeron.Counter readyCounter;
 
     private io.aeron.Counter openOrdersCountCounter;
@@ -384,17 +387,17 @@ public class OmsAdmissionClusteredService implements ClusteredService {
     }
 
     /** Test hook — replay validation fires once on first {@link #onRoleChange}. */
-    boolean replayValidationLoggedForTest() {
+    public boolean replayValidationLoggedForTest() {
         return replayValidationLogged;
     }
 
     /** Test hook — session messages counted since {@link #onStart}. */
-    long sessionMessageCountSinceStartForTest() {
+    public long sessionMessageCountSinceStartForTest() {
         return sessionMessageCountSinceStart;
     }
 
     /** Test hook — current readiness counter value, or -1 if absent. */
-    long readinessCounterValueForTest() {
+    public long readinessCounterValueForTest() {
         return readyCounter == null ? -1L : readyCounter.get();
     }
 
@@ -507,8 +510,18 @@ public class OmsAdmissionClusteredService implements ClusteredService {
     }
 
     /** Test hook — published open-order count counter value, or -1 if absent. */
-    long openOrdersCountCounterValueForTest() {
+    public long openOrdersCountCounterValueForTest() {
         return openOrdersCountCounter == null ? -1L : openOrdersCountCounter.get();
+    }
+
+    /** Visible for recovery IT — true when {@link #onStart} loaded a snapshot image. */
+    public boolean snapshotLoadedAtStartForTest() {
+        return snapshotLoadedOnStart;
+    }
+
+    /** Visible for recovery IT — successful {@link #onTakeSnapshot} count this JVM. */
+    public long snapshotTakenCountForTest() {
+        return snapshotTakenCount;
     }
 
     /**
@@ -634,6 +647,7 @@ public class OmsAdmissionClusteredService implements ClusteredService {
         // Phase 4 slice 4h — drives oms.cluster.snapshot.age_seconds. Set AFTER the publish loop
         // returns success, so a back-pressured publish that throws does not advance freshness.
         lastSnapshotWriteEpochMs = System.currentTimeMillis();
+        snapshotTakenCount++;
     }
 
     private void loadSnapshot(Image snapshotImage) {
@@ -757,6 +771,26 @@ public class OmsAdmissionClusteredService implements ClusteredService {
 
         emitAdmitted(cmd, clusterTimestampMillis, admitted.version());
         emitAccepted(session, cmd.correlationId(), admitted, clusterTimestampMillis, false);
+        maybePromoteReadinessAfterAdmission();
+    }
+
+    /**
+     * First {@link #onRoleChange} can run before any {@link #onSessionMessage} on cold boot, leaving
+     * NOT_READY under the empty-replay gate even though the cluster is healthy. Once replay
+     * validation has run and we have admitted orders, promote to READY (recovery IT + ingress gate).
+     */
+    private void maybePromoteReadinessAfterAdmission() {
+        if (!replayValidationLogged || readyCounter == null || readyCounter.get() == READINESS_VALUE_READY) {
+            return;
+        }
+        if (orderIndex.isEmpty()) {
+            return;
+        }
+        readyCounter.setOrdered(READINESS_VALUE_READY);
+        log.info(
+                "readiness counter -> READY after admission (id={} value={})",
+                readyCounter.id(),
+                readyCounter.get());
     }
 
     /**

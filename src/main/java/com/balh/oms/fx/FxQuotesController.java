@@ -5,6 +5,7 @@ import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -201,6 +202,35 @@ public class FxQuotesController {
         body.put("asOf", clock.instant().toString());
         body.put("count", rows.size());
         body.put("rows", rows);
+        return ResponseEntity.ok(body);
+    }
+
+    /**
+     * Recall a previously minted quote for server-side settlement (wallet FX,
+     * send-money, order accept). Returns 422 when missing or expired.
+     */
+    @GetMapping("/quote/{quoteId}")
+    public ResponseEntity<Map<String, Object>> recallQuote(@PathVariable("quoteId") String quoteId) {
+        var fx = omsConfig.getFx();
+        if (!fx.isModuleEnabled()) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "fx_module_disabled"));
+        }
+        FxQuoteService.CachedQuote q = quoteService.recall(quoteId);
+        if (q == null) {
+            return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY).body(Map.of(
+                    "error", "fx_quote_expired",
+                    "rejectCode", "RISK_FX_QUOTE_EXPIRED",
+                    "quoteId", quoteId == null ? "" : quoteId));
+        }
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("quoteId", q.quoteId());
+        body.put("pair", q.pair());
+        body.put("tier", q.tier());
+        body.put("bid", q.bid().toPlainString());
+        body.put("ask", q.ask().toPlainString());
+        body.put("mid", q.mid().toPlainString());
+        body.put("capturedAt", q.capturedAt().toString());
+        body.put("expiresAt", q.expiresAt().toString());
         return ResponseEntity.ok(body);
     }
 

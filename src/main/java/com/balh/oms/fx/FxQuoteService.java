@@ -226,14 +226,16 @@ public class FxQuoteService {
                     "fx_tier_killed",
                     "tier " + tierLow + " is currently killed for pair " + pairUp);
         }
-        MidWithSource ms = midWithSourceForPair(pairUp);
-        BigDecimal mid = ms.mid();
+        VendorBboWithSource vendor = vendorBboWithSourceForPair(pairUp);
 
         BigDecimal bidBps = lookupMarkupBps(pairUp, "BID", tierLow);
         BigDecimal askBps = lookupMarkupBps(pairUp, "ASK", tierLow);
 
-        BigDecimal bid = applyMarkup(mid, bidBps, /*direction*/ -1);
-        BigDecimal ask = applyMarkup(mid, askBps, /*direction*/ +1);
+        FxBboMarkup.CustomerBbo customer = FxBboMarkup.customerFromVendor(
+                vendor.bid(), vendor.offer(), bidBps, askBps);
+        BigDecimal bid = customer.bid();
+        BigDecimal ask = customer.ask();
+        BigDecimal mid = customer.mid();
 
         Instant now = clock.instant();
         Instant exp = now.plusMillis(validityMillis);
@@ -243,12 +245,14 @@ public class FxQuoteService {
         body.put("quoteId", quoteId);
         body.put("pair", pairUp);
         body.put("tier", tierLow);
-        body.put("mid", mid.setScale(RATE_SCALE, RoundingMode.HALF_UP).toPlainString());
-        body.put("bid", bid.setScale(RATE_SCALE, RoundingMode.HALF_UP).toPlainString());
-        body.put("ask", ask.setScale(RATE_SCALE, RoundingMode.HALF_UP).toPlainString());
+        body.put("vendorBid", vendor.bid().setScale(RATE_SCALE, RoundingMode.HALF_UP).toPlainString());
+        body.put("vendorOffer", vendor.offer().setScale(RATE_SCALE, RoundingMode.HALF_UP).toPlainString());
+        body.put("mid", mid.toPlainString());
+        body.put("bid", bid.toPlainString());
+        body.put("ask", ask.toPlainString());
         body.put("bidMarkupBps", bidBps.toPlainString());
         body.put("askMarkupBps", askBps.toPlainString());
-        body.put("source", ms.source());
+        body.put("source", vendor.source());
         body.put("capturedAt", now.toString());
         body.put("expiresAt", exp.toString());
         body.put("validityMs", validityMillis);
@@ -391,12 +395,15 @@ public class FxQuoteService {
      * cold-start case). An unknown pair throws — the controller maps that
      * to HTTP 400.
      */
-    private MidWithSource midWithSourceForPair(String pair) {
+    /** Half-spread (bps per side) when synthesizing BBO from stub mid only. */
+    private static final BigDecimal STUB_HALF_SPREAD_BPS = new BigDecimal("10");
+
+    private VendorBboWithSource vendorBboWithSourceForPair(String pair) {
         if (liveMidSubscriber != null) {
-            BigDecimal live = liveMidSubscriber.midFor(pair);
+            OmsFxMidSubscriber.BboSample live = liveMidSubscriber.bboFor(pair);
             if (live != null) {
                 midFromSubscriberCounter.increment();
-                return new MidWithSource(live, "vendor-mid-live");
+                return new VendorBboWithSource(live.bid(), live.offer(), "vendor-bbo-live");
             }
         }
         if (!omsConfig.getFx().isStubMidsAllowed()) {
@@ -404,17 +411,18 @@ public class FxQuoteService {
                     HttpStatus.UNPROCESSABLE_ENTITY,
                     RejectCode.RISK_FX_STALE_QUOTE,
                     "fx_mid_stale",
-                    "vendor mid stale or absent for pair " + pair);
+                    "vendor BBO stale or absent for pair " + pair);
         }
-        BigDecimal stub = STUB_MIDS.get(pair);
-        if (stub == null) {
+        BigDecimal stubMid = STUB_MIDS.get(pair);
+        if (stubMid == null) {
             throw new IllegalArgumentException("no mid configured for pair " + pair);
         }
         midFromStubCounter.increment();
-        return new MidWithSource(stub, "internal-mid-stub");
+        FxBboMarkup.VendorBbo synthetic = FxBboMarkup.vendorBboFromStubMid(stubMid, STUB_HALF_SPREAD_BPS);
+        return new VendorBboWithSource(synthetic.bid(), synthetic.offer(), "internal-bbo-stub");
     }
 
-    private record MidWithSource(BigDecimal mid, String source) {}
+    private record VendorBboWithSource(BigDecimal bid, BigDecimal offer, String source) {}
 
     /**
      * Read-only listing of the active {@code fx_pair_markups} grid for
@@ -492,15 +500,6 @@ public class FxQuoteService {
         }
         quoteMissesCounter.increment();
         throw new IllegalStateException("no markup row for " + pair + " " + side + " (tier=" + tier + " nor default)");
-    }
-
-    private static BigDecimal applyMarkup(BigDecimal mid, BigDecimal bps, int direction) {
-        // markup_bps is in basis points (1 bp = 0.0001). bid = mid * (1 - bps/10_000),
-        // ask = mid * (1 + bps/10_000). direction = -1 for bid, +1 for ask.
-        BigDecimal factor = BigDecimal.ONE.add(
-                bps.divide(new BigDecimal("10000"), 10, RoundingMode.HALF_UP)
-                        .multiply(new BigDecimal(direction)));
-        return mid.multiply(factor);
     }
 
     /** Package-private test hook — seeds the in-memory cache directly. */

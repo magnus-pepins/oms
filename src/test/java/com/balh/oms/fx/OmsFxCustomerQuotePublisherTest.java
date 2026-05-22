@@ -77,25 +77,25 @@ class OmsFxCustomerQuotePublisherTest {
     }
 
     @Test
-    void applyMarkup_buildsBidBelowAndAskAboveMid() {
-        // Reference: FxQuoteService.applyMarkup. 20 bps on EURUSD mid 1.0850 →
-        //   bid = 1.0850 * (1 - 0.0020) = 1.08283
-        //   ask = 1.0850 * (1 + 0.0020) = 1.08717
-        BigDecimal mid = new BigDecimal("1.0850");
+    void customerFromVendor_markupOffPbBidAndOffer_notMid() {
+        BigDecimal pbBid = new BigDecimal("1.0840");
+        BigDecimal pbOffer = new BigDecimal("1.0860");
         BigDecimal bps = new BigDecimal("20.00");
-        BigDecimal bid = OmsFxCustomerQuotePublisher.applyMarkup(mid, bps, -1);
-        BigDecimal ask = OmsFxCustomerQuotePublisher.applyMarkup(mid, bps, +1);
-        assertThat(bid.setScale(5, RoundingMode.HALF_UP).toPlainString()).isEqualTo("1.08283");
-        assertThat(ask.setScale(5, RoundingMode.HALF_UP).toPlainString()).isEqualTo("1.08717");
+        FxBboMarkup.CustomerBbo out = FxBboMarkup.customerFromVendor(pbBid, pbOffer, bps, bps);
+        assertThat(out.bid().setScale(5, RoundingMode.HALF_UP).toPlainString()).isEqualTo("1.08183");
+        assertThat(out.ask().setScale(5, RoundingMode.HALF_UP).toPlainString()).isEqualTo("1.08817");
+        assertThat(out.bid()).isLessThan(pbBid);
+        assertThat(out.ask()).isGreaterThan(pbOffer);
     }
 
     @Test
-    void applyMarkup_zeroBpsReturnsMid() {
-        BigDecimal mid = new BigDecimal("1.2345");
-        BigDecimal bid = OmsFxCustomerQuotePublisher.applyMarkup(mid, BigDecimal.ZERO, -1);
-        BigDecimal ask = OmsFxCustomerQuotePublisher.applyMarkup(mid, BigDecimal.ZERO, +1);
-        assertThat(bid.setScale(4, RoundingMode.HALF_UP)).isEqualByComparingTo("1.2345");
-        assertThat(ask.setScale(4, RoundingMode.HALF_UP)).isEqualByComparingTo("1.2345");
+    void customerFromVendor_zeroBpsPreservesVendorBbo() {
+        BigDecimal pbBid = new BigDecimal("10.4000");
+        BigDecimal pbOffer = new BigDecimal("10.4020");
+        FxBboMarkup.CustomerBbo out = FxBboMarkup.customerFromVendor(
+                pbBid, pbOffer, BigDecimal.ZERO, BigDecimal.ZERO);
+        assertThat(out.bid()).isEqualByComparingTo("10.40000000");
+        assertThat(out.ask()).isEqualByComparingTo("10.40200000");
     }
 
     @Test
@@ -234,8 +234,8 @@ class OmsFxCustomerQuotePublisherTest {
 
         long fresh = NOW.toEpochMilli() - 500;
         when(midSubscriber.snapshot()).thenReturn(Map.of(
-                "EURUSD", new OmsFxMidSubscriber.MidSample(new BigDecimal("1.0850"), fresh),
-                "GBPUSD", new OmsFxMidSubscriber.MidSample(new BigDecimal("1.2500"), fresh)));
+                "EURUSD", new OmsFxMidSubscriber.BboSample(new BigDecimal("1.0840"), new BigDecimal("1.0860"), fresh),
+                "GBPUSD", new OmsFxMidSubscriber.BboSample(new BigDecimal("1.2490"), new BigDecimal("1.2510"), fresh)));
 
         OmsFxCustomerQuotePublisher.GridSnapshot g = publisher.previewQuoteGrid();
 
@@ -250,11 +250,11 @@ class OmsFxCustomerQuotePublisherTest {
         assertThat(eurusd.tiers().get("basic").bidMarkupBps()).isEqualTo("20.00");
         assertThat(eurusd.tiers().get("elite").bidMarkupBps()).isEqualTo("10.00");
         assertThat(eurusd.tiers().get("basic").overrideApplied()).isFalse();
-        // Quotes match the standalone applyMarkup math (20 bps × 1.0850).
+        // 20 bps off vendor bid 1.0840 / offer 1.0860 (not mid).
         assertThat(new BigDecimal(eurusd.tiers().get("basic").bid()))
-                .isEqualByComparingTo("1.08283000");
+                .isEqualByComparingTo("1.08183200");
         assertThat(new BigDecimal(eurusd.tiers().get("basic").ask()))
-                .isEqualByComparingTo("1.08717000");
+                .isEqualByComparingTo("1.08817200");
     }
 
     @Test
@@ -269,7 +269,7 @@ class OmsFxCustomerQuotePublisherTest {
 
         long stale = NOW.toEpochMilli() - 60_000L; // older than maxMidAgeMs=30_000
         when(midSubscriber.snapshot()).thenReturn(Map.of(
-                "EURUSD", new OmsFxMidSubscriber.MidSample(new BigDecimal("1.0850"), stale)));
+                "EURUSD", new OmsFxMidSubscriber.BboSample(new BigDecimal("1.0840"), new BigDecimal("1.0860"), stale)));
 
         OmsFxCustomerQuotePublisher.GridSnapshot g = publisher.previewQuoteGrid();
         assertThat(g.rows()).hasSize(1);
@@ -290,7 +290,7 @@ class OmsFxCustomerQuotePublisherTest {
                 NOW.minusSeconds(60), NOW.plusSeconds(60))));
 
         when(midSubscriber.snapshot()).thenReturn(Map.of(
-                "EURUSD", new OmsFxMidSubscriber.MidSample(new BigDecimal("1.0850"), NOW.toEpochMilli() - 500)));
+                "EURUSD", new OmsFxMidSubscriber.BboSample(new BigDecimal("1.0840"), new BigDecimal("1.0860"), NOW.toEpochMilli() - 500)));
 
         OmsFxCustomerQuotePublisher.GridSnapshot g = publisher.previewQuoteGrid();
         OmsFxCustomerQuotePublisher.TierQuote elite = g.rows().get(0).tiers().get("elite");
@@ -311,7 +311,7 @@ class OmsFxCustomerQuotePublisherTest {
         publisher.primeMarkupCache(cache);
 
         when(midSubscriber.snapshot()).thenReturn(Map.of(
-                "EURUSD", new OmsFxMidSubscriber.MidSample(new BigDecimal("1.0850"), NOW.toEpochMilli() - 500)));
+                "EURUSD", new OmsFxMidSubscriber.BboSample(new BigDecimal("1.0840"), new BigDecimal("1.0860"), NOW.toEpochMilli() - 500)));
 
         OmsFxCustomerQuotePublisher.GridSnapshot g = publisher.previewQuoteGrid();
         OmsFxCustomerQuotePublisher.TierQuote elite = g.rows().get(0).tiers().get("elite");
@@ -337,7 +337,7 @@ class OmsFxCustomerQuotePublisherTest {
                 null, "elite", NOW.minusSeconds(60), NOW.plusSeconds(60))));
 
         when(midSubscriber.snapshot()).thenReturn(Map.of(
-                "EURUSD", new OmsFxMidSubscriber.MidSample(new BigDecimal("1.0850"), NOW.toEpochMilli() - 500)));
+                "EURUSD", new OmsFxMidSubscriber.BboSample(new BigDecimal("1.0840"), new BigDecimal("1.0860"), NOW.toEpochMilli() - 500)));
 
         OmsFxCustomerQuotePublisher.GridSnapshot g = publisher.previewQuoteGrid();
         OmsFxCustomerQuotePublisher.PairRow row = g.rows().get(0);
@@ -365,8 +365,8 @@ class OmsFxCustomerQuotePublisherTest {
                 "EURUSD", "elite", NOW.minusSeconds(60), NOW.plusSeconds(60))));
 
         when(midSubscriber.snapshot()).thenReturn(Map.of(
-                "EURUSD", new OmsFxMidSubscriber.MidSample(new BigDecimal("1.0850"), NOW.toEpochMilli() - 500),
-                "GBPUSD", new OmsFxMidSubscriber.MidSample(new BigDecimal("1.2500"), NOW.toEpochMilli() - 500)));
+                "EURUSD", new OmsFxMidSubscriber.BboSample(new BigDecimal("1.0840"), new BigDecimal("1.0860"), NOW.toEpochMilli() - 500),
+                "GBPUSD", new OmsFxMidSubscriber.BboSample(new BigDecimal("1.2490"), new BigDecimal("1.2510"), NOW.toEpochMilli() - 500)));
 
         OmsFxCustomerQuotePublisher.GridSnapshot g = publisher.previewQuoteGrid();
         OmsFxCustomerQuotePublisher.PairRow eurusd = g.rows().stream()
@@ -390,7 +390,7 @@ class OmsFxCustomerQuotePublisherTest {
                 "EURUSD", "basic", NOW.minusSeconds(120), NOW.minusSeconds(60))));
 
         when(midSubscriber.snapshot()).thenReturn(Map.of(
-                "EURUSD", new OmsFxMidSubscriber.MidSample(new BigDecimal("1.0850"), NOW.toEpochMilli() - 500)));
+                "EURUSD", new OmsFxMidSubscriber.BboSample(new BigDecimal("1.0840"), new BigDecimal("1.0860"), NOW.toEpochMilli() - 500)));
 
         OmsFxCustomerQuotePublisher.GridSnapshot g = publisher.previewQuoteGrid();
         assertThat(g.rows().get(0).tiers().get("basic").killed()).isFalse();

@@ -37,7 +37,8 @@ import java.util.concurrent.ConcurrentHashMap;
  * {@link FxQuoteService}'s mid source.
  *
  * <p>Wire contract (post 2026-05): payload is {@code { base_currency, quote_currency,
- * bid, ask, timestamp, published_at }}. Mid is derived as {@code (bid+ask)/2}.
+ * bid, ask, timestamp, published_at }}. Both legs are retained for per-side
+ * markup (§11.5.6); mid is derived only for diagnostics.
  *
  * <p>Behaviour:
  * <ul>
@@ -45,8 +46,8 @@ import java.util.concurrent.ConcurrentHashMap;
  *   <li>On connect, subscribes to wildcard {@code fx/+/+/quote}. EMQX retained
  *       messages are delivered immediately so we have a quote per pair before
  *       the first vendor tick.</li>
- *   <li>Maintains a {@code (pair -> {mid, capturedAt})} table. Reads are O(1) via
- *       {@link #midFor(String)}; staleness beyond {@code OMS_FX_MID_STALENESS_MS}
+ *   <li>Maintains a {@code (pair -> vendor BBO)} table. Reads are O(1) via
+ *       {@link #bboFor(String)}; staleness beyond {@code OMS_FX_MID_STALENESS_MS}
  *       returns null so {@link FxQuoteService} can fall back to its STUB_MIDS.</li>
  *   <li>Auto-reconnects (Paho's built-in {@code setAutomaticReconnect}) and logs
  *       at WARN on every connectionLost/reconnect, INFO on subscribe ack.</li>
@@ -87,7 +88,7 @@ public class OmsFxMidSubscriber implements MqttCallback {
     private final Clock clock;
     private final Counter ticksCounter;
     private final Counter parseErrorsCounter;
-    private final Map<String, MidSample> mids = new ConcurrentHashMap<>();
+    private final Map<String, BboSample> bbos = new ConcurrentHashMap<>();
 
     private final String brokerUrl;
     private final String username;
@@ -189,18 +190,28 @@ public class OmsFxMidSubscriber implements MqttCallback {
      * was captured within the staleness window. Otherwise returns null and
      * the caller should fall back (typically to {@link FxQuoteService#STUB_MIDS}).
      */
-    public BigDecimal midFor(String pair) {
+    /**
+     * Latest vendor BBO for the pair if captured within the staleness window.
+     */
+    public BboSample bboFor(String pair) {
         if (pair == null || pair.isBlank()) return null;
-        MidSample sample = mids.get(pair.toUpperCase());
+        BboSample sample = bbos.get(pair.toUpperCase());
         if (sample == null) return null;
         Instant now = clock.instant();
         if (now.toEpochMilli() - sample.capturedAtMs() > stalenessMillis) return null;
-        return sample.mid();
+        return sample;
+    }
+
+    /** @deprecated use {@link #bboFor(String)} — mid-only callers lose spread. */
+    @Deprecated
+    public BigDecimal midFor(String pair) {
+        BboSample sample = bboFor(pair);
+        return sample == null ? null : sample.mid();
     }
 
     /** Diagnostic snapshot for {@code GET /internal/v1/fx/mids/live} and metrics. */
-    public Map<String, MidSample> snapshot() {
-        return Map.copyOf(mids);
+    public Map<String, BboSample> snapshot() {
+        return Map.copyOf(bbos);
     }
 
     /**
@@ -214,7 +225,7 @@ public class OmsFxMidSubscriber implements MqttCallback {
     public SubscriberStatus status() {
         return new SubscriberStatus(
                 client != null && client.isConnected(),
-                mids.size(),
+                bbos.size(),
                 lastTickAtMs,
                 stalenessMillis);
     }
@@ -240,22 +251,24 @@ public class OmsFxMidSubscriber implements MqttCallback {
             JsonNode askNode = node.get("ask");
             JsonNode rateNode = node.get("rate");
 
-            BigDecimal mid = null;
+            BigDecimal pbBid = null;
+            BigDecimal pbOffer = null;
             if (bidNode != null && askNode != null && bidNode.isNumber() && askNode.isNumber()) {
-                BigDecimal bid = bidNode.decimalValue();
-                BigDecimal ask = askNode.decimalValue();
-                if (bid.signum() > 0 && ask.signum() > 0) {
-                    mid = bid.add(ask).divide(BigDecimal.valueOf(2), 10, RoundingMode.HALF_UP);
-                }
+                pbBid = bidNode.decimalValue();
+                pbOffer = askNode.decimalValue();
             } else if (rateNode != null && rateNode.isNumber() && rateNode.decimalValue().signum() > 0) {
-                mid = rateNode.decimalValue();
+                BigDecimal midOnly = rateNode.decimalValue();
+                FxBboMarkup.VendorBbo synthetic = FxBboMarkup.vendorBboFromStubMid(
+                        midOnly, new BigDecimal("5"));
+                pbBid = synthetic.bid();
+                pbOffer = synthetic.offer();
             }
-            if (mid == null) {
+            if (pbBid == null || pbOffer == null || pbBid.signum() <= 0 || pbOffer.signum() <= 0) {
                 parseErrorsCounter.increment();
                 return;
             }
             long nowMs = clock.millis();
-            mids.put(pair, new MidSample(mid, nowMs));
+            bbos.put(pair, new BboSample(pbBid, pbOffer, nowMs));
             lastTickAtMs = nowMs;
             ticksCounter.increment();
         } catch (Exception e) {
@@ -297,19 +310,31 @@ public class OmsFxMidSubscriber implements MqttCallback {
     }
 
     /**
-     * Snapshot of the latest mid for a pair plus the wall-clock time we
-     * captured it. Used by {@link #midFor(String)} for staleness checks and
-     * by {@link #snapshot()} for diagnostic endpoints.
+     * Snapshot of the latest vendor BBO for a pair plus capture time.
      */
-    public record MidSample(BigDecimal mid, long capturedAtMs) {
+    public record BboSample(BigDecimal bid, BigDecimal offer, long capturedAtMs) {
         public Instant capturedAt() { return Instant.ofEpochMilli(capturedAtMs); }
         public Duration ageFrom(Instant now) { return Duration.between(capturedAt(), now); }
+        public BigDecimal mid() {
+            return bid.add(offer).divide(BigDecimal.valueOf(2), 10, RoundingMode.HALF_UP);
+        }
+        /** @deprecated use {@link #bid()} / {@link #offer()}. */
+        @Deprecated
+        public BigDecimal midOnly() { return mid(); }
+    }
+
+    /** @deprecated renamed to {@link BboSample}. */
+    @Deprecated
+    public record MidSample(BigDecimal mid, long capturedAtMs) {
+        public static MidSample fromBbo(BboSample bbo) {
+            return new MidSample(bbo.mid(), bbo.capturedAtMs());
+        }
     }
 
     @SuppressWarnings("unused") // Kept for an at-glance debug line in operator runbooks.
     public String summary() {
-        return Arrays.toString(mids.entrySet().stream()
-                .map(e -> e.getKey() + "=" + e.getValue().mid())
+        return Arrays.toString(bbos.entrySet().stream()
+                .map(e -> e.getKey() + "=" + e.getValue().bid() + "/" + e.getValue().offer())
                 .toArray());
     }
 }

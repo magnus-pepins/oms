@@ -318,13 +318,13 @@ public class OmsFxCustomerQuotePublisher {
         MqttAsyncClient c = client;
         if (c == null || !c.isConnected()) return;
         if (markupCache.isEmpty()) return;
-        Map<String, OmsFxMidSubscriber.MidSample> snapshot = midSubscriber.snapshot();
+        Map<String, OmsFxMidSubscriber.BboSample> snapshot = midSubscriber.snapshot();
         if (snapshot.isEmpty()) return;
         long nowMs = clock.millis();
         Instant nowInstant = Instant.ofEpochMilli(nowMs);
-        for (Map.Entry<String, OmsFxMidSubscriber.MidSample> e : snapshot.entrySet()) {
+        for (Map.Entry<String, OmsFxMidSubscriber.BboSample> e : snapshot.entrySet()) {
             String pair = e.getKey();
-            OmsFxMidSubscriber.MidSample sample = e.getValue();
+            OmsFxMidSubscriber.BboSample sample = e.getValue();
             if (sample == null) continue;
             long age = nowMs - sample.capturedAtMs();
             if (age > maxMidAgeMs) {
@@ -343,7 +343,7 @@ public class OmsFxCustomerQuotePublisher {
     }
 
     private void publishOne(MqttAsyncClient c, String pair, String tier,
-                            OmsFxMidSubscriber.MidSample sample, Instant now) {
+                            OmsFxMidSubscriber.BboSample sample, Instant now) {
         BigDecimal bidBps = lookupMarkup(pair, "BID", tier);
         BigDecimal askBps = lookupMarkup(pair, "ASK", tier);
         if (bidBps == null || askBps == null) {
@@ -354,9 +354,11 @@ public class OmsFxCustomerQuotePublisher {
             }
             return;
         }
-        BigDecimal mid = sample.mid();
-        BigDecimal bid = applyMarkup(mid, bidBps, -1);
-        BigDecimal ask = applyMarkup(mid, askBps, +1);
+        FxBboMarkup.CustomerBbo customer = FxBboMarkup.customerFromVendor(
+                sample.bid(), sample.offer(), bidBps, askBps);
+        BigDecimal bid = customer.bid();
+        BigDecimal ask = customer.ask();
+        BigDecimal mid = customer.mid();
         if (pair.length() < 6) {
             return;
         }
@@ -377,7 +379,9 @@ public class OmsFxCustomerQuotePublisher {
             body.put("mid", mid.setScale(RATE_SCALE, RoundingMode.HALF_UP).toPlainString());
             body.put("bidMarkupBps", bidBps.toPlainString());
             body.put("askMarkupBps", askBps.toPlainString());
-            body.put("sourceFeed", "vendor-mid-live");
+            body.put("vendorBid", sample.bid().setScale(RATE_SCALE, RoundingMode.HALF_UP).toPlainString());
+            body.put("vendorOffer", sample.offer().setScale(RATE_SCALE, RoundingMode.HALF_UP).toPlainString());
+            body.put("sourceFeed", "vendor-bbo-live");
             body.put("captured_at", sample.capturedAt().toString());
             body.put("valid_until", validUntil.toString());
             body.put("published_at", now.toString());
@@ -460,11 +464,13 @@ public class OmsFxCustomerQuotePublisher {
         this.markupCacheLoadedAtMs = clock.millis();
     }
 
+    /**
+     * @deprecated use {@link FxBboMarkup#customerFromVendor} — mid-based markup
+     *     can tighten inside the vendor spread.
+     */
+    @Deprecated
     static BigDecimal applyMarkup(BigDecimal mid, BigDecimal bps, int direction) {
-        BigDecimal factor = BigDecimal.ONE.add(
-                bps.divide(BPS_DIVISOR, MARKUP_FACTOR_SCALE, RoundingMode.HALF_UP)
-                        .multiply(BigDecimal.valueOf(direction)));
-        return mid.multiply(factor);
+        return FxBboMarkup.applySideMarkup(mid, bps, direction);
     }
 
     /** Diagnostic snapshot for {@code GET /internal/v1/fx/customer-quote/status}. */
@@ -501,12 +507,12 @@ public class OmsFxCustomerQuotePublisher {
      * deletes rows from the panel.
      */
     public GridSnapshot previewQuoteGrid() {
-        Map<String, OmsFxMidSubscriber.MidSample> snapshot = midSubscriber.snapshot();
+        Map<String, OmsFxMidSubscriber.BboSample> snapshot = midSubscriber.snapshot();
         long nowMs = clock.millis();
         List<PairRow> rows = new ArrayList<>(snapshot.size());
-        for (Map.Entry<String, OmsFxMidSubscriber.MidSample> e : snapshot.entrySet()) {
+        for (Map.Entry<String, OmsFxMidSubscriber.BboSample> e : snapshot.entrySet()) {
             String pair = e.getKey();
-            OmsFxMidSubscriber.MidSample sample = e.getValue();
+            OmsFxMidSubscriber.BboSample sample = e.getValue();
             if (sample == null || pair == null || pair.length() < 6) continue;
             long age = nowMs - sample.capturedAtMs();
             boolean stale = age > maxMidAgeMs;
@@ -523,8 +529,10 @@ public class OmsFxCustomerQuotePublisher {
                     tierMap.put(tier, new TierQuote(null, null, null, null, null, null, killed));
                     continue;
                 }
-                BigDecimal bid = applyMarkup(mid, bidBps, -1).setScale(RATE_SCALE, RoundingMode.HALF_UP);
-                BigDecimal ask = applyMarkup(mid, askBps, +1).setScale(RATE_SCALE, RoundingMode.HALF_UP);
+                FxBboMarkup.CustomerBbo customer = FxBboMarkup.customerFromVendor(
+                        sample.bid(), sample.offer(), bidBps, askBps);
+                BigDecimal bid = customer.bid();
+                BigDecimal ask = customer.ask();
                 BigDecimal additiveBid = overrides.additiveBpsFor(pair, "BID", tier, nowInstant);
                 BigDecimal additiveAsk = overrides.additiveBpsFor(pair, "ASK", tier, nowInstant);
                 BigDecimal additive = additiveBid.add(additiveAsk);

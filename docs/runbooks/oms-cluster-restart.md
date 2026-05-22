@@ -42,7 +42,10 @@ The script stops **fix-egress → ingress → projector → cluster-node**, wait
 
 **Verify after success:**
 
-- `bash ~/system-documentation/scripts/smoke/oms-end-to-end.sh` → exit 0
+- `bash ~/system-documentation/scripts/smoke/ledger-end-to-end.sh` then
+  `bash ~/system-documentation/scripts/smoke/oms-end-to-end.sh` → exit 0 (OMS smoke runs
+  ledger preflight by default; `SKIP_LEDGER_PREFLIGHT=1` for OMS-only benches)
+- Optional: `bash ~/oms/scripts/pm2-oms-cluster-readiness-probe.sh` (same readiness gate as smoke)
 - `oms-ingress` on **8088**; internal key from `~/.oms-bench.env`
 - Recent WORKING order: `POST .../force-cancel` → **200** or **409**, **not** 410
 - Cluster log: `replay validation:` and/or `loaded admission snapshot: orders=N` with **N > 0** if history exists

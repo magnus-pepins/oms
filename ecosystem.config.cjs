@@ -371,6 +371,17 @@ const apps = [
       // three roles below DO boot Spring and DO consume SPRING_PROFILES_ACTIVE.
     },
     ...COMMON_PM2,
+    // Phase 5 (plans/oms-cluster-recovery-and-hardening.md §5.3): readiness is on
+    // oms-ingress HTTP (/actuator/oms-cluster-readiness), not cluster-node. Use
+    // scripts/pm2-oms-cluster-readiness-probe.sh from cron or restart-pop-oms-cluster.sh.
+    // PM2 wait_ready below is OFF until pop runs Phase 2–5 jars — enable manually:
+    //   wait_ready: true,
+    //   listen_timeout: 120000,
+    //   wait_ready_timeout: 120000,
+    // and ensure oms-ingress is up before cluster-node is marked ready (start order
+    // in restart-pop-oms-cluster.sh already does cluster-node → projector → egress → ingress).
+    // wait_ready: false,
+
     // 2026-05-21 zombie-JVM hardening: with OmsClusterNodeBootstrap now
     // System.exit(1)ing on any bootstrap failure (e.g. Aeron "active Mark file
     // detected" right after a fast PM2 restart), PM2 sees a real crash and applies

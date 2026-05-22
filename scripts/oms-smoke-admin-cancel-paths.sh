@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # Smoke OMS admin cancel endpoints on a running ingress (pop bench).
 #
+# Partial coverage only — exercises admin force-cancel / postgres-only paths with
+# real POSTs. The platform read-only gate is:
+#   system-documentation/scripts/smoke/oms-end-to-end.sh
+# Run ledger-end-to-end.sh first, then oms-end-to-end.sh, then this script if you
+# need admin-path verification (plans/oms-cluster-recovery-and-hardening.md §5.2).
+#
 # Required env (from ~/.oms-bench.env):
 #   OMS_INTERNAL_API_KEY
 #

@@ -236,6 +236,16 @@ public class OmsAdmissionClusteredService implements ClusteredService {
 
     private Cluster cluster;
 
+    /** Commands applied since {@link #onStart} — used for post-replay validation logging only. */
+    private long sessionMessageCountSinceStart;
+
+    private long startWallClockMillis;
+
+    private boolean replayValidationLogged;
+
+    /** Set in {@link #onStart} when Aeron supplies a snapshot image to load. */
+    private boolean snapshotLoadedOnStart;
+
     /**
      * Side publication carrying {@link OrderAdmittedEvent}s for the Postgres projector (Phase 2).
      *
@@ -353,9 +363,23 @@ public class OmsAdmissionClusteredService implements ClusteredService {
         return ageMs / 1000.0;
     }
 
+    /** Test hook — replay validation fires once on first {@link #onRoleChange}. */
+    boolean replayValidationLoggedForTest() {
+        return replayValidationLogged;
+    }
+
+    /** Test hook — session messages counted since {@link #onStart}. */
+    long sessionMessageCountSinceStartForTest() {
+        return sessionMessageCountSinceStart;
+    }
+
     @Override
     public void onStart(Cluster cluster, Image snapshotImage) {
         this.cluster = cluster;
+        this.sessionMessageCountSinceStart = 0L;
+        this.startWallClockMillis = System.currentTimeMillis();
+        this.replayValidationLogged = false;
+        this.snapshotLoadedOnStart = snapshotImage != null;
         if (snapshotImage != null) {
             loadSnapshot(snapshotImage);
         }
@@ -390,6 +414,7 @@ public class OmsAdmissionClusteredService implements ClusteredService {
             int offset,
             int length,
             Header header) {
+        sessionMessageCountSinceStart++;
         if (length < OmsClusterWireFormat.HEADER_LENGTH) {
             // Malformed; ignore. Logging here would break determinism on replay if log writes throw.
             return;
@@ -558,6 +583,34 @@ public class OmsAdmissionClusteredService implements ClusteredService {
     @Override
     public void onRoleChange(Cluster.Role newRole) {
         log.info("OmsAdmissionClusteredService role change -> {}", newRole);
+
+        // Phase 2.4 (plans/oms-cluster-recovery-and-hardening.md): first role change after onStart
+        // marks end of archive replay into the state machine. One greppable line for operators
+        // and restart-pop-oms-cluster.sh (parity with ledger Phase 2.6).
+        if (!replayValidationLogged) {
+            replayValidationLogged = true;
+            long replayElapsedMs = System.currentTimeMillis() - startWallClockMillis;
+            log.info(
+                    "replay validation: replayedMessages={} elapsedMs={} snapshotLoaded={}"
+                            + " currentState[orders={} idempotency={} executionRefs={} senderSeq={}]",
+                    sessionMessageCountSinceStart,
+                    replayElapsedMs,
+                    snapshotLoadedOnStart,
+                    orderIndex.size(),
+                    idempotencyIndex.size(),
+                    executionRefIndex.size(),
+                    senderSeqIndex.size());
+
+            if (sessionMessageCountSinceStart == 0L
+                    && orderIndex.isEmpty()
+                    && idempotencyIndex.isEmpty()
+                    && !snapshotLoadedOnStart) {
+                log.warn(
+                        "ANOMALY: replay completed with zero messages and zero in-memory state."
+                                + " If the archive on disk is non-empty this indicates a broken"
+                                + " recovery path. Follow oms/docs/runbooks/oms-cluster-recovery-incident.md.");
+            }
+        }
     }
 
     @Override

@@ -1196,4 +1196,13 @@ class OmsAdmissionClusteredServiceTest {
         assertThat(afterReject.quantityScaled()).isEqualTo(beforeReject.quantityScaled());
         assertThat(afterReject.version()).isEqualTo(beforeReject.version() + 1);
     }
+
+    @Test
+    void firstRoleChange_logsReplayValidationOnce() {
+        assertThat(service.replayValidationLoggedForTest()).isFalse();
+        service.onRoleChange(Cluster.Role.FOLLOWER);
+        assertThat(service.replayValidationLoggedForTest()).isTrue();
+        service.onRoleChange(Cluster.Role.LEADER);
+        assertThat(service.replayValidationLoggedForTest()).isTrue();
+    }
 }

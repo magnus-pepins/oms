@@ -1,0 +1,40 @@
+---
+description: AI agents must not mutate any deployed OMS cluster, ever, without explicit per-command operator approval
+alwaysApply: true
+---
+
+# No OMS mutations by AI agents
+
+Works with [respect-operator-warnings.mdc](respect-operator-warnings.mdc), [no-bandaids.mdc](no-bandaids.mdc), [serious-debugging.mdc](serious-debugging.mdc), and [stay-in-role.mdc](stay-in-role.mdc).
+
+## Context
+
+OMS admission state lives in the Aeron cluster (`oms-cluster-node`). Postgres is a mirror. A bad restart can leave **WORKING** orders in Postgres while the cluster has **forgotten** them (`410 cluster_forgot_order`). Recovery is operator-led; see `system-documentation/plans/oms-cluster-recovery-and-hardening.md`.
+
+## You MUST NOT, on any deployed OMS stack (pop, staging, production)
+
+- Run `pm2 start`, `pm2 restart`, `pm2 stop`, `pm2 reload`, `pm2 delete`, or anything that changes process state for `oms-cluster-node`, `oms-postgres-projector`, `oms-fix-egress`, or `oms-ingress`.
+- Run `ssh pop 'rm …'`, `ssh pop 'mv …'`, or any filesystem mutation under `~/oms/build/aeron-cluster/**`, `~/oms/logs/**`, or projector data dirs.
+- Run `psql -c "INSERT"`, `UPDATE`, `DELETE`, `TRUNCATE`, `ALTER`, or migration SQL against `oms` projector DBs on deployed hosts.
+- Run `./gradlew clusterSnapshot` on pop without explicit per-command approval naming that exact command.
+- Run `system-documentation/scripts/restart-pop-oms-cluster.sh` without explicit approval naming that script by filename.
+- Run deploy scripts that bounce `oms-cluster-node` or journal paths.
+- Submit cluster-mutating `POST` to deployed ingress without operator approval.
+
+## You MAY, with explicit single-task scope on each command
+
+- Read-only logs, `psql SELECT`, `curl` actuators, `pm2 list/logs`, `oms-end-to-end.sh`.
+
+Name each command before running it.
+
+## You MAY, on your local Mac
+
+- Edit code, `./gradlew test`, local boot.
+
+## You MAY, only with explicit per-action operator approval
+
+- Deploy, `restart-pop-oms-cluster.sh`, `clusterSnapshot` on pop.
+
+## Sibling parity
+
+Canonical: `system-documentation/.cursor/rules/no-oms-mutations.mdc`. This file must match when the canonical changes.

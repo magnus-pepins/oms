@@ -5,6 +5,7 @@
 **Related:**
 
 - Snapshot before restart: [`oms-cluster-node-snapshot.md`](oms-cluster-node-snapshot.md)
+- Recovery incident (`orders=0`, 410): [`oms-cluster-recovery-incident.md`](oms-cluster-recovery-incident.md)
 - Known issues (force-cancel 410, orphaned orders): [`../../../system-documentation/handovers/2026-05-20-oms-known-issues.md`](../../../system-documentation/handovers/2026-05-20-oms-known-issues.md) §1
 - ADR: [`../adr/0001-aeron-cluster-substrate.md`](../adr/0001-aeron-cluster-substrate.md)
 
@@ -27,32 +28,32 @@ Postgres can show a **WORKING** order while the cluster **no longer has that ord
 
 **Goal:** bounded replay time; no orphaned orders.
 
-1. **Snapshot** (leader must be up):
+**Use the sanctioned script** (do **not** bounce cluster-node with a bare PM2 restart — fast restart can leave Aeron mark files active; see zombie section below):
 
-   ```bash
-   cd ~/oms
-   OMS_AERON_CLUSTER_DIR=build/aeron-cluster/consensus-module ./gradlew clusterSnapshot
-   # Wait for describeLatestConsensusModuleSnapshot / metrics age ~0 — see oms-cluster-node-snapshot.md
-   ```
+```bash
+cd ~/system-documentation
+# Recommended: snapshot before stop
+RUN_SNAPSHOT=1 bash scripts/restart-pop-oms-cluster.sh
+# Operator drill only:
+# SKIP_CONFIRM=1 RUN_SNAPSHOT=1 bash scripts/restart-pop-oms-cluster.sh
+```
 
-2. **Restart order** (shared Aeron media driver — cluster first, then consumers):
+The script stops **fix-egress → ingress → projector → cluster-node**, waits **35s** for mark-file release, starts **cluster-node → projector → fix-egress → ingress**, and aborts if the new boot logs **`replay validation:`** with **`orders=0`** while Postgres still has open orders. Follow [`oms-cluster-recovery-incident.md`](oms-cluster-recovery-incident.md) on abort.
 
-   ```bash
-   export PATH="$HOME/.nvm/versions/node/v24.14.1/bin:$PATH"
-   pm2 restart oms-cluster-node
-   # Wait until cluster-node logs show healthy leader / snapshot load
-   pm2 restart oms-postgres-projector
-   pm2 restart oms-fix-egress
-   pm2 restart oms-ingress
-   ```
+**Verify after success:**
 
-3. **Verify**
-
-   - `oms-ingress` listens on **8088**; internal key from `~/.oms-bench.env`
-   - Pick a recent WORKING order: `POST .../force-cancel` → expect **200** `force_cancel_applied` or **409** if already terminal — **not** 410
-   - `pm2 logs oms-cluster-node --lines 50` — look for `loaded admission snapshot: orders=N` on boot (not only position-0 replay)
+- `bash ~/system-documentation/scripts/smoke/oms-end-to-end.sh` → exit 0
+- `oms-ingress` on **8088**; internal key from `~/.oms-bench.env`
+- Recent WORKING order: `POST .../force-cancel` → **200** or **409**, **not** 410
+- Cluster log: `replay validation:` and/or `loaded admission snapshot: orders=N` with **N > 0** if history exists
 
 `kill_timeout: 30000` on cluster roles is intentional (clean MediaDriver shutdown).
+
+---
+
+## Do not: bare `pm2 restart` on cluster-node
+
+Fast `pm2 restart` on `oms-cluster-node` without the sanctioned stop/wait/start sequence caused mark-file races and false “healthy” JVMs on pre-2026-05-21 builds. Use [`restart-pop-oms-cluster.sh`](../../../system-documentation/scripts/restart-pop-oms-cluster.sh) instead. Emergency manual recovery is in the zombie section below.
 
 ---
 
@@ -176,7 +177,7 @@ Use only when **410** confirms the cluster forgot the order and the order should
 
 | Situation | Action |
 |-----------|--------|
-| Planned deploy, journal intact | Snapshot → rolling `pm2 restart` (above) |
+| Planned deploy, journal intact | `RUN_SNAPSHOT=1 bash system-documentation/scripts/restart-pop-oms-cluster.sh` |
 | Stale Aeron mark file / hung JVM | `pm2 stop` cluster roles → wait 30s → `pm2 start` — **do not** delete dirs unless you accept orphan cleanup |
 | Corrupt archive / intentional reset | Wipe journal dirs → **run orphan detection** on all non-terminal `orders` → Postgres cleanup for each 410 |
 | Schema bump (`SNAPSHOT_SCHEMA_VERSION`) | Follow deploy notes in [`oms-cluster-node-snapshot.md`](oms-cluster-node-snapshot.md) — snapshot under new code before mixed versions |

@@ -36,4 +36,10 @@ class OmsClusterReadinessFilterDecisionTest {
         assertThat(OmsClusterReadinessFilter.isGatedFor("GET", "/actuator/oms-cluster-readiness"))
                 .isFalse();
     }
+
+    @Test
+    void actuatorReconcile_notGated() {
+        assertThat(OmsClusterReadinessFilter.isGatedFor("GET", "/actuator/oms-cluster-reconcile"))
+                .isFalse();
+    }
 }

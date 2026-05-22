@@ -24,6 +24,9 @@ firing alerts as a prompt to investigate rather than as definitive evidence of a
 | Projector lag | sample (per scrape) | > 5 s for 10 min | > 30 s for 5 min | `oms.projector.lag_seconds` (slice 4d) |
 | FIX-egress lag | sample (per scrape) | > 5 s for 10 min | > 30 s for 5 min | `oms.fix_egress.lag_seconds` (slice 4d) |
 | Snapshot freshness | sample (per scrape) | > 1 h for 30 min | > 4 h for 30 min | `oms.cluster.snapshot.age_seconds` (slice 4h, this slice) |
+| Cluster ↔ projector open orders | sample (per scrape) | `oms_cluster_reconcile_in_sync == 0` for 5 min | — | `oms_cluster_reconcile_in_sync`, `oms_drift{kind="open_orders"}` (recovery hardening Phase 3) |
+| Reconcile poll freshness | sample (per scrape) | `oms_cluster_reconcile_age_seconds > 180` for 5 min | — | `oms_cluster_reconcile_age_seconds` (30 s default poll) |
+| Cluster readiness (HTTP) | probe | `/actuator/oms-cluster-readiness` not READY for 2 min | — | `probe_success{job="oms-ingress-readiness"}` (configure blackbox probe on pop) |
 | Cluster-node up | sample (per scrape) | — | `up == 0` for 2 min | scrape-target up state |
 | Lag publisher producing data | sample (per scrape) | `lag == -1` for 10 min after boot | — | `oms.projector.lag_seconds`, `oms.fix_egress.lag_seconds` (slice 4d sentinel) |
 
@@ -117,6 +120,30 @@ not run, or the cursor row has never been read, or Postgres returned no row for 
 publisher boots. Beyond ~10 min it indicates a real fault (publisher bean missing, profile not
 active, or Postgres unreachable at boot and never recovered). Warning, not critical: it doesn't
 mean OMS is broken, but the lag SLO is unmonitored until this is fixed.
+
+### Cluster ↔ projector reconcile — 5 min drift, 3 min stale poll
+
+`OmsReconciliationService` (recovery hardening Phase 3) polls the cluster Aeron counter
+`oms-cluster-open-orders-count` (non-terminal orders in admission state) and compares it to
+`SELECT count(*) FROM orders WHERE status IN ('PENDING_NEW','NEW','WORKING','PARTIALLY_FILLED')`
+on the projector. Gauges: `oms_cluster_count{kind=open_orders}`,
+`oms_projector_count{kind=open_orders}`, `oms_drift{kind=open_orders}`,
+`oms_cluster_reconcile_in_sync`, `oms_cluster_reconcile_age_seconds`.
+
+`OmsClusterReconcileDrift` fires when `in_sync == 0` for 5 minutes with a fresh observation
+(`age_seconds < 180`). This is the proactive counterpart to per-order admin **410
+cluster_forgot_order** — count mismatch before an operator hits a single order path.
+
+Debug surface: `GET /actuator/oms-cluster-reconcile` on ingress (200 when inSync, 503 with
+per-entity breakdown otherwise). Smoke: `system-documentation/scripts/smoke/oms-end-to-end.sh`
+exit code **11** when reconcile is not inSync.
+
+### Cluster readiness HTTP probe — 2 min
+
+`OmsClusterNotReady` assumes a Prometheus blackbox (or equivalent) probe on
+`GET /actuator/oms-cluster-readiness` with `job="oms-ingress-readiness"`. Until that probe is
+wired on pop, the alert rule is inert. Ingress already gates cluster-mutating POSTs with
+**503 OMS_CLUSTER_NOT_READY** when the Aeron readiness counter is not READY.
 
 ## What the alerts do not catch
 

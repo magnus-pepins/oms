@@ -118,6 +118,11 @@ public class OmsAdmissionClusteredService implements ClusteredService {
 
     public static final long READINESS_VALUE_READY = 1L;
 
+    /** Phase 3 count-only reconcile — open (non-terminal) orders in {@link #orderIndex}. */
+    public static final int OPEN_ORDERS_COUNT_COUNTER_TYPE_ID = 2_000_010;
+
+    public static final String OPEN_ORDERS_COUNT_COUNTER_LABEL = "oms-cluster-open-orders-count";
+
     private static final String ENV_READINESS_ALLOW_EMPTY_REPLAY = "OMS_READINESS_ALLOW_EMPTY_REPLAY";
 
     /** Initial buffer capacity for command processing. Grown on demand. */
@@ -258,6 +263,8 @@ public class OmsAdmissionClusteredService implements ClusteredService {
     private boolean snapshotLoadedOnStart;
 
     private io.aeron.Counter readyCounter;
+
+    private io.aeron.Counter openOrdersCountCounter;
 
     /**
      * Side publication carrying {@link OrderAdmittedEvent}s for the Postgres projector (Phase 2).
@@ -422,15 +429,23 @@ public class OmsAdmissionClusteredService implements ClusteredService {
             }
             readyCounter = cluster.aeron().addCounter(READINESS_COUNTER_TYPE_ID, READINESS_COUNTER_LABEL);
             readyCounter.setOrdered(READINESS_VALUE_NOT_READY);
+            if (openOrdersCountCounter != null) {
+                openOrdersCountCounter.close();
+                openOrdersCountCounter = null;
+            }
+            openOrdersCountCounter =
+                    cluster.aeron().addCounter(OPEN_ORDERS_COUNT_COUNTER_TYPE_ID, OPEN_ORDERS_COUNT_COUNTER_LABEL);
+            syncOpenOrdersCountCounter();
         }
 
         log.info(
-                "OmsAdmissionClusteredService started; orders={}, role={}, eventsPub={}/{} readinessCounterId={}",
+                "OmsAdmissionClusteredService started; orders={}, role={}, eventsPub={}/{} readinessCounterId={} openOrdersCounterId={}",
                 orderIndex.size(),
                 cluster.role(),
                 OmsClusterWireFormat.EVENTS_CHANNEL,
                 OmsClusterWireFormat.EVENTS_STREAM_ID,
-                readyCounter == null ? -1 : readyCounter.id());
+                readyCounter == null ? -1 : readyCounter.id(),
+                openOrdersCountCounter == null ? -1 : openOrdersCountCounter.id());
     }
 
     @Override
@@ -475,6 +490,25 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                 // adding an UnknownCommandRejected event is a Phase 2 concern.
             }
         }
+        syncOpenOrdersCountCounter();
+    }
+
+    private void syncOpenOrdersCountCounter() {
+        if (openOrdersCountCounter == null) {
+            return;
+        }
+        long open = 0L;
+        for (AdmittedOrder order : orderIndex.values()) {
+            if (!isTerminal(order.statusCode())) {
+                open++;
+            }
+        }
+        openOrdersCountCounter.setOrdered(open);
+    }
+
+    /** Test hook — published open-order count counter value, or -1 if absent. */
+    long openOrdersCountCounterValueForTest() {
+        return openOrdersCountCounter == null ? -1L : openOrdersCountCounter.get();
     }
 
     /**
@@ -661,6 +695,7 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                 log.warn(
                         "readiness counter remains NOT_READY (empty replay, OMS_READINESS_ALLOW_EMPTY_REPLAY=false)");
             }
+            syncOpenOrdersCountCounter();
         }
     }
 
@@ -677,6 +712,10 @@ public class OmsAdmissionClusteredService implements ClusteredService {
         if (readyCounter != null) {
             readyCounter.close();
             readyCounter = null;
+        }
+        if (openOrdersCountCounter != null) {
+            openOrdersCountCounter.close();
+            openOrdersCountCounter = null;
         }
     }
 

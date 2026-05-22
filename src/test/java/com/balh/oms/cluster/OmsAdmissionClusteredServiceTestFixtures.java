@@ -24,5 +24,12 @@ final class OmsAdmissionClusteredServiceTestFixtures {
                         OmsAdmissionClusteredService.READINESS_COUNTER_TYPE_ID,
                         OmsAdmissionClusteredService.READINESS_COUNTER_LABEL))
                 .thenReturn(readinessCounter);
+        io.aeron.Counter openOrdersCounter = Mockito.mock(io.aeron.Counter.class);
+        when(openOrdersCounter.get()).thenReturn(0L);
+        when(openOrdersCounter.id()).thenReturn(2);
+        when(aeronMock.addCounter(
+                        OmsAdmissionClusteredService.OPEN_ORDERS_COUNT_COUNTER_TYPE_ID,
+                        OmsAdmissionClusteredService.OPEN_ORDERS_COUNT_COUNTER_LABEL))
+                .thenReturn(openOrdersCounter);
     }
 }

@@ -85,9 +85,7 @@ class OmsAdmissionClusteredServiceTest {
                 .thenAnswer(this::captureAdmitted);
 
         Aeron aeronMock = mock(Aeron.class);
-        when(aeronMock.addExclusivePublication(
-                        OmsClusterWireFormat.EVENTS_CHANNEL, OmsClusterWireFormat.EVENTS_STREAM_ID))
-                .thenReturn(eventsPublicationMock);
+        OmsAdmissionClusteredServiceTestFixtures.wireClusterAeronMocks(aeronMock, eventsPublicationMock);
 
         clusterMock = mock(Cluster.class);
         when(clusterMock.role()).thenReturn(Cluster.Role.LEADER);
@@ -660,9 +658,7 @@ class OmsAdmissionClusteredServiceTest {
         Aeron aeronMock = mock(Aeron.class);
         ExclusivePublication eventsPub = mock(ExclusivePublication.class);
         when(eventsPub.offer(any(DirectBuffer.class), anyInt(), anyInt())).thenReturn(1L);
-        when(aeronMock.addExclusivePublication(
-                        OmsClusterWireFormat.EVENTS_CHANNEL, OmsClusterWireFormat.EVENTS_STREAM_ID))
-                .thenReturn(eventsPub);
+        OmsAdmissionClusteredServiceTestFixtures.wireClusterAeronMocks(aeronMock, eventsPub);
         when(mockCluster.aeron()).thenReturn(aeronMock);
         Image snapshotImage = mockSnapshotImage(snapshotBytes);
         restored.onStart(mockCluster, snapshotImage);
@@ -881,9 +877,7 @@ class OmsAdmissionClusteredServiceTest {
                 return 1L;
             });
             Aeron aeronMock = mock(Aeron.class);
-            when(aeronMock.addExclusivePublication(
-                            OmsClusterWireFormat.EVENTS_CHANNEL, OmsClusterWireFormat.EVENTS_STREAM_ID))
-                    .thenReturn(eventsPub);
+            OmsAdmissionClusteredServiceTestFixtures.wireClusterAeronMocks(aeronMock, eventsPub);
             Cluster clusterMock = mock(Cluster.class);
             when(clusterMock.role()).thenReturn(Cluster.Role.LEADER);
             when(clusterMock.aeron()).thenReturn(aeronMock);
@@ -1205,4 +1199,5 @@ class OmsAdmissionClusteredServiceTest {
         service.onRoleChange(Cluster.Role.LEADER);
         assertThat(service.replayValidationLoggedForTest()).isTrue();
     }
+
 }

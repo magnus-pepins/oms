@@ -3,6 +3,8 @@ package com.balh.oms;
 import com.balh.oms.cluster.OmsAdmissionClusteredService;
 import com.balh.oms.cluster.OmsClusterWireFormat;
 import com.balh.oms.cluster.admin.OmsClusterNodeMetricsExporter;
+import com.balh.oms.cluster.snapshot.OmsClusterSnapshotOnShutdown;
+import com.balh.oms.cluster.snapshot.OmsClusterSnapshotScheduler;
 import io.aeron.Aeron;
 import io.aeron.archive.Archive;
 import io.aeron.archive.ArchiveThreadingMode;
@@ -20,6 +22,7 @@ import org.slf4j.LoggerFactory;
 import java.io.File;
 import java.util.Locale;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Cluster-node JVM entrypoint per ADR 0001.
@@ -146,6 +149,14 @@ public final class OmsClusterNodeBootstrap {
      */
     static final String DEFAULT_ARCHIVE_CONTROL_CHANNEL = "aeron:udp?endpoint=localhost:8010";
 
+    static final String ENV_SNAPSHOT_INTERVAL_MS = "OMS_CLUSTER_SNAPSHOT_INTERVAL_MS";
+
+    static final String ENV_SNAPSHOT_INITIAL_DELAY_MS = "OMS_CLUSTER_SNAPSHOT_INITIAL_DELAY_MS";
+
+    static final String ENV_SNAPSHOT_ON_SHUTDOWN = "OMS_CLUSTER_SNAPSHOT_ON_SHUTDOWN";
+
+    private static final long SHUTDOWN_WATCHDOG_TIMEOUT_MS = 25_000L;
+
     private OmsClusterNodeBootstrap() {}
 
     public static void main(String[] args) {
@@ -183,11 +194,14 @@ public final class OmsClusterNodeBootstrap {
         ClusteredMediaDriver clusteredMediaDriver = null;
         EventsRecordingHandle eventsRecording = null;
         ClusteredServiceContainer container = null;
+        OmsAdmissionClusteredService clusteredService = null;
+        OmsClusterSnapshotScheduler snapshotScheduler = null;
         try {
+            MediaDriver.Context mediaCtx = buildMediaDriverContext(paths);
+            Archive.Context archiveCtx = buildArchiveContext(paths);
+            assertDestructiveDirPolicy(mediaCtx, archiveCtx);
             clusteredMediaDriver = ClusteredMediaDriver.launch(
-                    buildMediaDriverContext(paths),
-                    buildArchiveContext(paths),
-                    buildConsensusModuleContext(paths, memberId, clusterMembers));
+                    mediaCtx, archiveCtx, buildConsensusModuleContext(paths, memberId, clusterMembers));
 
             // Register Archive recording for the projector event stream BEFORE launching the service container.
             // The cluster service's onStart will then create the publication on EVENTS_CHANNEL/EVENTS_STREAM_ID
@@ -195,13 +209,29 @@ public final class OmsClusterNodeBootstrap {
             // cursor a stable monotonic position into a continuous recording.
             eventsRecording = startEventsRecording(paths);
 
+            clusteredService = new OmsAdmissionClusteredService(metricsExporter.meterRegistry());
             container = ClusteredServiceContainer.launch(
-                    buildServiceContainerContext(
-                            paths, new OmsAdmissionClusteredService(metricsExporter.meterRegistry())));
+                    buildServiceContainerContext(paths, clusteredService));
+
+            long snapshotIntervalMs = parseLongEnv(
+                    ENV_SNAPSHOT_INTERVAL_MS, OmsClusterSnapshotScheduler.DEFAULT_INTERVAL_MS);
+            long snapshotInitialDelayMs = parseLongEnv(
+                    ENV_SNAPSHOT_INITIAL_DELAY_MS, OmsClusterSnapshotScheduler.DEFAULT_INITIAL_DELAY_MS);
+            if (snapshotIntervalMs > 0L) {
+                snapshotScheduler = new OmsClusterSnapshotScheduler(
+                        new File(paths.clusterDir()),
+                        snapshotIntervalMs,
+                        snapshotInitialDelayMs,
+                        metricsExporter.meterRegistry());
+                snapshotScheduler.start();
+            } else {
+                log.info("periodic OMS cluster snapshot scheduler disabled via {}=0", ENV_SNAPSHOT_INTERVAL_MS);
+            }
         } catch (Throwable bootstrapFailure) {
             log.error(
                     "OMS cluster-node bootstrap failed; closing partial state and forcing JVM exit",
                     bootstrapFailure);
+            CloseHelper.quietClose(snapshotScheduler);
             CloseHelper.quietClose(container);
             CloseHelper.quietClose(eventsRecording);
             CloseHelper.quietClose(clusteredMediaDriver);
@@ -217,37 +247,52 @@ public final class OmsClusterNodeBootstrap {
             return;
         }
 
-        // Effectively-final references for the shutdown hook (the try-block locals may have been
-        // reassigned during recovery).
         final ClusteredMediaDriver driverRef = clusteredMediaDriver;
         final EventsRecordingHandle eventsRef = eventsRecording;
         final ClusteredServiceContainer containerRef = container;
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            log.info("OMS cluster-node received shutdown signal");
-            try {
-                containerRef.close();
-            } catch (Exception e) {
-                log.warn("error closing cluster service container", e);
-            }
-            CloseHelper.quietClose(eventsRef);
-            try {
-                driverRef.close();
-            } catch (Exception e) {
-                log.warn("error closing clustered media driver", e);
-            }
-            try {
-                metricsExporter.close();
-            } catch (Exception e) {
-                log.warn("error closing cluster-node metrics exporter", e);
-            }
-            shutdownLatch.countDown();
-        }, "oms-cluster-node-shutdown"));
+        final OmsAdmissionClusteredService serviceRef = clusteredService;
+        final OmsClusterSnapshotScheduler schedulerRef = snapshotScheduler;
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> shutdownLatch.countDown(), "oms-cluster-node-latch-trip"));
 
         log.info("OMS cluster-node started; awaiting shutdown signal");
         try {
             shutdownLatch.await();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+        }
+
+        log.info("OMS cluster-node draining (watchdog={}ms)", SHUTDOWN_WATCHDOG_TIMEOUT_MS);
+        Thread watchdog = new Thread(() -> {
+            try {
+                TimeUnit.MILLISECONDS.sleep(SHUTDOWN_WATCHDOG_TIMEOUT_MS);
+                log.error("shutdown watchdog: cleanup exceeded {}ms, System.exit(1)", SHUTDOWN_WATCHDOG_TIMEOUT_MS);
+                System.exit(1);
+            } catch (InterruptedException ignored) {
+                // clean exit
+            }
+        }, "oms-cluster-node-shutdown-watchdog");
+        watchdog.setDaemon(true);
+        watchdog.start();
+
+        boolean snapshotOnShutdownDisabled =
+                "false".equalsIgnoreCase(envOrDefault(ENV_SNAPSHOT_ON_SHUTDOWN, "true"));
+        OmsClusterSnapshotOnShutdown.takeIfReady(serviceRef, schedulerRef, snapshotOnShutdownDisabled);
+        CloseHelper.quietClose(schedulerRef);
+        try {
+            containerRef.close();
+        } catch (Exception e) {
+            log.warn("error closing cluster service container", e);
+        }
+        CloseHelper.quietClose(eventsRef);
+        try {
+            driverRef.close();
+        } catch (Exception e) {
+            log.warn("error closing clustered media driver", e);
+        }
+        try {
+            metricsExporter.close();
+        } catch (Exception e) {
+            log.warn("error closing cluster-node metrics exporter", e);
         }
     }
 
@@ -452,6 +497,32 @@ public final class OmsClusterNodeBootstrap {
             if (!f.exists() && !f.mkdirs()) {
                 throw new IllegalStateException("failed to create Aeron working directory: " + dir);
             }
+        }
+    }
+
+    static long parseLongEnv(String name, long defaultValue) {
+        String raw = System.getenv(name);
+        if (raw == null || raw.isBlank()) {
+            return defaultValue;
+        }
+        try {
+            return Long.parseLong(raw.trim());
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException(
+                    String.format(Locale.ROOT, "Invalid %s='%s'; expected a long", name, raw), e);
+        }
+    }
+
+    /**
+     * Safety invariant (Phase 2.5): only the media-driver dir is wiped on start; archive and
+     * consensus state must persist across restarts.
+     */
+    static void assertDestructiveDirPolicy(MediaDriver.Context media, Archive.Context archive) {
+        if (!media.dirDeleteOnStart()) {
+            throw new IllegalStateException("media driver must use dirDeleteOnStart(true)");
+        }
+        if (archive.deleteArchiveOnStart()) {
+            throw new IllegalStateException("archive must not use deleteArchiveOnStart(true)");
         }
     }
 

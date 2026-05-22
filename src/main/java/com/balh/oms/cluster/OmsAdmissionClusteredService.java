@@ -109,6 +109,17 @@ public class OmsAdmissionClusteredService implements ClusteredService {
      */
     static final int SNAPSHOT_SCHEMA_VERSION = 4;
 
+    /** Phase 2.1 readiness counter — see {@code plans/oms-cluster-recovery-and-hardening.md}. */
+    public static final int READINESS_COUNTER_TYPE_ID = 2_000_002;
+
+    public static final String READINESS_COUNTER_LABEL = "oms-cluster-ready";
+
+    public static final long READINESS_VALUE_NOT_READY = 0L;
+
+    public static final long READINESS_VALUE_READY = 1L;
+
+    private static final String ENV_READINESS_ALLOW_EMPTY_REPLAY = "OMS_READINESS_ALLOW_EMPTY_REPLAY";
+
     /** Initial buffer capacity for command processing. Grown on demand. */
     private static final int INITIAL_BUFFER_CAPACITY = 1024;
 
@@ -246,6 +257,8 @@ public class OmsAdmissionClusteredService implements ClusteredService {
     /** Set in {@link #onStart} when Aeron supplies a snapshot image to load. */
     private boolean snapshotLoadedOnStart;
 
+    private io.aeron.Counter readyCounter;
+
     /**
      * Side publication carrying {@link OrderAdmittedEvent}s for the Postgres projector (Phase 2).
      *
@@ -373,6 +386,19 @@ public class OmsAdmissionClusteredService implements ClusteredService {
         return sessionMessageCountSinceStart;
     }
 
+    /** Test hook — current readiness counter value, or -1 if absent. */
+    long readinessCounterValueForTest() {
+        return readyCounter == null ? -1L : readyCounter.get();
+    }
+
+    /**
+     * Whether replay validation completed and the cluster may accept admission commands
+     * (Phase 2.1 shutdown snapshot gate).
+     */
+    public boolean isReadyForClusterAdmission() {
+        return readyCounter != null && readyCounter.get() == READINESS_VALUE_READY;
+    }
+
     @Override
     public void onStart(Cluster cluster, Image snapshotImage) {
         this.cluster = cluster;
@@ -388,12 +414,23 @@ public class OmsAdmissionClusteredService implements ClusteredService {
         // bridge to the Archive recording, which is the durable projection signal.
         this.eventsPublication = cluster.aeron().addExclusivePublication(
                 OmsClusterWireFormat.EVENTS_CHANNEL, OmsClusterWireFormat.EVENTS_STREAM_ID);
+
+        if (cluster.aeron() != null) {
+            if (readyCounter != null) {
+                readyCounter.close();
+                readyCounter = null;
+            }
+            readyCounter = cluster.aeron().addCounter(READINESS_COUNTER_TYPE_ID, READINESS_COUNTER_LABEL);
+            readyCounter.setOrdered(READINESS_VALUE_NOT_READY);
+        }
+
         log.info(
-                "OmsAdmissionClusteredService started; orders={}, role={}, eventsPub={}/{}",
+                "OmsAdmissionClusteredService started; orders={}, role={}, eventsPub={}/{} readinessCounterId={}",
                 orderIndex.size(),
                 cluster.role(),
                 OmsClusterWireFormat.EVENTS_CHANNEL,
-                OmsClusterWireFormat.EVENTS_STREAM_ID);
+                OmsClusterWireFormat.EVENTS_STREAM_ID,
+                readyCounter == null ? -1 : readyCounter.id());
     }
 
     @Override
@@ -601,16 +638,35 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                     executionRefIndex.size(),
                     senderSeqIndex.size());
 
-            if (sessionMessageCountSinceStart == 0L
-                    && orderIndex.isEmpty()
-                    && idempotencyIndex.isEmpty()
-                    && !snapshotLoadedOnStart) {
+            boolean emptyReplayNoSnapshot =
+                    sessionMessageCountSinceStart == 0L
+                            && orderIndex.isEmpty()
+                            && idempotencyIndex.isEmpty()
+                            && !snapshotLoadedOnStart;
+            if (emptyReplayNoSnapshot) {
                 log.warn(
                         "ANOMALY: replay completed with zero messages and zero in-memory state."
                                 + " If the archive on disk is non-empty this indicates a broken"
                                 + " recovery path. Follow oms/docs/runbooks/oms-cluster-recovery-incident.md.");
             }
+
+            boolean allowReady = !emptyReplayNoSnapshot || parseAllowEmptyReplayFromEnv();
+            if (readyCounter != null && allowReady) {
+                readyCounter.setOrdered(READINESS_VALUE_READY);
+                log.info(
+                        "readiness counter -> READY (id={} value={})",
+                        readyCounter.id(),
+                        readyCounter.get());
+            } else if (readyCounter != null) {
+                log.warn(
+                        "readiness counter remains NOT_READY (empty replay, OMS_READINESS_ALLOW_EMPTY_REPLAY=false)");
+            }
         }
+    }
+
+    private static boolean parseAllowEmptyReplayFromEnv() {
+        String raw = System.getenv(ENV_READINESS_ALLOW_EMPTY_REPLAY);
+        return raw != null && ("1".equals(raw.trim()) || "true".equalsIgnoreCase(raw.trim()));
     }
 
     @Override
@@ -618,6 +674,10 @@ public class OmsAdmissionClusteredService implements ClusteredService {
         log.info("OmsAdmissionClusteredService terminating; orders={}", orderIndex.size());
         CloseHelper.quietClose(eventsPublication);
         eventsPublication = null;
+        if (readyCounter != null) {
+            readyCounter.close();
+            readyCounter = null;
+        }
     }
 
     // ------------------------------------------------------------------------

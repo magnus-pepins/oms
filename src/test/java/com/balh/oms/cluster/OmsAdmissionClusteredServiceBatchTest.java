@@ -56,9 +56,7 @@ class OmsAdmissionClusteredServiceBatchTest {
                 .thenReturn(1L);
 
         Aeron aeronMock = mock(Aeron.class);
-        when(aeronMock.addExclusivePublication(
-                        OmsClusterWireFormat.EVENTS_CHANNEL, OmsClusterWireFormat.EVENTS_STREAM_ID))
-                .thenReturn(eventsPublicationMock);
+        OmsAdmissionClusteredServiceTestFixtures.wireClusterAeronMocks(aeronMock, eventsPublicationMock);
 
         Cluster clusterMock = mock(Cluster.class);
         when(clusterMock.role()).thenReturn(Cluster.Role.LEADER);

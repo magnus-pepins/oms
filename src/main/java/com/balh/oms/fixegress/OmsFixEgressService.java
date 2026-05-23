@@ -256,7 +256,7 @@ public class OmsFixEgressService {
     @PostConstruct
     void init() {
         // 2026-05-23 hardening (handover §9.6). Load the saved cursor in its full
-        // (recording_id, position) shape. Three cases:
+        // (recording_id, position, high_water) shape. Four cases:
         //
         //   1. Empty Optional      — first-ever egress start (no row in oms_fix_egress_cursor).
         //                            Replay loop will bootstrap from the oldest recording at pos 0.
@@ -265,9 +265,16 @@ public class OmsFixEgressService {
         //                            recording when the saved position overshot, losing the
         //                            pointer to events in earlier recordings. We refuse to start
         //                            until an operator pins the recording id explicitly via SQL.
-        //   3. Recording-aware row — resume from the saved (recording_id, position) directly.
-        Optional<OmsFixEgressCursorRepository.RecordedCursor> savedCursor = cursorRepository
-                .findLastAppliedCursor(EGRESS_ID, OmsClusterWireFormat.EVENTS_STREAM_ID);
+        //   3. V60 rewind detected — high_water is non-NULL and lexicographically exceeds
+        //                            last_applied. Operator (or a bug) UPDATEd the cursor
+        //                            backwards. Replaying from the rewound point would re-ship
+        //                            duplicate NOS to the broker; refuse to start until the
+        //                            operator explicitly zeros the high-water mark too.
+        //   4. Recording-aware row — resume from the saved (recording_id, position) directly.
+        Optional<OmsFixEgressCursorRepository.RecordedCursorWithHighWater> savedRow = cursorRepository
+                .findLastAppliedCursorWithHighWater(EGRESS_ID, OmsClusterWireFormat.EVENTS_STREAM_ID);
+        Optional<OmsFixEgressCursorRepository.RecordedCursor> savedCursor =
+                savedRow.map(OmsFixEgressCursorRepository.RecordedCursorWithHighWater::lastApplied);
         if (savedCursor.isPresent() && !savedCursor.get().hasRecordingId()) {
             long legacyPos = savedCursor.get().position();
             String repairSql = String.format(
@@ -286,6 +293,31 @@ public class OmsFixEgressService {
                             + " current at the moment the saved position was written) and run: "
                             + repairSql
                             + " — see system-documentation/handovers/2026-05-23-oms-snapshot-magic-mismatch-and-stability-rework.md §9.6.");
+        }
+        // V60 rewind guard. Honoured only when both pairs are recording-aware; legacy rows are
+        // caught above. Refuses to start when last_applied < high_water lexicographically: that
+        // means the cursor has been rewound (operator SQL UPDATE, a bug, or a recovery script
+        // that didn't acknowledge the rewind by zeroing the high-water mark). Replaying from
+        // the rewound point would re-ship admit events as duplicate NOS to the broker.
+        if (savedRow.isPresent() && savedRow.get().isRewound()) {
+            OmsFixEgressCursorRepository.RecordedCursor last = savedRow.get().lastApplied();
+            OmsFixEgressCursorRepository.RecordedCursor high = savedRow.get().highWater();
+            String repairSql = String.format(
+                    "UPDATE oms_fix_egress_cursor SET high_water_recording_id = %d, high_water_position = %d"
+                            + " WHERE egress_id = '%s' AND stream_id = %d;",
+                    last.recordingId(), last.position(), EGRESS_ID, OmsClusterWireFormat.EVENTS_STREAM_ID);
+            throw new IllegalStateException(
+                    "oms-fix-egress refuses to start: cursor has been rewound."
+                            + " last_applied=(recordingId=" + last.recordingId()
+                            + ", position=" + last.position() + "), but historical"
+                            + " high_water=(recordingId=" + high.recordingId()
+                            + ", position=" + high.position() + ") is lexicographically greater."
+                            + " Replaying from the rewound point would re-ship admit events as duplicate NOS"
+                            + " to the broker (option-1 dedupe assumes the broker honours DupClOrdID, which is"
+                            + " venue-specific and operationally noisy even when it works). If the rewind is"
+                            + " intentional (operator recovery), acknowledge it by zeroing the high-water mark"
+                            + " before next start: " + repairSql
+                            + " — see system-documentation/handovers/2026-05-23-oms-snapshot-magic-mismatch-and-stability-rework.md §10.");
         }
         savedCursor.ifPresent(startupCursor::set);
         long resumePos;
@@ -493,43 +525,10 @@ public class OmsFixEgressService {
                                 + "; init() / bootstrap should have set it. This is a programming bug.");
             }
             RecordingDescriptor descriptor = findRecordingById(archive, recordingIdNow);
-            if (descriptor == null) {
-                // Saved recording id is no longer listed in the Archive. This is not a "the
-                // recording is empty so reset to 0" situation — it means the on-disk recording
-                // files for our saved id have been deleted (manual rm, archive recompaction,
-                // disk wipe). Silent reset would re-send every admit since the start of the new
-                // active recording (broker would reject duplicates via DupClOrdID, but every
-                // admit from the missing recording would never be sent at all). FAIL LOUD
-                // instead; operator decides whether to bootstrap fresh (resetWithRecording to
-                // (newOldestId, 0) and accept loss) or restore the recording files.
-                throw new IllegalStateException(
-                        "oms-fix-egress cannot continue: saved recordingId="
-                                + recordingIdNow
-                                + " is not listed in the Aeron Archive for events stream "
-                                + OmsClusterWireFormat.EVENTS_STREAM_ID
-                                + " (channel=" + OmsClusterWireFormat.EVENTS_CHANNEL + ")."
-                                + " The recording files may have been deleted or the egress is wired to the wrong"
-                                + " Aeron Archive. Operator must decide between (a) repointing to a different Archive,"
-                                + " or (b) accepting data loss by running resetWithRecording to a known-good"
-                                + " (recordingId, position). Refusing to silently reset to position 0 of an unrelated"
-                                + " recording — see handover §9.6.");
-            }
+            requireRecordingPresent(recordingIdNow, descriptor);
             long savedPosition = lastAppliedPosition.get();
             long upperBound = recordingUpperBound(archive, descriptor);
-            if (savedPosition > upperBound) {
-                // Saved position is beyond the end of this recording. Pre-hardening behaviour
-                // silently reset to descriptor.startPosition() and persisted that — which is
-                // exactly the projector bug that hit pop on 2026-05-23. We refuse and FAIL LOUD.
-                throw new IllegalStateException(
-                        "oms-fix-egress saved cursor (recordingId="
-                                + recordingIdNow
-                                + ", position=" + savedPosition + ") is past the end of the recording (upperBound="
-                                + upperBound + ", startPosition=" + descriptor.startPosition()
-                                + ", stopPosition=" + descriptor.stopPosition()
-                                + "). This indicates the recording was truncated or replaced under the egress."
-                                + " Refusing to silently reset to position 0 — operator must inspect via"
-                                + " AeronArchive control + resetWithRecording to a verified (recordingId, position).");
-            }
+            requirePositionWithinRecording(recordingIdNow, savedPosition, upperBound, descriptor);
             if (savedPosition < descriptor.startPosition()) {
                 // Saved position is below the recording's start. Acceptable to advance to
                 // startPosition: the broker's DupClOrdID dedupe makes re-sending NOS for already
@@ -764,7 +763,58 @@ public class OmsFixEgressService {
      * Snapshot of the recording's identity and bounds returned by
      * {@link AeronArchive#listRecordingsForUri}.
      */
-    private record RecordingDescriptor(long recordingId, long startPosition, long stopPosition) {}
+    record RecordingDescriptor(long recordingId, long startPosition, long stopPosition) {}
+
+    /**
+     * Loud-fail when the saved recording id is no longer listed in the Aeron Archive. The
+     * pre-hardening behaviour silently reset to position 0 of the active recording, which on
+     * a non-DupClOrdID-tolerant venue would mean every admit from the missing recording is
+     * never sent as NOS to the broker. Refuse instead; operator decides whether to bootstrap
+     * fresh via {@code resetWithRecording(newOldestId, 0)} (accept loss) or restore the
+     * recording files. Package-private so the unit test in
+     * {@code OmsFixEgressServiceReplayCursorGuardTest} can exercise both branches without
+     * standing up a real {@link AeronArchive}.
+     */
+    static void requireRecordingPresent(long savedRecordingId, RecordingDescriptor descriptor) {
+        if (descriptor != null) {
+            return;
+        }
+        throw new IllegalStateException(
+                "oms-fix-egress cannot continue: saved recordingId="
+                        + savedRecordingId
+                        + " is not listed in the Aeron Archive for events stream "
+                        + OmsClusterWireFormat.EVENTS_STREAM_ID
+                        + " (channel=" + OmsClusterWireFormat.EVENTS_CHANNEL + ")."
+                        + " The recording files may have been deleted or the egress is wired to the wrong"
+                        + " Aeron Archive. Operator must decide between (a) repointing to a different Archive,"
+                        + " or (b) accepting data loss by running resetWithRecording to a known-good"
+                        + " (recordingId, position). Refusing to silently reset to position 0 of an unrelated"
+                        + " recording — see handover §9.6.");
+    }
+
+    /**
+     * Loud-fail when the saved cursor position is past the live upper bound (stopPosition for
+     * a closed recording, write-head for an active one). Same shape as the projector twin;
+     * package-private for unit tests.
+     */
+    static void requirePositionWithinRecording(
+            long savedRecordingId,
+            long savedPosition,
+            long upperBound,
+            RecordingDescriptor descriptor) {
+        if (savedPosition <= upperBound) {
+            return;
+        }
+        throw new IllegalStateException(
+                "oms-fix-egress saved cursor (recordingId="
+                        + savedRecordingId
+                        + ", position=" + savedPosition + ") is past the end of the recording (upperBound="
+                        + upperBound + ", startPosition=" + descriptor.startPosition()
+                        + ", stopPosition=" + descriptor.stopPosition()
+                        + "). This indicates the recording was truncated or replaced under the egress."
+                        + " Refusing to silently reset to position 0 — operator must inspect via"
+                        + " AeronArchive control + resetWithRecording to a verified (recordingId, position).");
+    }
 
     /**
      * Decodes one fragment and applies it: slice 3b-2 builds + sends {@link NewOrderSingle},

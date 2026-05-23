@@ -270,4 +270,107 @@ class OmsFixEgressCursorRepositoryIntegrationTest extends AbstractPostgresIntegr
         // After the repair, a recording-aware advance lands cleanly.
         assertThat(cursorRepository.advanceWithRecording(EGRESS_ID, STREAM_ID, 16L, 100L)).isTrue();
     }
+
+    // --------------------------------------------------------------------------------------
+    // V60 high-water-mark coverage (gap 2 of the post-V55/V56 stability review).
+    // --------------------------------------------------------------------------------------
+
+    @Test
+    void v60_advanceWithRecording_bumpsHighWaterInLockstep() {
+        cursorRepository.advanceWithRecording(EGRESS_ID, STREAM_ID, 16L, 1_000L);
+        cursorRepository.advanceWithRecording(EGRESS_ID, STREAM_ID, 16L, 2_000L);
+        cursorRepository.advanceWithRecording(EGRESS_ID, STREAM_ID, 17L, 0L);
+
+        OmsFixEgressCursorRepository.RecordedCursorWithHighWater row =
+                cursorRepository.findLastAppliedCursorWithHighWater(EGRESS_ID, STREAM_ID).get();
+        assertThat(row.lastApplied().recordingId()).isEqualTo(17L);
+        assertThat(row.lastApplied().position()).isEqualTo(0L);
+        assertThat(row.highWater()).isNotNull();
+        assertThat(row.highWater().recordingId()).isEqualTo(17L);
+        assertThat(row.highWater().position()).isEqualTo(0L);
+        assertThat(row.isRewound()).isFalse();
+    }
+
+    @Test
+    void v60_resetWithRecording_doesNotTouchHighWater_so_rewindIsDetectable() {
+        // Steady-state: advance lockstep-bumps both pairs.
+        cursorRepository.advanceWithRecording(EGRESS_ID, STREAM_ID, 16L, 5_000L);
+
+        // Operator rewinds via resetWithRecording. last_applied moves backwards; high_water
+        // stays in place. This is the breadcrumb that lets init() detect the rewind.
+        cursorRepository.resetWithRecording(EGRESS_ID, STREAM_ID, 16L, 100L);
+
+        OmsFixEgressCursorRepository.RecordedCursorWithHighWater row =
+                cursorRepository.findLastAppliedCursorWithHighWater(EGRESS_ID, STREAM_ID).get();
+        assertThat(row.lastApplied().recordingId()).isEqualTo(16L);
+        assertThat(row.lastApplied().position()).isEqualTo(100L);
+        assertThat(row.highWater().recordingId()).isEqualTo(16L);
+        assertThat(row.highWater().position()).isEqualTo(5_000L);
+        assertThat(row.isRewound()).isTrue();
+    }
+
+    @Test
+    void v60_resetWithRecording_rewindToLowerRecordingId_isDetectable() {
+        cursorRepository.advanceWithRecording(EGRESS_ID, STREAM_ID, 16L, 0L);
+        cursorRepository.resetWithRecording(EGRESS_ID, STREAM_ID, 12L, 0L);
+
+        OmsFixEgressCursorRepository.RecordedCursorWithHighWater row =
+                cursorRepository.findLastAppliedCursorWithHighWater(EGRESS_ID, STREAM_ID).get();
+        assertThat(row.lastApplied().recordingId()).isEqualTo(12L);
+        assertThat(row.highWater().recordingId()).isEqualTo(16L);
+        assertThat(row.isRewound()).isTrue();
+    }
+
+    @Test
+    void v60_setHighWater_acknowledgesRewind_isRewoundReturnsFalse() {
+        cursorRepository.advanceWithRecording(EGRESS_ID, STREAM_ID, 16L, 5_000L);
+        cursorRepository.resetWithRecording(EGRESS_ID, STREAM_ID, 12L, 0L);
+
+        // Operator acknowledges the rewind by zeroing the high-water mark.
+        cursorRepository.setHighWater(EGRESS_ID, STREAM_ID, 12L, 0L);
+
+        OmsFixEgressCursorRepository.RecordedCursorWithHighWater row =
+                cursorRepository.findLastAppliedCursorWithHighWater(EGRESS_ID, STREAM_ID).get();
+        assertThat(row.lastApplied().recordingId()).isEqualTo(12L);
+        assertThat(row.lastApplied().position()).isEqualTo(0L);
+        assertThat(row.highWater().recordingId()).isEqualTo(12L);
+        assertThat(row.highWater().position()).isEqualTo(0L);
+        assertThat(row.isRewound()).isFalse();
+    }
+
+    @Test
+    void v60_resetWithRecording_freshInsert_leavesHighWaterNull_treatedAsFirstStart() {
+        // Fresh insert via resetWithRecording (operator bootstrap path or first-ever start
+        // taken by the egress' bootstrapFromOldestRecording). High-water columns stay NULL;
+        // init() must treat that as "first-ever V60 boot, not a rewind".
+        cursorRepository.resetWithRecording(EGRESS_ID, STREAM_ID, 12L, 0L);
+
+        OmsFixEgressCursorRepository.RecordedCursorWithHighWater row =
+                cursorRepository.findLastAppliedCursorWithHighWater(EGRESS_ID, STREAM_ID).get();
+        assertThat(row.lastApplied().recordingId()).isEqualTo(12L);
+        assertThat(row.highWater()).isNull();
+        assertThat(row.isRewound()).isFalse();
+
+        // The next successful advance lockstep-seeds the high-water columns.
+        cursorRepository.advanceWithRecording(EGRESS_ID, STREAM_ID, 12L, 100L);
+        OmsFixEgressCursorRepository.RecordedCursorWithHighWater after =
+                cursorRepository.findLastAppliedCursorWithHighWater(EGRESS_ID, STREAM_ID).get();
+        assertThat(after.lastApplied().position()).isEqualTo(100L);
+        assertThat(after.highWater()).isNotNull();
+        assertThat(after.highWater().recordingId()).isEqualTo(12L);
+        assertThat(after.highWater().position()).isEqualTo(100L);
+    }
+
+    @Test
+    void v60_recordedCursor_compareLex_legacyRow_throws() {
+        OmsFixEgressCursorRepository.RecordedCursor legacy =
+                OmsFixEgressCursorRepository.RecordedCursor.legacyWithoutRecordingId(100L);
+        OmsFixEgressCursorRepository.RecordedCursor normal =
+                OmsFixEgressCursorRepository.RecordedCursor.of(16L, 100L);
+
+        org.junit.jupiter.api.Assertions.assertThrows(
+                IllegalStateException.class, () -> legacy.compareLex(normal));
+        org.junit.jupiter.api.Assertions.assertThrows(
+                IllegalStateException.class, () -> normal.compareLex(legacy));
+    }
 }

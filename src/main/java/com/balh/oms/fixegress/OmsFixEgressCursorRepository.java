@@ -76,6 +76,20 @@ public class OmsFixEgressCursorRepository {
                AND stream_id = :stream_id
             """;
 
+    /**
+     * V60 high-water columns. Read alongside {@link #SELECT_CURSOR_SQL} when the egress'
+     * init() rewind guard needs to compare the saved cursor against the historical high
+     * water mark. Returning both pairs in one row avoids a second round-trip and avoids
+     * the read-skew window between the two queries.
+     */
+    private static final String SELECT_CURSOR_AND_HIGH_WATER_SQL = """
+            SELECT last_applied_recording_id, last_applied_position,
+                   high_water_recording_id, high_water_position
+              FROM oms_fix_egress_cursor
+             WHERE egress_id = :egress_id
+               AND stream_id = :stream_id
+            """;
+
     /** Slice 4d: source for the {@code oms.fix_egress.lag_seconds} gauge. */
     private static final String SELECT_LAST_APPLIED_AT_SQL = """
             SELECT last_applied_at
@@ -99,14 +113,29 @@ public class OmsFixEgressCursorRepository {
      * recording id equals the saved one and the position is strictly higher. A {@code NULL}
      * saved recording id never matches under this guard — those rows must be repaired via
      * {@link #resetWithRecording} before a recording-aware caller can advance them.
+     *
+     * <p><b>V60 high-water bookkeeping.</b> On every successful advance the high-water columns
+     * are pinned to the new {@code (recording_id, position)} too, since by construction the
+     * lexicographic monotonic guard makes the new pair the new maximum. A fresh insert (no
+     * prior row) seeds both pairs to the same value. The high-water columns are intentionally
+     * NOT touched by {@link #RESET_WITH_RECORDING_SQL} below — that is the operator-rewind
+     * affordance that {@link OmsFixEgressService#init} uses to detect rewinds.
      */
     private static final String UPSERT_WITH_RECORDING_SQL = """
             INSERT INTO oms_fix_egress_cursor
-                (egress_id, stream_id, last_applied_recording_id, last_applied_position, last_applied_at)
-            VALUES (:egress_id, :stream_id, :last_applied_recording_id, :last_applied_position, NOW())
+                (egress_id, stream_id,
+                 last_applied_recording_id, last_applied_position,
+                 high_water_recording_id, high_water_position,
+                 last_applied_at)
+            VALUES (:egress_id, :stream_id,
+                    :last_applied_recording_id, :last_applied_position,
+                    :last_applied_recording_id, :last_applied_position,
+                    NOW())
             ON CONFLICT (egress_id, stream_id) DO UPDATE
                SET last_applied_recording_id = EXCLUDED.last_applied_recording_id,
                    last_applied_position = EXCLUDED.last_applied_position,
+                   high_water_recording_id = EXCLUDED.last_applied_recording_id,
+                   high_water_position = EXCLUDED.last_applied_position,
                    last_applied_at = EXCLUDED.last_applied_at
              WHERE oms_fix_egress_cursor.last_applied_recording_id IS NOT NULL
                AND (
@@ -126,6 +155,16 @@ public class OmsFixEgressCursorRepository {
                    last_applied_at = EXCLUDED.last_applied_at
             """;
 
+    /**
+     * <b>Does NOT touch the V60 high-water columns.</b> That is intentional: when an operator
+     * rewinds the cursor via {@code resetWithRecording(R, P)} to recover from a recording
+     * trim or to re-seed bootstrap, the historical high-water mark stays in place so that
+     * {@link OmsFixEgressService#init} can detect the rewind and refuse to start without
+     * explicit operator acknowledgement. For a fresh insert (no prior row), the high-water
+     * columns are left {@code NULL} on purpose — init() treats {@code NULL} high-water as
+     * "first-ever V60 boot" and seeds it from {@code last_applied_*} after the first
+     * successful advance.
+     */
     private static final String RESET_WITH_RECORDING_SQL = """
             INSERT INTO oms_fix_egress_cursor
                 (egress_id, stream_id, last_applied_recording_id, last_applied_position, last_applied_at)
@@ -134,6 +173,22 @@ public class OmsFixEgressCursorRepository {
                SET last_applied_recording_id = EXCLUDED.last_applied_recording_id,
                    last_applied_position = EXCLUDED.last_applied_position,
                    last_applied_at = EXCLUDED.last_applied_at
+            """;
+
+    /**
+     * V60 operator-explicit affordance: zero the high-water mark to acknowledge a rewind
+     * decision before next start. Sets {@code high_water_recording_id} and
+     * {@code high_water_position} to the values supplied (typically the same as
+     * {@code last_applied_*}), bypassing the lock-step bump that {@link #UPSERT_WITH_RECORDING_SQL}
+     * provides on the advance path. Never called by the egress' hot path; only invoked by
+     * the operator cursor-repair script and a follow-up admin tool.
+     */
+    private static final String SET_HIGH_WATER_SQL = """
+            UPDATE oms_fix_egress_cursor
+               SET high_water_recording_id = :recording_id,
+                   high_water_position = :position
+             WHERE egress_id = :egress_id
+               AND stream_id = :stream_id
             """;
 
     private final NamedParameterJdbcTemplate jdbc;
@@ -160,6 +215,56 @@ public class OmsFixEgressCursorRepository {
         } catch (EmptyResultDataAccessException e) {
             return OptionalLong.empty();
         }
+    }
+
+    /**
+     * V60 high-water-aware view. Returns the full snapshot of the cursor row needed by
+     * {@link OmsFixEgressService#init} to enforce the rewind guard: {@code last_applied}
+     * pair, {@code high_water} pair, plus presence flags for the legacy NULL paths
+     * (pre-V56 last_applied_recording_id NULL, pre-V60 high_water_* NULL).
+     */
+    public Optional<RecordedCursorWithHighWater> findLastAppliedCursorWithHighWater(
+            String egressId, int streamId) {
+        var params = new MapSqlParameterSource()
+                .addValue("egress_id", egressId)
+                .addValue("stream_id", streamId);
+        try {
+            return Optional.ofNullable(jdbc.queryForObject(
+                    SELECT_CURSOR_AND_HIGH_WATER_SQL,
+                    params,
+                    (rs, rowNum) -> {
+                        long lastRecordingId = rs.getLong(1);
+                        boolean lastRecordingIdPresent = !rs.wasNull();
+                        long lastPosition = rs.getLong(2);
+                        long highRecordingId = rs.getLong(3);
+                        boolean highRecordingIdPresent = !rs.wasNull();
+                        long highPosition = rs.getLong(4);
+                        boolean highPositionPresent = !rs.wasNull();
+                        return new RecordedCursorWithHighWater(
+                                lastRecordingIdPresent
+                                        ? RecordedCursor.of(lastRecordingId, lastPosition)
+                                        : RecordedCursor.legacyWithoutRecordingId(lastPosition),
+                                highRecordingIdPresent && highPositionPresent
+                                        ? RecordedCursor.of(highRecordingId, highPosition)
+                                        : null);
+                    }));
+        } catch (EmptyResultDataAccessException e) {
+            return Optional.empty();
+        }
+    }
+
+    /**
+     * V60 operator affordance. Sets the high-water mark to {@code (recordingId, position)},
+     * typically called by the cursor-repair tool to acknowledge an operator rewind. Never
+     * called on the hot path.
+     */
+    public void setHighWater(String egressId, int streamId, long recordingId, long position) {
+        var params = new MapSqlParameterSource()
+                .addValue("egress_id", egressId)
+                .addValue("stream_id", streamId)
+                .addValue("recording_id", recordingId)
+                .addValue("position", position);
+        jdbc.update(SET_HIGH_WATER_SQL, params);
     }
 
     /**
@@ -313,6 +418,39 @@ public class OmsFixEgressCursorRepository {
 
         public static RecordedCursor legacyWithoutRecordingId(long position) {
             return new RecordedCursor(0L, position, false);
+        }
+
+        /**
+         * Lexicographic order on {@code (recordingId, position)}. Both sides must have
+         * {@link #hasRecordingId()} true; comparing a legacy row is a programming bug and
+         * throws (init() loud-fails on legacy rows before this is ever reachable).
+         */
+        public int compareLex(RecordedCursor other) {
+            if (!this.hasRecordingId || !other.hasRecordingId) {
+                throw new IllegalStateException(
+                        "compareLex called on a legacy cursor without recording id; init() must"
+                                + " loud-fail on legacy rows before any comparison happens.");
+            }
+            int byRecording = Long.compare(this.recordingId, other.recordingId);
+            return byRecording != 0 ? byRecording : Long.compare(this.position, other.position);
+        }
+    }
+
+    /**
+     * V60. Full snapshot of a cursor row including the high-water mark. The {@code highWater}
+     * field is {@code null} when the row predates V60 — init() treats that as "first-ever V60
+     * boot" and lets the next advance seed the high-water columns from {@code lastApplied}.
+     */
+    public record RecordedCursorWithHighWater(RecordedCursor lastApplied, RecordedCursor highWater) {
+        /**
+         * @return true when a non-null {@code highWater} exists and lexicographically exceeds
+         *     {@code lastApplied} — the rewind signal init() acts on.
+         */
+        public boolean isRewound() {
+            return highWater != null
+                    && lastApplied.hasRecordingId()
+                    && highWater.hasRecordingId()
+                    && lastApplied.compareLex(highWater) < 0;
         }
     }
 }

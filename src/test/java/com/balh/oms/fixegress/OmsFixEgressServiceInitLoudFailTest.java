@@ -13,6 +13,7 @@ import java.time.Clock;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -68,7 +69,8 @@ class OmsFixEgressServiceInitLoudFailTest {
 
     @Test
     void init_emptyCursorTable_succeedsAndDefersToBootstrap() {
-        when(cursorRepository.findLastAppliedCursor(anyString(), anyInt())).thenReturn(Optional.empty());
+        when(cursorRepository.findLastAppliedCursorWithHighWater(anyString(), anyInt()))
+                .thenReturn(Optional.empty());
 
         egress.init();
 
@@ -80,25 +82,23 @@ class OmsFixEgressServiceInitLoudFailTest {
 
     @Test
     void init_recordingAwareCursor_seedsBothPositionAndRecordingId() {
-        when(cursorRepository.findLastAppliedCursor(anyString(), anyInt()))
-                .thenReturn(Optional.of(
-                        OmsFixEgressCursorRepository.RecordedCursor.of(16L, 42_464L)));
+        when(cursorRepository.findLastAppliedCursorWithHighWater(anyString(), anyInt()))
+                .thenReturn(Optional.of(new OmsFixEgressCursorRepository.RecordedCursorWithHighWater(
+                        OmsFixEgressCursorRepository.RecordedCursor.of(16L, 42_464L),
+                        OmsFixEgressCursorRepository.RecordedCursor.of(16L, 42_464L))));
 
         egress.init();
 
         assertThat(egress.lastAppliedPosition()).isEqualTo(42_464L);
-        // currentRecordingId is package-private state; we verify it indirectly: init() seeded
-        // both fields and the no-op replay thread will exit cleanly (aeronDirectory blank).
-        // The recording-id seed itself is exercised by the service-test setUp's manual seed
-        // in the apply-path tests; the projector twin test makes the same trade-off.
         egress.close();
     }
 
     @Test
     void init_legacyNullRecordingIdCursor_failsLoudWithRepairSql() {
-        when(cursorRepository.findLastAppliedCursor(anyString(), anyInt()))
-                .thenReturn(Optional.of(
-                        OmsFixEgressCursorRepository.RecordedCursor.legacyWithoutRecordingId(42_464L)));
+        when(cursorRepository.findLastAppliedCursorWithHighWater(anyString(), anyInt()))
+                .thenReturn(Optional.of(new OmsFixEgressCursorRepository.RecordedCursorWithHighWater(
+                        OmsFixEgressCursorRepository.RecordedCursor.legacyWithoutRecordingId(42_464L),
+                        null)));
 
         assertThatThrownBy(egress::init)
                 .isInstanceOf(IllegalStateException.class)
@@ -108,5 +108,84 @@ class OmsFixEgressServiceInitLoudFailTest {
                 .hasMessageContaining("WHERE egress_id = '" + OmsFixEgressService.EGRESS_ID + "'")
                 .hasMessageContaining("stream_id = " + OmsClusterWireFormat.EVENTS_STREAM_ID)
                 .hasMessageContaining("42464");
+    }
+
+    @Test
+    void init_v60_preV60RowWithNullHighWater_succeedsBecauseHighWaterSeedsOnFirstAdvance() {
+        // High-water columns NULL (row was last written by pre-V60 code or by V60
+        // resetWithRecording on a fresh insert). init() treats this as a normal recording-aware
+        // resume; first successful advance after start lockstep-bumps the high-water mark.
+        when(cursorRepository.findLastAppliedCursorWithHighWater(anyString(), anyInt()))
+                .thenReturn(Optional.of(new OmsFixEgressCursorRepository.RecordedCursorWithHighWater(
+                        OmsFixEgressCursorRepository.RecordedCursor.of(16L, 42_464L),
+                        null)));
+
+        assertThatCode(egress::init).doesNotThrowAnyException();
+        assertThat(egress.lastAppliedPosition()).isEqualTo(42_464L);
+        egress.close();
+    }
+
+    @Test
+    void init_v60_lastAppliedEqualsHighWater_succeedsNoRewindDetected() {
+        // Normal steady state: cursor advanced through advanceWithRecording so both pairs are
+        // in sync. Lex-compare returns 0; isRewound() returns false.
+        when(cursorRepository.findLastAppliedCursorWithHighWater(anyString(), anyInt()))
+                .thenReturn(Optional.of(new OmsFixEgressCursorRepository.RecordedCursorWithHighWater(
+                        OmsFixEgressCursorRepository.RecordedCursor.of(16L, 42_464L),
+                        OmsFixEgressCursorRepository.RecordedCursor.of(16L, 42_464L))));
+
+        assertThatCode(egress::init).doesNotThrowAnyException();
+        egress.close();
+    }
+
+    @Test
+    void init_v60_rewoundWithinSameRecording_failsLoudWithHighWaterAck() {
+        // Operator UPDATEd last_applied_position backwards within the same recording. Egress
+        // refuses with a SQL repair string that zeroes the high-water mark to (16, 100).
+        when(cursorRepository.findLastAppliedCursorWithHighWater(anyString(), anyInt()))
+                .thenReturn(Optional.of(new OmsFixEgressCursorRepository.RecordedCursorWithHighWater(
+                        OmsFixEgressCursorRepository.RecordedCursor.of(16L, 100L),
+                        OmsFixEgressCursorRepository.RecordedCursor.of(16L, 42_464L))));
+
+        assertThatThrownBy(egress::init)
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("cursor has been rewound")
+                .hasMessageContaining("last_applied=(recordingId=16, position=100)")
+                .hasMessageContaining("high_water=(recordingId=16, position=42464)")
+                .hasMessageContaining("re-ship admit events as duplicate NOS")
+                .hasMessageContaining("high_water_recording_id = 16")
+                .hasMessageContaining("high_water_position = 100")
+                .hasMessageContaining("handover");
+    }
+
+    @Test
+    void init_v60_rewoundToLowerRecording_failsLoudWithHighWaterAck() {
+        // Operator rewound the cursor to a lower recording id (e.g. (12, 0) after pin to (16, 0)).
+        // Egress refuses; repair SQL targets the lower (12, 0) pair.
+        when(cursorRepository.findLastAppliedCursorWithHighWater(anyString(), anyInt()))
+                .thenReturn(Optional.of(new OmsFixEgressCursorRepository.RecordedCursorWithHighWater(
+                        OmsFixEgressCursorRepository.RecordedCursor.of(12L, 0L),
+                        OmsFixEgressCursorRepository.RecordedCursor.of(16L, 0L))));
+
+        assertThatThrownBy(egress::init)
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("cursor has been rewound")
+                .hasMessageContaining("last_applied=(recordingId=12, position=0)")
+                .hasMessageContaining("high_water=(recordingId=16, position=0)")
+                .hasMessageContaining("high_water_recording_id = 12")
+                .hasMessageContaining("high_water_position = 0");
+    }
+
+    @Test
+    void init_v60_rewindAckBySettingHighWaterToLastApplied_allowsStart() {
+        // Operator did the rewind AND zeroed high_water (= last_applied). isRewound() returns
+        // false because compareLex == 0. Start permitted.
+        when(cursorRepository.findLastAppliedCursorWithHighWater(anyString(), anyInt()))
+                .thenReturn(Optional.of(new OmsFixEgressCursorRepository.RecordedCursorWithHighWater(
+                        OmsFixEgressCursorRepository.RecordedCursor.of(12L, 0L),
+                        OmsFixEgressCursorRepository.RecordedCursor.of(12L, 0L))));
+
+        assertThatCode(egress::init).doesNotThrowAnyException();
+        egress.close();
     }
 }

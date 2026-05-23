@@ -519,42 +519,10 @@ public class OmsPostgresProjector {
                                 + "; init() / bootstrap should have set it. This is a programming bug.");
             }
             RecordingDescriptor descriptor = findRecordingById(archive, recordingIdNow);
-            if (descriptor == null) {
-                // Saved recording id is no longer listed in the Archive. This is not a "the
-                // recording is empty so reset to 0" situation — it means the on-disk recording
-                // files for our saved id have been deleted (manual rm, archive recompaction,
-                // disk wipe). Silent reset would lose every event up to the saved position.
-                // FAIL LOUD instead; operator decides whether to bootstrap fresh
-                // (resetWithRecording to (newOldestId, 0) and accept loss) or restore the
-                // recording files.
-                throw new IllegalStateException(
-                        "oms-postgres-projector cannot continue: saved recordingId="
-                                + recordingIdNow
-                                + " is not listed in the Aeron Archive for events stream "
-                                + OmsClusterWireFormat.EVENTS_STREAM_ID
-                                + " (channel=" + OmsClusterWireFormat.EVENTS_CHANNEL + ")."
-                                + " The recording files may have been deleted or the projector is wired to the wrong"
-                                + " Aeron Archive. Operator must decide between (a) repointing to a different Archive,"
-                                + " or (b) accepting data loss by running resetWithRecording to a known-good"
-                                + " (recordingId, position). Refusing to silently reset to position 0 of an unrelated"
-                                + " recording — see handover §9.");
-            }
+            requireRecordingPresent(recordingIdNow, descriptor);
             long savedPosition = lastAppliedPosition.get();
             long upperBound = recordingUpperBound(archive, descriptor);
-            if (savedPosition > upperBound) {
-                // Saved position is beyond the end of this recording. Pre-hardening behaviour
-                // silently reset to descriptor.startPosition() and persisted that — which is
-                // exactly what destroyed pop's cursor on 2026-05-23. We refuse and FAIL LOUD.
-                throw new IllegalStateException(
-                        "oms-postgres-projector saved cursor (recordingId="
-                                + recordingIdNow
-                                + ", position=" + savedPosition + ") is past the end of the recording (upperBound="
-                                + upperBound + ", startPosition=" + descriptor.startPosition()
-                                + ", stopPosition=" + descriptor.stopPosition()
-                                + "). This indicates the recording was truncated or replaced under the projector."
-                                + " Refusing to silently reset to position 0 — operator must inspect via"
-                                + " AeronArchive control + resetWithRecording to a verified (recordingId, position).");
-            }
+            requirePositionWithinRecording(recordingIdNow, savedPosition, upperBound, descriptor);
             if (savedPosition < descriptor.startPosition()) {
                 // Saved position is below the recording's start. Reset upward to the recording's
                 // start is safe because the projector's row writes are idempotent (orders ON CONFLICT,
@@ -723,7 +691,60 @@ public class OmsPostgresProjector {
      * Snapshot of the recording's identity and bounds returned by
      * {@link AeronArchive#listRecordingsForUri}.
      */
-    private record RecordingDescriptor(long recordingId, long startPosition, long stopPosition) {}
+    record RecordingDescriptor(long recordingId, long startPosition, long stopPosition) {}
+
+    /**
+     * Loud-fail when the saved recording id is no longer listed in the Aeron Archive. The
+     * pre-hardening behaviour was to silently reset to position 0 of the active recording on
+     * this branch, which would lose every event up to the saved position (the projector bug
+     * fixed by V55 on 2026-05-23). Refuse instead; operator decides whether to bootstrap
+     * fresh via {@code resetWithRecording(newOldestId, 0)} (accept loss) or restore the
+     * recording files. Package-private so the unit test in {@code OmsPostgresProjectorReplayCursorGuardTest}
+     * can exercise both branches without standing up a real {@link AeronArchive}.
+     */
+    static void requireRecordingPresent(long savedRecordingId, RecordingDescriptor descriptor) {
+        if (descriptor != null) {
+            return;
+        }
+        throw new IllegalStateException(
+                "oms-postgres-projector cannot continue: saved recordingId="
+                        + savedRecordingId
+                        + " is not listed in the Aeron Archive for events stream "
+                        + OmsClusterWireFormat.EVENTS_STREAM_ID
+                        + " (channel=" + OmsClusterWireFormat.EVENTS_CHANNEL + ")."
+                        + " The recording files may have been deleted or the projector is wired to the wrong"
+                        + " Aeron Archive. Operator must decide between (a) repointing to a different Archive,"
+                        + " or (b) accepting data loss by running resetWithRecording to a known-good"
+                        + " (recordingId, position). Refusing to silently reset to position 0 of an unrelated"
+                        + " recording — see handover §9.");
+    }
+
+    /**
+     * Loud-fail when the saved cursor position is past the live upper bound (stopPosition for
+     * a closed recording, write-head for an active one). The pre-hardening behaviour silently
+     * reset to {@code descriptor.startPosition()} and persisted that — exactly the bug that
+     * destroyed pop's cursor on 2026-05-23. Refuse instead; operator must verify and
+     * {@code resetWithRecording} to a known-good {@code (recordingId, position)}.
+     * Package-private for unit tests.
+     */
+    static void requirePositionWithinRecording(
+            long savedRecordingId,
+            long savedPosition,
+            long upperBound,
+            RecordingDescriptor descriptor) {
+        if (savedPosition <= upperBound) {
+            return;
+        }
+        throw new IllegalStateException(
+                "oms-postgres-projector saved cursor (recordingId="
+                        + savedRecordingId
+                        + ", position=" + savedPosition + ") is past the end of the recording (upperBound="
+                        + upperBound + ", startPosition=" + descriptor.startPosition()
+                        + ", stopPosition=" + descriptor.stopPosition()
+                        + "). This indicates the recording was truncated or replaced under the projector."
+                        + " Refusing to silently reset to position 0 — operator must inspect via"
+                        + " AeronArchive control + resetWithRecording to a verified (recordingId, position).");
+    }
 
     /**
      * Decodes one fragment and applies it to Postgres inside a single transaction:

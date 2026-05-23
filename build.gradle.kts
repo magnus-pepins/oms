@@ -396,6 +396,38 @@ tasks.register<JavaExec>("clusterSnapshot") {
 }
 
 /**
+ * 2026-05-23 gap 1: rebuild the projector's `orders` rows from the cluster's latest snapshot.
+ * Dry-run by default (writes JSON to stdout); pass `-Pcommit=true` to apply INSERT ... ON
+ * CONFLICT DO NOTHING. The tool reads the cluster's Aeron MediaDriver + Archive as a client
+ * (no consensus join), decodes the snapshot via `OmsClusterSnapshotDecoder`, and inserts
+ * missing rows only — never updates existing ones. Per `no-oms-mutations.mdc`, the agent must
+ * not run `-Pcommit=true` without explicit per-action operator approval naming this task.
+ * See `system-documentation/handovers/2026-05-23-oms-snapshot-magic-mismatch-and-stability-rework.md`
+ * §10 for the full recovery runbook.
+ */
+tasks.register<JavaExec>("rebuildProjectorOrdersFromSnapshot") {
+    group = "application"
+    description =
+        "Rebuild projector orders rows from the latest cluster snapshot." +
+                " Dry-run by default; pass -Pcommit=true to apply INSERTs." +
+                " -PsnapshotRecordingId=N pins a specific snapshot recording."
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.balh.oms.cluster.admin.OmsProjectorRebuildFromSnapshotTool")
+    jvmArgs(lowLatencyJvmModuleOpens)
+    doFirst {
+        val toolArgs = mutableListOf<String>()
+        if (project.hasProperty("commit") && project.property("commit") == "true") {
+            toolArgs.add("--commit")
+        }
+        if (project.hasProperty("snapshotRecordingId")) {
+            toolArgs.add("--snapshot-recording-id")
+            toolArgs.add(project.property("snapshotRecordingId").toString())
+        }
+        args = toolArgs
+    }
+}
+
+/**
  * Phase 4 slice 4e (cluster bench harness): boot a single-node in-process Aeron Cluster, run a
  * steady-state AcceptOrderCommand offer loop at OMS_BENCH_THROUGHPUT_OPS_PER_S for
  * OMS_BENCH_DURATION_S, capture HdrHistogram of commit-round-trip latencies, write summary.md +

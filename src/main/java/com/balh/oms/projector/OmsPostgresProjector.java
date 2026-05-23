@@ -593,18 +593,13 @@ public class OmsPostgresProjector {
                     long recordingStop = refreshed.stopPosition();
                     long currentApplied = lastAppliedPosition.get();
                     RecordingDescriptor successor = findNextRecording(archive, recordingIdNow);
-                    boolean caughtUpToClosedRecording =
-                            recordingStop != io.aeron.archive.client.AeronArchive.NULL_POSITION
-                                    && currentApplied >= recordingStop;
-                    boolean staleOpenRecording =
-                            recordingStop == io.aeron.archive.client.AeronArchive.NULL_POSITION
-                                    && successor != null;
-                    if ((caughtUpToClosedRecording || staleOpenRecording) && successor != null) {
+                    WalkForwardDecision decision = decideWalkForward(recordingStop, currentApplied, successor);
+                    if (decision.walk) {
                         log.info(
                                 "Projector recording boundary: recordingId={} {} at stopPosition={};"
                                         + " rolling forward to recordingId={} startPosition={}.",
                                 recordingIdNow,
-                                caughtUpToClosedRecording ? "complete" : "stale-open (successor exists)",
+                                decision.reason,
                                 recordingStop,
                                 successor.recordingId(),
                                 successor.startPosition());
@@ -710,6 +705,51 @@ public class OmsPostgresProjector {
      * {@link AeronArchive#listRecordingsForUri}.
      */
     record RecordingDescriptor(long recordingId, long startPosition, long stopPosition) {}
+
+    /**
+     * Outcome of the per-poll walk-forward decision: should the replay loop break out of the
+     * current recording and reopen against {@code successor}? Used by
+     * {@link #runReplayLoopWithRecordingWalk} and tested directly by
+     * {@code OmsPostgresProjectorWalkForwardTest}.
+     */
+    record WalkForwardDecision(boolean walk, String reason) {
+        static WalkForwardDecision park() {
+            return new WalkForwardDecision(false, "park");
+        }
+    }
+
+    /**
+     * Pure decision function — package-private for unit test. Walk forward when either
+     * <ul>
+     *   <li>the current recording is closed ({@code recordingStop != NULL_POSITION}) and we've
+     *       fully drained it ({@code currentApplied >= recordingStop}), AND a successor
+     *       exists, OR</li>
+     *   <li>the current recording is stuck-open ({@code recordingStop == NULL_POSITION},
+     *       typically a recording from a crashed cluster session that was never properly
+     *       closed) AND a higher-id recording exists on the same channel+stream — the
+     *       cluster only writes to one recording at a time, so a successor's existence
+     *       proves the current recording is no longer being written to.</li>
+     * </ul>
+     * Without the stale-open branch the projector parked forever on the dead recording 16
+     * on pop after the 2026-05-23 cluster crash + restart cycle, leaving the
+     * {@code cluster=9 projector=0} open-orders drift unresolved.
+     */
+    static WalkForwardDecision decideWalkForward(
+            long recordingStop, long currentApplied, RecordingDescriptor successor) {
+        if (successor == null) {
+            return WalkForwardDecision.park();
+        }
+        long nullPos = io.aeron.archive.client.AeronArchive.NULL_POSITION;
+        boolean closedAndDrained = recordingStop != nullPos && currentApplied >= recordingStop;
+        boolean staleOpen = recordingStop == nullPos;
+        if (closedAndDrained) {
+            return new WalkForwardDecision(true, "complete");
+        }
+        if (staleOpen) {
+            return new WalkForwardDecision(true, "stale-open (successor exists)");
+        }
+        return WalkForwardDecision.park();
+    }
 
     /**
      * Loud-fail when the saved recording id is no longer listed in the Aeron Archive. The

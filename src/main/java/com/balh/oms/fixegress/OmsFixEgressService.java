@@ -599,18 +599,13 @@ public class OmsFixEgressService {
                     long recordingStop = refreshed.stopPosition();
                     long currentApplied = lastAppliedPosition.get();
                     RecordingDescriptor successor = findNextRecording(archive, recordingIdNow);
-                    boolean caughtUpToClosedRecording =
-                            recordingStop != AeronArchive.NULL_POSITION
-                                    && currentApplied >= recordingStop;
-                    boolean staleOpenRecording =
-                            recordingStop == AeronArchive.NULL_POSITION
-                                    && successor != null;
-                    if ((caughtUpToClosedRecording || staleOpenRecording) && successor != null) {
+                    WalkForwardDecision decision = decideWalkForward(recordingStop, currentApplied, successor);
+                    if (decision.walk) {
                         log.info(
                                 "Egress recording boundary: recordingId={} {} at stopPosition={};"
                                         + " rolling forward to recordingId={} startPosition={}.",
                                 recordingIdNow,
-                                caughtUpToClosedRecording ? "complete" : "stale-open (successor exists)",
+                                decision.reason,
                                 recordingStop,
                                 successor.recordingId(),
                                 successor.startPosition());
@@ -777,6 +772,42 @@ public class OmsFixEgressService {
      * {@link AeronArchive#listRecordingsForUri}.
      */
     record RecordingDescriptor(long recordingId, long startPosition, long stopPosition) {}
+
+    /**
+     * Outcome of the per-poll walk-forward decision: should the replay loop break out of the
+     * current recording and reopen against {@code successor}? Same shape as the projector's
+     * decision (see {@code OmsPostgresProjector.WalkForwardDecision}) on purpose — both
+     * services run the same recording-walk machinery against the same Aeron Archive.
+     */
+    record WalkForwardDecision(boolean walk, String reason) {
+        static WalkForwardDecision park() {
+            return new WalkForwardDecision(false, "park");
+        }
+    }
+
+    /**
+     * Pure decision function — package-private for {@code OmsFixEgressServiceWalkForwardTest}.
+     * Walk forward when either (a) the current recording is closed and we've fully drained
+     * it, OR (b) the current recording is stuck-open ({@code stopPosition == NULL_POSITION}
+     * from a crashed cluster session) AND a successor exists. The stale-open branch was
+     * added 2026-05-23 alongside the projector fix — without it the egress would park
+     * forever on a dead recording after any ungraceful cluster restart, dropping new FIX
+     * emissions.
+     */
+    static WalkForwardDecision decideWalkForward(
+            long recordingStop, long currentApplied, RecordingDescriptor successor) {
+        if (successor == null) {
+            return WalkForwardDecision.park();
+        }
+        long nullPos = AeronArchive.NULL_POSITION;
+        if (recordingStop != nullPos && currentApplied >= recordingStop) {
+            return new WalkForwardDecision(true, "complete");
+        }
+        if (recordingStop == nullPos) {
+            return new WalkForwardDecision(true, "stale-open (successor exists)");
+        }
+        return WalkForwardDecision.park();
+    }
 
     /**
      * Loud-fail when the saved recording id is no longer listed in the Aeron Archive. The

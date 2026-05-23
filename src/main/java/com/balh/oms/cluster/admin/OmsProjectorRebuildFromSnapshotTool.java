@@ -518,22 +518,25 @@ public final class OmsProjectorRebuildFromSnapshotTool {
         };
     }
 
+    // Side / TIF wire codes are owned by AcceptOrderCommand; we delegate to its sideName /
+    // timeInForceName so the tool can't drift off the cluster's encoding. Re-asserting the
+    // ordinals here (BUY=0, SELL=1; DAY=0, IOC=1, FOK=2, GTC=3) only as documentation.
     static String sideName(byte side) {
-        return switch (side) {
-            case 1 -> "BUY";
-            case 2 -> "SELL";
-            default -> throw new IllegalStateException("unknown side=" + side);
-        };
+        if (side != com.balh.oms.cluster.AcceptOrderCommand.SIDE_BUY
+                && side != com.balh.oms.cluster.AcceptOrderCommand.SIDE_SELL) {
+            throw new IllegalStateException("unknown side=" + side);
+        }
+        return com.balh.oms.cluster.AcceptOrderCommand.sideName(side);
     }
 
     static String tifName(byte tif) {
-        return switch (tif) {
-            case 1 -> "DAY";
-            case 2 -> "GTC";
-            case 3 -> "IOC";
-            case 4 -> "FOK";
-            default -> throw new IllegalStateException("unknown tif=" + tif);
-        };
+        if (tif != com.balh.oms.cluster.AcceptOrderCommand.TIF_DAY
+                && tif != com.balh.oms.cluster.AcceptOrderCommand.TIF_IOC
+                && tif != com.balh.oms.cluster.AcceptOrderCommand.TIF_FOK
+                && tif != com.balh.oms.cluster.AcceptOrderCommand.TIF_GTC) {
+            throw new IllegalStateException("unknown tif=" + tif);
+        }
+        return com.balh.oms.cluster.AcceptOrderCommand.timeInForceName(tif);
     }
 
     static BigDecimal scaledToDecimal(long scaled, long denom) {

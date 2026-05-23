@@ -103,25 +103,38 @@ class OmsProjectorRebuildFromSnapshotToolTest {
     }
 
     @Test
-    void sideName_mappingMatchesDomainSideName() {
-        // Two-byte side wire: BUY=1, SELL=2 (see AcceptOrderCommand.sideName equivalent in
-        // cluster wire format). Assert against Side enum to catch any drift.
-        assertThat(OmsProjectorRebuildFromSnapshotTool.sideName((byte) 1)).isEqualTo(Side.BUY.name());
-        assertThat(OmsProjectorRebuildFromSnapshotTool.sideName((byte) 2)).isEqualTo(Side.SELL.name());
+    void sideName_mappingMatchesAcceptOrderCommand() {
+        // Wire codes are owned by AcceptOrderCommand (SIDE_BUY=0, SIDE_SELL=1) — same constants
+        // the cluster's admit path writes and the projector reads. The previous version of this
+        // test asserted BUY=1/SELL=2 and was the cause of the live pop dry-run failing with
+        // "unknown side=0" on the first decoded order — the test had captured the tool author's
+        // wrong assumption rather than the actual wire format. Don't change these numbers
+        // without also updating AcceptOrderCommand.
+        assertThat(OmsProjectorRebuildFromSnapshotTool.sideName(com.balh.oms.cluster.AcceptOrderCommand.SIDE_BUY))
+                .isEqualTo(Side.BUY.name());
+        assertThat(OmsProjectorRebuildFromSnapshotTool.sideName(com.balh.oms.cluster.AcceptOrderCommand.SIDE_SELL))
+                .isEqualTo(Side.SELL.name());
     }
 
     @Test
     void sideName_unknown_throws() {
-        assertThatThrownBy(() -> OmsProjectorRebuildFromSnapshotTool.sideName((byte) 0))
+        // 99 is well outside the {0,1} valid range; using a sentinel byte instead of 0
+        // because 0 is the real SIDE_BUY value.
+        assertThatThrownBy(() -> OmsProjectorRebuildFromSnapshotTool.sideName((byte) 99))
                 .isInstanceOf(IllegalStateException.class);
     }
 
     @Test
     void tifName_knownCodes_returnHumanReadable() {
-        assertThat(OmsProjectorRebuildFromSnapshotTool.tifName((byte) 1)).isEqualTo("DAY");
-        assertThat(OmsProjectorRebuildFromSnapshotTool.tifName((byte) 2)).isEqualTo("GTC");
-        assertThat(OmsProjectorRebuildFromSnapshotTool.tifName((byte) 3)).isEqualTo("IOC");
-        assertThat(OmsProjectorRebuildFromSnapshotTool.tifName((byte) 4)).isEqualTo("FOK");
+        // TIF codes owned by AcceptOrderCommand (TIF_DAY=0 .. TIF_GTC=3).
+        assertThat(OmsProjectorRebuildFromSnapshotTool.tifName(com.balh.oms.cluster.AcceptOrderCommand.TIF_DAY))
+                .isEqualTo("DAY");
+        assertThat(OmsProjectorRebuildFromSnapshotTool.tifName(com.balh.oms.cluster.AcceptOrderCommand.TIF_IOC))
+                .isEqualTo("IOC");
+        assertThat(OmsProjectorRebuildFromSnapshotTool.tifName(com.balh.oms.cluster.AcceptOrderCommand.TIF_FOK))
+                .isEqualTo("FOK");
+        assertThat(OmsProjectorRebuildFromSnapshotTool.tifName(com.balh.oms.cluster.AcceptOrderCommand.TIF_GTC))
+                .isEqualTo("GTC");
     }
 
     @Test
@@ -140,10 +153,10 @@ class OmsProjectorRebuildFromSnapshotToolTest {
                 /* clientIdempotencyKey */ "key-with-\"quotes\"",
                 /* accountIdHash */ "h",
                 /* instrumentSymbol */ "AAPL",
-                /* side */ (byte) 1,
+                /* side */ com.balh.oms.cluster.AcceptOrderCommand.SIDE_BUY,
                 /* quantityScaled */ 100_000_000L,
                 /* limitPriceScaledOrZero */ 15_000_000_000L,
-                /* timeInForceCode */ (byte) 1,
+                /* timeInForceCode */ com.balh.oms.cluster.AcceptOrderCommand.TIF_DAY,
                 /* ledgerBalanceIdOrNull */ "bal-9",
                 /* version */ 7,
                 /* acceptedAtMillis */ 1_700_000_000_000L,
@@ -175,7 +188,9 @@ class OmsProjectorRebuildFromSnapshotToolTest {
         OmsAdmissionClusteredService.AdmittedOrder order = new OmsAdmissionClusteredService.AdmittedOrder(
                 UUID.randomUUID(),
                 "acct", "key", "h", "AAPL",
-                (byte) 1, 100L, 0L, (byte) 1,
+                com.balh.oms.cluster.AcceptOrderCommand.SIDE_BUY,
+                100L, 0L,
+                com.balh.oms.cluster.AcceptOrderCommand.TIF_DAY,
                 /* ledgerBalanceIdOrNull */ null,
                 0, 0L, (byte) 1, 0L, 0);
 

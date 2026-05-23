@@ -265,7 +265,7 @@ public class OmsFixEgressService {
         //                            recording when the saved position overshot, losing the
         //                            pointer to events in earlier recordings. We refuse to start
         //                            until an operator pins the recording id explicitly via SQL.
-        //   3. V60 rewind detected — high_water is non-NULL and lexicographically exceeds
+        //   3. V59 rewind detected — high_water is non-NULL and lexicographically exceeds
         //                            last_applied. Operator (or a bug) UPDATEd the cursor
         //                            backwards. Replaying from the rewound point would re-ship
         //                            duplicate NOS to the broker; refuse to start until the
@@ -294,7 +294,7 @@ public class OmsFixEgressService {
                             + repairSql
                             + " — see system-documentation/handovers/2026-05-23-oms-snapshot-magic-mismatch-and-stability-rework.md §9.6.");
         }
-        // V60 rewind guard. Honoured only when both pairs are recording-aware; legacy rows are
+        // V59 rewind guard. Honoured only when both pairs are recording-aware; legacy rows are
         // caught above. Refuses to start when last_applied < high_water lexicographically: that
         // means the cursor has been rewound (operator SQL UPDATE, a bug, or a recovery script
         // that didn't acknowledge the rewind by zeroing the high-water mark). Replaying from
@@ -578,9 +578,18 @@ public class OmsFixEgressService {
                     if (polled > 0) {
                         continue;
                     }
-                    // No fragments. Two cases:
-                    //   (a) live-tail wait on an active recording — park, keep polling.
-                    //   (b) end of a completed recording with a successor available — roll forward.
+                    // No fragments. Three cases — mirrors OmsPostgresProjector.runReplayLoopWithRecordingWalk:
+                    //   (a) live-tail wait on the cluster's currently-active recording — park.
+                    //   (b) end of a completed recording (stopPosition set) with a successor
+                    //       available — roll forward.
+                    //   (c) stale-open recording from a crashed cluster session: stopPosition
+                    //       is NULL_POSITION (never properly closed) but the cluster has
+                    //       restarted and is writing to a higher recordingId. Without this
+                    //       branch the egress would park on the dead recording forever and
+                    //       never emit FIX for new admits. Detected as "a successor exists on
+                    //       the same channel/stream" — cluster writes one recording at a time,
+                    //       so a higher recordingId means the current one is no longer being
+                    //       written to. Symmetric to the projector fix landed 2026-05-23.
                     RecordingDescriptor refreshed = findRecordingById(archive, recordingIdNow);
                     if (refreshed == null) {
                         // Recording vanished mid-replay (extremely unusual). Fall through to
@@ -589,34 +598,38 @@ public class OmsFixEgressService {
                     }
                     long recordingStop = refreshed.stopPosition();
                     long currentApplied = lastAppliedPosition.get();
-                    if (recordingStop != AeronArchive.NULL_POSITION
-                            && currentApplied >= recordingStop) {
-                        RecordingDescriptor successor = findNextRecording(archive, recordingIdNow);
-                        if (successor != null) {
-                            log.info(
-                                    "Egress recording boundary: recordingId={} complete at stopPosition={};"
-                                            + " rolling forward to recordingId={} startPosition={}.",
-                                    recordingIdNow,
-                                    recordingStop,
-                                    successor.recordingId(),
-                                    successor.startPosition());
-                            // CRITICAL: flush any pending batched cursor advance under the OLD
-                            // recording id BEFORE persisting the successor. If we skipped this,
-                            // a pendingCursorPosition belonging to the old recording would be
-                            // written with the new recording id by the next advanceCursor call,
-                            // violating the (recording_id, position) invariant.
-                            flushPendingCursorAdvance("recording boundary roll-forward");
-                            cursorRepository.resetWithRecording(
-                                    EGRESS_ID,
-                                    OmsClusterWireFormat.EVENTS_STREAM_ID,
-                                    successor.recordingId(),
-                                    successor.startPosition());
-                            currentRecordingId.set(successor.recordingId());
-                            lastAppliedPosition.set(successor.startPosition());
-                            pendingCursorPosition = successor.startPosition();
-                            eventsSinceCursorFlush = 0;
-                            break; // exit inner poll loop -> outer loop reopens against successor
-                        }
+                    RecordingDescriptor successor = findNextRecording(archive, recordingIdNow);
+                    boolean caughtUpToClosedRecording =
+                            recordingStop != AeronArchive.NULL_POSITION
+                                    && currentApplied >= recordingStop;
+                    boolean staleOpenRecording =
+                            recordingStop == AeronArchive.NULL_POSITION
+                                    && successor != null;
+                    if ((caughtUpToClosedRecording || staleOpenRecording) && successor != null) {
+                        log.info(
+                                "Egress recording boundary: recordingId={} {} at stopPosition={};"
+                                        + " rolling forward to recordingId={} startPosition={}.",
+                                recordingIdNow,
+                                caughtUpToClosedRecording ? "complete" : "stale-open (successor exists)",
+                                recordingStop,
+                                successor.recordingId(),
+                                successor.startPosition());
+                        // CRITICAL: flush any pending batched cursor advance under the OLD
+                        // recording id BEFORE persisting the successor. If we skipped this,
+                        // a pendingCursorPosition belonging to the old recording would be
+                        // written with the new recording id by the next advanceCursor call,
+                        // violating the (recording_id, position) invariant.
+                        flushPendingCursorAdvance("recording boundary roll-forward");
+                        cursorRepository.resetWithRecording(
+                                EGRESS_ID,
+                                OmsClusterWireFormat.EVENTS_STREAM_ID,
+                                successor.recordingId(),
+                                successor.startPosition());
+                        currentRecordingId.set(successor.recordingId());
+                        lastAppliedPosition.set(successor.startPosition());
+                        pendingCursorPosition = successor.startPosition();
+                        eventsSinceCursorFlush = 0;
+                        break; // exit inner poll loop -> outer loop reopens against successor
                     }
                     LockSupport.parkNanos(cfg.getPollParkNanos());
                 }

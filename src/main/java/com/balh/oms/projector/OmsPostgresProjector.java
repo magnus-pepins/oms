@@ -567,9 +567,23 @@ public class OmsPostgresProjector {
                     if (polled > 0) {
                         continue;
                     }
-                    // No fragments. Two cases:
-                    //   (a) live-tail wait on an active recording — park, keep polling.
-                    //   (b) end of a completed recording with a successor available — roll forward.
+                    // No fragments. Three cases:
+                    //   (a) live-tail wait on the cluster's currently-active recording — park,
+                    //       keep polling so newly written events flow through.
+                    //   (b) end of a completed recording (stopPosition set) with a successor
+                    //       available — roll forward to the successor.
+                    //   (c) stale-open recording from a crashed cluster session: the recording
+                    //       was never properly closed (stopPosition = NULL_POSITION) but the
+                    //       cluster has since restarted and is writing to a higher recordingId.
+                    //       Without this branch the projector would park on the dead recording
+                    //       forever and never pick up the new events. Detected as "a successor
+                    //       exists on the same channel/stream" — the cluster only writes to one
+                    //       recording at a time, so the existence of a higher recordingId on
+                    //       the events stream means the current recording is no longer being
+                    //       written to. The post-V55 pop incident on 2026-05-23 hit exactly
+                    //       this: cursor pinned to recording 16 (stop=-1 from a crash), cluster
+                    //       restarted into recordings 17, 18, ..., projector parked forever and
+                    //       the `cluster=9 projector=0` open-orders drift never closed.
                     RecordingDescriptor refreshed = findRecordingById(archive, recordingIdNow);
                     if (refreshed == null) {
                         // Recording vanished mid-replay (extremely unusual). Fall through to
@@ -578,26 +592,30 @@ public class OmsPostgresProjector {
                     }
                     long recordingStop = refreshed.stopPosition();
                     long currentApplied = lastAppliedPosition.get();
-                    if (recordingStop != io.aeron.archive.client.AeronArchive.NULL_POSITION
-                            && currentApplied >= recordingStop) {
-                        RecordingDescriptor successor = findNextRecording(archive, recordingIdNow);
-                        if (successor != null) {
-                            log.info(
-                                    "Projector recording boundary: recordingId={} complete at stopPosition={};"
-                                            + " rolling forward to recordingId={} startPosition={}.",
-                                    recordingIdNow,
-                                    recordingStop,
-                                    successor.recordingId(),
-                                    successor.startPosition());
-                            cursorRepository.resetWithRecording(
-                                    PROJECTOR_ID,
-                                    OmsClusterWireFormat.EVENTS_STREAM_ID,
-                                    successor.recordingId(),
-                                    successor.startPosition());
-                            currentRecordingId.set(successor.recordingId());
-                            lastAppliedPosition.set(successor.startPosition());
-                            break; // exit inner poll loop -> outer loop reopens against successor
-                        }
+                    RecordingDescriptor successor = findNextRecording(archive, recordingIdNow);
+                    boolean caughtUpToClosedRecording =
+                            recordingStop != io.aeron.archive.client.AeronArchive.NULL_POSITION
+                                    && currentApplied >= recordingStop;
+                    boolean staleOpenRecording =
+                            recordingStop == io.aeron.archive.client.AeronArchive.NULL_POSITION
+                                    && successor != null;
+                    if ((caughtUpToClosedRecording || staleOpenRecording) && successor != null) {
+                        log.info(
+                                "Projector recording boundary: recordingId={} {} at stopPosition={};"
+                                        + " rolling forward to recordingId={} startPosition={}.",
+                                recordingIdNow,
+                                caughtUpToClosedRecording ? "complete" : "stale-open (successor exists)",
+                                recordingStop,
+                                successor.recordingId(),
+                                successor.startPosition());
+                        cursorRepository.resetWithRecording(
+                                PROJECTOR_ID,
+                                OmsClusterWireFormat.EVENTS_STREAM_ID,
+                                successor.recordingId(),
+                                successor.startPosition());
+                        currentRecordingId.set(successor.recordingId());
+                        lastAppliedPosition.set(successor.startPosition());
+                        break; // exit inner poll loop -> outer loop reopens against successor
                     }
                     LockSupport.parkNanos(projectorCfg.getPollParkNanos());
                 }

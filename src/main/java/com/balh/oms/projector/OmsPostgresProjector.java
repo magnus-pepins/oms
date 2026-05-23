@@ -28,6 +28,7 @@ import com.balh.oms.persistence.SellFillPositionSplit;
 import com.balh.oms.risk.BuyFundsRequirement;
 import com.balh.oms.returnpath.ExecutionTradeCommand;
 import com.balh.oms.returnpath.MarketContextVenueEvidence;
+import com.balh.oms.settlement.SettlementDateCalculator;
 import com.balh.oms.tailer.OrderControlAdmission;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -171,6 +172,14 @@ public class OmsPostgresProjector {
     private final TransactionTemplate transactionTemplate;
     private final Clock wallClock;
     /**
+     * Stock-settlement gap plan §5.3 Slice 1 — derives {@code trade_date} and
+     * {@code expected_settlement_date} for each TRADE row at projector time so the matcher
+     * (and downstream UI) can reason about settlement calendar correctness without rederiving
+     * both dates on every comparison. Placeholder default cycle today; the eventual rule is
+     * profile-driven.
+     */
+    private final SettlementDateCalculator settlementDateCalculator;
+    /**
      * Phase 4 Tier 2.5 phase E-2 — pre-registered counter for the defensive shard guard in
      * {@link #applyAdmittedEvent}. See {@link #METRIC_SHARD_MISMATCH_DROPPED} for the contract.
      */
@@ -212,7 +221,8 @@ public class OmsPostgresProjector {
             ObjectProvider<MarketdataPlatformHttpClient> marketdataHttp,
             MeterRegistry meterRegistry,
             ObjectMapper objectMapper,
-            PlatformTransactionManager transactionManager) {
+            PlatformTransactionManager transactionManager,
+            SettlementDateCalculator settlementDateCalculator) {
         this(
                 config,
                 cursorRepository,
@@ -228,7 +238,8 @@ public class OmsPostgresProjector {
                 meterRegistry,
                 objectMapper,
                 transactionManager,
-                Clock.systemUTC());
+                Clock.systemUTC(),
+                settlementDateCalculator);
     }
 
     /**
@@ -251,7 +262,8 @@ public class OmsPostgresProjector {
             MeterRegistry meterRegistry,
             ObjectMapper objectMapper,
             PlatformTransactionManager transactionManager,
-            Clock wallClock) {
+            Clock wallClock,
+            SettlementDateCalculator settlementDateCalculator) {
         this.config = config;
         this.cursorRepository = cursorRepository;
         this.ordersRepository = ordersRepository;
@@ -266,6 +278,7 @@ public class OmsPostgresProjector {
         this.meterRegistry = meterRegistry;
         this.objectMapper = objectMapper;
         this.wallClock = wallClock;
+        this.settlementDateCalculator = settlementDateCalculator;
         this.shardMismatchCounter = Counter.builder(METRIC_SHARD_MISMATCH_DROPPED)
                 .description(
                         "Cluster events whose shard id did not match this projector's "
@@ -1255,17 +1268,23 @@ public class OmsPostgresProjector {
         // the merge.
         mergeMarketContextEvidenceForTrade(order, ev, lastQty, lastPx, leaves, newCum);
 
+        Instant venueTs = Instant.ofEpochSecond(0L, ev.venueTsNanos());
+        java.time.LocalDate tradeDate = settlementDateCalculator.computeTradeDate(venueTs);
+        java.time.LocalDate expectedSettlementDate =
+                settlementDateCalculator.computeExpectedSettlementDate(tradeDate);
         Optional<Long> insertedId = executionsRepository.tryInsertTrade(
                 order.id(),
                 order.accountId(),
                 ev.venueId(),
-                Instant.ofEpochSecond(0L, ev.venueTsNanos()),
+                venueTs,
                 ev.venueExecRef(),
                 lastQty,
                 lastPx,
                 leaves,
                 newCum,
-                raw);
+                raw,
+                tradeDate,
+                expectedSettlementDate);
         if (insertedId.isEmpty()) {
             meterRegistry.counter(METRIC_EXECUTIONS_APPLIED, TAG_OUTCOME, OUTCOME_DUPLICATE).increment();
             return false;

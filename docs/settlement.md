@@ -28,6 +28,10 @@ This document describes the **securities post-trade** tables and wiring in OMS. 
 
 - **`ledger_settlement_outbox`** — optional enqueue when **`OMS_LEDGER_SETTLEMENT_OUTBOX_ENABLED=true`** in the same transaction as **`settled`** on **`TRADE`** rows; optional drain when **`OMS_LEDGER_SETTLEMENT_OUTBOX_RECONCILER_ENABLED=true`** (see [settlement-ledger-posting.md](settlement-ledger-posting.md)).
 
+### Flyway `V54__broker_trade_confirms.sql`
+
+- **`broker_confirm_batch`** / **`broker_trade_confirm`** / **`broker_trade_confirm_fee`** — Phase A.1 of the [stock-settlement production gap plan](../../system-documentation/plans/stock-settlement-production-gap-plan.md) §5.1. Adds the economic broker confirm contract alongside the v1 fixture path: full row carries `(broker_id, broker_trade_id, venue_exec_ref, account_id, instrument, side, quantity, price, fees, trade_date, settlement_date, correction_type, raw_row_json)` with idempotency on file `sha256` and `(broker_id, broker_file_id)`. **Parser, ingest endpoint, and matcher land in follow-up slices.** Envelope types: [`BrokerTradeConfirmEnvelope`](../src/main/java/com/balh/oms/settlement/BrokerTradeConfirmEnvelope.java), [`BrokerTradeConfirmRow`](../src/main/java/com/balh/oms/settlement/BrokerTradeConfirmRow.java), [`BrokerTradeConfirmFeeRow`](../src/main/java/com/balh/oms/settlement/BrokerTradeConfirmFeeRow.java).
+
 ## State machine (§12.3)
 
 Forward-only path persisted on **`executions`**:

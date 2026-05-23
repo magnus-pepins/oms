@@ -3,8 +3,11 @@ package com.balh.oms.ingress;
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.persistence.SettlementExecutionsRepository;
 import com.balh.oms.settlement.BrokerFixtureRow;
+import com.balh.oms.settlement.BrokerTradeConfirmIngestService;
+import com.balh.oms.settlement.BrokerTradeConfirmMatcher;
 import com.balh.oms.settlement.MarkTradeFailedResult;
 import com.balh.oms.settlement.LedgerSettlementOutboxRepository;
+import com.balh.oms.settlement.ReconciliationBreakRepository;
 import com.balh.oms.settlement.SettlementConfirmProcessor;
 import com.balh.oms.settlement.SettlementFileImportBatchRepository;
 import com.balh.oms.settlement.SettlementFileImportService;
@@ -69,6 +72,24 @@ public class SettlementController {
     public record SettlementFileImportBatchesResponse(
             List<SettlementFileImportBatchRepository.FileImportBatchListRow> items, int limit, int offset) {}
 
+    public record BrokerTradeConfirmImportResponse(
+            boolean duplicate,
+            long batchId,
+            String status,
+            Integer rowCount,
+            String errorSummary,
+            int insertedRows,
+            int insertedFees,
+            int skippedDuplicateRows) {}
+
+    public record BrokerTradeMatchResultResponse(
+            long confirmId, Long executionId, String outcome, String matchDiffJson) {}
+
+    public record BrokerTradeMatchBatchResponse(List<BrokerTradeMatchResultResponse> items) {}
+
+    public record ReconciliationBreaksListResponse(
+            List<ReconciliationBreakRepository.BreakRow> items, String status, int limit, int offset) {}
+
     public record MarkTradeFailedResponse(String result) {}
 
     private final SettlementConfirmProcessor processor;
@@ -77,6 +98,9 @@ public class SettlementController {
     private final SettlementFileImportService settlementFileImportService;
     private final SettlementFileImportBatchRepository settlementFileImportBatchRepository;
     private final SettlementTimelineService timelineService;
+    private final BrokerTradeConfirmIngestService brokerTradeConfirmIngestService;
+    private final BrokerTradeConfirmMatcher brokerTradeConfirmMatcher;
+    private final ReconciliationBreakRepository reconciliationBreaks;
 
     private static final int MAX_FILE_IMPORT_LIST_OFFSET = 10_000;
 
@@ -97,7 +121,10 @@ public class SettlementController {
             SettlementFileImportService settlementFileImportService,
             SettlementFileImportBatchRepository settlementFileImportBatchRepository,
             SettlementTimelineService timelineService,
-            LedgerSettlementOutboxRepository ledgerSettlementOutbox) {
+            LedgerSettlementOutboxRepository ledgerSettlementOutbox,
+            BrokerTradeConfirmIngestService brokerTradeConfirmIngestService,
+            BrokerTradeConfirmMatcher brokerTradeConfirmMatcher,
+            ReconciliationBreakRepository reconciliationBreaks) {
         this.processor = processor;
         this.config = config;
         this.settlementExecutions = settlementExecutions;
@@ -105,6 +132,9 @@ public class SettlementController {
         this.settlementFileImportBatchRepository = settlementFileImportBatchRepository;
         this.timelineService = timelineService;
         this.ledgerSettlementOutbox = ledgerSettlementOutbox;
+        this.brokerTradeConfirmIngestService = brokerTradeConfirmIngestService;
+        this.brokerTradeConfirmMatcher = brokerTradeConfirmMatcher;
+        this.reconciliationBreaks = reconciliationBreaks;
     }
 
     /**
@@ -264,6 +294,130 @@ public class SettlementController {
         var r = processor.registerBrokerConfirmsFromFixture(body.rows());
         return ResponseEntity.ok(
                 new BrokerFixtureImportResponse(r.insertedRows(), r.skippedUnresolvedRows(), r.skippedInvalidRows()));
+    }
+
+    /**
+     * v1 economic broker confirm ingest (gap plan §5.1) — JSON body. Mirrors
+     * {@link #importSettlementFile(String, MultipartFile) /file-import} but for the v2 economic
+     * envelope ({@code BrokerTradeConfirmEnvelope}). Matching (gap plan §5.2) is **not** wired here;
+     * rows land with {@code resolved_execution_id = NULL} and {@code match_status = 'pending'}.
+     */
+    @PostMapping("/broker-trade-confirms/import-json")
+    public ResponseEntity<BrokerTradeConfirmImportResponse> importBrokerTradeConfirms(
+            @RequestParam(name = "source", required = false) String source,
+            @RequestBody(required = false) byte[] body) {
+        String src = (source == null || source.isBlank()) ? "http-json" : source.trim();
+        if (body == null || body.length == 0) {
+            return ResponseEntity.badRequest().build();
+        }
+        return runBrokerTradeConfirmIngest(src, "import-json.json", body);
+    }
+
+    /** v1 economic broker confirm ingest (gap plan §5.1) — multipart file upload. */
+    @PostMapping(value = "/broker-trade-confirms/file-import", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ResponseEntity<BrokerTradeConfirmImportResponse> importBrokerTradeConfirmsFile(
+            @RequestParam("source") String source, @RequestPart("file") MultipartFile file) {
+        if (source == null || source.isBlank() || file == null || file.isEmpty()) {
+            return ResponseEntity.badRequest().build();
+        }
+        long max = config.getSettlement().getFileImportMaxBytes();
+        if (file.getSize() > 0 && file.getSize() > max) {
+            return ResponseEntity.status(HttpStatus.PAYLOAD_TOO_LARGE).build();
+        }
+        final byte[] bytes;
+        try {
+            bytes = file.getBytes();
+        } catch (java.io.IOException e) {
+            return ResponseEntity.badRequest().build();
+        }
+        if (bytes.length > max) {
+            return ResponseEntity.status(HttpStatus.PAYLOAD_TOO_LARGE).build();
+        }
+        return runBrokerTradeConfirmIngest(source.trim(), file.getOriginalFilename(), bytes);
+    }
+
+    /**
+     * Matcher batch trigger (gap plan §5.2). Resolves up to {@code maxBatch} pending
+     * {@code broker_trade_confirm} rows to OMS executions, compares economic fields, and
+     * writes one of three outcomes per row: {@code matched} (also enqueues v1
+     * {@code broker_settlement_confirm} so settlement advances), {@code mismatch} or
+     * {@code unresolved} (opens a {@code reconciliation_breaks} row).
+     */
+    @PostMapping("/broker-trade-confirms/process-pending-matches")
+    public ResponseEntity<BrokerTradeMatchBatchResponse> processPendingMatches(
+            @RequestParam(name = "maxBatch", required = false) Integer maxBatch) {
+        int cap = maxBatch == null ? config.getSettlement().getBrokerConfirmReconcilerBatchSize() : maxBatch;
+        var results = brokerTradeConfirmMatcher.processPendingBatch(cap);
+        return ResponseEntity.ok(new BrokerTradeMatchBatchResponse(results.stream()
+                .map(r -> new BrokerTradeMatchResultResponse(
+                        r.confirmId(),
+                        r.executionId(),
+                        r.outcome().name().toLowerCase(java.util.Locale.ROOT),
+                        r.diffJson()))
+                .toList()));
+    }
+
+    /** Manual single-row match trigger (gap plan §5.2). Returns 404 if the row is not pending. */
+    @PostMapping("/broker-trade-confirms/{id}/match")
+    public ResponseEntity<BrokerTradeMatchResultResponse> matchOneConfirm(@PathVariable long id) {
+        return brokerTradeConfirmMatcher
+                .matchById(id)
+                .map(r -> new BrokerTradeMatchResultResponse(
+                        r.confirmId(),
+                        r.executionId(),
+                        r.outcome().name().toLowerCase(java.util.Locale.ROOT),
+                        r.diffJson()))
+                .map(ResponseEntity::ok)
+                .orElse(ResponseEntity.notFound().build());
+    }
+
+    /** Beard Admin reads the break queue here (gap plan §5.13). */
+    @GetMapping("/reconciliation-breaks")
+    public ResponseEntity<ReconciliationBreaksListResponse> listReconciliationBreaks(
+            @RequestParam(required = false) String status,
+            @RequestParam(required = false) Integer limit,
+            @RequestParam(required = false) Integer offset) {
+        String st = (status == null || status.isBlank()) ? "open" : status;
+        int max = config.getSettlement().getFileImportListMaxLimit();
+        int def = config.getSettlement().getFileImportListDefaultLimit();
+        int lim = limit == null ? def : limit;
+        if (lim < 1) {
+            lim = def;
+        }
+        lim = Math.min(lim, max);
+        int off = offset == null ? 0 : offset;
+        if (off < 0 || off > MAX_FILE_IMPORT_LIST_OFFSET) {
+            return ResponseEntity.badRequest().build();
+        }
+        List<ReconciliationBreakRepository.BreakRow> rows;
+        try {
+            rows = reconciliationBreaks.listByStatus(st, lim, off);
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().build();
+        }
+        return ResponseEntity.ok(new ReconciliationBreaksListResponse(rows, st, lim, off));
+    }
+
+    private ResponseEntity<BrokerTradeConfirmImportResponse> runBrokerTradeConfirmIngest(
+            String source, String filename, byte[] bytes) {
+        try {
+            BrokerTradeConfirmIngestService.Result r =
+                    brokerTradeConfirmIngestService.ingest(source, filename, bytes);
+            return ResponseEntity.ok(new BrokerTradeConfirmImportResponse(
+                    r.duplicate(),
+                    r.batchId(),
+                    r.status(),
+                    r.rowCount(),
+                    r.errorSummary(),
+                    r.insertedRows(),
+                    r.insertedFees(),
+                    r.skippedDuplicateRows()));
+        } catch (IllegalArgumentException ex) {
+            if ("file too large".equals(ex.getMessage())) {
+                return ResponseEntity.status(HttpStatus.PAYLOAD_TOO_LARGE).build();
+            }
+            return ResponseEntity.badRequest().build();
+        }
     }
 
     @PostMapping(value = "/file-import", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)

@@ -18,6 +18,20 @@ spring:
     enabled: true
     locations: classpath:db/migration
     baseline-on-migrate: false
+    postgresql:
+      # Disable the transactional advisory lock so that migrations marked
+      # `flyway:executeInTransaction=false` (e.g. V36 CREATE INDEX CONCURRENTLY,
+      # V55, V56 ALTER TYPE) can complete on a fresh bootstrap.
+      #
+      # Default `true` keeps the Flyway lock-holder connection in
+      # `idle in transaction` for the whole migration, which CIC waits on via
+      # virtualxid ShareLock — verified hang at fresh bootstrap, observed
+      # 2026-05-23 (see plans/oms-test-infra-hardening.md). The session-level
+      # lock chosen by `false` does not wrap the lock connection in a JDBC
+      # transaction, so CIC no longer blocks. Required on Flyway >= 9.19.4
+      # (we ship 10.20.1); see Redgate docs "Flyway PostgreSQL Transactional
+      # Lock Setting" and flyway/flyway#3508.
+      transactional-lock: ${OMS_FLYWAY_PG_TRANSACTIONAL_LOCK:false}
   servlet:
     multipart:
       max-file-size: ${OMS_SETTLEMENT_FILE_IMPORT_MAX_BYTES:10000000}

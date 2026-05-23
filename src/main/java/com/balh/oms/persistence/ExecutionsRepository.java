@@ -7,6 +7,7 @@ import org.springframework.stereotype.Repository;
 
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -21,11 +22,13 @@ public class ExecutionsRepository {
             INSERT INTO executions (
                 order_id, account_id, venue_id, venue_ts, venue_exec_ref,
                 last_quantity, last_price, leaves_quantity, cum_quantity_after,
-                exec_type, raw_envelope_json
+                exec_type, raw_envelope_json,
+                trade_date, expected_settlement_date
             ) VALUES (
                 :order_id, :account_id, :venue_id, :venue_ts, :venue_exec_ref,
                 :last_quantity, :last_price, :leaves_quantity, :cum_quantity_after,
-                CAST(:exec_type AS execution_exec_type), CAST(:raw_json AS JSONB)
+                CAST(:exec_type AS execution_exec_type), CAST(:raw_json AS JSONB),
+                :trade_date, :expected_settlement_date
             )
             ON CONFLICT (account_id, venue_exec_ref) DO NOTHING
             RETURNING id
@@ -56,6 +59,13 @@ public class ExecutionsRepository {
     }
 
     /**
+     * @param tradeDate calendar date of the execution; populated by
+     *                  {@link com.balh.oms.settlement.SettlementDateCalculator#computeTradeDate}.
+     *                  Nullable for historical / backfill writers that do not have it; new
+     *                  callers (gap plan §5.3 Slice 1) must pass it.
+     * @param expectedSettlementDate OMS-computed expected settlement date (see
+     *                  {@link com.balh.oms.settlement.SettlementDateCalculator#computeExpectedSettlementDate}).
+     *                  Nullable for the same reason.
      * @return inserted {@code executions.id}, or empty if idempotent duplicate on {@code (account_id, venue_exec_ref)}.
      */
     public Optional<Long> tryInsertTrade(
@@ -68,9 +78,12 @@ public class ExecutionsRepository {
             BigDecimal lastPrice,
             BigDecimal leavesQuantity,
             BigDecimal cumQuantityAfter,
-            String rawJson) {
+            String rawJson,
+            LocalDate tradeDate,
+            LocalDate expectedSettlementDate) {
         return insertReturning(INSERT_TRADE_SQL, orderId, accountId, venueId, venueTs, venueExecRef,
-                lastQuantity, lastPrice, leavesQuantity, cumQuantityAfter, "TRADE", rawJson);
+                lastQuantity, lastPrice, leavesQuantity, cumQuantityAfter, "TRADE", rawJson,
+                tradeDate, expectedSettlementDate);
     }
 
     /**
@@ -85,7 +98,8 @@ public class ExecutionsRepository {
             BigDecimal cumQuantityAfter,
             String rawJson) {
         return insertReturning(INSERT_TRADE_SQL, orderId, accountId, venueId, venueTs, venueExecRef,
-                BigDecimal.ZERO, null, BigDecimal.ZERO, cumQuantityAfter, "CANCEL", rawJson);
+                BigDecimal.ZERO, null, BigDecimal.ZERO, cumQuantityAfter, "CANCEL", rawJson,
+                /* tradeDate = */ null, /* expectedSettlementDate = */ null);
     }
 
     /**
@@ -100,7 +114,8 @@ public class ExecutionsRepository {
             BigDecimal cumQuantityAfter,
             String rawJson) {
         return insertReturning(INSERT_TRADE_SQL, orderId, accountId, venueId, venueTs, venueExecRef,
-                BigDecimal.ZERO, null, BigDecimal.ZERO, cumQuantityAfter, "REJECT", rawJson);
+                BigDecimal.ZERO, null, BigDecimal.ZERO, cumQuantityAfter, "REJECT", rawJson,
+                /* tradeDate = */ null, /* expectedSettlementDate = */ null);
     }
 
     /**
@@ -140,7 +155,9 @@ public class ExecutionsRepository {
                 leavesQuantity,
                 cumQuantityAfter,
                 "REPLACE",
-                rawJson);
+                rawJson,
+                /* tradeDate = */ null,
+                /* expectedSettlementDate = */ null);
     }
 
     /**
@@ -169,7 +186,9 @@ public class ExecutionsRepository {
                 BigDecimal.ZERO,
                 cumQuantityAfter,
                 "CANCEL_REJECT",
-                rawJson);
+                rawJson,
+                /* tradeDate = */ null,
+                /* expectedSettlementDate = */ null);
     }
 
     /**
@@ -197,7 +216,9 @@ public class ExecutionsRepository {
                 BigDecimal.ZERO,
                 cumQuantityAfter,
                 "REPLACE_REJECT",
-                rawJson);
+                rawJson,
+                /* tradeDate = */ null,
+                /* expectedSettlementDate = */ null);
     }
 
     private Optional<Long> insertReturning(
@@ -212,7 +233,9 @@ public class ExecutionsRepository {
             BigDecimal leavesQuantity,
             BigDecimal cumQuantityAfter,
             String execType,
-            String rawJson) {
+            String rawJson,
+            LocalDate tradeDate,
+            LocalDate expectedSettlementDate) {
         var params = new MapSqlParameterSource()
                 .addValue("order_id", orderId)
                 .addValue("account_id", accountId)
@@ -224,7 +247,11 @@ public class ExecutionsRepository {
                 .addValue("leaves_quantity", leavesQuantity)
                 .addValue("cum_quantity_after", cumQuantityAfter)
                 .addValue("exec_type", execType)
-                .addValue("raw_json", rawJson);
+                .addValue("raw_json", rawJson)
+                .addValue("trade_date", tradeDate == null ? null : java.sql.Date.valueOf(tradeDate))
+                .addValue(
+                        "expected_settlement_date",
+                        expectedSettlementDate == null ? null : java.sql.Date.valueOf(expectedSettlementDate));
         List<Long> ids = jdbc.query(
                 sql,
                 params,
@@ -313,6 +340,33 @@ public class ExecutionsRepository {
               AND settlement_status <> CAST('settled' AS execution_settlement_status)
               AND settlement_status <> CAST('failed' AS execution_settlement_status)
             """;
+
+    private static final String SELECT_EXPECTED_SETTLEMENT_DATE = """
+            SELECT expected_settlement_date
+            FROM executions
+            WHERE id = :id
+              AND exec_type = CAST('TRADE' AS execution_exec_type)
+            """;
+
+    /**
+     * Returns the OMS-computed expected settlement date stored at TRADE-projection time
+     * (gap plan §5.3 Slice 1 / V58). Empty when the execution row is absent, is not a TRADE,
+     * or pre-dates V58 (NULL column). Callers must treat empty as "OMS expectation unknown,
+     * do not raise a calendar-drift break".
+     */
+    public Optional<LocalDate> findExpectedSettlementDate(long executionId) {
+        List<LocalDate> dates = jdbc.query(
+                SELECT_EXPECTED_SETTLEMENT_DATE,
+                new MapSqlParameterSource("id", executionId),
+                (rs, rowNum) -> {
+                    java.sql.Date d = rs.getDate("expected_settlement_date");
+                    return d == null ? null : d.toLocalDate();
+                });
+        if (dates.isEmpty() || dates.getFirst() == null) {
+            return Optional.empty();
+        }
+        return Optional.of(dates.getFirst());
+    }
 
     public Optional<Long> findTradeExecutionIdByAccountAndVenueRef(UUID accountId, String venueExecRef) {
         if (accountId == null || venueExecRef == null || venueExecRef.isBlank()) {

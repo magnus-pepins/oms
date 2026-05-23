@@ -107,7 +107,9 @@ class OmsPostgresProjectorD3OrderAcceptedTest {
                 meterRegistry,
                 objectMapper,
                 txManager,
-                pinned);
+                pinned,
+                new com.balh.oms.settlement.SettlementDateCalculator(
+                        com.balh.oms.settlement.SettlementDateCalculator.DEFAULT_CYCLE_FALLBACK));
     }
 
     @Test
@@ -162,7 +164,9 @@ class OmsPostgresProjectorD3OrderAcceptedTest {
                 meterRegistry,
                 objectMapper,
                 txManager,
-                pinned);
+                pinned,
+                new com.balh.oms.settlement.SettlementDateCalculator(
+                        com.balh.oms.settlement.SettlementDateCalculator.DEFAULT_CYCLE_FALLBACK));
 
         OrderAdmittedEvent ev = new OrderAdmittedEvent(
                 UUID.fromString("00000000-0000-4000-8000-0000000000d3"),
@@ -223,7 +227,9 @@ class OmsPostgresProjectorD3OrderAcceptedTest {
                 meterRegistry,
                 objectMapper,
                 txManager,
-                pinned);
+                pinned,
+                new com.balh.oms.settlement.SettlementDateCalculator(
+                        com.balh.oms.settlement.SettlementDateCalculator.DEFAULT_CYCLE_FALLBACK));
 
         OrderAdmittedEvent ev = new OrderAdmittedEvent(
                 UUID.randomUUID(),

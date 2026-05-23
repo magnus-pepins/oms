@@ -140,6 +140,8 @@ public abstract class AbstractPostgresIntegrationTest {
                     + " ledger_inflight_outbox, executions, market_context,"
                     + " corporate_action_event, manual_settlement_actions, ledger_settlement_outbox,"
                     + " broker_settlement_confirm, settlement_file_import_batch, position_history,"
+                    + " reconciliation_breaks,"
+                    + " broker_trade_confirm_fee, broker_trade_confirm, broker_confirm_batch,"
                     + " positions, orders, fx_stub_leg_group CASCADE";
 
     /** Docker / runner flakes: retry container start before failing the JVM test run (Testcontainers path only). */
@@ -283,6 +285,14 @@ public abstract class AbstractPostgresIntegrationTest {
      * {@link com.balh.oms.cluster.OmsClusterIngressClientIT} (defaults around 20110-20440)
      * or {@link OmsClusterNodeBootstrapSmokeIT} when those classes run in the same Gradle test
      * JVM.
+     *
+     * <p><strong>Stale-JVM recovery.</strong> The JVM shutdown hook does NOT run on
+     * {@code SIGKILL} (e.g. {@code kill -9} on the gradle script, IDE force-quit, test
+     * timeout). A killed Gradle test worker can therefore survive its parent and keep
+     * holding the Aeron UDP sockets, causing the next run to fail at
+     * {@link ClusteredMediaDriver#launch} with {@code Address already in use (localhost:20550)}.
+     * Recover with {@code ./scripts/clean-stale-test-jvms.sh}, which finds and kills any
+     * stale {@code GradleWorkerMain} JVMs and verifies the ports are free.
      */
     private static final class TestAeronClusterSingleton {
 

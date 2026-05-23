@@ -91,7 +91,9 @@ class OmsPostgresProjectorInitLoudFailTest {
                 new SimpleMeterRegistry(),
                 new ObjectMapper(),
                 txManager,
-                Clock.systemUTC());
+                Clock.systemUTC(),
+                new com.balh.oms.settlement.SettlementDateCalculator(
+                        com.balh.oms.settlement.SettlementDateCalculator.DEFAULT_CYCLE_FALLBACK));
     }
 
     @Test

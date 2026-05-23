@@ -5,7 +5,7 @@ alwaysApply: true
 
 # No OMS mutations by AI agents
 
-Works with [respect-operator-warnings.mdc](respect-operator-warnings.mdc), [no-bandaids.mdc](no-bandaids.mdc), [serious-debugging.mdc](serious-debugging.mdc), [stay-in-role.mdc](stay-in-role.mdc), and [no-ledger-mutations.mdc](no-ledger-mutations.mdc).
+Works with [respect-operator-warnings.mdc](respect-operator-warnings.mdc), [no-bandaids.mdc](no-bandaids.mdc), [serious-debugging.mdc](serious-debugging.mdc), and [stay-in-role.mdc](stay-in-role.mdc).
 
 ## Context
 
@@ -18,40 +18,31 @@ OMS admission state lives in the Aeron cluster (`oms-cluster-node`). Postgres is
 - Run `psql -c "INSERT"`, `UPDATE`, `DELETE`, `TRUNCATE`, `ALTER`, or migration SQL against `oms` projector DBs on deployed hosts.
 - Run `./gradlew clusterSnapshot` on pop without explicit per-command approval naming that exact command.
 - Run `system-documentation/scripts/restart-pop-oms-cluster.sh` without explicit approval naming that script by filename.
-- Run `system-documentation/scripts/wipe-and-restart-pop-oms-cluster.sh`. This is a destructive operator-only script that deletes the entire `~/oms/build/aeron-cluster/**` tree. Never. Even with "approval to do whatever you think is best".
 - Run deploy scripts that bounce `oms-cluster-node` or journal paths.
-- Submit cluster-mutating `POST` to deployed ingress (accept order, admin force paths that change admission) without operator approval.
+- Submit cluster-mutating `POST` to deployed ingress without operator approval.
 
 ## You MAY, with explicit single-task scope on each command
 
-- `ssh pop 'tail -N ~/oms/logs/…'`, `grep`, `ls -la` on cluster dirs (read-only).
-- `ssh pop 'psql … -c "SELECT …"'` (read-only).
-- `ssh pop 'curl -s http://127.0.0.1:8088/actuator/health'` and other read-only HTTP probes.
-- `ssh pop 'pm2 list'`, `ssh pop 'pm2 logs --nostream'` (read-only).
-- `bash system-documentation/scripts/smoke/oms-end-to-end.sh` on pop (read-only).
+- Read-only logs, `psql SELECT`, `curl` actuators, `pm2 list/logs`, `oms-end-to-end.sh`.
 
-Name each command before running it. Do not chain reads so the operator cannot intervene.
+Name each command before running it.
 
-## You MAY, on your local Mac (no `ssh pop` prefix)
+## You MAY, on your local Mac
 
-- Edit code in `oms/` and sibling repos.
-- Run `./gradlew test`, `integrationTest`, `bootJar*` locally.
-- Boot local cluster roles for IT smoke.
+- Edit code, `./gradlew test`, local boot.
 
-## You MAY, only with explicit per-action operator approval that names the action
+## You MAY, only with explicit per-action operator approval
 
-- Deploy OMS jars to pop (operator pastes the exact command).
-- Run `restart-pop-oms-cluster.sh` (operator names the script).
-- Run `./gradlew clusterSnapshot` on pop when the operator names it.
+- Deploy, `restart-pop-oms-cluster.sh`, `clusterSnapshot` on pop.
 
-"You have my approval to do whatever you think is best" is **not** per-action approval.
+Per-action approval is one of:
 
-## If you find yourself reasoning toward a forbidden action
+1. Operator pastes a command (or names a script by filename) and tells the agent to run it.
+2. Operator explicitly approves a runbook the agent sent in the most recent assistant message (e.g. "run the runbook", "do all the steps", "run all the sql commands and restarts you listed"). The agent then executes exactly those commands, in order, without inventing new mutating steps.
+3. Operator explicitly authorises a single named ongoing task ("deploy V55 + V56 now"). The agent enumerates the commands it will run BEFORE running them and stops the moment the scope is exhausted.
 
-- Stop.
-- Write the proposed command in your reply.
-- Wait for the operator to paste it back or give a different instruction.
+"Do whatever you think is best" with no reference to a specific runbook / script / command / named task is **not** approval.
 
 ## Sibling parity
 
-Canonical: `system-documentation/.cursor/rules/no-oms-mutations.mdc`. Copy to `oms/.cursor/rules/no-oms-mutations.mdc` when changed.
+Canonical: `system-documentation/.cursor/rules/no-oms-mutations.mdc`. This file must match when the canonical changes.

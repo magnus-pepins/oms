@@ -9,6 +9,7 @@ import io.aeron.archive.client.AeronArchive;
 import io.aeron.archive.client.RecordingDescriptorConsumer;
 import io.aeron.cluster.ConsensusModule;
 import io.aeron.cluster.RecordingLog;
+import io.aeron.logbuffer.FragmentHandler;
 import org.agrona.CloseHelper;
 
 import java.io.File;
@@ -274,7 +275,25 @@ public final class OmsProjectorRebuildFromSnapshotTool {
                         }
                     },
                     /* onExecutionRefs = */ null);
-            ImageFragmentAssembler assembler = new ImageFragmentAssembler(decoder);
+            // Aeron Cluster snapshot recordings are framed as:
+            //   [SnapshotMarkerEncoder BEGIN] -> [service payload] -> [SnapshotMarkerEncoder END]
+            // The service's onStart(Image) callback in production runs through framework
+            // machinery that consumes the markers before handing the service its slice of the
+            // image. When this tool replays the raw recording it sees the markers too — their
+            // first 4 bytes are an SBE MessageHeader, not OMS_SNAPSHOT_MAGIC, so the decoder
+            // loud-fails on them. Filter at the fragment level: anything not starting with
+            // OMS_SNAPSHOT_MAGIC is treated as a marker frame and skipped.
+            FragmentHandler skipMarkers = (buf, off, len, hdr) -> {
+                if (len < Integer.BYTES) {
+                    return;
+                }
+                int magic = buf.getInt(off);
+                if (magic != OmsClusterSnapshotDecoder.SNAPSHOT_MAGIC) {
+                    return;
+                }
+                decoder.onFragment(buf, off, len, hdr);
+            };
+            ImageFragmentAssembler assembler = new ImageFragmentAssembler(skipMarkers);
 
             replay = archive.replay(
                     chosen.recordingId,

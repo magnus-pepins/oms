@@ -40,6 +40,16 @@ import java.util.function.Consumer;
  */
 public final class OmsClusterSnapshotDecoder implements FragmentHandler {
 
+    /**
+     * Re-exposed copy of {@code OmsAdmissionClusteredService.SNAPSHOT_MAGIC} (which is
+     * package-private) for callers outside {@code com.balh.oms.cluster}. Operator tools that
+     * need to pre-filter Aeron cluster snapshot recording frames (e.g. skip the framework's
+     * SnapshotMarker BEGIN/END SBE messages that surround the service payload) use this
+     * constant to identify the OMS payload frame. Kept in lockstep with
+     * {@code OmsAdmissionClusteredService.SNAPSHOT_MAGIC} by being assigned from it here.
+     */
+    public static final int SNAPSHOT_MAGIC = OmsAdmissionClusteredService.SNAPSHOT_MAGIC;
+
     private final Consumer<OmsAdmissionClusteredService.AdmittedOrder> onOrder;
 
     /** Optional execution-ref callback. Most tools ignore this; set to {@code null} to skip. */

@@ -226,13 +226,13 @@ public class FxQuoteService {
                     "fx_tier_killed",
                     "tier " + tierLow + " is currently killed for pair " + pairUp);
         }
-        VendorBboWithSource vendor = vendorBboWithSourceForPair(pairUp);
+        ResolvedVendorBbo vendor = resolveVendorBboForPair(pairUp);
 
-        BigDecimal bidBps = lookupMarkupBps(pairUp, "BID", tierLow);
-        BigDecimal askBps = lookupMarkupBps(pairUp, "ASK", tierLow);
+        BigDecimal bidBps = lookupMarkupBps(pairUp, "BID", tierLow, vendor.markupFromInversePair());
+        BigDecimal askBps = lookupMarkupBps(pairUp, "ASK", tierLow, vendor.markupFromInversePair());
 
         FxBboMarkup.CustomerBbo customer = FxBboMarkup.customerFromVendor(
-                vendor.bid(), vendor.offer(), bidBps, askBps);
+                vendor.bbo().bid(), vendor.bbo().offer(), bidBps, askBps);
         BigDecimal bid = customer.bid();
         BigDecimal ask = customer.ask();
         BigDecimal mid = customer.mid();
@@ -245,14 +245,17 @@ public class FxQuoteService {
         body.put("quoteId", quoteId);
         body.put("pair", pairUp);
         body.put("tier", tierLow);
-        body.put("vendorBid", vendor.bid().setScale(RATE_SCALE, RoundingMode.HALF_UP).toPlainString());
-        body.put("vendorOffer", vendor.offer().setScale(RATE_SCALE, RoundingMode.HALF_UP).toPlainString());
+        body.put("vendorBid", vendor.bbo().bid().setScale(RATE_SCALE, RoundingMode.HALF_UP).toPlainString());
+        body.put("vendorOffer", vendor.bbo().offer().setScale(RATE_SCALE, RoundingMode.HALF_UP).toPlainString());
         body.put("mid", mid.toPlainString());
         body.put("bid", bid.toPlainString());
         body.put("ask", ask.toPlainString());
         body.put("bidMarkupBps", bidBps.toPlainString());
         body.put("askMarkupBps", askBps.toPlainString());
         body.put("source", vendor.source());
+        if (vendor.markupFromInversePair()) {
+            body.put("vendorPair", vendor.vendorPair());
+        }
         body.put("capturedAt", now.toString());
         body.put("expiresAt", exp.toString());
         body.put("validityMs", validityMillis);
@@ -398,7 +401,42 @@ public class FxQuoteService {
     /** Half-spread (bps per side) when synthesizing BBO from stub mid only. */
     private static final BigDecimal STUB_HALF_SPREAD_BPS = new BigDecimal("10");
 
-    private VendorBboWithSource vendorBboWithSourceForPair(String pair) {
+    private ResolvedVendorBbo resolveVendorBboForPair(String pair) {
+        VendorBboWithSource direct = vendorBboWithSourceForPairDirect(pair);
+        if (direct != null) {
+            return new ResolvedVendorBbo(
+                    new FxBboMarkup.VendorBbo(direct.bid(), direct.offer()),
+                    direct.source(),
+                    pair,
+                    false);
+        }
+        String inverse = FxPairCatalog.inversePair(pair);
+        if (inverse == null) {
+            throw new IllegalArgumentException("no mid configured for pair " + pair);
+        }
+        VendorBboWithSource fromInverse = vendorBboWithSourceForPairDirect(inverse);
+        if (fromInverse == null) {
+            if (!omsConfig.getFx().isStubMidsAllowed()) {
+                throw new FxQuoteStaleException(
+                        HttpStatus.UNPROCESSABLE_ENTITY,
+                        RejectCode.RISK_FX_STALE_QUOTE,
+                        "fx_mid_stale",
+                        "vendor BBO stale or absent for pair " + pair + " (inverse " + inverse + ")");
+            }
+            throw new IllegalArgumentException("no mid configured for pair " + pair);
+        }
+        FxBboMarkup.VendorBbo inverted = FxPairCatalog.invertVendorBbo(fromInverse.bid(), fromInverse.offer());
+        String source = fromInverse.source().endsWith("-inverse")
+                ? fromInverse.source()
+                : fromInverse.source() + "-inverse";
+        return new ResolvedVendorBbo(inverted, source, inverse, true);
+    }
+
+    /**
+     * Live tick or stub mid for the exact pair orientation requested by the caller.
+     * Returns null when neither is available (caller may try {@link FxPairCatalog#inversePair}).
+     */
+    private VendorBboWithSource vendorBboWithSourceForPairDirect(String pair) {
         if (liveMidSubscriber != null) {
             OmsFxMidSubscriber.BboSample live = liveMidSubscriber.bboFor(pair);
             if (live != null) {
@@ -407,15 +445,11 @@ public class FxQuoteService {
             }
         }
         if (!omsConfig.getFx().isStubMidsAllowed()) {
-            throw new FxQuoteStaleException(
-                    HttpStatus.UNPROCESSABLE_ENTITY,
-                    RejectCode.RISK_FX_STALE_QUOTE,
-                    "fx_mid_stale",
-                    "vendor BBO stale or absent for pair " + pair);
+            return null;
         }
         BigDecimal stubMid = STUB_MIDS.get(pair);
         if (stubMid == null) {
-            throw new IllegalArgumentException("no mid configured for pair " + pair);
+            return null;
         }
         midFromStubCounter.increment();
         FxBboMarkup.VendorBbo synthetic = FxBboMarkup.vendorBboFromStubMid(stubMid, STUB_HALF_SPREAD_BPS);
@@ -423,6 +457,9 @@ public class FxQuoteService {
     }
 
     private record VendorBboWithSource(BigDecimal bid, BigDecimal offer, String source) {}
+
+    private record ResolvedVendorBbo(
+            FxBboMarkup.VendorBbo bbo, String source, String vendorPair, boolean markupFromInversePair) {}
 
     /**
      * Read-only listing of the active {@code fx_pair_markups} grid for
@@ -476,19 +513,74 @@ public class FxQuoteService {
      *         pair without a rate-card.
      */
     BigDecimal lookupMarkupBps(String pair, String side, String tier) {
-        BigDecimal base = lookupBaseMarkupBps(pair, side, tier);
-        BigDecimal additive = overrides.additiveBpsFor(pair, side, tier, clock.instant());
-        if (additive.signum() == 0) return base;
+        return lookupMarkupBps(pair, side, tier, false);
+    }
+
+    BigDecimal lookupMarkupBps(String pair, String side, String tier, boolean fromInverseVendorPair) {
+        MarkupLookupKey key = markupLookupKey(pair, side, fromInverseVendorPair);
+        BigDecimal base = lookupBaseMarkupBps(pair, side, tier, fromInverseVendorPair);
+        BigDecimal additive = overrides.additiveBpsFor(key.pair(), key.side(), tier, clock.instant());
+        if (additive.signum() == 0) {
+            return base;
+        }
         BigDecimal effective = base.add(additive);
         return effective.signum() < 0 ? BigDecimal.ZERO : effective;
     }
 
     private BigDecimal lookupBaseMarkupBps(String pair, String side, String tier) {
+        return lookupBaseMarkupBps(pair, side, tier, false);
+    }
+
+    private BigDecimal lookupBaseMarkupBps(String pair, String side, String tier, boolean fromInverseVendorPair) {
+        String markupPair = pair;
+        String markupSide = side;
+        if (fromInverseVendorPair) {
+            String inverse = FxPairCatalog.inversePair(pair);
+            if (inverse == null) {
+                quoteMissesCounter.increment();
+                throw new IllegalStateException("no markup row for " + pair + " " + side + " (tier=" + tier + " nor default)");
+            }
+            markupPair = inverse;
+            markupSide = FxPairCatalog.markupSideForInverseQuote(side);
+        }
+        BigDecimal resolved = queryMarkupRow(markupPair, markupSide, tier);
+        if (resolved != null) {
+            return resolved;
+        }
+        if (!fromInverseVendorPair) {
+            String inverse = FxPairCatalog.inversePair(pair);
+            if (inverse != null) {
+                resolved = queryMarkupRow(inverse, FxPairCatalog.markupSideForInverseQuote(side), tier);
+                if (resolved != null) {
+                    return resolved;
+                }
+            }
+        }
+        quoteMissesCounter.increment();
+        throw new IllegalStateException("no markup row for " + pair + " " + side + " (tier=" + tier + " nor default)");
+    }
+
+    private static MarkupLookupKey markupLookupKey(String pair, String side, boolean fromInverseVendorPair) {
+        if (!fromInverseVendorPair) {
+            return new MarkupLookupKey(pair, side);
+        }
+        String inverse = FxPairCatalog.inversePair(pair);
+        if (inverse == null) {
+            return new MarkupLookupKey(pair, side);
+        }
+        return new MarkupLookupKey(inverse, FxPairCatalog.markupSideForInverseQuote(side));
+    }
+
+    private record MarkupLookupKey(String pair, String side) {}
+
+    private BigDecimal queryMarkupRow(String pair, String side, String tier) {
         String sql = "SELECT markup_bps FROM fx_pair_markups "
                 + "WHERE pair = ? AND side = ? AND tier = ? AND is_active = TRUE LIMIT 1";
         try {
             List<BigDecimal> rows = jdbc.queryForList(sql, BigDecimal.class, pair, side, tier);
-            if (!rows.isEmpty()) return rows.get(0);
+            if (!rows.isEmpty()) {
+                return rows.get(0);
+            }
             if (!"default".equals(tier)) {
                 List<BigDecimal> def = jdbc.queryForList(sql, BigDecimal.class, pair, side, "default");
                 if (!def.isEmpty()) {
@@ -498,8 +590,7 @@ public class FxQuoteService {
         } catch (DataAccessException e) {
             log.warn("[fx-quote] markup lookup failed pair={} side={} tier={}", pair, side, tier, e);
         }
-        quoteMissesCounter.increment();
-        throw new IllegalStateException("no markup row for " + pair + " " + side + " (tier=" + tier + " nor default)");
+        return null;
     }
 
     /** Package-private test hook — seeds the in-memory cache directly. */

@@ -54,6 +54,12 @@ class OmsFixEgressServiceTest {
     private static final long ACCEPTED_AT_MS = 1_700_000_000_000L;
     private static final long NOW_MS = ACCEPTED_AT_MS + 17L;
     private static final long FRAGMENT_POSITION = 4096L;
+    // 2026-05-23 hardening (V56): unit tests bypass the replay loop that would normally seed
+    // currentRecordingId from the live Aeron Archive, so each test wires this constant via
+    // setCurrentRecordingIdForTesting in setUp(). 7 is arbitrary — the production code only
+    // requires recording id to be ≥ 0; the value is asserted in verify(advanceWithRecording)
+    // calls to prove the cursor write threads it through correctly.
+    private static final long CURRENT_RECORDING_ID = 7L;
 
     @Mock private OmsFixEgressCursorRepository cursorRepository;
     @Mock private FixNewOrderSingleBuilder builder;
@@ -81,6 +87,10 @@ class OmsFixEgressServiceTest {
         // but we skip init() so the replay thread doesn't spin up. Flip the flag directly so the
         // synchronous send-and-record path under test executes the way it would in production.
         flipRunning(service, true);
+        // 2026-05-23 hardening (V56). Seed the recording id that the production replay loop
+        // would have populated before any fragment poll. requireCurrentRecordingId() inside
+        // advanceCursor / flushPendingCursorAdvance refuses to write to Postgres otherwise.
+        service.setCurrentRecordingIdForTesting(CURRENT_RECORDING_ID);
     }
 
     private static void flipRunning(OmsFixEgressService svc, boolean value) {
@@ -91,6 +101,18 @@ class OmsFixEgressServiceTest {
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException("failed to flip running flag for test", e);
         }
+    }
+
+    /**
+     * 2026-05-23 hardening (V56). Tests that construct their own {@link OmsFixEgressService}
+     * (cursor-only fallback, batched flush, cancel, replace) need the same recording-id seed
+     * the @BeforeEach setUp applies to the shared service, because the V56 advanceCursor /
+     * flushPendingCursorAdvance path calls requireCurrentRecordingId() before writing the
+     * cursor. Without this seed the call throws IllegalStateException.
+     */
+    private static void seedRunningAndRecordingId(OmsFixEgressService svc) {
+        flipRunning(svc, true);
+        svc.setCurrentRecordingIdForTesting(CURRENT_RECORDING_ID);
     }
 
     @Test
@@ -105,7 +127,11 @@ class OmsFixEgressServiceTest {
         assertThat(advanced).isTrue();
         verify(send).send(nos);
         verify(cursorRepository)
-                .advance(OmsFixEgressService.EGRESS_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, FRAGMENT_POSITION);
+                .advanceWithRecording(
+                        OmsFixEgressService.EGRESS_ID,
+                        OmsClusterWireFormat.EVENTS_STREAM_ID,
+                        CURRENT_RECORDING_ID,
+                        FRAGMENT_POSITION);
 
         Timer timer = meterRegistry.find(OmsPipelineMeterNames.CLUSTER_ADMIT_TO_FIX_NOS)
                 .tags(Tags.of(
@@ -174,14 +200,18 @@ class OmsFixEgressServiceTest {
                 /* orderCancelRequestBuilder = */ null,
                 /* orderCancelReplaceRequestBuilder = */ null,
                 /* send = */ null);
-        flipRunning(cursorOnly, true);
+        seedRunningAndRecordingId(cursorOnly);
 
         OrderAdmittedEvent ev = sampleAdmitted(AcceptOrderCommand.SIDE_BUY, AcceptOrderCommand.TIF_DAY);
         boolean advanced = cursorOnly.applyAdmittedEvent(ev, FRAGMENT_POSITION);
 
         assertThat(advanced).isTrue();
         verify(cursorRepository)
-                .advance(OmsFixEgressService.EGRESS_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, FRAGMENT_POSITION);
+                .advanceWithRecording(
+                        OmsFixEgressService.EGRESS_ID,
+                        OmsClusterWireFormat.EVENTS_STREAM_ID,
+                        CURRENT_RECORDING_ID,
+                        FRAGMENT_POSITION);
         assertThat(meterRegistry.find(OmsPipelineMeterNames.CLUSTER_ADMIT_TO_FIX_NOS).timer())
                 .as("cursor-only mode emits no NOS — admit-to-fix-nos Timer must stay unregistered")
                 .isNull();
@@ -203,7 +233,7 @@ class OmsFixEgressServiceTest {
                 /* orderCancelReplaceRequestBuilder = */ null,
                 send);
         setCursorFlushEvery(batched, 3);
-        flipRunning(batched, true);
+        seedRunningAndRecordingId(batched);
 
         when(builder.build(any(OrderAdmittedEvent.class))).thenReturn(new NewOrderSingle());
         when(send.hasActiveSession()).thenReturn(true);
@@ -222,19 +252,35 @@ class OmsFixEgressServiceTest {
 
         assertThat(batched.applyAdmittedEvent(sampleAdmitted(AcceptOrderCommand.SIDE_BUY, AcceptOrderCommand.TIF_DAY), pos3)).isTrue();
         verify(cursorRepository, times(1))
-                .advance(OmsFixEgressService.EGRESS_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, pos3);
+                .advanceWithRecording(
+                        OmsFixEgressService.EGRESS_ID,
+                        OmsClusterWireFormat.EVENTS_STREAM_ID,
+                        CURRENT_RECORDING_ID,
+                        pos3);
 
         for (long pos : new long[] {pos4, pos5}) {
             assertThat(batched.applyAdmittedEvent(sampleAdmitted(AcceptOrderCommand.SIDE_BUY, AcceptOrderCommand.TIF_DAY), pos)).isTrue();
         }
         verify(cursorRepository, never())
-                .advance(OmsFixEgressService.EGRESS_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, pos4);
+                .advanceWithRecording(
+                        OmsFixEgressService.EGRESS_ID,
+                        OmsClusterWireFormat.EVENTS_STREAM_ID,
+                        CURRENT_RECORDING_ID,
+                        pos4);
         verify(cursorRepository, never())
-                .advance(OmsFixEgressService.EGRESS_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, pos5);
+                .advanceWithRecording(
+                        OmsFixEgressService.EGRESS_ID,
+                        OmsClusterWireFormat.EVENTS_STREAM_ID,
+                        CURRENT_RECORDING_ID,
+                        pos5);
 
         assertThat(batched.applyAdmittedEvent(sampleAdmitted(AcceptOrderCommand.SIDE_BUY, AcceptOrderCommand.TIF_DAY), pos6)).isTrue();
         verify(cursorRepository, times(1))
-                .advance(OmsFixEgressService.EGRESS_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, pos6);
+                .advanceWithRecording(
+                        OmsFixEgressService.EGRESS_ID,
+                        OmsClusterWireFormat.EVENTS_STREAM_ID,
+                        CURRENT_RECORDING_ID,
+                        pos6);
 
         verifyNoMoreInteractions(cursorRepository);
     }
@@ -284,7 +330,7 @@ class OmsFixEgressServiceTest {
                 cancelBuilder,
                 /* replaceBuilder = */ null,
                 send);
-        flipRunning(egress, true);
+        seedRunningAndRecordingId(egress);
 
         OrderCancelRequestedEvent ev = sampleCancelRequested();
         OrderCancelRequest msg = new OrderCancelRequest();
@@ -296,7 +342,11 @@ class OmsFixEgressServiceTest {
         assertThat(advanced).isTrue();
         verify(send).send(msg);
         verify(cursorRepository)
-                .advance(OmsFixEgressService.EGRESS_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, FRAGMENT_POSITION);
+                .advanceWithRecording(
+                        OmsFixEgressService.EGRESS_ID,
+                        OmsClusterWireFormat.EVENTS_STREAM_ID,
+                        CURRENT_RECORDING_ID,
+                        FRAGMENT_POSITION);
     }
 
     @Test
@@ -313,7 +363,7 @@ class OmsFixEgressServiceTest {
                 /* cancelBuilder = */ null,
                 replaceBuilder,
                 send);
-        flipRunning(egress, true);
+        seedRunningAndRecordingId(egress);
 
         OrderReplaceRequestedEvent ev = sampleReplaceRequested();
         OrderCancelReplaceRequest msg = new OrderCancelReplaceRequest();
@@ -325,7 +375,11 @@ class OmsFixEgressServiceTest {
         assertThat(advanced).isTrue();
         verify(send).send(msg);
         verify(cursorRepository)
-                .advance(OmsFixEgressService.EGRESS_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, FRAGMENT_POSITION);
+                .advanceWithRecording(
+                        OmsFixEgressService.EGRESS_ID,
+                        OmsClusterWireFormat.EVENTS_STREAM_ID,
+                        CURRENT_RECORDING_ID,
+                        FRAGMENT_POSITION);
     }
 
     @Test
@@ -343,13 +397,17 @@ class OmsFixEgressServiceTest {
                 /* cancelBuilder = */ null,
                 /* replaceBuilder = */ null,
                 /* send = */ null);
-        flipRunning(cursorOnly, true);
+        seedRunningAndRecordingId(cursorOnly);
 
         boolean advanced = cursorOnly.applyCancelRequestedEvent(sampleCancelRequested(), FRAGMENT_POSITION);
 
         assertThat(advanced).isTrue();
         verify(cursorRepository)
-                .advance(OmsFixEgressService.EGRESS_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, FRAGMENT_POSITION);
+                .advanceWithRecording(
+                        OmsFixEgressService.EGRESS_ID,
+                        OmsClusterWireFormat.EVENTS_STREAM_ID,
+                        CURRENT_RECORDING_ID,
+                        FRAGMENT_POSITION);
         verifyNoInteractions(send);
     }
 

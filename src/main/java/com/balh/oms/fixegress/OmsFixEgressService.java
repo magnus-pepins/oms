@@ -30,7 +30,12 @@ import quickfix.SessionNotFound;
 import quickfix.fix44.NewOrderSingle;
 
 import java.time.Clock;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
 
@@ -103,14 +108,37 @@ import java.util.concurrent.locks.LockSupport;
  * exit without advancing; restart redelivers the fragment from the persisted cursor (one
  * fragment behind the failed send, since slice 3b-1's cursor advance is post-send).
  *
- * <h2>Failure handling (replay infrastructure, unchanged from slice 3b-1)</h2>
+ * <h2>Failure handling (replay infrastructure, 2026-05-23 hardening — V56)</h2>
  *
- * <p>If the recording does not yet exist (cluster startup race), the thread polls every
- * {@link OmsConfig.Cluster.FixEgress#getRecordingLookupParkMs()} ms until it appears. If the
- * persisted cursor falls outside the current recording's range (recording recreated across
- * cluster incarnations), {@link #clampToRecording} rewinds to {@code startPosition} and
- * {@link OmsFixEgressCursorRepository#reset} persists the rewind. If Aeron rejects a replay
- * position as not frame-aligned, {@link #openReplay} retries from {@code startPosition}.
+ * <p>If the cluster has never written a recording (first ever cluster boot, fresh archive
+ * directory), the thread polls every
+ * {@link OmsConfig.Cluster.FixEgress#getRecordingLookupParkMs()} ms until a recording appears,
+ * then bootstraps the cursor to {@code (oldestRecordingId, startPosition)}. Once at least one
+ * recording exists the cursor always carries an explicit Aeron Archive recording id (V56
+ * migration) and the replay loop walks recordings in id order, rolling forward at each
+ * recording's {@code stopPosition} when a successor exists. The bug class fixed by V56 is the
+ * pre-hardening silent-clamp behaviour: when the saved cursor fell outside the active
+ * recording's bounds (e.g. saved position pointed into a previous, still-on-disk recording the
+ * egress no longer had a pointer to), the old {@code clampToRecording} path silently reset
+ * to {@code descriptor.startPosition()} of the latest recording and persisted that — destroying
+ * the breadcrumb to the earlier recording's events. The egress' specific impact is harder to
+ * spot than the projector's (the bench broker idempotently re-accepts NOS retries, hiding the
+ * "skipped events" symptom), but the bug is identical to the projector pre-V55. See
+ * {@code system-documentation/handovers/2026-05-23-oms-snapshot-magic-mismatch-and-stability-rework.md}
+ * §9 / §9.6 for the full incident narrative and the projector-side fix that this commit mirrors.
+ *
+ * <p>The egress now fails loud (throws {@link IllegalStateException} and the replay loop exits)
+ * in three situations that the pre-V56 code silently papered over:
+ * <ul>
+ *   <li>A legacy {@code oms_fix_egress_cursor} row exists where {@code last_applied_recording_id}
+ *       is {@code NULL} (pre-V56 schema or a row written by pre-2026-05-23 code). The operator
+ *       must pin a recording id explicitly via SQL before the egress can resume.</li>
+ *   <li>The saved recording id no longer appears in the Aeron Archive listing (disk wipe,
+ *       manual archive deletion, wiring pointed at the wrong archive). Operator decides
+ *       whether to repoint the archive or accept data loss via {@code resetWithRecording}.</li>
+ *   <li>The saved position is past the live tail of the saved recording (recording truncated
+ *       under the egress, or other unusual condition). Operator inspection only.</li>
+ * </ul>
  *
  * <h2>Optional FIX dependencies</h2>
  *
@@ -143,6 +171,24 @@ public class OmsFixEgressService {
 
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicReference<Long> lastAppliedPosition = new AtomicReference<>(0L);
+    /**
+     * 2026-05-23 hardening (handover §9.6). Aeron Archive recording id this egress is currently
+     * replaying. Read by {@link #advanceCursor} / {@link #flushPendingCursorAdvance} so each
+     * persisted {@code (recording_id, position)} pair always travels together.
+     *
+     * <p>{@code -1} means "not yet set" — the replay loop populates it before opening the first
+     * replay subscription. A value of {@code -1} reaching the cursor write is a programming bug
+     * and {@link #requireCurrentRecordingId} fails loud rather than writing {@code -1} to
+     * Postgres.
+     */
+    private final AtomicLong currentRecordingId = new AtomicLong(-1L);
+    /**
+     * 2026-05-23 hardening. When non-empty, {@link #init} stashes the resume cursor here and the
+     * replay loop honors it as the start position; on a fresh first-ever start it stays empty and
+     * the replay loop bootstraps from the oldest available recording at position 0.
+     */
+    private final AtomicReference<OmsFixEgressCursorRepository.RecordedCursor> startupCursor =
+            new AtomicReference<>(null);
     private Thread replayThread;
 
     /**
@@ -209,10 +255,49 @@ public class OmsFixEgressService {
 
     @PostConstruct
     void init() {
-        long resumePos = cursorRepository
-                .findLastAppliedPosition(EGRESS_ID, OmsClusterWireFormat.EVENTS_STREAM_ID)
-                .orElse(0L);
-        lastAppliedPosition.set(resumePos);
+        // 2026-05-23 hardening (handover §9.6). Load the saved cursor in its full
+        // (recording_id, position) shape. Three cases:
+        //
+        //   1. Empty Optional      — first-ever egress start (no row in oms_fix_egress_cursor).
+        //                            Replay loop will bootstrap from the oldest recording at pos 0.
+        //   2. Legacy NULL row     — row exists but predates V56 (no recording id). The pre-V56
+        //                            replay loop silently clamped position to 0 of the active
+        //                            recording when the saved position overshot, losing the
+        //                            pointer to events in earlier recordings. We refuse to start
+        //                            until an operator pins the recording id explicitly via SQL.
+        //   3. Recording-aware row — resume from the saved (recording_id, position) directly.
+        Optional<OmsFixEgressCursorRepository.RecordedCursor> savedCursor = cursorRepository
+                .findLastAppliedCursor(EGRESS_ID, OmsClusterWireFormat.EVENTS_STREAM_ID);
+        if (savedCursor.isPresent() && !savedCursor.get().hasRecordingId()) {
+            long legacyPos = savedCursor.get().position();
+            String repairSql = String.format(
+                    "UPDATE oms_fix_egress_cursor SET last_applied_recording_id = <pick the recording id matching the saved position %d>"
+                            + " WHERE egress_id = '%s' AND stream_id = %d;",
+                    legacyPos, EGRESS_ID, OmsClusterWireFormat.EVENTS_STREAM_ID);
+            throw new IllegalStateException(
+                    "oms-fix-egress refuses to start: oms_fix_egress_cursor row exists but"
+                            + " last_applied_recording_id IS NULL (pre-V56 schema or pre-2026-05-23-hardening write)."
+                            + " Without the recording id the egress cannot tell which Aeron Archive recording the"
+                            + " saved position " + legacyPos + " refers to, and the old code path silently reset to"
+                            + " position 0 of the current recording, which on a non-DupClOrdID-tolerant venue would"
+                            + " mean admit events from prior cluster incarnations are never sent as NOS to the"
+                            + " broker. Operator must pick the correct recording id (ls"
+                            + " /opt/oms/aeron-archive/data/*-events*.rec, or psql to check which recording was"
+                            + " current at the moment the saved position was written) and run: "
+                            + repairSql
+                            + " — see system-documentation/handovers/2026-05-23-oms-snapshot-magic-mismatch-and-stability-rework.md §9.6.");
+        }
+        savedCursor.ifPresent(startupCursor::set);
+        long resumePos;
+        if (savedCursor.isPresent()) {
+            OmsFixEgressCursorRepository.RecordedCursor c = savedCursor.get();
+            resumePos = c.position();
+            lastAppliedPosition.set(resumePos);
+            currentRecordingId.set(c.recordingId());
+        } else {
+            resumePos = 0L;
+            lastAppliedPosition.set(0L);
+        }
         pendingCursorPosition = resumePos;
         eventsSinceCursorFlush = 0;
         // Slice 4l H2: cache cursor-flush-every from OmsConfig so the hot replay path doesn't
@@ -220,19 +305,41 @@ public class OmsFixEgressService {
         // belt-and-braces clamp here to fail closed on pathological injection.
         cursorFlushEvery = Math.max(1, config.getCluster().getFixEgress().getCursorFlushEvery());
         boolean fixWired = newOrderSingleBuilder != null && fixOutboundSessionSend != null;
-        log.info(
-                "oms-fix-egress starting (slice 3b-2 — {}); resuming from log position {} (egressId={}, streamId={}); cursorFlushEvery={}",
-                fixWired
-                        ? "FIX send active: NewOrderSingle via FixOutboundSessionSend"
-                        : "cursor-only mode (no FIX beans on classpath; routing.backend != fix)",
-                resumePos,
-                EGRESS_ID,
-                OmsClusterWireFormat.EVENTS_STREAM_ID,
-                cursorFlushEvery);
+        if (savedCursor.isPresent()) {
+            log.info(
+                    "oms-fix-egress starting ({}); resuming from recording {} at log position {} (egressId={}, streamId={}); cursorFlushEvery={}",
+                    fixWired
+                            ? "FIX send active: NewOrderSingle via FixOutboundSessionSend"
+                            : "cursor-only mode (no FIX beans on classpath; routing.backend != fix)",
+                    savedCursor.get().recordingId(),
+                    resumePos,
+                    EGRESS_ID,
+                    OmsClusterWireFormat.EVENTS_STREAM_ID,
+                    cursorFlushEvery);
+        } else {
+            log.info(
+                    "oms-fix-egress starting fresh (no saved cursor; will bootstrap from oldest available events recording at position 0) ({}); (egressId={}, streamId={}); cursorFlushEvery={}",
+                    fixWired
+                            ? "FIX send active: NewOrderSingle via FixOutboundSessionSend"
+                            : "cursor-only mode (no FIX beans on classpath; routing.backend != fix)",
+                    EGRESS_ID,
+                    OmsClusterWireFormat.EVENTS_STREAM_ID,
+                    cursorFlushEvery);
+        }
         running.set(true);
         replayThread = new Thread(this::replayLoop, "oms-fix-egress-replay");
         replayThread.setDaemon(true);
         replayThread.start();
+    }
+
+    /**
+     * Visible for tests that drive {@link #applyAdmittedEvent} / {@link #applyCancelRequestedEvent}
+     * / {@link #applyReplaceRequestedEvent} directly (bypassing {@link #init} and the replay loop
+     * that would normally seed the recording id from the Aeron Archive). Production code never
+     * calls this — the replay loop owns the field.
+     */
+    void setCurrentRecordingIdForTesting(long recordingId) {
+        currentRecordingId.set(recordingId);
     }
 
     @PreDestroy
@@ -259,6 +366,20 @@ public class OmsFixEgressService {
         return lastAppliedPosition.get();
     }
 
+    /**
+     * 2026-05-23 hardening (handover §9.6). Rewritten to walk all events recordings sorted by id
+     * instead of unconditionally picking the highest-id recording and silently clamping the
+     * saved cursor to its start position. Mirrors the projector's V55 rewrite shape-for-shape;
+     * see {@code OmsPostgresProjector#replayLoop} for the per-step rationale.
+     *
+     * <p>The egress has one extra concern the projector does not: batched cursor flush
+     * ({@code cursorFlushEvery > 1}). Every recording-boundary roll-forward AND every
+     * recording-start clamp flushes the pending batch <em>under the old recording id</em>
+     * before {@link OmsFixEgressCursorRepository#resetWithRecording} moves the cursor to the
+     * new recording. Without the pre-reset flush, a pending position belonging to the OLD
+     * recording would be persisted with the NEW recording id, violating the cursor's
+     * (recording_id, position) invariant.
+     */
     private void replayLoop() {
         OmsConfig.Cluster.FixEgress cfg = config.getCluster().getFixEgress();
         if (cfg.getAeronDirectory().isBlank()) {
@@ -274,7 +395,6 @@ public class OmsFixEgressService {
         }
         Aeron aeron = null;
         AeronArchive archive = null;
-        Subscription replay = null;
         try {
             aeron = Aeron.connect(new Aeron.Context().aeronDirectoryName(cfg.getAeronDirectory()));
             archive = AeronArchive.connect(new AeronArchive.Context()
@@ -283,31 +403,20 @@ public class OmsFixEgressService {
                     .controlRequestChannel(cfg.getArchiveControlRequestChannel())
                     .controlResponseChannel(cfg.getArchiveControlResponseChannel()));
 
-            RecordingDescriptor descriptor = waitForRecording(archive, cfg.getRecordingLookupParkMs());
-            if (descriptor == null) {
-                return;
-            }
-
-            long persistedPos = lastAppliedPosition.get();
-            long requestedPos = clampToRecording(archive, descriptor, persistedPos);
-            replay = openReplay(archive, descriptor, requestedPos, cfg);
-            log.info(
-                    "oms-fix-egress replay open; recordingId={} startPos={} (recordingStart={}, recordingStop={}) channel={} streamId={}",
-                    descriptor.recordingId(),
-                    lastAppliedPosition.get(),
-                    descriptor.startPosition(),
-                    descriptor.stopPosition(),
-                    cfg.getReplayChannel(),
-                    cfg.getReplayStreamId());
-
-            FragmentHandler handler = new EgressFragmentHandler();
-            while (running.get()) {
-                int polled = replay.poll(handler, cfg.getFragmentLimit());
-                if (polled == 0) {
-                    LockSupport.parkNanos(cfg.getPollParkNanos());
+            // Bootstrap: if no saved cursor at startup, wait for the first recording to appear,
+            // then persist (oldestId, 0) so subsequent restarts have a recording id to anchor on.
+            if (startupCursor.get() == null) {
+                if (!bootstrapFromOldestRecording(archive, cfg.getRecordingLookupParkMs())) {
+                    return; // shutdown requested during bootstrap
                 }
             }
+
+            runReplayLoopWithRecordingWalk(archive, cfg);
         } catch (RuntimeException e) {
+            // Loud failures from the recording-walk loop (saved recording id missing from
+            // Archive, saved position past recording end, etc.) land here and stop the egress.
+            // Operators see the stack trace and the diagnostic context in the exception message;
+            // restarting without fixing the underlying state would re-throw immediately.
             log.error("oms-fix-egress replay loop terminating", e);
         } finally {
             // Slice 4l H2: flush any pending batched cursor advance before tearing down. The
@@ -315,11 +424,304 @@ public class OmsFixEgressService {
             // so reading them here (still on the replay thread) is race-free. With
             // cursorFlushEvery=1 (default) this is always a no-op.
             flushPendingCursorAdvance("replay loop shutdown");
-            CloseHelper.quietClose(replay);
             CloseHelper.quietClose(archive);
             CloseHelper.quietClose(aeron);
             log.info("oms-fix-egress replay loop stopped");
         }
+    }
+
+    /**
+     * First-ever-start path: picks the oldest events recording on the channel/stream, persists
+     * {@code (oldestId, startPosition)} as the initial cursor, and seeds
+     * {@link #currentRecordingId} + {@link #lastAppliedPosition} + the batch-flush bookkeeping.
+     *
+     * @return {@code true} if a recording was found and persisted; {@code false} if shutdown was
+     *     requested before any recording appeared.
+     */
+    private boolean bootstrapFromOldestRecording(AeronArchive archive, long parkMs) {
+        while (running.get()) {
+            List<RecordingDescriptor> recordings = listEventsRecordingsSorted(archive);
+            if (!recordings.isEmpty()) {
+                RecordingDescriptor oldest = recordings.get(0);
+                log.info(
+                        "oms-fix-egress bootstrap: persisting initial cursor (recordingId={}, position={})"
+                                + " — first start on this egress, no prior cursor row.",
+                        oldest.recordingId(),
+                        oldest.startPosition());
+                cursorRepository.resetWithRecording(
+                        EGRESS_ID,
+                        OmsClusterWireFormat.EVENTS_STREAM_ID,
+                        oldest.recordingId(),
+                        oldest.startPosition());
+                currentRecordingId.set(oldest.recordingId());
+                lastAppliedPosition.set(oldest.startPosition());
+                pendingCursorPosition = oldest.startPosition();
+                eventsSinceCursorFlush = 0;
+                return true;
+            }
+            try {
+                Thread.sleep(parkMs);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The reopen-and-poll outer loop, exited only on shutdown or unrecoverable error. Each
+     * iteration looks up the current recording descriptor, validates the saved position against
+     * it, opens a replay, drains it, and decides whether to roll forward to a newer recording.
+     *
+     * <p>Roll-forward semantics: a recording is "complete" when its {@code stopPosition} is
+     * finalized (set by Aeron Archive when the recording's writer publication closes — cluster
+     * exit). When the egress reaches the {@code stopPosition} of the current recording AND a
+     * recording with a higher id exists on the same stream, the egress flushes its pending
+     * batched cursor (under the OLD recording id), promotes its cursor to
+     * {@code (nextId, startPosition)} via {@code resetWithRecording}, and re-opens replay
+     * against the new recording.
+     */
+    private void runReplayLoopWithRecordingWalk(AeronArchive archive, OmsConfig.Cluster.FixEgress cfg) {
+        FragmentHandler handler = new EgressFragmentHandler();
+        while (running.get()) {
+            long recordingIdNow = currentRecordingId.get();
+            if (recordingIdNow < 0L) {
+                throw new IllegalStateException(
+                        "oms-fix-egress replay loop entered with currentRecordingId="
+                                + recordingIdNow
+                                + "; init() / bootstrap should have set it. This is a programming bug.");
+            }
+            RecordingDescriptor descriptor = findRecordingById(archive, recordingIdNow);
+            if (descriptor == null) {
+                // Saved recording id is no longer listed in the Archive. This is not a "the
+                // recording is empty so reset to 0" situation — it means the on-disk recording
+                // files for our saved id have been deleted (manual rm, archive recompaction,
+                // disk wipe). Silent reset would re-send every admit since the start of the new
+                // active recording (broker would reject duplicates via DupClOrdID, but every
+                // admit from the missing recording would never be sent at all). FAIL LOUD
+                // instead; operator decides whether to bootstrap fresh (resetWithRecording to
+                // (newOldestId, 0) and accept loss) or restore the recording files.
+                throw new IllegalStateException(
+                        "oms-fix-egress cannot continue: saved recordingId="
+                                + recordingIdNow
+                                + " is not listed in the Aeron Archive for events stream "
+                                + OmsClusterWireFormat.EVENTS_STREAM_ID
+                                + " (channel=" + OmsClusterWireFormat.EVENTS_CHANNEL + ")."
+                                + " The recording files may have been deleted or the egress is wired to the wrong"
+                                + " Aeron Archive. Operator must decide between (a) repointing to a different Archive,"
+                                + " or (b) accepting data loss by running resetWithRecording to a known-good"
+                                + " (recordingId, position). Refusing to silently reset to position 0 of an unrelated"
+                                + " recording — see handover §9.6.");
+            }
+            long savedPosition = lastAppliedPosition.get();
+            long upperBound = recordingUpperBound(archive, descriptor);
+            if (savedPosition > upperBound) {
+                // Saved position is beyond the end of this recording. Pre-hardening behaviour
+                // silently reset to descriptor.startPosition() and persisted that — which is
+                // exactly the projector bug that hit pop on 2026-05-23. We refuse and FAIL LOUD.
+                throw new IllegalStateException(
+                        "oms-fix-egress saved cursor (recordingId="
+                                + recordingIdNow
+                                + ", position=" + savedPosition + ") is past the end of the recording (upperBound="
+                                + upperBound + ", startPosition=" + descriptor.startPosition()
+                                + ", stopPosition=" + descriptor.stopPosition()
+                                + "). This indicates the recording was truncated or replaced under the egress."
+                                + " Refusing to silently reset to position 0 — operator must inspect via"
+                                + " AeronArchive control + resetWithRecording to a verified (recordingId, position).");
+            }
+            if (savedPosition < descriptor.startPosition()) {
+                // Saved position is below the recording's start. Acceptable to advance to
+                // startPosition: the broker's DupClOrdID dedupe makes re-sending NOS for already
+                // admitted orders safe (option-1 at-least-once-at-broker semantics, see class
+                // Javadoc). Flush any pending batch under the OLD recording id first so the
+                // (recording_id, position) invariant is preserved across the reset.
+                log.warn(
+                        "Egress cursor below recording startPosition: saved=(recordingId={}, position={}),"
+                                + " recordingStart={}; advancing to recording start (NOS re-sends will be"
+                                + " deduplicated by the broker via DupClOrdID).",
+                        recordingIdNow,
+                        savedPosition,
+                        descriptor.startPosition());
+                flushPendingCursorAdvance("recording-start clamp");
+                cursorRepository.resetWithRecording(
+                        EGRESS_ID,
+                        OmsClusterWireFormat.EVENTS_STREAM_ID,
+                        recordingIdNow,
+                        descriptor.startPosition());
+                lastAppliedPosition.set(descriptor.startPosition());
+                pendingCursorPosition = descriptor.startPosition();
+                eventsSinceCursorFlush = 0;
+                savedPosition = descriptor.startPosition();
+            }
+
+            Subscription replay = null;
+            try {
+                replay = archive.replay(
+                        descriptor.recordingId(),
+                        savedPosition,
+                        /* length = */ Long.MAX_VALUE,
+                        cfg.getReplayChannel(),
+                        cfg.getReplayStreamId());
+                log.info(
+                        "oms-fix-egress replay open; recordingId={} startPos={} (recordingStart={},"
+                                + " recordingStop={}, upperBound={}) channel={} streamId={}",
+                        descriptor.recordingId(),
+                        savedPosition,
+                        descriptor.startPosition(),
+                        descriptor.stopPosition(),
+                        upperBound,
+                        cfg.getReplayChannel(),
+                        cfg.getReplayStreamId());
+
+                while (running.get()) {
+                    int polled = replay.poll(handler, cfg.getFragmentLimit());
+                    if (polled > 0) {
+                        continue;
+                    }
+                    // No fragments. Two cases:
+                    //   (a) live-tail wait on an active recording — park, keep polling.
+                    //   (b) end of a completed recording with a successor available — roll forward.
+                    RecordingDescriptor refreshed = findRecordingById(archive, recordingIdNow);
+                    if (refreshed == null) {
+                        // Recording vanished mid-replay (extremely unusual). Fall through to
+                        // outer loop iteration which will fail loud.
+                        break;
+                    }
+                    long recordingStop = refreshed.stopPosition();
+                    long currentApplied = lastAppliedPosition.get();
+                    if (recordingStop != AeronArchive.NULL_POSITION
+                            && currentApplied >= recordingStop) {
+                        RecordingDescriptor successor = findNextRecording(archive, recordingIdNow);
+                        if (successor != null) {
+                            log.info(
+                                    "Egress recording boundary: recordingId={} complete at stopPosition={};"
+                                            + " rolling forward to recordingId={} startPosition={}.",
+                                    recordingIdNow,
+                                    recordingStop,
+                                    successor.recordingId(),
+                                    successor.startPosition());
+                            // CRITICAL: flush any pending batched cursor advance under the OLD
+                            // recording id BEFORE persisting the successor. If we skipped this,
+                            // a pendingCursorPosition belonging to the old recording would be
+                            // written with the new recording id by the next advanceCursor call,
+                            // violating the (recording_id, position) invariant.
+                            flushPendingCursorAdvance("recording boundary roll-forward");
+                            cursorRepository.resetWithRecording(
+                                    EGRESS_ID,
+                                    OmsClusterWireFormat.EVENTS_STREAM_ID,
+                                    successor.recordingId(),
+                                    successor.startPosition());
+                            currentRecordingId.set(successor.recordingId());
+                            lastAppliedPosition.set(successor.startPosition());
+                            pendingCursorPosition = successor.startPosition();
+                            eventsSinceCursorFlush = 0;
+                            break; // exit inner poll loop -> outer loop reopens against successor
+                        }
+                    }
+                    LockSupport.parkNanos(cfg.getPollParkNanos());
+                }
+            } finally {
+                CloseHelper.quietClose(replay);
+            }
+        }
+    }
+
+    /**
+     * Lists every recording on the events channel+stream and returns it sorted ascending by
+     * {@code recordingId}. Empty list means no recording exists yet (cluster has never run on
+     * this Archive directory).
+     */
+    private List<RecordingDescriptor> listEventsRecordingsSorted(AeronArchive archive) {
+        List<RecordingDescriptor> out = new ArrayList<>();
+        archive.listRecordingsForUri(
+                /* fromRecordingId = */ 0L,
+                /* recordCount = */ 1024,
+                OmsClusterWireFormat.EVENTS_CHANNEL,
+                OmsClusterWireFormat.EVENTS_STREAM_ID,
+                (controlSessionId,
+                        correlationId,
+                        recordingId,
+                        startTimestamp,
+                        stopTimestamp,
+                        startPosition,
+                        stopPosition,
+                        initialTermId,
+                        segmentFileLength,
+                        termBufferLength,
+                        mtuLength,
+                        sessionId,
+                        streamId,
+                        strippedChannel,
+                        originalChannel,
+                        sourceIdentity) -> {
+                    if (streamId == OmsClusterWireFormat.EVENTS_STREAM_ID) {
+                        out.add(new RecordingDescriptor(recordingId, startPosition, stopPosition));
+                    }
+                });
+        out.sort(Comparator.comparingLong(RecordingDescriptor::recordingId));
+        return out;
+    }
+
+    /**
+     * @return the descriptor with the given recording id, or {@code null} if absent from the
+     *     Archive's listing for the events channel/stream.
+     */
+    private RecordingDescriptor findRecordingById(AeronArchive archive, long recordingId) {
+        for (RecordingDescriptor d : listEventsRecordingsSorted(archive)) {
+            if (d.recordingId() == recordingId) {
+                return d;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * @return the lowest-id recording strictly greater than {@code currentId}, or {@code null}
+     *     if no successor exists yet (current recording is the live tail).
+     */
+    private RecordingDescriptor findNextRecording(AeronArchive archive, long currentId) {
+        for (RecordingDescriptor d : listEventsRecordingsSorted(archive)) {
+            if (d.recordingId() > currentId) {
+                return d;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Effective upper bound for a recording at this instant. For a stopped recording it is the
+     * finalized {@code stopPosition}; for an active recording it is the Archive's live
+     * write-head position. Returns {@code startPosition} when neither is available.
+     */
+    private long recordingUpperBound(AeronArchive archive, RecordingDescriptor descriptor) {
+        long stop = descriptor.stopPosition();
+        if (stop != AeronArchive.NULL_POSITION) {
+            return stop;
+        }
+        long head = archive.getRecordingPosition(descriptor.recordingId());
+        if (head == AeronArchive.NULL_POSITION) {
+            return descriptor.startPosition();
+        }
+        return head;
+    }
+
+    /**
+     * 2026-05-23 hardening. Reads {@link #currentRecordingId} for use by any cursor write in
+     * the apply path. The replay loop guarantees this is set to a non-negative Aeron Archive
+     * recording id before any fragment can be polled, so {@code -1} reaching here is a
+     * programming bug — not an operational condition — and we fail loud rather than write
+     * {@code -1} to Postgres.
+     */
+    private long requireCurrentRecordingId() {
+        long id = currentRecordingId.get();
+        if (id < 0L) {
+            throw new IllegalStateException(
+                    "oms-fix-egress apply path invoked before currentRecordingId was set"
+                            + " (got " + id + "). This indicates the replay loop opened a Subscription"
+                            + " without seeding the recording id — programming bug, not an operational condition.");
+        }
+        return id;
     }
 
     /**
@@ -329,6 +731,13 @@ public class OmsFixEgressService {
      * no-op. Failures are logged but not rethrown — on restart, replay redelivers the
      * batch's worth of fragments and the broker rejects duplicate NOS via {@code DupClOrdID}
      * (option 1 dedupe).
+     *
+     * <p>2026-05-23 hardening (V56): writes the pending position under the
+     * {@link #requireCurrentRecordingId() current recording id}. Callers that cross a
+     * recording boundary MUST invoke this BEFORE advancing {@link #currentRecordingId} —
+     * otherwise the pending position (from the OLD recording) would be persisted under the
+     * NEW recording id, violating the (recording_id, position) invariant. The recording-walk
+     * loop above honours that ordering at every roll-forward / recording-start-clamp site.
      */
     private void flushPendingCursorAdvance(String reason) {
         if (eventsSinceCursorFlush <= 0) {
@@ -337,7 +746,11 @@ public class OmsFixEgressService {
         long pos = pendingCursorPosition;
         eventsSinceCursorFlush = 0;
         try {
-            cursorRepository.advance(EGRESS_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, pos);
+            cursorRepository.advanceWithRecording(
+                    EGRESS_ID,
+                    OmsClusterWireFormat.EVENTS_STREAM_ID,
+                    requireCurrentRecordingId(),
+                    pos);
         } catch (RuntimeException e) {
             log.warn(
                     "oms-fix-egress: pending cursor flush failed at {} (reason={}); restart will replay fragments and broker will dedupe via DupClOrdID",
@@ -347,147 +760,9 @@ public class OmsFixEgressService {
         }
     }
 
-    private RecordingDescriptor waitForRecording(AeronArchive archive, long parkMs) {
-        while (running.get()) {
-            RecordingDescriptor[] result = {null};
-            archive.listRecordingsForUri(
-                    /* fromRecordingId = */ 0L,
-                    /* recordCount = */ 1024,
-                    OmsClusterWireFormat.EVENTS_CHANNEL,
-                    OmsClusterWireFormat.EVENTS_STREAM_ID,
-                    (controlSessionId,
-                            correlationId,
-                            recordingId,
-                            startTimestamp,
-                            stopTimestamp,
-                            startPosition,
-                            stopPosition,
-                            initialTermId,
-                            segmentFileLength,
-                            termBufferLength,
-                            mtuLength,
-                            sessionId,
-                            streamId,
-                            strippedChannel,
-                            originalChannel,
-                            sourceIdentity) -> {
-                        if (streamId == OmsClusterWireFormat.EVENTS_STREAM_ID
-                                && (result[0] == null || recordingId > result[0].recordingId())) {
-                            result[0] = new RecordingDescriptor(recordingId, startPosition, stopPosition);
-                        }
-                    });
-            if (result[0] != null) {
-                return result[0];
-            }
-            try {
-                Thread.sleep(parkMs);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return null;
-            }
-        }
-        return null;
-    }
-
-    /**
-     * Opens the replay subscription, with a one-shot fallback to the recording's
-     * {@code startPosition} if Aeron rejects the requested position as not frame-aligned.
-     *
-     * <p>Mirrors {@link com.balh.oms.projector.OmsPostgresProjector}'s {@code openReplay} —
-     * frame boundaries depend on the term layout established when the recording was created
-     * (initial term id, term length, mtu). Across cluster restarts or archive recreation the
-     * same numerical position may fall mid-frame in the new recording even if it was a clean
-     * boundary in the old one. The safe response is "rewind to startPosition and replay"; for
-     * slice 3b-1 the side-effect is just a cursor advance (idempotent), so a rewind is purely
-     * a re-traversal cost. Slice 3b-2's {@code Session.sendToTarget} side effect changes that
-     * trade-off — see plan slice 3b-2 for the dedupe options.
-     */
-    private Subscription openReplay(
-            AeronArchive archive,
-            RecordingDescriptor descriptor,
-            long requestedPos,
-            OmsConfig.Cluster.FixEgress cfg) {
-        long currentPos = requestedPos;
-        try {
-            Subscription sub = archive.replay(
-                    descriptor.recordingId(),
-                    currentPos,
-                    /* length = */ Long.MAX_VALUE,
-                    cfg.getReplayChannel(),
-                    cfg.getReplayStreamId());
-            persistResolvedStartPos(currentPos);
-            return sub;
-        } catch (io.aeron.archive.client.ArchiveException e) {
-            log.warn(
-                    "archive.replay({}, pos={}) failed: {}; resetting to recording startPosition={}.",
-                    descriptor.recordingId(),
-                    currentPos,
-                    e.getMessage(),
-                    descriptor.startPosition());
-            currentPos = descriptor.startPosition();
-            cursorRepository.reset(EGRESS_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, currentPos);
-            lastAppliedPosition.set(currentPos);
-            return archive.replay(
-                    descriptor.recordingId(),
-                    currentPos,
-                    /* length = */ Long.MAX_VALUE,
-                    cfg.getReplayChannel(),
-                    cfg.getReplayStreamId());
-        }
-    }
-
-    private void persistResolvedStartPos(long pos) {
-        if (pos != lastAppliedPosition.get()) {
-            cursorRepository.reset(EGRESS_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, pos);
-            lastAppliedPosition.set(pos);
-        }
-    }
-
-    /**
-     * Aeron Archive replay requires the start position to be a frame boundary inside the
-     * recording's available range. A persisted cursor can fall outside that range when the
-     * recording is recreated (test JVM reboot, prod node disk wipe, manual archive deletion).
-     * Mirrors {@link com.balh.oms.projector.OmsPostgresProjector}'s {@code clampToRecording}:
-     * we clamp to the recording's {@code startPosition}; for an active recording (still being
-     * written, {@code stopPosition == NULL_POSITION}), the upper bound is
-     * {@link AeronArchive#getRecordingPosition(long)}.
-     */
-    private long clampToRecording(AeronArchive archive, RecordingDescriptor descriptor, long cursorPos) {
-        long start = descriptor.startPosition();
-        if (cursorPos < start) {
-            log.warn(
-                    "Egress cursor {} below recording startPosition {}; resuming from {}.",
-                    cursorPos,
-                    start,
-                    start);
-            return start;
-        }
-        long upperBound;
-        long stop = descriptor.stopPosition();
-        if (stop == AeronArchive.NULL_POSITION) {
-            upperBound = archive.getRecordingPosition(descriptor.recordingId());
-            if (upperBound == AeronArchive.NULL_POSITION) {
-                upperBound = start;
-            }
-        } else {
-            upperBound = stop;
-        }
-        if (cursorPos > upperBound) {
-            log.warn(
-                    "Egress cursor {} above recording upper-bound {} (likely stale cursor from a previous"
-                            + " incarnation); resuming from {}.",
-                    cursorPos,
-                    upperBound,
-                    start);
-            return start;
-        }
-        return cursorPos;
-    }
-
     /**
      * Snapshot of the recording's identity and bounds returned by
-     * {@link AeronArchive#listRecordingsForUri}. Used to clamp a stale cursor to a valid
-     * replay range.
+     * {@link AeronArchive#listRecordingsForUri}.
      */
     private record RecordingDescriptor(long recordingId, long startPosition, long stopPosition) {}
 
@@ -546,15 +821,12 @@ public class OmsFixEgressService {
      * advance shape from {@link #applyAdmittedEvent} so the at-least-once-at-broker semantics
      * stay identical: on JVM crash before the cursor write, restart replays the unrelated
      * fragment and we no-op again.
+     *
+     * <p>Delegates to {@link #advanceCursor} so the V56 recording-aware cursor write path is
+     * the single source of truth for batched flush + recording-id threading.
      */
     boolean applyCursorOnly(long newPosition) {
-        pendingCursorPosition = newPosition;
-        eventsSinceCursorFlush++;
-        if (eventsSinceCursorFlush >= cursorFlushEvery) {
-            cursorRepository.advance(EGRESS_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, newPosition);
-            eventsSinceCursorFlush = 0;
-        }
-        return true;
+        return advanceCursor(newPosition);
     }
 
     /**
@@ -681,12 +953,22 @@ public class OmsFixEgressService {
      * preserved: with the default {@code cursorFlushEvery=1} every fragment flushes inline; with
      * {@code N>1} the Postgres UPSERT is amortised across {@code N} fragments at the cost of up
      * to {@code N-1} redelivered broker messages per crash.
+     *
+     * <p>2026-05-23 hardening (V56): writes go through
+     * {@link OmsFixEgressCursorRepository#advanceWithRecording} with the current Aeron Archive
+     * recording id. {@link #requireCurrentRecordingId} fails loud if the recording id has not
+     * been seeded by the replay loop's bootstrap / outer-loop machinery (programming bug, not
+     * an operational condition).
      */
     private boolean advanceCursor(long newPosition) {
         pendingCursorPosition = newPosition;
         eventsSinceCursorFlush++;
         if (eventsSinceCursorFlush >= cursorFlushEvery) {
-            cursorRepository.advance(EGRESS_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, newPosition);
+            cursorRepository.advanceWithRecording(
+                    EGRESS_ID,
+                    OmsClusterWireFormat.EVENTS_STREAM_ID,
+                    requireCurrentRecordingId(),
+                    newPosition);
             eventsSinceCursorFlush = 0;
         }
         return true;

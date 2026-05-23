@@ -14,12 +14,10 @@ import java.util.OptionalLong;
  * Persistence for the Aeron-log replay cursor consumed by {@link OmsFixEgressService}.
  *
  * <p>Mirrors {@link com.balh.oms.projector.AeronProjectorCursorRepository} shape-for-shape on a
- * separate physical table ({@code oms_fix_egress_cursor}, V26). The egress JVM advances the
- * cursor after a successful {@code Session.sendToTarget(NewOrderSingle)} so a restart resumes
- * from the last applied log position rather than re-sending every admitted order since cluster
- * boot. {@link #advance} is monotonic (the conflict-path WHERE clause guards against a stale
- * write rolling the cursor backwards); {@link #reset} bypasses that guard and is reserved for
- * the recording-clamp / recording-recreation path (slice 3b — same shape as the projector).
+ * separate physical table ({@code oms_fix_egress_cursor}, V26 + V56). The egress JVM advances
+ * the cursor after a successful {@code Session.sendToTarget(NewOrderSingle)} so a restart
+ * resumes from the last applied log position rather than re-sending every admitted order since
+ * cluster boot.
  *
  * <p>This class does not perform the FIX side-effect itself — it is the cursor side-car.
  * Callers are expected to issue {@code Session.sendToTarget} <em>before</em> advancing, and to
@@ -27,12 +25,52 @@ import java.util.OptionalLong;
  * msgSeqNum and broker-side {@code DupClOrdID} handling are the protocol-level safeguards;
  * future slices add an explicit dedupe table if operational duplicate-NOS pressure exceeds the
  * broker's tolerance).
+ *
+ * <p><b>2026-05-23 hardening (V56).</b> The cursor now carries an explicit Aeron Archive
+ * {@code last_applied_recording_id} alongside the position. Position is meaningless across
+ * recording boundaries: each cluster process lifetime owns one Aeron Archive recording on the
+ * events stream, and recording ids are monotonically assigned by Aeron Archive across cluster
+ * restarts. Without the recording-id qualifier the egress silently fell back to recording-start
+ * (position 0) on the active recording whenever the persisted cursor fell outside the active
+ * recording's bounds (post-restart, the persisted cursor often pointed into a previous,
+ * still-on-disk recording the egress no longer had a pointer to). The bug is identical to the
+ * projector's pre-V55 bug — see
+ * {@code system-documentation/handovers/2026-05-23-oms-snapshot-magic-mismatch-and-stability-rework.md}
+ * §9 and §9.6.
+ *
+ * <p><b>Monotonic guard for the recording-aware API.</b> {@link #advanceWithRecording} only
+ * advances the cursor when {@code (recording_id, position)} is strictly greater than the saved
+ * value in lexicographic order:
+ *
+ * <ul>
+ *   <li>{@code (R, P) -> (R, P')} allowed iff {@code P' > P} — continuing within the same recording.</li>
+ *   <li>{@code (R, P) -> (R', 0)} allowed iff {@code R' > R} — rolling forward to a newer
+ *       recording (the egress finished one recording and is starting the next).</li>
+ *   <li>{@code (R, P) -> (R', P')} rejected when {@code R' < R} — recording ids never decrease
+ *       in Aeron Archive; a smaller value indicates a wiring bug or a corrupted cursor.</li>
+ *   <li>{@code (NULL, P) -> anything}: the saved row has the legacy V26 shape with no recording
+ *       id, and the egress refused to start (loud-fail recovery). Operators reset via
+ *       {@link #resetWithRecording} or SQL before the next start.</li>
+ * </ul>
+ *
+ * <p><b>Legacy API.</b> The position-only {@link #advance(String, int, long)} and
+ * {@link #reset(String, int, long)} methods are preserved for backward compatibility with
+ * pre-V56 test fixtures but are <b>no longer used</b> by {@link OmsFixEgressService} on the
+ * production path; production code goes through {@link #advanceWithRecording} /
+ * {@link #resetWithRecording} so the recording id moves in lockstep with the position.
  */
 @Repository
 public class OmsFixEgressCursorRepository {
 
     private static final String SELECT_POSITION_SQL = """
             SELECT last_applied_position
+              FROM oms_fix_egress_cursor
+             WHERE egress_id = :egress_id
+               AND stream_id = :stream_id
+            """;
+
+    private static final String SELECT_CURSOR_SQL = """
+            SELECT last_applied_recording_id, last_applied_position
               FROM oms_fix_egress_cursor
              WHERE egress_id = :egress_id
                AND stream_id = :stream_id
@@ -55,11 +93,46 @@ public class OmsFixEgressCursorRepository {
              WHERE oms_fix_egress_cursor.last_applied_position < EXCLUDED.last_applied_position
             """;
 
+    /**
+     * Recording-aware upsert. Lexicographic monotonic guard on {@code (recording_id, position)}:
+     * accept the new value iff its recording id is strictly higher than the saved one, OR its
+     * recording id equals the saved one and the position is strictly higher. A {@code NULL}
+     * saved recording id never matches under this guard — those rows must be repaired via
+     * {@link #resetWithRecording} before a recording-aware caller can advance them.
+     */
+    private static final String UPSERT_WITH_RECORDING_SQL = """
+            INSERT INTO oms_fix_egress_cursor
+                (egress_id, stream_id, last_applied_recording_id, last_applied_position, last_applied_at)
+            VALUES (:egress_id, :stream_id, :last_applied_recording_id, :last_applied_position, NOW())
+            ON CONFLICT (egress_id, stream_id) DO UPDATE
+               SET last_applied_recording_id = EXCLUDED.last_applied_recording_id,
+                   last_applied_position = EXCLUDED.last_applied_position,
+                   last_applied_at = EXCLUDED.last_applied_at
+             WHERE oms_fix_egress_cursor.last_applied_recording_id IS NOT NULL
+               AND (
+                     EXCLUDED.last_applied_recording_id > oms_fix_egress_cursor.last_applied_recording_id
+                  OR (
+                       EXCLUDED.last_applied_recording_id = oms_fix_egress_cursor.last_applied_recording_id
+                       AND EXCLUDED.last_applied_position > oms_fix_egress_cursor.last_applied_position
+                     )
+                   )
+            """;
+
     private static final String RESET_SQL = """
             INSERT INTO oms_fix_egress_cursor (egress_id, stream_id, last_applied_position, last_applied_at)
             VALUES (:egress_id, :stream_id, :last_applied_position, NOW())
             ON CONFLICT (egress_id, stream_id) DO UPDATE
                SET last_applied_position = EXCLUDED.last_applied_position,
+                   last_applied_at = EXCLUDED.last_applied_at
+            """;
+
+    private static final String RESET_WITH_RECORDING_SQL = """
+            INSERT INTO oms_fix_egress_cursor
+                (egress_id, stream_id, last_applied_recording_id, last_applied_position, last_applied_at)
+            VALUES (:egress_id, :stream_id, :last_applied_recording_id, :last_applied_position, NOW())
+            ON CONFLICT (egress_id, stream_id) DO UPDATE
+               SET last_applied_recording_id = EXCLUDED.last_applied_recording_id,
+                   last_applied_position = EXCLUDED.last_applied_position,
                    last_applied_at = EXCLUDED.last_applied_at
             """;
 
@@ -69,6 +142,14 @@ public class OmsFixEgressCursorRepository {
         this.jdbc = jdbc;
     }
 
+    /**
+     * @return last applied position for {@code (egressId, streamId)}, or empty if the egress
+     *     has never applied.
+     *
+     * <p><b>Position-only view.</b> Callers that need the recording id alongside the position
+     * (mandatory for safe recovery across cluster restarts — see class Javadoc and V56 migration)
+     * must use {@link #findLastAppliedCursor} instead.
+     */
     public OptionalLong findLastAppliedPosition(String egressId, int streamId) {
         var params = new MapSqlParameterSource()
                 .addValue("egress_id", egressId)
@@ -82,9 +163,41 @@ public class OmsFixEgressCursorRepository {
     }
 
     /**
+     * Recording-aware view of the saved cursor. Returns empty if the row does not exist yet
+     * (first-ever egress start). Returns {@link RecordedCursor#hasRecordingId()} {@code false}
+     * if the row exists but predates V56 (no recording id was recorded) — recording-aware
+     * callers MUST treat this as a loud-fail signal rather than silently continuing.
+     */
+    public Optional<RecordedCursor> findLastAppliedCursor(String egressId, int streamId) {
+        var params = new MapSqlParameterSource()
+                .addValue("egress_id", egressId)
+                .addValue("stream_id", streamId);
+        try {
+            return Optional.ofNullable(jdbc.queryForObject(
+                    SELECT_CURSOR_SQL,
+                    params,
+                    (rs, rowNum) -> {
+                        long recordingId = rs.getLong(1);
+                        boolean recordingIdPresent = !rs.wasNull();
+                        long position = rs.getLong(2);
+                        return recordingIdPresent
+                                ? RecordedCursor.of(recordingId, position)
+                                : RecordedCursor.legacyWithoutRecordingId(position);
+                    }));
+        } catch (EmptyResultDataAccessException e) {
+            return Optional.empty();
+        }
+    }
+
+    /**
      * Advance (or insert) the cursor to {@code newPosition}. The {@code WHERE} clause on the
      * conflict path makes this a monotonic write — calling with a position {@code <=} the
      * stored value is a no-op, so retried events never roll the cursor backwards.
+     *
+     * <p><b>Position-only API (legacy).</b> Does not write {@code last_applied_recording_id};
+     * leaves it {@code NULL} on a fresh insert. Production code in {@link OmsFixEgressService}
+     * now uses {@link #advanceWithRecording} instead — this overload is kept for backward
+     * compatibility with pre-V56 callers and tests.
      *
      * @return {@code true} if the cursor was inserted or advanced; {@code false} if the call
      *     was a no-op (older or equal position).
@@ -98,10 +211,31 @@ public class OmsFixEgressCursorRepository {
     }
 
     /**
+     * Recording-aware advance. Monotonic guard on {@code (recording_id, position)} in
+     * lexicographic order — see {@link #UPSERT_WITH_RECORDING_SQL}. Refuses to write past a
+     * legacy row whose {@code last_applied_recording_id IS NULL}; the operator must
+     * {@link #resetWithRecording} to repair the legacy row before recording-aware advances can
+     * land.
+     *
+     * @return {@code true} if the cursor was inserted or advanced; {@code false} if the call
+     *     was a no-op (the new pair was not strictly greater than the saved one, or the saved
+     *     row had a NULL recording id).
+     */
+    public boolean advanceWithRecording(
+            String egressId, int streamId, long recordingId, long newPosition) {
+        var params = new MapSqlParameterSource()
+                .addValue("egress_id", egressId)
+                .addValue("stream_id", streamId)
+                .addValue("last_applied_recording_id", recordingId)
+                .addValue("last_applied_position", newPosition);
+        return jdbc.update(UPSERT_WITH_RECORDING_SQL, params) == 1;
+    }
+
+    /**
      * @return wall-clock {@code last_applied_at} of the egress cursor (set server-side via
-     *     {@code NOW()} on every {@link #advance}), or empty if the egress JVM has never sent
-     *     a NOS for this {@code (egressId, streamId)}. Drives the {@code oms.fix_egress.lag_seconds}
-     *     gauge (slice 4d).
+     *     {@code NOW()} on every {@link #advance} / {@link #advanceWithRecording}), or empty if
+     *     the egress JVM has never sent a NOS for this {@code (egressId, streamId)}. Drives the
+     *     {@code oms.fix_egress.lag_seconds} gauge (slice 4d).
      */
     public Optional<Instant> findLastAppliedAt(String egressId, int streamId) {
         var params = new MapSqlParameterSource()
@@ -124,15 +258,11 @@ public class OmsFixEgressCursorRepository {
      * Force the cursor to {@code newPosition}, bypassing the monotonic guard used by
      * {@link #advance}.
      *
-     * <p>Reserved for the egress' <em>recording-clamp</em> path: when the persisted cursor is
-     * outside the current recording's {@code [startPosition, stopPosition]} range — typically
-     * after the recording has been recreated (test JVM reboot, prod node disk wipe, manual
-     * archive deletion) — the egress resets the cursor to the recording's
-     * {@code startPosition} so replay can resume against the new recording. This is the only
-     * place the cursor moves backwards. Callers must guarantee the new position is consistent
-     * with the recording it pairs with; otherwise downstream events will be re-applied (which
-     * is fine for the cursor itself, but each replay re-sends NOS, so operators must prefer a
-     * deliberate reset over silent rewinding).
+     * <p><b>Position-only API (legacy).</b> Does not touch {@code last_applied_recording_id}
+     * for existing rows and does not insert one on conflict — only the position changes. New
+     * rows are inserted with a {@code NULL} recording id, which is the trigger that makes the
+     * loud-fail path in {@link OmsFixEgressService#init} refuse to start. Use
+     * {@link #resetWithRecording} instead in new code.
      */
     public void reset(String egressId, int streamId, long newPosition) {
         var params = new MapSqlParameterSource()
@@ -140,5 +270,49 @@ public class OmsFixEgressCursorRepository {
                 .addValue("stream_id", streamId)
                 .addValue("last_applied_position", newPosition);
         jdbc.update(RESET_SQL, params);
+    }
+
+    /**
+     * Force the cursor to {@code (recordingId, newPosition)}, bypassing the monotonic guard.
+     *
+     * <p>Two intended uses, both deliberately not silent:
+     *
+     * <ol>
+     *   <li><b>Operator one-time repair</b> of a row stuck at
+     *       {@code last_applied_recording_id IS NULL} (legacy V26 row, or a row corrupted by
+     *       the pre-V56 silent-clamp bug). Operator chooses which {@code (recordingId, position)}
+     *       pair represents the egress' true state and pins the cursor explicitly; subsequent
+     *       recording-aware advances then run cleanly under the monotonic guard.</li>
+     *   <li><b>Egress first-ever start</b> when {@link #findLastAppliedCursor} returned empty
+     *       — the egress picks the oldest recording on the events stream, persists
+     *       {@code (firstRecordingId, 0)} as the initial cursor, and begins replay.</li>
+     * </ol>
+     *
+     * <p>Not used as a fallback path inside the live replay loop — the egress' loud-fail
+     * design forbids that.
+     */
+    public void resetWithRecording(
+            String egressId, int streamId, long recordingId, long newPosition) {
+        var params = new MapSqlParameterSource()
+                .addValue("egress_id", egressId)
+                .addValue("stream_id", streamId)
+                .addValue("last_applied_recording_id", recordingId)
+                .addValue("last_applied_position", newPosition);
+        jdbc.update(RESET_WITH_RECORDING_SQL, params);
+    }
+
+    /**
+     * Saved cursor shape returned by {@link #findLastAppliedCursor}. {@link #recordingId} is
+     * meaningful only when {@link #hasRecordingId()} is true; a {@code false} value indicates a
+     * pre-V56 legacy row that recording-aware callers must refuse to advance from.
+     */
+    public record RecordedCursor(long recordingId, long position, boolean hasRecordingId) {
+        public static RecordedCursor of(long recordingId, long position) {
+            return new RecordedCursor(recordingId, position, true);
+        }
+
+        public static RecordedCursor legacyWithoutRecordingId(long position) {
+            return new RecordedCursor(0L, position, false);
+        }
     }
 }

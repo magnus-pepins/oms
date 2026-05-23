@@ -289,6 +289,12 @@ public final class OmsProjectorRebuildFromSnapshotTool {
     }
 
     private static List<SnapshotRecording> listSnapshotRecordings(AeronArchive archive) {
+        // Use listRecordings (no URI filter) rather than listRecordingsForUri: the cluster's
+        // snapshot recording is stored under a stripped channel that may include extra params
+        // (e.g. term-length, MTU) beyond the bare "aeron:ipc?alias=snapshot" pattern, and
+        // listRecordingsForUri does a strict prefix match that misses those rows on pop.
+        // Filter by stream id only here; that's unambiguous because the consensus module owns
+        // SNAPSHOT_STREAM_ID_DEFAULT (107) exclusively on this Aeron Archive.
         List<SnapshotRecording> out = new ArrayList<>();
         RecordingDescriptorConsumer consumer = (controlSessionId,
                 correlationId,
@@ -310,12 +316,7 @@ public final class OmsProjectorRebuildFromSnapshotTool {
                 out.add(new SnapshotRecording(recordingId, startPosition, stopPosition));
             }
         };
-        archive.listRecordingsForUri(
-                /* fromRecordingId = */ 0L,
-                /* recordCount = */ 4096,
-                ConsensusModule.Configuration.SNAPSHOT_CHANNEL_DEFAULT,
-                ConsensusModule.Configuration.SNAPSHOT_STREAM_ID_DEFAULT,
-                consumer);
+        archive.listRecordings(/* fromRecordingId = */ 0L, /* recordCount = */ 4096, consumer);
         out.sort(Comparator.comparingLong((SnapshotRecording r) -> r.recordingId).reversed());
         return out;
     }

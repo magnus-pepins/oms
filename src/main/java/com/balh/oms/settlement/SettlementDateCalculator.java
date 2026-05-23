@@ -5,8 +5,13 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneId;
 import java.util.Locale;
+import java.util.Optional;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.lang.Nullable;
 import org.springframework.stereotype.Component;
 
 /**
@@ -32,19 +37,27 @@ import org.springframework.stereotype.Component;
  *       still rolled forward).</li>
  * </ul>
  *
- * <p><b>Why a placeholder default cycle is honest, not a band-aid.</b> The right rule is
- * "look up the instrument's settlement profile and use its cycle, falling back to the venue
- * default". We do not yet carry that profile, and inventing a venue-MIC heuristic
- * (XNAS → T+1, XSTO → T+2) inside this class would lock in a wrong assumption the day a
- * non-equity instrument trades. Instead we expose a single configured default that an
- * operator can flip per environment (e.g. {@code T+2} now → {@code T+1} on 2027-10-11 when
- * EU migrates), and ship an honest {@code TODO} naming the eventual lookup site. The matcher
- * (next slice) will treat any execution row whose {@code expected_settlement_date} disagrees
- * with the broker's {@code settlementDate} as a {@code settlement_date_mismatch} break — but
- * it will look up the actual rule through the profile by then, not via this class.</p>
+ * <p><b>Slice 2b-1 (V61):</b> the configured default cycle is now a <em>fallback</em>, not
+ * the primary rule. {@link #resolveExpectedSettlementDate(LocalDate, String)} consults
+ * {@link SettlementProfileLookup} (backed by {@link InstrumentSettlementProfileRepository}
+ * at runtime, by a hand-rolled fake in unit tests) and uses the per-instrument
+ * {@code settlement_cycle} when an effective row exists for the symbol at the trade date.
+ * Empty / missing profile falls back to the configured default — same behaviour as Slice 1,
+ * just routed through the lookup so the fallback is explicit and instrumented (DEBUG log
+ * line at lookup-miss). The legacy {@link #computeExpectedSettlementDate(LocalDate)} stays
+ * for unit-test callers that do not want to construct a lookup; production code paths
+ * (projector) should call the symbol-aware overload.
+ *
+ * <p>The matcher (Slice 2a) already treats any execution row whose
+ * {@code expected_settlement_date} disagrees with the broker's {@code settlementDate} as a
+ * {@code settlement_date_mismatch} break — so populating {@code instrument_settlement_profile}
+ * with the wrong cycle will surface as a break, not as a silent calendar drift. That is the
+ * intentional safety net for skeleton-stage data.</p>
  */
 @Component
 public class SettlementDateCalculator {
+
+    private static final Logger log = LoggerFactory.getLogger(SettlementDateCalculator.class);
 
     /** Spring property key for the placeholder default cycle. */
     public static final String DEFAULT_CYCLE_PROPERTY = "oms.settlement.default-cycle";
@@ -62,9 +75,30 @@ public class SettlementDateCalculator {
 
     private final int defaultCycleDays;
 
+    /**
+     * Optional dependency wired by Spring via {@link #setProfileLookup(SettlementProfileLookup)}.
+     * {@code null} when no {@link SettlementProfileLookup} bean is present (true in unit tests
+     * that construct the calculator directly). When {@code null} the symbol-aware
+     * {@link #resolveExpectedSettlementDate(LocalDate, String)} call short-circuits to the
+     * configured default cycle, preserving Slice 1 behaviour for unit-test callers.
+     */
+    @Nullable
+    private SettlementProfileLookup profileLookup;
+
     public SettlementDateCalculator(
             @Value("${" + DEFAULT_CYCLE_PROPERTY + ":" + DEFAULT_CYCLE_FALLBACK + "}") String defaultCycle) {
         this.defaultCycleDays = parseCycleDays(defaultCycle);
+    }
+
+    /**
+     * Spring wiring entry point. Marked {@code required=false} so the Slice-1 unit tests
+     * that construct the calculator with just a cycle string still compile and run. The
+     * production {@link InstrumentSettlementProfileRepository} bean satisfies this in real
+     * deployments and is verified by the integration tests.
+     */
+    @Autowired(required = false)
+    public void setProfileLookup(SettlementProfileLookup profileLookup) {
+        this.profileLookup = profileLookup;
     }
 
     /**
@@ -79,20 +113,99 @@ public class SettlementDateCalculator {
     }
 
     /**
-     * Returns {@code tradeDate} advanced by the configured cycle's worth of business days,
-     * rolling Saturdays and Sundays forward to the next Monday. No holiday calendar.
+     * Returns {@code tradeDate} advanced by the configured default cycle's worth of business
+     * days, rolling Saturdays and Sundays forward to the next Monday. No holiday calendar.
+     *
+     * <p>Kept for the Slice-1 unit tests that drive the pure compute path without a profile
+     * lookup. Production callers (projector) should use
+     * {@link #resolveExpectedSettlementDate(LocalDate, String)} so per-instrument cycles are
+     * honoured.
      */
     public LocalDate computeExpectedSettlementDate(LocalDate tradeDate) {
         if (tradeDate == null) {
             throw new IllegalArgumentException("tradeDate must not be null");
         }
+        return advanceByBusinessDays(tradeDate, defaultCycleDays);
+    }
+
+    /**
+     * Symbol-aware compute: looks up the active {@code instrument_settlement_profile} for
+     * {@code instrumentSymbol} at {@code tradeDate} and uses its
+     * {@code settlement_cycle}. Falls back to the configured default cycle when the lookup
+     * is empty, the symbol is null/blank, or no {@link SettlementProfileLookup} is wired.
+     *
+     * <p>The fallback path is logged at DEBUG so operators can see — in a production tail —
+     * which symbols still need profile rows. We deliberately do not log at INFO because the
+     * skeleton table starts empty and a noisy log here would drown out real signal.
+     */
+    public LocalDate resolveExpectedSettlementDate(LocalDate tradeDate, String instrumentSymbol) {
+        if (tradeDate == null) {
+            throw new IllegalArgumentException("tradeDate must not be null");
+        }
+        int cycleDays = resolveCycleDaysForSymbol(tradeDate, instrumentSymbol);
+        return advanceByBusinessDays(tradeDate, cycleDays);
+    }
+
+    private int resolveCycleDaysForSymbol(LocalDate tradeDate, String instrumentSymbol) {
+        if (profileLookup == null || instrumentSymbol == null || instrumentSymbol.isBlank()) {
+            return defaultCycleDays;
+        }
+        Optional<InstrumentSettlementProfile> profile;
+        try {
+            profile = profileLookup.findActiveBySymbol(instrumentSymbol, tradeDate);
+        } catch (RuntimeException e) {
+            // Defensive: a JDBC failure inside the projector's transaction would already
+            // cause Spring to roll back. We log and fall back rather than re-throw so the
+            // trade-projection writer reports the actual SQLException at the executions
+            // insert if there's a real problem, not at an unrelated profile read.
+            log.warn(
+                    "instrument_settlement_profile lookup failed for symbol={} tradeDate={}; falling back to default cycle ({} days)",
+                    instrumentSymbol,
+                    tradeDate,
+                    defaultCycleDays,
+                    e);
+            return defaultCycleDays;
+        }
+        if (profile.isEmpty()) {
+            log.debug(
+                    "instrument_settlement_profile miss for symbol={} tradeDate={}; using default cycle ({} days)",
+                    instrumentSymbol,
+                    tradeDate,
+                    defaultCycleDays);
+            return defaultCycleDays;
+        }
+        int parsed;
+        try {
+            parsed = parseCycleDays(profile.get().settlementCycle());
+        } catch (IllegalStateException e) {
+            // The V61 CHECK constraint enforces a 4-value allowlist, so this branch should
+            // never fire in practice. We keep it as belt-and-braces: if a future migration
+            // adds a new cycle value but forgets to widen the parser, fall back rather than
+            // hard-crash the trade-projection writer.
+            log.warn(
+                    "instrument_settlement_profile carried unparseable cycle={} for symbol={} (profileId={}); falling back to default ({} days)",
+                    profile.get().settlementCycle(),
+                    instrumentSymbol,
+                    profile.get().id(),
+                    defaultCycleDays);
+            return defaultCycleDays;
+        }
+        return parsed;
+    }
+
+    /**
+     * Pure business-day advance. Extracted so both
+     * {@link #computeExpectedSettlementDate(LocalDate)} and
+     * {@link #resolveExpectedSettlementDate(LocalDate, String)} share one implementation.
+     */
+    private static LocalDate advanceByBusinessDays(LocalDate tradeDate, int cycleDays) {
         LocalDate d = tradeDate;
-        int remaining = defaultCycleDays;
         // T+0 still rolls a weekend trade-date forward to the next business day, which is the
         // standard same-day-settle convention when the calendar lands on a weekend.
-        if (remaining == 0) {
+        if (cycleDays == 0) {
             return rollForwardToBusinessDay(d);
         }
+        int remaining = cycleDays;
         while (remaining > 0) {
             d = d.plusDays(1);
             if (isBusinessDay(d)) {

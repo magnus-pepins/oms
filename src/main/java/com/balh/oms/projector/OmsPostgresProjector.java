@@ -1291,8 +1291,12 @@ public class OmsPostgresProjector {
 
         Instant venueTs = Instant.ofEpochSecond(0L, ev.venueTsNanos());
         java.time.LocalDate tradeDate = settlementDateCalculator.computeTradeDate(venueTs);
-        java.time.LocalDate expectedSettlementDate =
-                settlementDateCalculator.computeExpectedSettlementDate(tradeDate);
+        // Slice 2b-1: use the symbol-aware resolver so an effective `instrument_settlement_profile`
+        // row drives the cycle. Empty profile (the skeleton's default state until ops loads
+        // data) falls back to the configured default cycle — same outcome as Slice 1, just
+        // routed through the lookup so future profile loads take effect without a code change.
+        java.time.LocalDate expectedSettlementDate = settlementDateCalculator.resolveExpectedSettlementDate(
+                tradeDate, order.instrumentSymbol());
         Optional<Long> insertedId = executionsRepository.tryInsertTrade(
                 order.id(),
                 order.accountId(),

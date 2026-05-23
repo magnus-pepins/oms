@@ -35,6 +35,12 @@ import static org.assertj.core.api.Assertions.assertThat;
  *       a {@code reconciliation_breaks} row of type {@code unresolved_confirm}.</li>
  * </ul>
  *
+ * <p>Slice 2a of gap plan §5.3 layers in the settlement-date axis: the matcher now also
+ * compares broker {@code settlementDate} against the OMS-stored
+ * {@code executions.expected_settlement_date} (V58 + {@code SettlementDateCalculator}) and
+ * opens a side break of type {@code settlement_date_mismatch} (severity {@code medium})
+ * when an otherwise-matched confirm disagrees on date — without blocking settlement.
+ *
  * <p>Also asserts the {@code GET /reconciliation-breaks} endpoint returns the rows the
  * matcher wrote (gap plan §5.13).
  */
@@ -163,6 +169,116 @@ class BrokerTradeConfirmMatcherIntegrationTest extends AbstractPostgresIntegrati
 
         ResponseEntity<SettlementController.BrokerTradeMatchResultResponse> second = postMatchOne(confirmId);
         assertThat(second.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+    }
+
+    /**
+     * Gap plan §5.3 Slice 2a: when broker {@code settlementDate} agrees with the OMS-stored
+     * {@code expected_settlement_date}, the matched path must NOT open a side break. This
+     * case asserts the {@code settlementDate} axis serialises as
+     * {@code "match": true} in the confirm's stored {@code match_diff_json} so future
+     * regressions in the axis serialiser are caught here.
+     */
+    @Test
+    void processPendingMatches_settlementDateMatches_diffCarriesMatchTrueAxisAndNoBreak() {
+        UUID accountId = UUID.randomUUID();
+        String venueExecRef = "EX-SDM-" + UUID.randomUUID();
+        seedTradeExecution(accountId, venueExecRef, "AAPL", "BUY", "10", "5.00");
+
+        long confirmId = ingestSingleConfirm(accountId, venueExecRef, "AAPL", "BUY", "10", "5.00", "BT-SDM-OK-1");
+        var matchRes = postProcessPending();
+        assertThat(matchRes.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(matchRes.getBody().items().getFirst().outcome()).isEqualTo("matched");
+
+        String diffJson = jdbc.queryForObject(
+                "SELECT match_diff_json::text FROM broker_trade_confirm WHERE id = ?", String.class, confirmId);
+        assertThat(diffJson)
+                .contains("\"settlementDate\"")
+                .contains("\"broker\": \"2026-05-27\"")
+                .contains("\"oms\": \"2026-05-27\"")
+                .contains("\"match\": true");
+        assertThat(jdbc.queryForObject(
+                        "SELECT COUNT(*)::int FROM reconciliation_breaks", Integer.class))
+                .isZero();
+    }
+
+    /**
+     * Gap plan §5.3 Slice 2a: when broker {@code settlementDate} disagrees with OMS
+     * {@code expected_settlement_date} on an otherwise-matched confirm, the matcher opens
+     * a {@code settlement_date_mismatch} break (severity {@code medium}) AND still marks
+     * the confirm {@code matched} AND still enqueues the v1 {@code broker_settlement_confirm}
+     * so settlement is not blocked — the broker is authoritative on actual settlement
+     * date, and the break exists only for calendar / config drift visibility.
+     */
+    @Test
+    void processPendingMatches_settlementDateMismatchOnMatched_opensSideBreakSeverityMedium() {
+        UUID accountId = UUID.randomUUID();
+        String venueExecRef = "EX-SDM-DRIFT-" + UUID.randomUUID();
+        seedTradeExecution(
+                accountId, venueExecRef, "AAPL", "BUY", "10", "5.00", LocalDate.of(2026, 5, 28));
+
+        long confirmId =
+                ingestSingleConfirm(accountId, venueExecRef, "AAPL", "BUY", "10", "5.00", "BT-SDM-DRIFT-1");
+        var matchRes = postProcessPending();
+        assertThat(matchRes.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(matchRes.getBody().items().getFirst().outcome()).isEqualTo("matched");
+
+        assertThat(jdbc.queryForObject(
+                        "SELECT match_status FROM broker_trade_confirm WHERE id = ?", String.class, confirmId))
+                .isEqualTo("matched");
+        Long resolvedExecutionId = jdbc.queryForObject(
+                "SELECT resolved_execution_id FROM broker_trade_confirm WHERE id = ?", Long.class, confirmId);
+        assertThat(jdbc.queryForObject(
+                        "SELECT COUNT(*)::int FROM broker_settlement_confirm WHERE execution_id = ?",
+                        Integer.class,
+                        resolvedExecutionId))
+                .isEqualTo(1);
+
+        assertThat(jdbc.queryForObject(
+                        "SELECT COUNT(*)::int FROM reconciliation_breaks", Integer.class))
+                .isEqualTo(1);
+        var brk = jdbc.queryForMap(
+                "SELECT break_type, severity, source_system, status, confirm_id, execution_id, account_id, diff_json::text AS diff_json"
+                        + " FROM reconciliation_breaks WHERE confirm_id = ?",
+                confirmId);
+        assertThat(brk.get("break_type")).isEqualTo("settlement_date_mismatch");
+        assertThat(brk.get("severity")).isEqualTo("medium");
+        assertThat(brk.get("source_system")).isEqualTo("broker");
+        assertThat(brk.get("status")).isEqualTo("open");
+        assertThat(brk.get("confirm_id")).isEqualTo(confirmId);
+        assertThat(brk.get("execution_id")).isEqualTo(resolvedExecutionId);
+        assertThat(((String) brk.get("diff_json")))
+                .contains("\"settlementDate\"")
+                .contains("\"broker\": \"2026-05-27\"")
+                .contains("\"oms\": \"2026-05-28\"")
+                .contains("\"match\": false");
+    }
+
+    /**
+     * Gap plan §5.3 Slice 2a: when the OMS execution has NULL
+     * {@code expected_settlement_date} (legacy row pre-V58 or non-TRADE), the matcher must
+     * NOT open a settlement-date break — the OMS expectation is simply unknown. The diff
+     * JSON records the reason for ops visibility.
+     */
+    @Test
+    void processPendingMatches_omsExpectedSettlementDateNull_skipsAxisAndNoBreak() {
+        UUID accountId = UUID.randomUUID();
+        String venueExecRef = "EX-SDM-NULL-" + UUID.randomUUID();
+        seedTradeExecution(accountId, venueExecRef, "AAPL", "BUY", "10", "5.00", null);
+
+        long confirmId =
+                ingestSingleConfirm(accountId, venueExecRef, "AAPL", "BUY", "10", "5.00", "BT-SDM-NULL-1");
+        var matchRes = postProcessPending();
+        assertThat(matchRes.getBody().items().getFirst().outcome()).isEqualTo("matched");
+
+        assertThat(jdbc.queryForObject(
+                        "SELECT COUNT(*)::int FROM reconciliation_breaks", Integer.class))
+                .isZero();
+        String diffJson = jdbc.queryForObject(
+                "SELECT match_diff_json::text FROM broker_trade_confirm WHERE id = ?", String.class, confirmId);
+        assertThat(diffJson)
+                .contains("\"settlementDate\"")
+                .contains("\"oms\": null")
+                .contains("\"reason\": \"oms_expected_unknown_pre_v58_or_non_trade\"");
     }
 
     @Test

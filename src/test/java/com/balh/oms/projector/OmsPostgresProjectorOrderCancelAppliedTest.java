@@ -102,6 +102,8 @@ class OmsPostgresProjectorOrderCancelAppliedTest {
                 new ObjectMapper(),
                 txManager,
                 pinned);
+        // Seed the recording id for the apply path's cursor write (unit tests bypass the replay loop).
+        projector.setCurrentRecordingIdForTesting(13L);
     }
 
     @Test
@@ -125,9 +127,10 @@ class OmsPostgresProjectorOrderCancelAppliedTest {
         verify(executionsRepository, never()).tryInsertCancel(any(), any(), any(), any(), any(), any(), any());
         verify(envelopeCodec).orderCancelled(any(Order.class), eq(2), eq(""), eq(""));
         verify(domainEventOutboxRepository).insert(eq(orderId), eq("{\"type\":\"OrderCancelled\"}"));
-        verify(cursorRepository).advance(
+        verify(cursorRepository).advanceWithRecording(
                 OmsPostgresProjector.PROJECTOR_ID,
                 OmsClusterWireFormat.EVENTS_STREAM_ID,
+                13L,
                 FRAGMENT_POSITION);
     }
 
@@ -143,9 +146,10 @@ class OmsPostgresProjectorOrderCancelAppliedTest {
                 any(), anyInt(), any(), any(), any(), any());
         verify(envelopeCodec, never()).orderCancelled(any(), anyInt(), anyString(), anyString());
         verify(domainEventOutboxRepository, never()).insert(any(), anyString());
-        verify(cursorRepository, times(1)).advance(
+        verify(cursorRepository, times(1)).advanceWithRecording(
                 OmsPostgresProjector.PROJECTOR_ID,
                 OmsClusterWireFormat.EVENTS_STREAM_ID,
+                13L,
                 FRAGMENT_POSITION);
     }
 
@@ -166,9 +170,10 @@ class OmsPostgresProjectorOrderCancelAppliedTest {
 
         verify(envelopeCodec, never()).orderCancelled(any(), anyInt(), anyString(), anyString());
         verify(domainEventOutboxRepository, never()).insert(any(), anyString());
-        verify(cursorRepository).advance(
+        verify(cursorRepository).advanceWithRecording(
                 OmsPostgresProjector.PROJECTOR_ID,
                 OmsClusterWireFormat.EVENTS_STREAM_ID,
+                13L,
                 FRAGMENT_POSITION);
     }
 
@@ -179,9 +184,10 @@ class OmsPostgresProjectorOrderCancelAppliedTest {
 
         projector.applyOrderCancelAppliedEvent(sampleEvent(orderId, 1), FRAGMENT_POSITION);
 
-        verify(cursorRepository).advance(
+        verify(cursorRepository).advanceWithRecording(
                 OmsPostgresProjector.PROJECTOR_ID,
                 OmsClusterWireFormat.EVENTS_STREAM_ID,
+                13L,
                 FRAGMENT_POSITION);
     }
 

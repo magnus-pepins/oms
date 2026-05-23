@@ -100,6 +100,10 @@ class OmsPostgresProjectorD1BackfillTest {
                 objectMapper,
                 txManager,
                 pinned);
+        // Production seeding (init() → bootstrap → replay loop) is bypassed in unit tests that
+        // drive applyAdmittedEvent directly. Seed the recording id so the apply path's cursor
+        // write does not fail loud on -1.
+        projector.setCurrentRecordingIdForTesting(13L);
     }
 
     @Test
@@ -219,7 +223,7 @@ class OmsPostgresProjectorD1BackfillTest {
         projector.applyAdmittedEvent(ev, FRAGMENT_POSITION);
 
         verify(ledgerInflightOutboxRepository).insertIfAbsent(eq(ev.orderId()), any());
-        verify(cursorRepository).advance(anyString(), anyInt(), eq(FRAGMENT_POSITION));
+        verify(cursorRepository).advanceWithRecording(anyString(), anyInt(), eq(13L), eq(FRAGMENT_POSITION));
     }
 
     private static OrderAdmittedEvent admitted(

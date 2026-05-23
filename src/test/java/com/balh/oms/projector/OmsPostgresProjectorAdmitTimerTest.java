@@ -92,6 +92,8 @@ class OmsPostgresProjectorAdmitTimerTest {
                 new ObjectMapper(),
                 txManager,
                 pinned);
+        // Seed the recording id for the apply path's cursor write (unit tests bypass the replay loop).
+        projector.setCurrentRecordingIdForTesting(13L);
     }
 
     @Test
@@ -103,9 +105,10 @@ class OmsPostgresProjectorAdmitTimerTest {
 
         verify(ordersRepository).insertFromAdmittedEvent(ev);
         verify(controlAdmission).persistAdmission(any());
-        verify(cursorRepository).advance(
+        verify(cursorRepository).advanceWithRecording(
                 OmsPostgresProjector.PROJECTOR_ID,
                 OmsClusterWireFormat.EVENTS_STREAM_ID,
+                13L,
                 FRAGMENT_POSITION);
 
         Timer timer = meterRegistry.find(OmsPipelineMeterNames.CLUSTER_ADMIT_TO_PROJECTOR)

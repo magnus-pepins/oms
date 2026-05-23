@@ -54,11 +54,14 @@ import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.Clock;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
 
@@ -175,6 +178,23 @@ public class OmsPostgresProjector {
 
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicReference<Long> lastAppliedPosition = new AtomicReference<>(0L);
+    /**
+     * 2026-05-23 hardening (handover §9). Aeron Archive recording id this projector is currently
+     * replaying. The {@link ProjectingFragmentHandler} reads this when it advances the cursor so
+     * the persisted {@code (recording_id, position)} pair always travels together.
+     *
+     * <p>{@code -1} means "not yet set" — the replay loop populates it before opening the first
+     * replay subscription. A value of {@code -1} reaching the handler is a programming bug and
+     * the handler will refuse to advance.
+     */
+    private final AtomicLong currentRecordingId = new AtomicLong(-1L);
+    /**
+     * 2026-05-23 hardening. When non-empty, {@link #init} stashes the resume cursor here and the
+     * replay loop honors it as the start position; on a fresh first-ever start it stays empty and
+     * the replay loop bootstraps from the oldest available recording at position 0.
+     */
+    private final AtomicReference<AeronProjectorCursorRepository.RecordedCursor> startupCursor =
+            new AtomicReference<>(null);
     private Thread replayThread;
 
     @Autowired
@@ -261,15 +281,56 @@ public class OmsPostgresProjector {
 
     @PostConstruct
     void init() {
-        long resumePos = cursorRepository
-                .findLastAppliedPosition(PROJECTOR_ID, OmsClusterWireFormat.EVENTS_STREAM_ID)
-                .orElse(0L);
-        lastAppliedPosition.set(resumePos);
-        log.info(
-                "oms-postgres-projector starting; resuming from log position {} (projectorId={}, streamId={})",
-                resumePos,
-                PROJECTOR_ID,
-                OmsClusterWireFormat.EVENTS_STREAM_ID);
+        // 2026-05-23 hardening (handover §9). Load the saved cursor in its full
+        // (recording_id, position) shape. Three cases:
+        //
+        //   1. Empty Optional      — first-ever projector start (no row in aeron_projector_cursor).
+        //                             Replay loop will bootstrap from the oldest recording at pos 0.
+        //   2. Legacy NULL row     — row exists but predates V55 (no recording id). The
+        //                             pre-V55 replay loop silently clamped position to 0 of the
+        //                             current recording when the saved position overshot, losing
+        //                             the pointer to events in earlier recordings. We refuse to
+        //                             start until an operator pins the recording id explicitly
+        //                             via SQL (instruction in the exception message).
+        //   3. Recording-aware row — resume from the saved (recording_id, position) directly.
+        Optional<AeronProjectorCursorRepository.RecordedCursor> savedCursor = cursorRepository
+                .findLastAppliedCursor(PROJECTOR_ID, OmsClusterWireFormat.EVENTS_STREAM_ID);
+        if (savedCursor.isPresent() && !savedCursor.get().hasRecordingId()) {
+            long legacyPos = savedCursor.get().position();
+            String repairSql = String.format(
+                    "UPDATE aeron_projector_cursor SET last_applied_recording_id = <pick the recording id matching the saved position %d>"
+                            + " WHERE projector_id = '%s' AND stream_id = %d;",
+                    legacyPos, PROJECTOR_ID, OmsClusterWireFormat.EVENTS_STREAM_ID);
+            throw new IllegalStateException(
+                    "oms-postgres-projector refuses to start: aeron_projector_cursor row exists but"
+                            + " last_applied_recording_id IS NULL (pre-V55 schema or pre-2026-05-23-hardening write)."
+                            + " Without the recording id the projector cannot tell which Aeron Archive recording the"
+                            + " saved position " + legacyPos + " refers to, and the old code path silently reset to"
+                            + " position 0 of the current recording, losing visibility into events from prior cluster"
+                            + " incarnations. Operator must pick the correct recording id (ls"
+                            + " /opt/oms/aeron-archive/data/*-events*.rec, or psql to check which recording was"
+                            + " current at the moment the saved position was written) and run: "
+                            + repairSql
+                            + " — see system-documentation/handovers/2026-05-23-oms-snapshot-magic-mismatch-and-stability-rework.md §9.");
+        }
+        savedCursor.ifPresent(startupCursor::set);
+        if (savedCursor.isPresent()) {
+            AeronProjectorCursorRepository.RecordedCursor c = savedCursor.get();
+            lastAppliedPosition.set(c.position());
+            currentRecordingId.set(c.recordingId());
+            log.info(
+                    "oms-postgres-projector starting; resuming from recording {} at log position {} (projectorId={}, streamId={})",
+                    c.recordingId(),
+                    c.position(),
+                    PROJECTOR_ID,
+                    OmsClusterWireFormat.EVENTS_STREAM_ID);
+        } else {
+            log.info(
+                    "oms-postgres-projector starting fresh (no saved cursor); will bootstrap from the oldest available"
+                            + " events recording at position 0 (projectorId={}, streamId={})",
+                    PROJECTOR_ID,
+                    OmsClusterWireFormat.EVENTS_STREAM_ID);
+        }
         running.set(true);
         replayThread = new Thread(this::replayLoop, "oms-postgres-projector-replay");
         replayThread.setDaemon(true);
@@ -299,6 +360,50 @@ public class OmsPostgresProjector {
         return lastAppliedPosition.get();
     }
 
+    /**
+     * Visible for tests that drive {@link #applyAdmittedEvent} / {@link #applyExecutionAppliedEvent} /
+     * {@link #applyOrderCancelAppliedEvent} directly (bypassing {@link #init} and the replay loop
+     * that would normally seed the recording id from the Aeron Archive). Production code never
+     * calls this — the replay loop owns the field.
+     */
+    void setCurrentRecordingIdForTesting(long recordingId) {
+        currentRecordingId.set(recordingId);
+    }
+
+    /**
+     * 2026-05-23 hardening (handover §9). Rewritten to walk all events recordings sorted by id
+     * instead of unconditionally picking the highest-id recording and silently clamping the
+     * saved cursor to its start position.
+     *
+     * <p>The pre-hardening loop assumed there was only ever one events recording. In practice
+     * Aeron Archive opens a new recording every time the cluster process restarts (each cluster
+     * lifetime owns one recording). The old "find highest-id recording, clamp cursor to its
+     * bounds" path silently lost visibility into events from earlier recordings on every restart
+     * — on pop, that destroyed the projector's pointer to 9 working orders whose admit events
+     * lived in an older recording.
+     *
+     * <p>The new loop:
+     *
+     * <ol>
+     *   <li>Bootstraps {@link #currentRecordingId} from {@link #startupCursor} (loaded by
+     *       {@link #init}) or, on a first-ever start, picks the oldest available recording and
+     *       persists {@code (oldestId, 0)} via {@link AeronProjectorCursorRepository#resetWithRecording}.</li>
+     *   <li>Re-lists recordings, finds the descriptor for {@code currentRecordingId}, and
+     *       opens a replay subscription at the saved position. <b>Fails loud</b> if the saved
+     *       recording id is no longer in the Archive — this is an operator-fix-it condition,
+     *       never a silent reset to position 0.</li>
+     *   <li>Polls until the replay drains. When poll returns 0 AND the current recording has a
+     *       finalized {@code stopPosition} AND a newer recording exists, persists
+     *       {@code (nextId, 0)} via {@code resetWithRecording}, advances state, closes the
+     *       current replay, and loops to open the next one. Otherwise parks briefly to wait
+     *       for live-tail events on the current recording.</li>
+     * </ol>
+     *
+     * <p>"Recording id 0 is allowed even with a much larger saved position" is intentional and
+     * handled by the lex-monotonic guard inside {@code advanceWithRecording} (V55 repository
+     * doc): a new recording always wins over an old recording regardless of within-recording
+     * position. This is the cursor's promotion mechanism across cluster restarts.
+     */
     private void replayLoop() {
         OmsConfig.Cluster.Projector projectorCfg = config.getCluster().getProjector();
         if (projectorCfg.getAeronDirectory().isBlank()) {
@@ -312,7 +417,6 @@ public class OmsPostgresProjector {
         }
         Aeron aeron = null;
         AeronArchive archive = null;
-        Subscription replay = null;
         try {
             aeron = Aeron.connect(new Aeron.Context().aeronDirectoryName(projectorCfg.getAeronDirectory()));
             archive = AeronArchive.connect(new AeronArchive.Context()
@@ -321,34 +425,22 @@ public class OmsPostgresProjector {
                     .controlRequestChannel(projectorCfg.getArchiveControlRequestChannel())
                     .controlResponseChannel(projectorCfg.getArchiveControlResponseChannel()));
 
-            RecordingDescriptor descriptor = waitForRecording(archive, projectorCfg.getRecordingLookupParkMs());
-            if (descriptor == null) {
-                return; // shutdown requested before recording appeared
-            }
-
-            long persistedPos = lastAppliedPosition.get();
-            long requestedPos = clampToRecording(archive, descriptor, persistedPos);
-            replay = openReplay(archive, descriptor, requestedPos, projectorCfg);
-            log.info(
-                    "Projector replay open; recordingId={} startPos={} (recordingStart={}, recordingStop={}) channel={} streamId={}",
-                    descriptor.recordingId(),
-                    lastAppliedPosition.get(),
-                    descriptor.startPosition(),
-                    descriptor.stopPosition(),
-                    projectorCfg.getReplayChannel(),
-                    projectorCfg.getReplayStreamId());
-
-            FragmentHandler handler = new ProjectingFragmentHandler();
-            while (running.get()) {
-                int polled = replay.poll(handler, projectorCfg.getFragmentLimit());
-                if (polled == 0) {
-                    LockSupport.parkNanos(projectorCfg.getPollParkNanos());
+            // Bootstrap: if no saved cursor at startup, wait for the first recording to appear,
+            // then persist (oldestId, 0) so subsequent restarts have a recording id to anchor on.
+            if (startupCursor.get() == null) {
+                if (!bootstrapFromOldestRecording(archive, projectorCfg.getRecordingLookupParkMs())) {
+                    return; // shutdown requested during bootstrap
                 }
             }
+
+            runReplayLoopWithRecordingWalk(archive, projectorCfg);
         } catch (RuntimeException e) {
+            // Loud failures from the recording-walk loop (saved recording id missing from Archive,
+            // saved position past recording end, etc.) land here and stop the projector. Operators
+            // see the stack trace and the diagnostic context in the exception message; restarting
+            // without fixing the underlying state would re-throw immediately.
             log.error("oms-postgres-projector replay loop terminating", e);
         } finally {
-            CloseHelper.quietClose(replay);
             CloseHelper.quietClose(archive);
             CloseHelper.quietClose(aeron);
             log.info("oms-postgres-projector replay loop stopped");
@@ -356,156 +448,267 @@ public class OmsPostgresProjector {
     }
 
     /**
-     * Polls {@link AeronArchive#listRecordingsForUri} until the events stream recording appears.
+     * First-ever-start path: picks the oldest events recording on the channel/stream, persists
+     * {@code (oldestId, 0)} as the initial cursor, and seeds {@link #currentRecordingId} and
+     * {@link #lastAppliedPosition}.
      *
-     * @return recording descriptor (id + start/stop position), or {@code null} if shutdown was
-     *         requested before the recording appeared.
+     * @return {@code true} if a recording was found and persisted; {@code false} if shutdown was
+     *         requested before any recording appeared.
      */
-    private RecordingDescriptor waitForRecording(AeronArchive archive, long parkMs) {
+    private boolean bootstrapFromOldestRecording(AeronArchive archive, long parkMs) {
         while (running.get()) {
-            RecordingDescriptor[] result = {null};
-            archive.listRecordingsForUri(
-                    /* fromRecordingId = */ 0L,
-                    /* recordCount = */ 1024,
-                    OmsClusterWireFormat.EVENTS_CHANNEL,
-                    OmsClusterWireFormat.EVENTS_STREAM_ID,
-                    (controlSessionId,
-                            correlationId,
-                            recordingId,
-                            startTimestamp,
-                            stopTimestamp,
-                            startPosition,
-                            stopPosition,
-                            initialTermId,
-                            segmentFileLength,
-                            termBufferLength,
-                            mtuLength,
-                            sessionId,
-                            streamId,
-                            strippedChannel,
-                            originalChannel,
-                            sourceIdentity) -> {
-                        if (streamId == OmsClusterWireFormat.EVENTS_STREAM_ID
-                                && (result[0] == null || recordingId > result[0].recordingId())) {
-                            result[0] = new RecordingDescriptor(recordingId, startPosition, stopPosition);
-                        }
-                    });
-            if (result[0] != null) {
-                return result[0];
+            List<RecordingDescriptor> recordings = listEventsRecordingsSorted(archive);
+            if (!recordings.isEmpty()) {
+                RecordingDescriptor oldest = recordings.get(0);
+                log.info(
+                        "oms-postgres-projector bootstrap: persisting initial cursor (recordingId={}, position={})"
+                                + " — first start on this projector, no prior cursor row.",
+                        oldest.recordingId(),
+                        oldest.startPosition());
+                cursorRepository.resetWithRecording(
+                        PROJECTOR_ID,
+                        OmsClusterWireFormat.EVENTS_STREAM_ID,
+                        oldest.recordingId(),
+                        oldest.startPosition());
+                currentRecordingId.set(oldest.recordingId());
+                lastAppliedPosition.set(oldest.startPosition());
+                return true;
             }
             try {
                 Thread.sleep(parkMs);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                return null;
+                return false;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The reopen-and-poll outer loop, exited only on shutdown or unrecoverable error. Each
+     * iteration looks up the current recording descriptor, validates the saved position against
+     * it, opens a replay, drains it, and decides whether to roll forward to a newer recording.
+     *
+     * <p>Roll-forward semantics: a recording is "complete" when its {@code stopPosition} is
+     * finalized (set by Aeron Archive when the recording's writer publication closes — cluster
+     * exit). When the projector reaches the {@code stopPosition} of the current recording AND
+     * a recording with a higher id exists on the same stream, the projector promotes its cursor
+     * to {@code (nextId, 0)} and re-opens replay against the new recording.
+     */
+    private void runReplayLoopWithRecordingWalk(AeronArchive archive, OmsConfig.Cluster.Projector projectorCfg) {
+        FragmentHandler handler = new ProjectingFragmentHandler();
+        while (running.get()) {
+            long recordingIdNow = currentRecordingId.get();
+            if (recordingIdNow < 0L) {
+                throw new IllegalStateException(
+                        "oms-postgres-projector replay loop entered with currentRecordingId="
+                                + recordingIdNow
+                                + "; init() / bootstrap should have set it. This is a programming bug.");
+            }
+            RecordingDescriptor descriptor = findRecordingById(archive, recordingIdNow);
+            if (descriptor == null) {
+                // Saved recording id is no longer listed in the Archive. This is not a "the
+                // recording is empty so reset to 0" situation — it means the on-disk recording
+                // files for our saved id have been deleted (manual rm, archive recompaction,
+                // disk wipe). Silent reset would lose every event up to the saved position.
+                // FAIL LOUD instead; operator decides whether to bootstrap fresh
+                // (resetWithRecording to (newOldestId, 0) and accept loss) or restore the
+                // recording files.
+                throw new IllegalStateException(
+                        "oms-postgres-projector cannot continue: saved recordingId="
+                                + recordingIdNow
+                                + " is not listed in the Aeron Archive for events stream "
+                                + OmsClusterWireFormat.EVENTS_STREAM_ID
+                                + " (channel=" + OmsClusterWireFormat.EVENTS_CHANNEL + ")."
+                                + " The recording files may have been deleted or the projector is wired to the wrong"
+                                + " Aeron Archive. Operator must decide between (a) repointing to a different Archive,"
+                                + " or (b) accepting data loss by running resetWithRecording to a known-good"
+                                + " (recordingId, position). Refusing to silently reset to position 0 of an unrelated"
+                                + " recording — see handover §9.");
+            }
+            long savedPosition = lastAppliedPosition.get();
+            long upperBound = recordingUpperBound(archive, descriptor);
+            if (savedPosition > upperBound) {
+                // Saved position is beyond the end of this recording. Pre-hardening behaviour
+                // silently reset to descriptor.startPosition() and persisted that — which is
+                // exactly what destroyed pop's cursor on 2026-05-23. We refuse and FAIL LOUD.
+                throw new IllegalStateException(
+                        "oms-postgres-projector saved cursor (recordingId="
+                                + recordingIdNow
+                                + ", position=" + savedPosition + ") is past the end of the recording (upperBound="
+                                + upperBound + ", startPosition=" + descriptor.startPosition()
+                                + ", stopPosition=" + descriptor.stopPosition()
+                                + "). This indicates the recording was truncated or replaced under the projector."
+                                + " Refusing to silently reset to position 0 — operator must inspect via"
+                                + " AeronArchive control + resetWithRecording to a verified (recordingId, position).");
+            }
+            if (savedPosition < descriptor.startPosition()) {
+                // Saved position is below the recording's start. Reset upward to the recording's
+                // start is safe because the projector's row writes are idempotent (orders ON CONFLICT,
+                // executions unique on (account_id, venue_exec_ref)). Persist explicitly via
+                // resetWithRecording so the cursor row reflects the new state.
+                log.warn(
+                        "Projector cursor below recording startPosition: saved=(recordingId={}, position={}),"
+                                + " recordingStart={}; advancing to recording start (idempotent on row inserts).",
+                        recordingIdNow,
+                        savedPosition,
+                        descriptor.startPosition());
+                cursorRepository.resetWithRecording(
+                        PROJECTOR_ID,
+                        OmsClusterWireFormat.EVENTS_STREAM_ID,
+                        recordingIdNow,
+                        descriptor.startPosition());
+                lastAppliedPosition.set(descriptor.startPosition());
+                savedPosition = descriptor.startPosition();
+            }
+
+            Subscription replay = null;
+            try {
+                replay = archive.replay(
+                        descriptor.recordingId(),
+                        savedPosition,
+                        /* length = */ Long.MAX_VALUE,
+                        projectorCfg.getReplayChannel(),
+                        projectorCfg.getReplayStreamId());
+                log.info(
+                        "Projector replay open; recordingId={} startPos={} (recordingStart={}, recordingStop={},"
+                                + " upperBound={}) channel={} streamId={}",
+                        descriptor.recordingId(),
+                        savedPosition,
+                        descriptor.startPosition(),
+                        descriptor.stopPosition(),
+                        upperBound,
+                        projectorCfg.getReplayChannel(),
+                        projectorCfg.getReplayStreamId());
+
+                while (running.get()) {
+                    int polled = replay.poll(handler, projectorCfg.getFragmentLimit());
+                    if (polled > 0) {
+                        continue;
+                    }
+                    // No fragments. Two cases:
+                    //   (a) live-tail wait on an active recording — park, keep polling.
+                    //   (b) end of a completed recording with a successor available — roll forward.
+                    RecordingDescriptor refreshed = findRecordingById(archive, recordingIdNow);
+                    if (refreshed == null) {
+                        // Recording vanished mid-replay (extremely unusual). Fall through to
+                        // outer loop iteration which will fail loud.
+                        break;
+                    }
+                    long recordingStop = refreshed.stopPosition();
+                    long currentApplied = lastAppliedPosition.get();
+                    if (recordingStop != io.aeron.archive.client.AeronArchive.NULL_POSITION
+                            && currentApplied >= recordingStop) {
+                        RecordingDescriptor successor = findNextRecording(archive, recordingIdNow);
+                        if (successor != null) {
+                            log.info(
+                                    "Projector recording boundary: recordingId={} complete at stopPosition={};"
+                                            + " rolling forward to recordingId={} startPosition={}.",
+                                    recordingIdNow,
+                                    recordingStop,
+                                    successor.recordingId(),
+                                    successor.startPosition());
+                            cursorRepository.resetWithRecording(
+                                    PROJECTOR_ID,
+                                    OmsClusterWireFormat.EVENTS_STREAM_ID,
+                                    successor.recordingId(),
+                                    successor.startPosition());
+                            currentRecordingId.set(successor.recordingId());
+                            lastAppliedPosition.set(successor.startPosition());
+                            break; // exit inner poll loop -> outer loop reopens against successor
+                        }
+                    }
+                    LockSupport.parkNanos(projectorCfg.getPollParkNanos());
+                }
+            } finally {
+                CloseHelper.quietClose(replay);
+            }
+        }
+    }
+
+    /**
+     * Lists every recording on the events channel+stream and returns it sorted ascending by
+     * {@code recordingId}. Empty list means no recording exists yet (cluster has never run on
+     * this Archive directory).
+     */
+    private List<RecordingDescriptor> listEventsRecordingsSorted(AeronArchive archive) {
+        List<RecordingDescriptor> out = new ArrayList<>();
+        archive.listRecordingsForUri(
+                /* fromRecordingId = */ 0L,
+                /* recordCount = */ 1024,
+                OmsClusterWireFormat.EVENTS_CHANNEL,
+                OmsClusterWireFormat.EVENTS_STREAM_ID,
+                (controlSessionId,
+                        correlationId,
+                        recordingId,
+                        startTimestamp,
+                        stopTimestamp,
+                        startPosition,
+                        stopPosition,
+                        initialTermId,
+                        segmentFileLength,
+                        termBufferLength,
+                        mtuLength,
+                        sessionId,
+                        streamId,
+                        strippedChannel,
+                        originalChannel,
+                        sourceIdentity) -> {
+                    if (streamId == OmsClusterWireFormat.EVENTS_STREAM_ID) {
+                        out.add(new RecordingDescriptor(recordingId, startPosition, stopPosition));
+                    }
+                });
+        out.sort(Comparator.comparingLong(RecordingDescriptor::recordingId));
+        return out;
+    }
+
+    /**
+     * @return the descriptor with the given recording id, or {@code null} if absent from the
+     *         Archive's listing for the events channel/stream.
+     */
+    private RecordingDescriptor findRecordingById(AeronArchive archive, long recordingId) {
+        for (RecordingDescriptor d : listEventsRecordingsSorted(archive)) {
+            if (d.recordingId() == recordingId) {
+                return d;
             }
         }
         return null;
     }
 
     /**
-     * Opens the replay subscription, with a one-shot fallback to the recording's
-     * {@code startPosition} if Aeron rejects the requested position as not frame-aligned.
-     *
-     * <p>Frame boundaries in an Aeron Archive recording depend on the term layout established when
-     * the recording was created (initial term id, term length, mtu). Across cluster restarts or
-     * archive recreation, the same numerical position may fall mid-frame in the new recording even
-     * if it was a clean boundary in the old one. The persisted cursor cannot detect this on its
-     * own — the safe response is "rewind to startPosition and replay; the {@code orders} INSERT is
-     * idempotent". The fallback also covers the {@code "position must be less than the limit
-     * position"} error path when the cursor exceeded the live tail.
+     * @return the lowest-id recording strictly greater than {@code currentId}, or {@code null}
+     *         if no successor exists yet (current recording is the live tail).
      */
-    private Subscription openReplay(
-            AeronArchive archive,
-            RecordingDescriptor descriptor,
-            long requestedPos,
-            OmsConfig.Cluster.Projector projectorCfg) {
-        long currentPos = requestedPos;
-        try {
-            Subscription sub = archive.replay(
-                    descriptor.recordingId(),
-                    currentPos,
-                    /* length = */ Long.MAX_VALUE,
-                    projectorCfg.getReplayChannel(),
-                    projectorCfg.getReplayStreamId());
-            persistResolvedStartPos(currentPos);
-            return sub;
-        } catch (io.aeron.archive.client.ArchiveException e) {
-            log.warn(
-                    "archive.replay({}, pos={}) failed: {}; resetting to recording startPosition={}.",
-                    descriptor.recordingId(),
-                    currentPos,
-                    e.getMessage(),
-                    descriptor.startPosition());
-            currentPos = descriptor.startPosition();
-            cursorRepository.reset(PROJECTOR_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, currentPos);
-            lastAppliedPosition.set(currentPos);
-            Subscription sub = archive.replay(
-                    descriptor.recordingId(),
-                    currentPos,
-                    /* length = */ Long.MAX_VALUE,
-                    projectorCfg.getReplayChannel(),
-                    projectorCfg.getReplayStreamId());
-            return sub;
+    private RecordingDescriptor findNextRecording(AeronArchive archive, long currentId) {
+        for (RecordingDescriptor d : listEventsRecordingsSorted(archive)) {
+            if (d.recordingId() > currentId) {
+                return d;
+            }
         }
-    }
-
-    private void persistResolvedStartPos(long pos) {
-        if (pos != lastAppliedPosition.get()) {
-            cursorRepository.reset(PROJECTOR_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, pos);
-            lastAppliedPosition.set(pos);
-        }
+        return null;
     }
 
     /**
-     * Aeron Archive replay requires the start position to be a frame boundary inside the recording's
-     * available range. A persisted cursor can fall outside that range when the recording is recreated
-     * (test JVM reboot, prod node disk wipe, manual archive deletion). We clamp to the recording's
-     * {@code startPosition}; events between {@code startPosition} and the old cursor are re-applied,
-     * and the projector's idempotent {@code INSERT ... ON CONFLICT DO NOTHING} into {@code orders}
-     * keeps that safe.
-     *
-     * <p>For an active recording (still being written, {@code stopPosition == NULL_POSITION}), the
-     * upper bound is {@link AeronArchive#getRecordingPosition(long)} which returns the current
-     * write-head position. For a stopped recording, the descriptor's {@code stopPosition} is final.
+     * Effective upper bound for a recording at this instant. For a stopped recording it is the
+     * finalized {@code stopPosition}; for an active recording it is the Archive's live write-head
+     * position (which advances as the cluster emits events). Returns {@code startPosition} when
+     * neither is available (active recording with no events yet).
      */
-    private long clampToRecording(AeronArchive archive, RecordingDescriptor descriptor, long cursorPos) {
-        long start = descriptor.startPosition();
-        if (cursorPos < start) {
-            log.warn(
-                    "Projector cursor {} below recording startPosition {}; resuming from {}.",
-                    cursorPos,
-                    start,
-                    start);
-            return start;
-        }
-        long upperBound;
+    private long recordingUpperBound(AeronArchive archive, RecordingDescriptor descriptor) {
         long stop = descriptor.stopPosition();
-        if (stop == io.aeron.archive.client.AeronArchive.NULL_POSITION) {
-            // Active recording: ask the Archive for the live write head.
-            upperBound = archive.getRecordingPosition(descriptor.recordingId());
-            if (upperBound == io.aeron.archive.client.AeronArchive.NULL_POSITION) {
-                upperBound = start;
-            }
-        } else {
-            upperBound = stop;
+        if (stop != io.aeron.archive.client.AeronArchive.NULL_POSITION) {
+            return stop;
         }
-        if (cursorPos > upperBound) {
-            log.warn(
-                    "Projector cursor {} above recording upper-bound {} (likely stale cursor from a previous"
-                            + " incarnation); resuming from {}.",
-                    cursorPos,
-                    upperBound,
-                    start);
-            return start;
+        long head = archive.getRecordingPosition(descriptor.recordingId());
+        if (head == io.aeron.archive.client.AeronArchive.NULL_POSITION) {
+            return descriptor.startPosition();
         }
-        return cursorPos;
+        return head;
     }
 
     /**
      * Snapshot of the recording's identity and bounds returned by
-     * {@link AeronArchive#listRecordingsForUri}. Used to clamp a stale cursor to a valid replay
-     * range.
+     * {@link AeronArchive#listRecordingsForUri}.
      */
     private record RecordingDescriptor(long recordingId, long startPosition, long stopPosition) {}
 
@@ -560,9 +763,13 @@ public class OmsPostgresProjector {
                     // on a recording from a future schema. The cluster's snapshot bump procedure already
                     // gates schema-incompatible deploys at the cluster service; the projector is a
                     // downstream consumer that should drain unknown frames silently.
+                    long recordingIdNow = requireCurrentRecordingId();
                     transactionTemplate.executeWithoutResult(status ->
-                            cursorRepository.advance(
-                                    PROJECTOR_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, newPosition));
+                            cursorRepository.advanceWithRecording(
+                                    PROJECTOR_ID,
+                                    OmsClusterWireFormat.EVENTS_STREAM_ID,
+                                    recordingIdNow,
+                                    newPosition));
                     lastAppliedPosition.set(newPosition);
                 }
             }
@@ -609,8 +816,29 @@ public class OmsPostgresProjector {
         log.warn(
                 "projector shard mismatch: event orderId={} shardId={} but this projector serves shardId={}; dropping event without applying",
                 orderId, eventShardId, expectedShardId);
-        cursorRepository.advance(PROJECTOR_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, newPosition);
+        cursorRepository.advanceWithRecording(
+                PROJECTOR_ID,
+                OmsClusterWireFormat.EVENTS_STREAM_ID,
+                requireCurrentRecordingId(),
+                newPosition);
         return true;
+    }
+
+    /**
+     * 2026-05-23 hardening. Reads {@link #currentRecordingId} for use by any cursor write in the
+     * apply path. The replay loop guarantees this is set to a non-negative Aeron Archive recording
+     * id before any fragment can be polled, so {@code -1} reaching here is a programming bug —
+     * not an operational condition — and we fail loud rather than write {@code -1} to Postgres.
+     */
+    private long requireCurrentRecordingId() {
+        long id = currentRecordingId.get();
+        if (id < 0L) {
+            throw new IllegalStateException(
+                    "oms-postgres-projector apply path invoked before currentRecordingId was set"
+                            + " (got " + id + "). This indicates the replay loop opened a Subscription"
+                            + " without seeding the recording id — programming bug, not an operational condition.");
+        }
+        return id;
     }
 
     void applyAdmittedEvent(OrderAdmittedEvent ev, long newPosition) {
@@ -644,7 +872,11 @@ public class OmsPostgresProjector {
         // idempotent on replay because the V4 uq_ledger_inflight_outbox_order_id unique
         // index + ON CONFLICT DO NOTHING make this a safe no-op when the row already exists.
         recordLedgerInflightOutboxIfNeeded(ev);
-        cursorRepository.advance(PROJECTOR_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, newPosition);
+        cursorRepository.advanceWithRecording(
+                PROJECTOR_ID,
+                OmsClusterWireFormat.EVENTS_STREAM_ID,
+                requireCurrentRecordingId(),
+                newPosition);
         // Phase 4j per-event histogram: cluster-admit -> projector-applied. Recorded after the last
         // SQL operation in this fragment's transaction; the actual COMMIT happens when the wrapping
         // TransactionTemplate lambda returns (sub-ms after this point in the fast-path). If any of
@@ -847,7 +1079,11 @@ public class OmsPostgresProjector {
                     "Projector: ExecutionAppliedEvent for unknown order {} (venueExecRef={}); skipping.",
                     ev.orderId(),
                     ev.venueExecRef());
-            cursorRepository.advance(PROJECTOR_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, newPosition);
+            cursorRepository.advanceWithRecording(
+                PROJECTOR_ID,
+                OmsClusterWireFormat.EVENTS_STREAM_ID,
+                requireCurrentRecordingId(),
+                newPosition);
             return;
         }
         Order order = opt.get();
@@ -876,7 +1112,11 @@ public class OmsPostgresProjector {
                     ev.orderId(),
                     ev.venueExecRef());
         }
-        cursorRepository.advance(PROJECTOR_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, newPosition);
+        cursorRepository.advanceWithRecording(
+                PROJECTOR_ID,
+                OmsClusterWireFormat.EVENTS_STREAM_ID,
+                requireCurrentRecordingId(),
+                newPosition);
     }
 
     /**
@@ -918,7 +1158,11 @@ public class OmsPostgresProjector {
                     "Projector: OrderCancelAppliedEvent for unknown order {} (reason={}); skipping.",
                     ev.orderId(),
                     ev.reason());
-            cursorRepository.advance(PROJECTOR_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, newPosition);
+            cursorRepository.advanceWithRecording(
+                PROJECTOR_ID,
+                OmsClusterWireFormat.EVENTS_STREAM_ID,
+                requireCurrentRecordingId(),
+                newPosition);
             return;
         }
         Order order = opt.get();
@@ -929,7 +1173,11 @@ public class OmsPostgresProjector {
             log.debug(
                     "Projector: OrderCancelAppliedEvent already projected for order {}; advancing cursor only.",
                     ev.orderId());
-            cursorRepository.advance(PROJECTOR_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, newPosition);
+            cursorRepository.advanceWithRecording(
+                PROJECTOR_ID,
+                OmsClusterWireFormat.EVENTS_STREAM_ID,
+                requireCurrentRecordingId(),
+                newPosition);
             return;
         }
         int pgExpectedVersion = order.version();
@@ -951,7 +1199,11 @@ public class OmsPostgresProjector {
                     order.id(),
                     pgExpectedVersion,
                     order.status());
-            cursorRepository.advance(PROJECTOR_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, newPosition);
+            cursorRepository.advanceWithRecording(
+                PROJECTOR_ID,
+                OmsClusterWireFormat.EVENTS_STREAM_ID,
+                requireCurrentRecordingId(),
+                newPosition);
             return;
         }
         int newSeq = pgExpectedVersion + 1;
@@ -967,7 +1219,11 @@ public class OmsPostgresProjector {
             throw new IllegalStateException(
                     "domain event serialisation failed for OMS-cancel of order " + refreshed.id(), e);
         }
-        cursorRepository.advance(PROJECTOR_ID, OmsClusterWireFormat.EVENTS_STREAM_ID, newPosition);
+        cursorRepository.advanceWithRecording(
+                PROJECTOR_ID,
+                OmsClusterWireFormat.EVENTS_STREAM_ID,
+                requireCurrentRecordingId(),
+                newPosition);
     }
 
     /**

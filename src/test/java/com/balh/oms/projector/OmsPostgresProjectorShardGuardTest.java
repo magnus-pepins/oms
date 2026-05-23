@@ -92,6 +92,10 @@ class OmsPostgresProjectorShardGuardTest {
                 new ObjectMapper(),
                 txManager,
                 pinned);
+        // Production seeding (init() → bootstrap → replay loop) is bypassed in unit tests that
+        // drive applyAdmittedEvent / applyOrderCancelAppliedEvent directly. Seed the recording
+        // id so the apply path's cursor write does not fail loud on -1.
+        projector.setCurrentRecordingIdForTesting(13L);
     }
 
     @Test
@@ -107,9 +111,10 @@ class OmsPostgresProjectorShardGuardTest {
         projector.applyAdmittedEvent(ev, FRAGMENT_POSITION);
 
         verify(ordersRepository).insertFromAdmittedEvent(ev);
-        verify(cursorRepository).advance(
+        verify(cursorRepository).advanceWithRecording(
                 OmsPostgresProjector.PROJECTOR_ID,
                 OmsClusterWireFormat.EVENTS_STREAM_ID,
+                13L,
                 FRAGMENT_POSITION);
         assertThat(meterRegistry.counter(OmsPostgresProjector.METRIC_SHARD_MISMATCH_DROPPED)
                 .count()).isEqualTo(0.0);
@@ -130,9 +135,10 @@ class OmsPostgresProjectorShardGuardTest {
         verify(controlAdmission, never()).persistAdmission(any());
         verify(domainEventOutboxRepository, never()).insert(any(), any());
         verify(ledgerInflightOutboxRepository, never()).insertIfAbsent(any(), any());
-        verify(cursorRepository).advance(
+        verify(cursorRepository).advanceWithRecording(
                 OmsPostgresProjector.PROJECTOR_ID,
                 OmsClusterWireFormat.EVENTS_STREAM_ID,
+                13L,
                 FRAGMENT_POSITION);
         assertThat(meterRegistry.counter(OmsPostgresProjector.METRIC_SHARD_MISMATCH_DROPPED)
                 .count()).isEqualTo(1.0);
@@ -166,9 +172,10 @@ class OmsPostgresProjectorShardGuardTest {
         projector.applyOrderCancelAppliedEvent(ev, FRAGMENT_POSITION);
 
         verify(ordersRepository, never()).findById(any());
-        verify(cursorRepository).advance(
+        verify(cursorRepository).advanceWithRecording(
                 OmsPostgresProjector.PROJECTOR_ID,
                 OmsClusterWireFormat.EVENTS_STREAM_ID,
+                13L,
                 FRAGMENT_POSITION);
         assertThat(meterRegistry.counter(OmsPostgresProjector.METRIC_SHARD_MISMATCH_DROPPED)
                 .count()).isEqualTo(1.0);

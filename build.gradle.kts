@@ -428,6 +428,22 @@ tasks.register<JavaExec>("rebuildProjectorOrdersFromSnapshot") {
 }
 
 /**
+ * Read-only operator diagnostic: list every recording in the cluster's Aeron Archive with
+ * stream id, start/stop positions, and current write head. Added 2026-05-23 alongside the
+ * projector stale-open recording walk-forward fix — the projector log on its own does not
+ * show what successor recordings (if any) exist, which made the post-V55 incident hard to
+ * diagnose without read-only archive inspection. See OmsArchiveListRecordingsTool for the
+ * env-var contract.
+ */
+tasks.register<JavaExec>("listArchiveRecordings") {
+    group = "application"
+    description = "Read-only: list every recording in the cluster's Aeron Archive (operator diagnostic)."
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.balh.oms.cluster.admin.OmsArchiveListRecordingsTool")
+    jvmArgs(lowLatencyJvmModuleOpens)
+}
+
+/**
  * Phase 4 slice 4e (cluster bench harness): boot a single-node in-process Aeron Cluster, run a
  * steady-state AcceptOrderCommand offer loop at OMS_BENCH_THROUGHPUT_OPS_PER_S for
  * OMS_BENCH_DURATION_S, capture HdrHistogram of commit-round-trip latencies, write summary.md +

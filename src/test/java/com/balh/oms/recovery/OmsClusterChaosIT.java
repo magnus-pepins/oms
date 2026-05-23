@@ -73,6 +73,36 @@ class OmsClusterChaosIT {
     /** Five full cycles is enough to catch state leaks that only surface across multiple restarts. */
     private static final int CYCLE_COUNT = 5;
 
+    /**
+     * Approximate encoded size per {@link com.balh.oms.cluster.OmsAdmissionClusteredService.AdmittedOrder}
+     * in the snapshot: 6 longs + 2 ints + 4 status bytes + UTF-8 strings (accountId, idempotencyKey,
+     * accountIdHash, symbol, optional ledgerBalanceId) each with a 4-byte length prefix. Used only to
+     * size {@link #ORDER_COUNT_FOR_MULTI_FRAGMENT_SNAPSHOT} with a clear margin over Aeron's MTU.
+     */
+    private static final int APPROX_BYTES_PER_ADMITTED_ORDER = 150;
+
+    /**
+     * Order count chosen so the resulting snapshot reliably exceeds Aeron's default fragment MTU
+     * (~1408 bytes). 100 orders ≈ 15 KB ≈ 11 fragments — comfortable margin against future
+     * AdmittedOrder size growth and any MTU bump.
+     */
+    private static final int ORDER_COUNT_FOR_MULTI_FRAGMENT_SNAPSHOT = 100;
+
+    /** Larger snapshots need more time to land than the single-fragment case. */
+    private static final Duration LARGE_SNAPSHOT_LAND_TIMEOUT = Duration.ofSeconds(30);
+
+    /** Egress poll cadence inside the batch admit loop so the client buffers don't fill. */
+    private static final int BATCH_ADMIT_EGRESS_POLL_INTERVAL = 10;
+
+    /** Total wait budget for all batch acks to arrive on the egress listener. */
+    private static final Duration BATCH_ADMIT_EGRESS_WAIT_TIMEOUT = Duration.ofSeconds(60);
+
+    /**
+     * Stable MSB used by {@link #largeOrderIdForIndex} so generated UUIDs stay collision-free with
+     * the small-index {@link #orderIdForIndex} helper (which uses MSB=0) and survive across runs.
+     */
+    private static final long LARGE_ORDER_ID_MSB = 0xCAFEBABEDEAD0001L;
+
     private ClusterCycle cycle;
 
     @AfterEach
@@ -205,6 +235,73 @@ class OmsClusterChaosIT {
         }
     }
 
+    /**
+     * Phase 7 fragment-reassembly proof — what's missing from the other two tests in this class.
+     *
+     * <p>The 2026-05-23 pop incident root cause was that {@code OmsAdmissionClusteredService}'s
+     * {@code SnapshotLoader} implemented {@code FragmentHandler} directly, not wrapped in
+     * {@code ImageFragmentAssembler}. Snapshots that fit in one Aeron fragment (small clusters
+     * in the existing tests, ≤2 orders) loaded fine; snapshots that spanned multiple fragments
+     * (pop with ~74 balances / 195 transactions / etc.) caused {@code onFragment} to be invoked
+     * once per fragment with the SECOND fragment having no magic header at offset 0 — the
+     * loader then threw {@code snapshot magic mismatch: 0x{middle-of-payload}}.
+     *
+     * <p>This test admits enough orders that the snapshot payload comfortably exceeds Aeron's
+     * default MTU (~1408 bytes), forcing the fragmentation path. With the pre-fix code this
+     * test FAILS with {@code snapshotLoadFailedCount &gt; 0} on the second boot and the cluster
+     * comes up empty (state recovered only via the self-heal + replay fallback, which is the
+     * band-aid not the real fix). With the post-fix code (loader wrapped in
+     * {@code ImageFragmentAssembler}) the cluster loads the snapshot cleanly and
+     * {@code snapshotLoadFailedCount == 0}.
+     */
+    @Test
+    void largeSnapshotSurvivesFragmentationAcrossRestart(@TempDir Path tempDir) {
+        // ~150 bytes/order × ORDER_COUNT_FOR_MULTI_FRAGMENT_SNAPSHOT → snapshot easily exceeds the
+        // default Aeron MTU (~1408 B), forcing fragment reassembly on load. 100 was chosen as a
+        // safety margin: even if AdmittedOrder grows or the MTU rises, this stays multi-fragment.
+        final int orderCount = ORDER_COUNT_FOR_MULTI_FRAGMENT_SNAPSHOT;
+        OmsClusterNodeBootstrap.ClusterNodePaths paths = pathsUnder(tempDir);
+        ensureDirsFirstBoot(paths);
+
+        cycle = ClusterCycle.boot(paths);
+        awaitReplayCompleted(cycle.service);
+
+        List<UUID> admitted = admitOrderBatch(cycle, orderCount, 1);
+        assertThat(cycle.service.admittedOrderCount()).isEqualTo(orderCount);
+        awaitReady(cycle);
+
+        long beforeSnap = cycle.service.snapshotTakenCountForTest();
+        assertThat(triggerSnapshot(paths.clusterDir())).isTrue();
+        await().atMost(LARGE_SNAPSHOT_LAND_TIMEOUT)
+                .pollInterval(Duration.ofMillis(50))
+                .untilAsserted(() -> assertThat(cycle.service.snapshotTakenCountForTest()).isGreaterThan(beforeSnap));
+
+        cycle.close();
+        cycle = null;
+        ensureDirsRestart(paths);
+
+        cycle = ClusterCycle.boot(paths);
+        awaitReplayCompleted(cycle.service);
+
+        assertThat(cycle.service.snapshotLoadFailedCountForTest())
+                .as(
+                        "multi-fragment snapshot (%d orders, ~%d bytes/order, expected >1 Aeron"
+                                + " fragment) must load cleanly. Pre-fix this would self-heal past"
+                                + " a 'snapshot magic mismatch' on fragment 2 (2026-05-23 pop"
+                                + " incident).",
+                        orderCount,
+                        APPROX_BYTES_PER_ADMITTED_ORDER)
+                .isZero();
+        assertThat(cycle.service.admittedOrderCount())
+                .as("all %d orders must survive multi-fragment snapshot + restart", orderCount)
+                .isEqualTo(orderCount);
+        for (UUID orderId : admitted) {
+            assertThat(cycle.service.lookupByOrderId(orderId))
+                    .as("order %s must round-trip through multi-fragment snapshot", orderId)
+                    .isNotNull();
+        }
+    }
+
     private static void awaitReplayCompleted(OmsAdmissionClusteredService service) {
         await().atMost(ROLE_CHANGE_TIMEOUT)
                 .pollInterval(Duration.ofMillis(50))
@@ -299,6 +396,54 @@ class OmsClusterChaosIT {
         return orderId;
     }
 
+    /**
+     * Admits {@code count} orders over a single cluster session. Returns the order ids in submission
+     * order so the caller can assert each one round-tripped. Used by
+     * {@link #largeSnapshotSurvivesFragmentationAcrossRestart} to build a snapshot large enough to
+     * span multiple Aeron fragments without paying {@link #connect} cost per order.
+     */
+    private static List<UUID> admitOrderBatch(ClusterCycle cycle, int count, int baseIdx) {
+        AtomicInteger acks = new AtomicInteger();
+        List<UUID> ids = new ArrayList<>(count);
+        try (AeronCluster client = connect(cycle.driver, acks)) {
+            ExpandableArrayBuffer buffer = new ExpandableArrayBuffer(COMMAND_BUFFER_BYTES);
+            for (int i = 0; i < count; i++) {
+                int idx = baseIdx + i;
+                UUID orderId = largeOrderIdForIndex(idx);
+                ids.add(orderId);
+                offerUntilSuccess(
+                        client,
+                        buffer,
+                        new AcceptOrderCommand(
+                                        (long) idx,
+                                        orderId,
+                                        System.nanoTime(),
+                                        10_000_000_000L,
+                                        0L,
+                                        0,
+                                        AcceptOrderCommand.SIDE_BUY,
+                                        AcceptOrderCommand.TIF_DAY,
+                                        "chaos-account-batch",
+                                        "chaos-idem-batch-" + idx,
+                                        "chaos-hash-batch-" + idx,
+                                        "AAPL",
+                                        null)
+                                ::encode);
+                if (i % BATCH_ADMIT_EGRESS_POLL_INTERVAL == 0) {
+                    client.pollEgress();
+                }
+            }
+            await().atMost(BATCH_ADMIT_EGRESS_WAIT_TIMEOUT)
+                    .pollDelay(Duration.ZERO)
+                    .pollInterval(Duration.ofMillis(20))
+                    .untilAsserted(() -> {
+                        client.pollEgress();
+                        assertThat(acks.get()).isGreaterThanOrEqualTo(count);
+                    });
+        }
+        return ids;
+    }
+
     private static AeronCluster connect(ClusteredMediaDriver driver, AtomicInteger acceptedCount) {
         EgressListener listener = new EgressListener() {
             @Override
@@ -356,6 +501,15 @@ class OmsClusterChaosIT {
 
     private static UUID orderIdForIndex(int index) {
         return UUID.fromString(String.format("00000000-0000-4000-8000-0000000099%02d", index));
+    }
+
+    /**
+     * UUID generator for the large-snapshot test, supporting arbitrary positive indexes (the
+     * %02d-formatted {@link #orderIdForIndex} only spans 0-99). MSB is a constant marker so the
+     * two helpers never collide.
+     */
+    private static UUID largeOrderIdForIndex(int index) {
+        return new UUID(LARGE_ORDER_ID_MSB, (long) index);
     }
 
     private static void offerUntilSuccess(

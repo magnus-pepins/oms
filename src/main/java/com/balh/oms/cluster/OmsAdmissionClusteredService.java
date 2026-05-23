@@ -3,6 +3,7 @@ package com.balh.oms.cluster;
 import io.aeron.CommonContext;
 import io.aeron.ExclusivePublication;
 import io.aeron.Image;
+import io.aeron.ImageFragmentAssembler;
 import io.aeron.cluster.codecs.CloseReason;
 import io.aeron.cluster.service.ClientSession;
 import io.aeron.cluster.service.Cluster;
@@ -799,9 +800,17 @@ public class OmsAdmissionClusteredService implements ClusteredService {
     private boolean loadSnapshot(Image snapshotImage) {
         Timer.Sample sample = Timer.start(meterRegistry);
         SnapshotLoader loader = new SnapshotLoader();
+        // Wrap in ImageFragmentAssembler so a snapshot that exceeds the publication MTU
+        // (typically ~1376 bytes) is reassembled into a single onFragment delivery. Without
+        // this wrapper the loader sees the second+ fragments with no header at offset 0 and
+        // throws `snapshot magic mismatch` (or OOM on `readString`) on the middle-of-payload
+        // bytes — the failure mode that hit pop on 2026-05-23. The original code carried the
+        // comment "snapshot lives in a single fragment" which was true only while clusters
+        // were small.
+        ImageFragmentAssembler assembler = new ImageFragmentAssembler(loader);
         try {
             while (!snapshotImage.isEndOfStream()) {
-                int frags = snapshotImage.poll(loader, 1);
+                int frags = snapshotImage.poll(assembler, 1);
                 if (frags == 0) {
                     Thread.yield();
                 }
@@ -1618,9 +1627,12 @@ public class OmsAdmissionClusteredService implements ClusteredService {
     private final class SnapshotLoader implements io.aeron.logbuffer.FragmentHandler {
 
         /**
-         * Total bytes across all snapshot fragments seen by this loader. Snapshots today fit in a
-         * single fragment, but we sum-on-fragment so the metric stays correct if Phase 2+ ever
-         * splits the snapshot across multiple Aeron messages (see class doc §Snapshot format).
+         * Total bytes seen by this loader. Always equals the full snapshot payload size because
+         * {@link #loadSnapshot} wraps this loader in {@link ImageFragmentAssembler}: a snapshot
+         * that spans multiple Aeron fragments is reassembled into a single {@link #onFragment}
+         * call before the magic+length header is validated. The pre-assembler code assumed
+         * snapshots fit in one fragment, which broke as soon as cluster state exceeded MTU
+         * (the 2026-05-23 pop incident — see oms/docs/runbooks/oms-cluster-recovery-incident.md).
          */
         private long totalBytes;
 

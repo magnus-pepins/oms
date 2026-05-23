@@ -955,22 +955,26 @@ class OmsAdmissionClusteredServiceTest {
     }
 
     /**
-     * Build a mocked {@link Image} that delivers {@code snapshotBytes} as a
-     * single fragment then reports end-of-stream. Suffices for
-     * {@link OmsAdmissionClusteredService}'s snapshot loader (one fragment per
-     * snapshot today).
+     * Build a mocked {@link Image} that delivers {@code snapshotBytes} as a single complete
+     * fragment then reports end-of-stream. The supplied {@link io.aeron.logbuffer.Header} reports
+     * {@link io.aeron.logbuffer.FrameDescriptor#UNFRAGMENTED} so the {@link io.aeron.ImageFragmentAssembler}
+     * that wraps the loader in {@code loadSnapshot} short-circuits to the delegate (single-fragment
+     * pass-through). For multi-fragment behaviour see
+     * {@code OmsClusterChaosIT#largeSnapshotSurvivesFragmentationAcrossRestart}.
      */
     private static Image mockSnapshotImage(byte[] snapshotBytes) {
         Image image = mock(Image.class);
         AtomicBoolean delivered = new AtomicBoolean(false);
         when(image.isEndOfStream()).thenAnswer(inv -> delivered.get());
+        io.aeron.logbuffer.Header header = mock(io.aeron.logbuffer.Header.class);
+        when(header.flags()).thenReturn(io.aeron.logbuffer.FrameDescriptor.UNFRAGMENTED);
         when(image.poll(any(FragmentHandler.class), anyInt())).thenAnswer(inv -> {
             if (delivered.get()) {
                 return 0;
             }
             FragmentHandler handler = inv.getArgument(0);
             UnsafeBuffer buffer = new UnsafeBuffer(snapshotBytes);
-            handler.onFragment(buffer, 0, snapshotBytes.length, /* header = */ null);
+            handler.onFragment(buffer, 0, snapshotBytes.length, header);
             delivered.set(true);
             return 1;
         });

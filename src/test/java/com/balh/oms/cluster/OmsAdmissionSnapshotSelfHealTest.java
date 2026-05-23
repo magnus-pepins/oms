@@ -197,13 +197,20 @@ class OmsAdmissionSnapshotSelfHealTest {
         Image image = mock(Image.class);
         AtomicBoolean delivered = new AtomicBoolean(false);
         when(image.isEndOfStream()).thenAnswer(inv -> delivered.get());
+        // Real loadSnapshot wraps the loader in ImageFragmentAssembler, which checks
+        // header.flags() for FrameDescriptor.UNFRAGMENTED (BEGIN|END). Single-fragment mocks
+        // must supply a Header that reports those flags; otherwise the assembler treats the
+        // delivery as a partial fragment and buffers it forever (and the original null-header
+        // path would NPE inside the assembler).
+        io.aeron.logbuffer.Header header = mock(io.aeron.logbuffer.Header.class);
+        when(header.flags()).thenReturn(io.aeron.logbuffer.FrameDescriptor.UNFRAGMENTED);
         when(image.poll(any(FragmentHandler.class), anyInt())).thenAnswer(inv -> {
             if (delivered.get()) {
                 return 0;
             }
             FragmentHandler handler = inv.getArgument(0);
             UnsafeBuffer buf = new UnsafeBuffer(bytes);
-            handler.onFragment(buf, 0, bytes.length, null);
+            handler.onFragment(buf, 0, bytes.length, header);
             delivered.set(true);
             return 1;
         });

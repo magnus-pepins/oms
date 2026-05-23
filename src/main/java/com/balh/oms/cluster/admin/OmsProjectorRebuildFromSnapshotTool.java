@@ -8,8 +8,10 @@ import io.aeron.Subscription;
 import io.aeron.archive.client.AeronArchive;
 import io.aeron.archive.client.RecordingDescriptorConsumer;
 import io.aeron.cluster.ConsensusModule;
+import io.aeron.cluster.RecordingLog;
 import org.agrona.CloseHelper;
 
+import java.io.File;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.sql.Connection;
@@ -111,6 +113,28 @@ public final class OmsProjectorRebuildFromSnapshotTool {
 
     public static final String ENV_AERON_MEDIA_DRIVER_DIR = "OMS_AERON_MEDIA_DRIVER_DIR";
 
+    /**
+     * Env var: explicit cluster (consensus-module) directory containing the {@code recording-log}
+     * file. Default {@code <OMS_AERON_DIR_BASE>/consensus-module} — matches
+     * {@code OmsClusterNodeBootstrap.resolvePaths} and {@code OmsClusterSnapshotAdminTool}.
+     */
+    public static final String ENV_AERON_CLUSTER_DIR = "OMS_AERON_CLUSTER_DIR";
+
+    public static final String DEFAULT_CLUSTER_DIR_SUBDIR = "consensus-module";
+
+    /**
+     * Aeron cluster {@code RecordingLog} serviceId for the (single) clustered service in this
+     * cluster — {@code OmsAdmissionClusteredService}. Service snapshots are stored under this
+     * id; the consensus module's own snapshot lives under
+     * {@link ConsensusModule.Configuration#SERVICE_ID} ({@code -1}). The cluster's snapshot
+     * stream id (107) is shared between both kinds of snapshot, so filtering by stream id
+     * alone (via {@code AeronArchive.listRecordings}) catches consensus-module marker
+     * recordings whose payload bytes are not {@code OMS_SNAPSHOT_MAGIC} and the decoder
+     * loud-fails on them. {@link RecordingLog#getLatestSnapshot(int)} with this serviceId
+     * returns the right recordingId unambiguously.
+     */
+    public static final int SERVICE_ID = 0;
+
     public static final String ENV_ARCHIVE_CONTROL_REQUEST = "OMS_AERON_ARCHIVE_CONTROL_REQUEST_CHANNEL";
 
     public static final String DEFAULT_ARCHIVE_CONTROL_REQUEST = "aeron:ipc?term-length=64k";
@@ -206,10 +230,10 @@ public final class OmsProjectorRebuildFromSnapshotTool {
 
             List<SnapshotRecording> recordings = listSnapshotRecordings(archive);
             if (recordings.isEmpty()) {
-                System.err.println("FATAL: no snapshot recordings found on "
-                        + ConsensusModule.Configuration.SNAPSHOT_CHANNEL_DEFAULT
-                        + " stream " + ConsensusModule.Configuration.SNAPSHOT_STREAM_ID_DEFAULT
-                        + ". Has the cluster ever snapshotted? Trigger one with ./gradlew clusterSnapshot first.");
+                System.err.println("FATAL: no service snapshot recordings (serviceId=" + SERVICE_ID
+                        + ") found in RecordingLog at " + resolveClusterDir().getAbsolutePath()
+                        + ". Has the cluster ever taken a snapshot? "
+                        + "Trigger one with ./gradlew clusterSnapshot first.");
                 return EXIT_FAILURE;
             }
             SnapshotRecording chosen = chooseRecording(recordings, args.snapshotRecordingId);
@@ -288,17 +312,56 @@ public final class OmsProjectorRebuildFromSnapshotTool {
         }
     }
 
+    /**
+     * Resolves all valid OMS service snapshot recordings via the cluster's {@code RecordingLog}
+     * (serviceId = {@link #SERVICE_ID}). Filtering by Aeron Archive stream id alone caught
+     * the consensus module's marker recordings on the same snapshot stream (107) whose payload
+     * is not {@code OMS_SNAPSHOT_MAGIC} and made the decoder loud-fail. {@code RecordingLog}
+     * is the authoritative source for which recording corresponds to which clustered service's
+     * snapshot.
+     *
+     * <p>For each {@code RecordingLog} snapshot entry the Archive is queried for the recording's
+     * start/stop positions (required for {@link AeronArchive#replay}).
+     */
     private static List<SnapshotRecording> listSnapshotRecordings(AeronArchive archive) {
-        // Use listRecordings (no URI filter) rather than listRecordingsForUri: the cluster's
-        // snapshot recording is stored under a stripped channel that may include extra params
-        // (e.g. term-length, MTU) beyond the bare "aeron:ipc?alias=snapshot" pattern, and
-        // listRecordingsForUri does a strict prefix match that misses those rows on pop.
-        // Filter by stream id only here; that's unambiguous because the consensus module owns
-        // SNAPSHOT_STREAM_ID_DEFAULT (107) exclusively on this Aeron Archive.
+        File clusterDir = resolveClusterDir();
         List<SnapshotRecording> out = new ArrayList<>();
+        try (RecordingLog recordingLog = new RecordingLog(clusterDir, /* createIfMissing = */ false)) {
+            for (RecordingLog.Entry entry : recordingLog.entries()) {
+                if (entry.type != RecordingLog.ENTRY_TYPE_SNAPSHOT) {
+                    continue;
+                }
+                if (!entry.isValid) {
+                    continue;
+                }
+                if (entry.serviceId != SERVICE_ID) {
+                    continue;
+                }
+                long[] startStop = lookupRecordingStartStop(archive, entry.recordingId);
+                if (startStop == null) {
+                    System.err.printf(Locale.ROOT,
+                            "WARN: RecordingLog snapshot entry recordingId=%d (serviceId=%d) not found in Archive — skipping%n",
+                            entry.recordingId, entry.serviceId);
+                    continue;
+                }
+                out.add(new SnapshotRecording(entry.recordingId, startStop[0], startStop[1]));
+            }
+        }
+        out.sort(Comparator.comparingLong((SnapshotRecording r) -> r.recordingId).reversed());
+        return out;
+    }
+
+    /**
+     * Returns {@code [startPosition, stopPosition]} for the given recording, or {@code null} if
+     * the Archive does not know about it (recording deleted, catalog truncated). Defensive
+     * because {@code RecordingLog} on disk can outlive the Archive catalog after a manual
+     * archive wipe.
+     */
+    private static long[] lookupRecordingStartStop(AeronArchive archive, long recordingId) {
+        long[] holder = new long[]{-1L, -1L};
         RecordingDescriptorConsumer consumer = (controlSessionId,
                 correlationId,
-                recordingId,
+                rid,
                 startTimestamp,
                 stopTimestamp,
                 startPosition,
@@ -312,13 +375,25 @@ public final class OmsProjectorRebuildFromSnapshotTool {
                 strippedChannel,
                 originalChannel,
                 sourceIdentity) -> {
-            if (streamId == ConsensusModule.Configuration.SNAPSHOT_STREAM_ID_DEFAULT) {
-                out.add(new SnapshotRecording(recordingId, startPosition, stopPosition));
+            if (rid == recordingId) {
+                holder[0] = startPosition;
+                holder[1] = stopPosition;
             }
         };
-        archive.listRecordings(/* fromRecordingId = */ 0L, /* recordCount = */ 4096, consumer);
-        out.sort(Comparator.comparingLong((SnapshotRecording r) -> r.recordingId).reversed());
-        return out;
+        int matched = archive.listRecording(recordingId, consumer);
+        if (matched == 0 || holder[0] < 0) {
+            return null;
+        }
+        return holder;
+    }
+
+    static File resolveClusterDir() {
+        String explicit = System.getenv(ENV_AERON_CLUSTER_DIR);
+        if (explicit != null && !explicit.isBlank()) {
+            return new File(explicit);
+        }
+        String base = envOrDefault(ENV_AERON_DIR_BASE, DEFAULT_AERON_DIR_BASE);
+        return new File(base, DEFAULT_CLUSTER_DIR_SUBDIR);
     }
 
     private static SnapshotRecording chooseRecording(List<SnapshotRecording> recordings, Long preferredId) {

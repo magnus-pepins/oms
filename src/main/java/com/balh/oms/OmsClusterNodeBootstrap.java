@@ -448,15 +448,57 @@ public final class OmsClusterNodeBootstrap {
      */
     public static ClusteredServiceContainer.Context buildServiceContainerContext(
             ClusterNodePaths paths, OmsAdmissionClusteredService service) {
+        return buildServiceContainerContext(paths, service, null);
+    }
+
+    /**
+     * Phase 7 self-healing overload — caller supplies a fatal-error sink that is invoked when the
+     * {@link ClusteredServiceContainer}'s agent encounters an unrecoverable error (e.g. a
+     * {@code RuntimeException} that escapes {@code onStart}, {@code onSessionMessage},
+     * {@code onTakeSnapshot}, etc.). The production bootstrap wires this to log and
+     * {@link System#exit(int)} so PM2 sees a real crash and restarts visibly. Tests wire it to a
+     * latch or {@code AtomicReference} so they can assert "errorHandler fired" without taking the
+     * JVM down.
+     *
+     * <p>Why we own the {@code errorHandler}: Aeron's default
+     * {@code Throwable::printStackTrace} silently swallows the agent death and leaves the
+     * container's runner thread dead while the embedding JVM keeps running. That is the exact
+     * 2026-05-23 "green PM2 line, dead admission" failure shape we're closing here.
+     */
+    public static ClusteredServiceContainer.Context buildServiceContainerContext(
+            ClusterNodePaths paths,
+            OmsAdmissionClusteredService service,
+            org.agrona.ErrorHandler fatalErrorSink) {
+        org.agrona.ErrorHandler handler = fatalErrorSink == null
+                ? DEFAULT_FATAL_ERROR_HANDLER
+                : fatalErrorSink;
         return new ClusteredServiceContainer.Context()
                 .aeronDirectoryName(paths.aeronDirectory())
                 .clusterDir(new File(paths.clusterServicesDir()))
                 .clusteredService(service)
+                .errorHandler(handler)
                 .archiveContext(new AeronArchive.Context()
                         .aeronDirectoryName(paths.aeronDirectory())
                         .controlRequestChannel("aeron:ipc?term-length=64k")
                         .controlResponseChannel("aeron:ipc?term-length=64k"));
     }
+
+    /**
+     * Default fatal error handler used by {@link #main}: logs the throwable and exits the JVM with
+     * a non-zero code so PM2's restart loop kicks in. Without this, an unrecoverable error inside
+     * the {@code ClusteredServiceContainer} agent dies silently and leaves the cluster-node JVM
+     * alive but admission-dead (2026-05-23 pop incident). Snapshot-load failures are
+     * self-healed in the service and never reach this handler; anything that does is by definition
+     * something the cluster cannot recover from in-process. Tests that need to observe the error
+     * without taking the JVM down pass their own {@link org.agrona.ErrorHandler} sink to
+     * {@link #buildServiceContainerContext(ClusterNodePaths, OmsAdmissionClusteredService, org.agrona.ErrorHandler)}.
+     */
+    static final org.agrona.ErrorHandler DEFAULT_FATAL_ERROR_HANDLER = throwable -> {
+        log.error(
+                "FATAL: OMS clustered-service agent error; forcing JVM exit so PM2 restarts cleanly",
+                throwable);
+        System.exit(2);
+    };
 
     static int parseMemberId() {
         String raw = System.getenv(ENV_MEMBER_ID);

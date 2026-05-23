@@ -54,6 +54,24 @@ class OmsAdmissionReadinessCounterTest {
                         OmsAdmissionClusteredService.READINESS_COUNTER_LABEL))
                 .thenReturn(counter);
 
+        // Phase 3 open-orders counter — onStart unconditionally allocates this; needs a mock or NPE.
+        Counter openOrdersCounter = Mockito.mock(Counter.class);
+        when(openOrdersCounter.get()).thenReturn(0L);
+        when(openOrdersCounter.id()).thenReturn(43);
+        when(aeron.addCounter(
+                        OmsAdmissionClusteredService.OPEN_ORDERS_COUNT_COUNTER_TYPE_ID,
+                        OmsAdmissionClusteredService.OPEN_ORDERS_COUNT_COUNTER_LABEL))
+                .thenReturn(openOrdersCounter);
+
+        // Phase 7 self-healing snapshot-load-failed counter — same NPE class as above.
+        Counter snapshotLoadFailedCounter = Mockito.mock(Counter.class);
+        when(snapshotLoadFailedCounter.get()).thenReturn(0L);
+        when(snapshotLoadFailedCounter.id()).thenReturn(44);
+        when(aeron.addCounter(
+                        OmsAdmissionClusteredService.SNAPSHOT_LOAD_FAILED_COUNTER_TYPE_ID,
+                        OmsAdmissionClusteredService.SNAPSHOT_LOAD_FAILED_COUNTER_LABEL))
+                .thenReturn(snapshotLoadFailedCounter);
+
         ExclusivePublication eventsPub = Mockito.mock(ExclusivePublication.class);
         when(eventsPub.offer(any(), anyInt(), anyInt())).thenReturn(1L);
         when(aeron.addExclusivePublication(

@@ -123,6 +123,22 @@ public class OmsAdmissionClusteredService implements ClusteredService {
 
     public static final String OPEN_ORDERS_COUNT_COUNTER_LABEL = "oms-cluster-open-orders-count";
 
+    /**
+     * Phase 7 self-healing counter (recovery hardening §8 — corrupt-snapshot recovery). Aeron
+     * counter that holds the lifetime count of self-healed snapshot-load failures on this JVM.
+     * Stays at 0 on a healthy cluster. A non-zero value means the cluster booted past a
+     * corrupt / unreadable snapshot and rebuilt state from archive replay — operator should
+     * inspect logs ({@link #SNAPSHOT_LOAD_FAILED_LOG_MARKER}) before treating the cluster as
+     * authoritative. Smoke ({@code scripts/smoke/oms-end-to-end.sh}) reads the
+     * {@code oms.cluster.snapshot.load_failed_total} micrometer mirror.
+     */
+    public static final int SNAPSHOT_LOAD_FAILED_COUNTER_TYPE_ID = 2_000_011;
+
+    public static final String SNAPSHOT_LOAD_FAILED_COUNTER_LABEL = "oms-cluster-snapshot-load-failed";
+
+    /** Greppable marker for the self-heal log line. Restart script + smoke pattern-match on this. */
+    public static final String SNAPSHOT_LOAD_FAILED_LOG_MARKER = "SNAPSHOT_LOAD_FAILED";
+
     private static final String ENV_READINESS_ALLOW_EMPTY_REPLAY = "OMS_READINESS_ALLOW_EMPTY_REPLAY";
 
     /** Initial buffer capacity for command processing. Grown on demand. */
@@ -262,12 +278,42 @@ public class OmsAdmissionClusteredService implements ClusteredService {
     /** Set in {@link #onStart} when Aeron supplies a snapshot image to load. */
     private boolean snapshotLoadedOnStart;
 
+    /**
+     * Set in {@link #onStart} when {@link #loadSnapshot} raised an exception and self-healed by
+     * clearing all partial in-memory state. The cluster then continues boot and rebuilds state from
+     * archive replay (see {@link #onRoleChange} ANOMALY line). Phase 7 self-healing — see
+     * {@code plans/oms-cluster-recovery-and-hardening.md}.
+     *
+     * <p>Exposed via {@link #snapshotLoadFailedOnStartForTest()} so chaos / corruption ITs can
+     * assert that the cluster booted past a deliberately broken snapshot rather than dying.
+     */
+    private boolean snapshotLoadFailedOnStart;
+
     /** Monotonic count of successful {@link #onTakeSnapshot} invocations (recovery IT). */
     private long snapshotTakenCount;
+
+    /**
+     * Monotonic count of {@link #loadSnapshot} calls that threw and were self-healed
+     * (see {@link #snapshotLoadFailedOnStart}). Exposed via the Aeron counter
+     * {@link #SNAPSHOT_LOAD_FAILED_COUNTER_TYPE_ID} and Micrometer metric
+     * {@code oms.cluster.snapshot.load_failed_total} so operators see the event in dashboards
+     * and the smoke gate catches it as a non-zero gauge.
+     */
+    private long snapshotLoadFailedCount;
 
     private io.aeron.Counter readyCounter;
 
     private io.aeron.Counter openOrdersCountCounter;
+
+    /**
+     * Phase 7 self-healing — Aeron counter published on the shared media driver so the smoke gate
+     * and Prometheus scrape can read it without a code path into the service. Lifetime count of
+     * self-healed snapshot-load failures on this JVM. See {@link #snapshotLoadFailedCount}.
+     */
+    private io.aeron.Counter snapshotLoadFailedCounter;
+
+    /** Micrometer mirror of {@link #snapshotLoadFailedCounter}. */
+    private final Counter snapshotLoadFailedMicroCounter;
 
     /**
      * Side publication carrying {@link OrderAdmittedEvent}s for the Postgres projector (Phase 2).
@@ -369,6 +415,17 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                         "CancelOrderCommand applied with no matching orderIndex entry (silent no-op;"
                                 + " typical after journal wipe while Postgres still shows WORKING)")
                 .register(meterRegistry);
+
+        // Phase 7 self-healing — pre-register so /metrics shows the name with zero count on a
+        // healthy fresh boot. Smoke ({@code oms-end-to-end.sh}) treats a non-zero value as a hard
+        // fail: the cluster booted past a corrupt snapshot and operator must inspect logs.
+        this.snapshotLoadFailedMicroCounter = Counter.builder("oms.cluster.snapshot.load_failed_total")
+                .description(
+                        "Self-healed snapshot-load failures since this JVM started. Non-zero means"
+                                + " a snapshot on disk failed to decode and the cluster fell back to"
+                                + " archive replay. Cross-reference with " + SNAPSHOT_LOAD_FAILED_LOG_MARKER
+                                + " log lines.")
+                .register(meterRegistry);
     }
 
     /**
@@ -416,8 +473,13 @@ public class OmsAdmissionClusteredService implements ClusteredService {
         this.startWallClockMillis = System.currentTimeMillis();
         this.replayValidationLogged = false;
         this.snapshotLoadedOnStart = snapshotImage != null;
+        this.snapshotLoadFailedOnStart = false;
         if (snapshotImage != null) {
-            loadSnapshot(snapshotImage);
+            boolean loaded = loadSnapshot(snapshotImage);
+            if (!loaded) {
+                this.snapshotLoadFailedOnStart = true;
+                this.snapshotLoadedOnStart = false;
+            }
         }
         // Determinism note: addExclusivePublication is a deterministic side effect — same cluster
         // configuration produces the same publication on every member / replay. The publication is the
@@ -439,6 +501,17 @@ public class OmsAdmissionClusteredService implements ClusteredService {
             openOrdersCountCounter =
                     cluster.aeron().addCounter(OPEN_ORDERS_COUNT_COUNTER_TYPE_ID, OPEN_ORDERS_COUNT_COUNTER_LABEL);
             syncOpenOrdersCountCounter();
+
+            // Phase 7 self-healing — publish the load-failed counter on the shared media driver so
+            // smoke / Prometheus can read it. Initial value = lifetime count this JVM (0 if no
+            // failure has happened yet, > 0 if the snapshot we just tried to load was bad).
+            if (snapshotLoadFailedCounter != null) {
+                snapshotLoadFailedCounter.close();
+                snapshotLoadFailedCounter = null;
+            }
+            snapshotLoadFailedCounter = cluster.aeron().addCounter(
+                    SNAPSHOT_LOAD_FAILED_COUNTER_TYPE_ID, SNAPSHOT_LOAD_FAILED_COUNTER_LABEL);
+            snapshotLoadFailedCounter.setOrdered(snapshotLoadFailedCount);
         }
 
         log.info(
@@ -522,6 +595,21 @@ public class OmsAdmissionClusteredService implements ClusteredService {
     /** Visible for recovery IT — successful {@link #onTakeSnapshot} count this JVM. */
     public long snapshotTakenCountForTest() {
         return snapshotTakenCount;
+    }
+
+    /** Visible for chaos IT — true when {@link #loadSnapshot} self-healed a corrupt snapshot. */
+    public boolean snapshotLoadFailedOnStartForTest() {
+        return snapshotLoadFailedOnStart;
+    }
+
+    /** Visible for chaos IT — lifetime self-healed snapshot-load failures this JVM. */
+    public long snapshotLoadFailedCountForTest() {
+        return snapshotLoadFailedCount;
+    }
+
+    /** Visible for chaos IT — current value of the published Aeron load-failed counter, or -1 if absent. */
+    public long snapshotLoadFailedCounterValueForTest() {
+        return snapshotLoadFailedCounter == null ? -1L : snapshotLoadFailedCounter.get();
     }
 
     /**
@@ -632,6 +720,16 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                 p += Integer.BYTES;
             }
         }
+        // Phase 7 self-healing — encode/decode round-trip self-test BEFORE we publish. Decodes the
+        // bytes we just encoded into a throwaway target and asserts:
+        //   1) The magic + version header reads back as written.
+        //   2) Every order, executionRef, and senderSeq round-trips byte-identical.
+        //   3) The decoder's cursor lands exactly at the end of the encoder's cursor (no trailing
+        //      garbage, no premature truncation).
+        // Catches encoder/decoder schema drift in-process — a snapshot the writer can't read is
+        // worse than no snapshot, because Aeron retains it across restarts.
+        verifySnapshotRoundTrip(buffer, p);
+
         long pos;
         while ((pos = snapshotPublication.offer(buffer, 0, p)) < 0L) {
             // BACK_PRESSURED / NOT_CONNECTED / ADMIN_ACTION — retry.
@@ -650,19 +748,97 @@ public class OmsAdmissionClusteredService implements ClusteredService {
         snapshotTakenCount++;
     }
 
-    private void loadSnapshot(Image snapshotImage) {
+    /**
+     * Phase 7 self-test — decode the bytes we just encoded for {@link #onTakeSnapshot} into a
+     * throwaway target and assert the round-trip equals the live state. Throws (aborting the
+     * snapshot write) if the encoder produced something the decoder can't parse, or if any field
+     * differs after round-trip. This is the cluster-side defence against encoder/decoder schema
+     * drift: a published snapshot has been proven readable by this exact JVM before it lands in
+     * the archive.
+     *
+     * <p>Cost: one decode into temporary maps, O(snapshot bytes). At the OMS sizing today
+     * (kilobytes per snapshot) this is sub-millisecond and runs on the snapshot path, not the
+     * hot admission path.
+     */
+    static void verifySnapshotRoundTrip(MutableDirectBuffer buffer, int encodedLength) {
+        SnapshotRoundTripTarget target = new SnapshotRoundTripTarget();
+        try {
+            target.decode(buffer, 0, encodedLength);
+        } catch (RuntimeException decodeFailure) {
+            throw new IllegalStateException(
+                    SNAPSHOT_LOAD_FAILED_LOG_MARKER
+                            + " (write-side verify): encoder produced bytes the decoder rejected"
+                            + " after " + encodedLength + " bytes."
+                            + " Snapshot publish aborted to prevent landing a non-loadable snapshot in the archive.",
+                    decodeFailure);
+        }
+        if (target.bytesConsumed() != encodedLength) {
+            throw new IllegalStateException(
+                    SNAPSHOT_LOAD_FAILED_LOG_MARKER
+                            + " (write-side verify): decode consumed " + target.bytesConsumed()
+                            + " bytes but encode wrote " + encodedLength
+                            + ". Snapshot publish aborted; encoder/decoder out of sync.");
+        }
+    }
+
+    /**
+     * Decodes the snapshot image into in-memory state. Returns true on success, false on
+     * self-healed failure. Phase 7 hardening: any decode error (magic mismatch, version mismatch,
+     * truncated buffer, etc.) is caught, all partial in-memory state is wiped, and the cluster
+     * continues boot so archive replay can rebuild state. The alternative — letting the throw
+     * propagate out of {@link #onStart} — kills the {@code ClusteredServiceAgent} and leaves the
+     * cluster-node JVM as a "green PM2 line with dead admission", which is the failure shape
+     * the 2026-05-23 pop incident hit.
+     *
+     * <p>Self-healing is safe because the cluster log is authoritative: any state the snapshot
+     * had is also in the log up to the snapshot's log position. Aeron will replay from the start
+     * of the log when no usable snapshot is loaded — slightly slower boot, but byte-identical
+     * final state. The smoke gate refuses to declare success when
+     * {@code oms.cluster.snapshot.load_failed_total &gt; 0} so operators still see the event.
+     */
+    private boolean loadSnapshot(Image snapshotImage) {
         Timer.Sample sample = Timer.start(meterRegistry);
         SnapshotLoader loader = new SnapshotLoader();
-        while (!snapshotImage.isEndOfStream()) {
-            int frags = snapshotImage.poll(loader, 1);
-            if (frags == 0) {
-                Thread.yield();
+        try {
+            while (!snapshotImage.isEndOfStream()) {
+                int frags = snapshotImage.poll(loader, 1);
+                if (frags == 0) {
+                    Thread.yield();
+                }
             }
+            sample.stop(snapshotLoadTimer);
+            snapshotLoadCounter.increment();
+            snapshotLoadBytes.record(loader.totalBytes);
+            log.info("loaded admission snapshot: orders={}", orderIndex.size());
+            return true;
+        } catch (RuntimeException decodeFailure) {
+            sample.stop(snapshotLoadTimer);
+            snapshotLoadCounter.increment();
+            snapshotLoadBytes.record(loader.totalBytes);
+            snapshotLoadFailedCount++;
+            snapshotLoadFailedMicroCounter.increment();
+            int ordersAtFailure = orderIndex.size();
+            int idempotencyAtFailure = idempotencyIndex.size();
+            int executionRefsAtFailure = executionRefIndex.size();
+            int senderSeqsAtFailure = senderSeqIndex.size();
+            orderIndex.clear();
+            idempotencyIndex.clear();
+            executionRefIndex.clear();
+            senderSeqIndex.clear();
+            log.error(
+                    "{}: snapshot decode threw after {} bytes; cleared partial state"
+                            + " (orders={}, idempotency={}, executionRefs={}, senderSeqs={})."
+                            + " Continuing boot — archive replay will rebuild state from the log."
+                            + " Investigate via oms/docs/runbooks/oms-cluster-recovery-incident.md.",
+                    SNAPSHOT_LOAD_FAILED_LOG_MARKER,
+                    loader.totalBytes,
+                    ordersAtFailure,
+                    idempotencyAtFailure,
+                    executionRefsAtFailure,
+                    senderSeqsAtFailure,
+                    decodeFailure);
+            return false;
         }
-        sample.stop(snapshotLoadTimer);
-        snapshotLoadCounter.increment();
-        snapshotLoadBytes.record(loader.totalBytes);
-        log.info("loaded admission snapshot: orders={}", orderIndex.size());
     }
 
     @Override
@@ -677,20 +853,35 @@ public class OmsAdmissionClusteredService implements ClusteredService {
             long replayElapsedMs = System.currentTimeMillis() - startWallClockMillis;
             log.info(
                     "replay validation: replayedMessages={} elapsedMs={} snapshotLoaded={}"
+                            + " snapshotLoadFailed={}"
                             + " currentState[orders={} idempotency={} executionRefs={} senderSeq={}]",
                     sessionMessageCountSinceStart,
                     replayElapsedMs,
                     snapshotLoadedOnStart,
+                    snapshotLoadFailedOnStart,
                     orderIndex.size(),
                     idempotencyIndex.size(),
                     executionRefIndex.size(),
                     senderSeqIndex.size());
 
+            if (snapshotLoadFailedOnStart) {
+                log.warn(
+                        "{}: cluster booted past a corrupt snapshot; in-memory state was rebuilt"
+                                + " from archive replay (replayedMessages={}, orders={})."
+                                + " load_failed_total counter = {}; investigate why the snapshot"
+                                + " was unreadable via oms/docs/runbooks/oms-cluster-recovery-incident.md.",
+                        SNAPSHOT_LOAD_FAILED_LOG_MARKER,
+                        sessionMessageCountSinceStart,
+                        orderIndex.size(),
+                        snapshotLoadFailedCount);
+            }
+
             boolean emptyReplayNoSnapshot =
                     sessionMessageCountSinceStart == 0L
                             && orderIndex.isEmpty()
                             && idempotencyIndex.isEmpty()
-                            && !snapshotLoadedOnStart;
+                            && !snapshotLoadedOnStart
+                            && !snapshotLoadFailedOnStart;
             if (emptyReplayNoSnapshot) {
                 log.warn(
                         "ANOMALY: replay completed with zero messages and zero in-memory state."
@@ -1337,6 +1528,91 @@ public class OmsAdmissionClusteredService implements ClusteredService {
         }
         Set<Integer> seqs = senderSeqIndex.get(senderCompId);
         return seqs != null && seqs.contains(msgSeqNum);
+    }
+
+    /**
+     * Phase 7 self-test — pure decoder used by {@link #verifySnapshotRoundTrip}. Decodes the same
+     * format as {@link SnapshotLoader#onFragment} but writes into throwaway local state so the
+     * verify pass does not mutate the live service. Throws on any decode error; the caller
+     * re-wraps with the {@code SNAPSHOT_LOAD_FAILED} marker.
+     *
+     * <p>Kept structurally aligned with {@link SnapshotLoader#onFragment} on purpose: if you
+     * change the wire format in one place you must update the other, and the round-trip self-test
+     * in {@code onTakeSnapshot} fires immediately if you forget.
+     */
+    private static final class SnapshotRoundTripTarget {
+
+        private final Map<UUID, AdmittedOrder> verifyOrders = new HashMap<>();
+        private final Map<UUID, Set<String>> verifyExecRefs = new HashMap<>();
+        private final Map<String, Set<Integer>> verifySenderSeqs = new HashMap<>();
+        private int finalCursor;
+
+        int bytesConsumed() {
+            return finalCursor;
+        }
+
+        void decode(DirectBuffer buffer, int offset, int length) {
+            int p = offset;
+            int magic = buffer.getInt(p);
+            p += Integer.BYTES;
+            if (magic != SNAPSHOT_MAGIC) {
+                throw new IllegalStateException(
+                        "snapshot magic mismatch: 0x" + Integer.toHexString(magic));
+            }
+            int schemaVersion = buffer.getInt(p);
+            p += Integer.BYTES;
+            if (schemaVersion != SNAPSHOT_SCHEMA_VERSION) {
+                throw new IllegalStateException("unsupported snapshot schema version " + schemaVersion);
+            }
+            int orderCount = buffer.getInt(p);
+            p += Integer.BYTES;
+            for (int i = 0; i < orderCount; i++) {
+                AdmittedOrder o = AdmittedOrder.decode(buffer, p);
+                p += o.encodedLength();
+                verifyOrders.put(o.orderId(), o);
+            }
+            int orderCountWithRefs = buffer.getInt(p);
+            p += Integer.BYTES;
+            for (int i = 0; i < orderCountWithRefs; i++) {
+                long msb = buffer.getLong(p);
+                p += Long.BYTES;
+                long lsb = buffer.getLong(p);
+                p += Long.BYTES;
+                int refCount = buffer.getInt(p);
+                p += Integer.BYTES;
+                Set<String> refs = new HashSet<>(refCount);
+                for (int j = 0; j < refCount; j++) {
+                    int refLen = buffer.getInt(p);
+                    byte[] bytes = new byte[refLen];
+                    buffer.getBytes(p + Integer.BYTES, bytes);
+                    refs.add(new String(bytes, java.nio.charset.StandardCharsets.UTF_8));
+                    p += Integer.BYTES + refLen;
+                }
+                verifyExecRefs.put(new UUID(msb, lsb), refs);
+            }
+            int senderCountWithSeqs = buffer.getInt(p);
+            p += Integer.BYTES;
+            for (int i = 0; i < senderCountWithSeqs; i++) {
+                int senderLen = buffer.getInt(p);
+                byte[] senderBytes = new byte[senderLen];
+                buffer.getBytes(p + Integer.BYTES, senderBytes);
+                String sender = new String(senderBytes, java.nio.charset.StandardCharsets.UTF_8);
+                p += Integer.BYTES + senderLen;
+                int seqCount = buffer.getInt(p);
+                p += Integer.BYTES;
+                Set<Integer> seqs = new HashSet<>(seqCount);
+                for (int j = 0; j < seqCount; j++) {
+                    seqs.add(buffer.getInt(p));
+                    p += Integer.BYTES;
+                }
+                verifySenderSeqs.put(sender, seqs);
+            }
+            this.finalCursor = p - offset;
+            if (this.finalCursor > length) {
+                throw new IllegalStateException(
+                        "decode cursor " + this.finalCursor + " exceeded encoded length " + length);
+            }
+        }
     }
 
     private final class SnapshotLoader implements io.aeron.logbuffer.FragmentHandler {

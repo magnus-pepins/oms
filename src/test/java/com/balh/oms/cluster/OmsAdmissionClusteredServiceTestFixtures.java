@@ -31,5 +31,14 @@ final class OmsAdmissionClusteredServiceTestFixtures {
                         OmsAdmissionClusteredService.OPEN_ORDERS_COUNT_COUNTER_TYPE_ID,
                         OmsAdmissionClusteredService.OPEN_ORDERS_COUNT_COUNTER_LABEL))
                 .thenReturn(openOrdersCounter);
+        // Phase 7 self-healing snapshot-load-failed counter — must be wired here so existing tests
+        // don't NPE on the cluster.aeron().addCounter(...) call inside onStart.
+        io.aeron.Counter snapshotLoadFailedCounter = Mockito.mock(io.aeron.Counter.class);
+        when(snapshotLoadFailedCounter.get()).thenReturn(0L);
+        when(snapshotLoadFailedCounter.id()).thenReturn(3);
+        when(aeronMock.addCounter(
+                        OmsAdmissionClusteredService.SNAPSHOT_LOAD_FAILED_COUNTER_TYPE_ID,
+                        OmsAdmissionClusteredService.SNAPSHOT_LOAD_FAILED_COUNTER_LABEL))
+                .thenReturn(snapshotLoadFailedCounter);
     }
 }

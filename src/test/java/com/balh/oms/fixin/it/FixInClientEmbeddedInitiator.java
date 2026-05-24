@@ -38,6 +38,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.util.Comparator;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Stream;
@@ -47,12 +48,23 @@ public final class FixInClientEmbeddedInitiator {
 
     private static final Logger log = LoggerFactory.getLogger(FixInClientEmbeddedInitiator.class);
 
+    /**
+     * User-defined header tag (FIX 4.4 reserves tags >= 5000 for users) carrying a stale
+     * {@code SendingTime} override that the {@link StaleSendingTimeApplication} wrapper applies
+     * inside {@code toApp}. Per-message scope avoids ThreadLocal/threading assumptions about how
+     * QuickFIX dispatches {@code toApp}.
+     */
+    private static final int STALE_SENDING_TIME_TAG = 6100;
+
+    /** Matches QuickFIX's wire format for {@code SendingTime} (tag 52). */
+    private static final DateTimeFormatter FIX_SENDING_TIME =
+            DateTimeFormatter.ofPattern("yyyyMMdd-HH:mm:ss.SSS");
+
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final int connectPort;
     private final Path fileStorePath;
     private final String clientCompId;
     private final String omsCompId;
-    private static final ThreadLocal<LocalDateTime> STALE_SENDING_TIME_OVERRIDE = new ThreadLocal<>();
 
     private final Application wireApplication;
     private volatile Initiator initiator;
@@ -191,16 +203,20 @@ public final class FixInClientEmbeddedInitiator {
 
     public void sendNewOrderSingleWithSendingTime(
             String clOrdId, String symbol, double qty, double price, LocalDateTime sendingTimeUtc) {
-        STALE_SENDING_TIME_OVERRIDE.set(sendingTimeUtc);
-        try {
-            sendNewOrderSingleInternal(clOrdId, symbol, qty, price);
-        } finally {
-            STALE_SENDING_TIME_OVERRIDE.remove();
-        }
+        SessionID sid = requireSession();
+        NewOrderSingle nos = buildNewOrderSingle(clOrdId, symbol, qty, price);
+        // The wrapper Application reads this tag in toApp and rewrites SendingTime (52) before
+        // QuickFIX puts the message on the wire. Per-message scope = no ThreadLocal, no race.
+        nos.getHeader().setString(STALE_SENDING_TIME_TAG, sendingTimeUtc.format(FIX_SENDING_TIME));
+        sendApp(nos, sid);
     }
 
     private void sendNewOrderSingleInternal(String clOrdId, String symbol, double qty, double price) {
         SessionID sid = requireSession();
+        sendApp(buildNewOrderSingle(clOrdId, symbol, qty, price), sid);
+    }
+
+    private static NewOrderSingle buildNewOrderSingle(String clOrdId, String symbol, double qty, double price) {
         NewOrderSingle nos = new NewOrderSingle();
         nos.set(new ClOrdID(clOrdId));
         nos.set(new Symbol(symbol));
@@ -210,7 +226,7 @@ public final class FixInClientEmbeddedInitiator {
         nos.set(new Price(price));
         nos.set(new TimeInForce(TimeInForce.DAY));
         nos.set(new TransactTime(LocalDateTime.now(ZoneOffset.UTC)));
-        sendApp(nos, sid);
+        return nos;
     }
 
     private SessionSettings initiatorSettings() throws ConfigError {
@@ -278,9 +294,15 @@ public final class FixInClientEmbeddedInitiator {
 
         @Override
         public void toApp(Message message, SessionID sessionId) throws quickfix.DoNotSend {
-            LocalDateTime stale = STALE_SENDING_TIME_OVERRIDE.get();
-            if (stale != null) {
-                message.getHeader().setField(new SendingTime(stale));
+            try {
+                if (message.getHeader().isSetField(STALE_SENDING_TIME_TAG)) {
+                    String staleStr = message.getHeader().getString(STALE_SENDING_TIME_TAG);
+                    message.getHeader().removeField(STALE_SENDING_TIME_TAG);
+                    LocalDateTime stale = LocalDateTime.parse(staleStr, FIX_SENDING_TIME);
+                    message.getHeader().setField(new SendingTime(stale));
+                }
+            } catch (quickfix.FieldNotFound e) {
+                throw new IllegalStateException("stale_sending_time_tag_read_failed", e);
             }
             delegate.toApp(message, sessionId);
         }

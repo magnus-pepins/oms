@@ -2,6 +2,7 @@ package com.balh.oms.fixin.dev;
 
 import com.balh.oms.fixin.it.FixInClientCollectorApplication;
 import com.balh.oms.fixin.it.FixInClientEmbeddedInitiator;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -45,6 +46,7 @@ public final class FixInLoopbackConformanceProbeMain {
     private static final Duration LOGON_TIMEOUT = Duration.ofSeconds(45);
     private static final Duration WIRE_TIMEOUT = Duration.ofSeconds(30);
     private static final Duration ADMIN_TIMEOUT = Duration.ofSeconds(30);
+    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private static final String DEFAULT_HOST = "127.0.0.1";
     private static final int DEFAULT_PORT = 9877;
@@ -88,10 +90,10 @@ public final class FixInLoopbackConformanceProbeMain {
             awaitLogon(client);
             client.sendNewOrderSingle(clOrdId, "AAPL", 10, 100.0);
             client.sendNewOrderSingle(clOrdId, "AAPL", 10, 100.0);
-            Awaitility.await().atMost(WIRE_TIMEOUT).pollInterval(Duration.ofMillis(100)).until(() -> {
-                assertReceivedErCount(clOrdId, 2);
-                return true;
-            });
+            Awaitility.await()
+                    .atMost(WIRE_TIMEOUT)
+                    .pollInterval(Duration.ofMillis(100))
+                    .untilAsserted(() -> assertReceivedErCount(clOrdId, 2));
             List<FixInClientCollectorApplication.ReceivedEr> ers = ersForClOrdId(clOrdId);
             if (ers.size() < 2) {
                 return fail("6_duplicate_cl_ord_id", "expected 2 ERs, got " + ers.size());
@@ -124,10 +126,10 @@ public final class FixInLoopbackConformanceProbeMain {
             client.start();
             awaitLogon(client);
             client.sendNewOrderSingle(clOrdId, "AAPL", 1, 1.0);
-            Awaitility.await().atMost(WIRE_TIMEOUT).pollInterval(Duration.ofMillis(100)).until(() -> {
-                assertBmrCountAtLeast(1);
-                return true;
-            });
+            Awaitility.await()
+                    .atMost(WIRE_TIMEOUT)
+                    .pollInterval(Duration.ofMillis(100))
+                    .untilAsserted(() -> assertBmrCountAtLeast(1));
             FixInClientCollectorApplication.ReceivedBmr bmr =
                     FixInClientCollectorApplication.BUSINESS_REJECTS.get(0);
             if (!MsgType.ORDER_SINGLE.equals(bmr.refMsgType())) {
@@ -156,10 +158,10 @@ public final class FixInLoopbackConformanceProbeMain {
             awaitLogon(client);
             int erBefore = FixInClientCollectorApplication.RECEIVED.size();
             client.sendNewOrderSingleWithSendingTime(clOrdId, "AAPL", 1, 1.0, stale);
-            Awaitility.await().atMost(WIRE_TIMEOUT).pollInterval(Duration.ofMillis(100)).until(() -> {
-                assertRateLimitRejectObserved();
-                return true;
-            });
+            Awaitility.await()
+                    .atMost(WIRE_TIMEOUT)
+                    .pollInterval(Duration.ofMillis(100))
+                    .untilAsserted(FixInLoopbackConformanceProbeMain::assertRateLimitRejectObserved);
             if (!FixInClientCollectorApplication.BUSINESS_REJECTS.isEmpty()) {
                 FixInClientCollectorApplication.ReceivedBmr bmr =
                         FixInClientCollectorApplication.BUSINESS_REJECTS.get(
@@ -213,10 +215,14 @@ public final class FixInLoopbackConformanceProbeMain {
             return fail("8_sequence_reset", "logout HTTP " + logoutResp.statusCode() + " " + logoutResp.body());
         }
 
-        Awaitility.await().atMost(ADMIN_TIMEOUT).pollInterval(Duration.ofMillis(250)).until(() -> {
-            boolean loggedOn = fetchSessionLoggedOn(http, cfg, sessionId);
-            return !loggedOn;
-        });
+        Awaitility.await()
+                .atMost(ADMIN_TIMEOUT)
+                .pollInterval(Duration.ofMillis(250))
+                .untilAsserted(() -> {
+                    if (fetchSessionLoggedOn(http, cfg, sessionId)) {
+                        throw new AssertionError("session still logged on after operator logout");
+                    }
+                });
 
         String resetBody =
                 "{\"requestedBy\":\"conformance-probe\",\"approvedBy\":\"conformance-probe\",\"reason\":\"conformance probe\","
@@ -279,9 +285,12 @@ public final class FixInLoopbackConformanceProbeMain {
                         .build(),
                 HttpResponse.BodyHandlers.ofString());
         if (resp.statusCode() / 100 != 2) {
-            throw new IllegalStateException("session GET failed " + resp.statusCode());
+            throw new IllegalStateException("session GET failed " + resp.statusCode() + " body=" + resp.body());
         }
-        return resp.body().contains("\"loggedOn\":true");
+        // Response shape matches EnrichedSessionView: { ..., "runtime": { "loggedOn": bool, ... }, ... }
+        // Substring "loggedOn":true could match nested objects in unrelated futures of the API; parse instead.
+        JsonNode root = MAPPER.readTree(resp.body());
+        return root.path("runtime").path("loggedOn").asBoolean(false);
     }
 
     private static void awaitLogon(FixInClientEmbeddedInitiator client) {

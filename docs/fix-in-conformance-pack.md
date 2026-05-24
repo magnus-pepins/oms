@@ -80,6 +80,38 @@ Integrated into soak when `FIX_SOAK_CONFORMANCE=1` or `FIX_SOAK_RUN_GRADLE=1` (s
 - **OrderID(37):** OMS order UUID string.
 - **ClOrdID(11):** Client-supplied; dedupe key `(session_id, ClOrdID)`.
 
+## External counterparty (non-loopback)
+
+The conformance probe defaults assume the bundled loopback initiators (`LOOPBACK_CLIENT` for order
+entry, `LOOPBACK_DROP` for drop copy, target `BALH_OMS`, port `9877`, session UUID
+`00000001-0000-4000-8000-000000000001`). For a real counterparty (broker, algo desk) you must
+override the matching env vars **and** seed the session row first.
+
+| Env var | Default (loopback) | External counterparty |
+|---------|--------------------|------------------------|
+| `FIX_IN_CLIENT_CONNECT_HOST` | `127.0.0.1` | Acceptor host reachable from the **probe** runner |
+| `FIX_IN_CLIENT_CONNECT_PORT` | `9877` (`OMS_FIX_IN_ACCEPT_PORT`) | Per-environment |
+| `FIX_IN_CLIENT_SENDER` | `LOOPBACK_CLIENT` | Counterparty order-entry `SenderCompID` |
+| `FIX_IN_DROP_COPY_SENDER` | `LOOPBACK_DROP` | Counterparty drop-copy `SenderCompID` (or omit + skip scenario 7) |
+| `FIX_IN_CLIENT_TARGET` | `BALH_OMS` | OMS `TargetCompID` from the seeded row |
+| `FIX_IN_ORDER_ENTRY_SESSION_ID` | `00000001-…0001` | UUID of the order-entry `oms_fix_in_session` row |
+| `OMS_INTERNAL_API_KEY` | from `~/.oms-bench.env` | per environment |
+| `OMS_FIX_INGRESS_INTERNAL_BASE_URL` | `http://127.0.0.1:8095` | Internal base URL of `oms-fix-ingress` for admin probes |
+| `FIX_IN_PROBE_STALE_MS` | `125000` (just past QuickFIX's 120s session-layer guard) | Tune if counterparty uses different tolerance |
+
+**Scope notes for external runs:**
+
+- The probe sends real FIX messages and will produce an `oms_orders` row for scenario 6 (idempotent
+  duplicate). Run only against a non-production OMS acceptor or after coordinating a maintenance
+  window with the counterparty.
+- Scenario 7 requires the counterparty to actually log on as the drop-copy `SenderCompID`. If they
+  cannot, restrict the probe to scenarios 6, 8, 11 by editing `FixInLoopbackConformanceProbeMain`
+  or running scenarios manually per the matrix above.
+- Scenario 8 mutates state via the internal admin API (`force logout`, `sequence reset`). It does
+  **not** require the operator to log a row in `oms_fix_session_admin_actions` — the API writes one
+  with `requestedBy=conformance-probe`. Filter audit queries to exclude probe-origin rows when
+  compiling counterparty sign-off evidence.
+
 ## Pop / bench soak flags
 
 | Flag | Effect |

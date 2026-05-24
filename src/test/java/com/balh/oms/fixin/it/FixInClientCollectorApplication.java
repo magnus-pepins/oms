@@ -10,9 +10,6 @@ import quickfix.RejectLogon;
 import quickfix.SessionID;
 import quickfix.UnsupportedMessageType;
 import quickfix.field.MsgType;
-import quickfix.field.RefMsgType;
-import quickfix.field.SessionRejectReason;
-import quickfix.field.Text;
 import quickfix.fix44.BusinessMessageReject;
 import quickfix.fix44.ExecutionReport;
 import quickfix.fix44.Reject;
@@ -20,7 +17,22 @@ import quickfix.fix44.Reject;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 
-/** Test FIX-in client application that records inbound {@code ExecutionReport} and {@code BusinessMessageReject} messages. */
+/**
+ * Test FIX-in client application that records inbound {@link ExecutionReport},
+ * {@link BusinessMessageReject}, and session-level {@link Reject} messages.
+ *
+ * <h2>Concurrency contract</h2>
+ *
+ * The three collector lists ({@link #RECEIVED}, {@link #BUSINESS_REJECTS},
+ * {@link #SESSION_REJECTS}) are {@code static} and use {@link CopyOnWriteArrayList} so concurrent
+ * writes from the QuickFIX session thread and concurrent reads from the assertion thread are safe.
+ *
+ * However, the contents are shared across every collector instance in the JVM. Probes that run
+ * multiple scenarios must call {@link #reset()} between scenarios. Probes (or integration tests)
+ * that need parallel isolation must run in separate JVMs. The bundled
+ * {@code FixInLoopbackConformanceProbeMain} runs scenarios sequentially in a single JVM and resets
+ * between each.
+ */
 public final class FixInClientCollectorApplication implements Application {
 
     public record ReceivedEr(String clOrdId, char execType, char ordStatus, String orderIdOrNull) {}
@@ -92,11 +104,8 @@ public final class FixInClientCollectorApplication implements Application {
             String text = bmr.isSetText() ? bmr.getText().getValue() : "";
             BUSINESS_REJECTS.add(new ReceivedBmr(refMsgType, text));
             log.info("FIX-in IT client BMR refMsgType={} text={}", refMsgType, text);
-            return;
         }
-        if (MsgType.REJECT.equals(msgType)) {
-            recordSessionRejectIfPresent(message);
-        }
+        // Session-level Reject (35=3) is routed to fromAdmin by QuickFIX; do not duplicate-handle here.
     }
 
     private static void recordSessionRejectIfPresent(Message message) throws FieldNotFound {

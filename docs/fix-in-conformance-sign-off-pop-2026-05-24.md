@@ -20,7 +20,7 @@ This sign-off records **automated** evidence from deploy smoke and Gradle wire I
 | 6 | Duplicate ClOrdID | — | **Manual** — not in automated pack |
 | 7 | Drop copy session | — | **Manual** — seed + negative test |
 | 8 | Sequence reset | Admin API exists; audited in `oms_fix_session_admin_actions` | **Manual** on live counterparty |
-| 9 | Forced logout + reconnect | `FixInMutatingSoakIT` (logout + audit); pop soak with `FIX_SOAK_MUTATE=1` (+ optional `FIX_SOAK_REQUIRE_RECONNECT=1` when LOOPBACK_CLIENT live) | PASS (Gradle logout); pop logout POST **PASS** (2026-05-24); reconnect **not observed** without live initiator |
+| 9 | Forced logout + reconnect | `FixInMutatingSoakIT` (logout + audit); pop soak with `FIX_SOAK_MUTATE=1` + `FIX_SOAK_REQUIRE_RECONNECT=1` | **PASS** (2026-05-24, `oms-fix-in-loopback-client` PM2) |
 | 10 | JDBC store / resend | `FixInJdbcSessionStoreIT` + soak jdbc_store_config | PASS |
 | 11 | Rate limit | — | **Manual** |
 | 12 | Message audit | soak message_audit probe (CAST fix deployed) | PASS (pop) |
@@ -36,10 +36,11 @@ export OMS_INTERNAL_API_KEY="${OMS_INTERNAL_API_KEY:-$OMS_INTERNAL_KEY}"
 # Read-only baseline
 bash system-documentation/scripts/smoke/fix-in-uat-soak.sh
 
-# Mutating probes (logout + runtime drop; reconnect when LOOPBACK_CLIENT initiator is connected)
+# Mutating probes (logout + runtime drop + reconnect + audit)
 export FIX_SOAK_MUTATE=1
+export FIX_SOAK_REQUIRE_RECONNECT=1
 export FIX_IN_SESSION_ID=00000001-0000-4000-8000-000000000001
-# export FIX_SOAK_REQUIRE_RECONNECT=1   # fail if no re-logon within 90s
+# Requires oms-fix-in-loopback-client PM2 (see runbook)
 bash system-documentation/scripts/smoke/fix-in-uat-soak.sh
 
 # Full wire IT suite from pop host (requires OMS repo + Postgres test infra — usually run on dev Mac)

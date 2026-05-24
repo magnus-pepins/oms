@@ -83,6 +83,12 @@ public class SettlementOpsMetricsPublisher {
         Gauge.builder(METRIC_CASH_BREAKS, cashBreaksTotal, AtomicLong::doubleValue)
                 .description("Open cash reconciliation breaks (cash_mismatch).")
                 .register(meterRegistry);
+        Gauge.builder("oms_settlement_confirm_late_total", metricsRepo, SettlementOpsMetricsRepository::countLateSettlementExecutions)
+                .description("Executions past expected settlement date not settled/failed.")
+                .register(meterRegistry);
+        Gauge.builder("oms_broker_file_late_total", metricsRepo, SettlementOpsMetricsRepository::countLateBrokerFileBatches)
+                .description("Broker EOD file batches past business date not applied.")
+                .register(meterRegistry);
         log.info("Registered settlement ops metrics gauges (§5.18)");
     }
 
@@ -102,8 +108,8 @@ public class SettlementOpsMetricsPublisher {
             stuckOutboxTotal.set(metricsRepo.countStuckOutboxRows(config.getSettlement().getStuckOutboxMinAttempts()));
             openFailsTotal.set(metricsRepo.countOpenSettlementFails());
             pendingCorporateActions.set(metricsRepo.countPendingCorporateActionEvents());
-            positionBreaksTotal.set(byType.getOrDefault(ReconciliationBreakRepository.BREAK_POSITION_MISMATCH, 0));
-            cashBreaksTotal.set(byType.getOrDefault(ReconciliationBreakRepository.BREAK_CASH_MISMATCH, 0));
+            positionBreaksTotal.set(metricsRepo.countPositionReconciliationBreaks());
+            cashBreaksTotal.set(metricsRepo.countCashReconciliationBreaks());
         } catch (RuntimeException e) {
             log.warn("Settlement ops metrics poll failed: {}", e.toString());
         }

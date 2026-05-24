@@ -64,11 +64,11 @@ public class FixInReturnPublisher {
     public boolean publishExecutionApplied(ExecutionAppliedEvent ev) {
         List<FixInOrderMapRow> mappings = orderMapRepository.findByOmsOrderId(ev.orderId());
         if (mappings.isEmpty()) {
-            return false;
+            return true;
         }
         Optional<Order> orderOpt = ordersRepository.findById(ev.orderId());
         if (orderOpt.isEmpty()) {
-            log.warn("FIX-in return skipped — order {} not in projection yet", ev.orderId());
+            log.warn("FIX-in return deferred — order {} not in projection yet", ev.orderId());
             return false;
         }
         Order order = orderOpt.get();

@@ -36,9 +36,9 @@ public class CorporateActionImpactRepository {
             """
                     INSERT INTO corporate_action_cash_impact (
                         corporate_action_event_id, account_id, gross_amount, net_amount,
-                        currency, payable_date
+                        currency, payable_date, withholding_amount
                     ) VALUES (
-                        :eventId, :accountId, :gross, :net, :ccy, :payableDate
+                        :eventId, :accountId, :gross, :net, :ccy, :payableDate, :withholding
                     )
                     ON CONFLICT (corporate_action_event_id, account_id) DO NOTHING
                     """;
@@ -92,6 +92,17 @@ public class CorporateActionImpactRepository {
             BigDecimal net,
             String currency,
             LocalDate payableDate) {
+        return insertCashImpactWithWithholding(eventId, accountId, gross, net, null, currency, payableDate);
+    }
+
+    public int insertCashImpactWithWithholding(
+            long eventId,
+            java.util.UUID accountId,
+            BigDecimal gross,
+            BigDecimal net,
+            BigDecimal withholding,
+            String currency,
+            LocalDate payableDate) {
         return jdbc.update(
                 INSERT_CASH_IMPACT,
                 new MapSqlParameterSource()
@@ -100,6 +111,7 @@ public class CorporateActionImpactRepository {
                         .addValue("gross", gross)
                         .addValue("net", net)
                         .addValue("ccy", currency)
-                        .addValue("payableDate", payableDate == null ? null : java.sql.Date.valueOf(payableDate)));
+                        .addValue("payableDate", payableDate == null ? null : java.sql.Date.valueOf(payableDate))
+                        .addValue("withholding", withholding));
     }
 }

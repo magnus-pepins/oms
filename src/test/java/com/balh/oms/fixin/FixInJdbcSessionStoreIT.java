@@ -3,6 +3,8 @@ package com.balh.oms.fixin;
 import com.balh.oms.AbstractPostgresIntegrationTest;
 import com.balh.oms.config.OmsProfiles;
 import com.balh.oms.fixin.it.FixInClientEmbeddedInitiator;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.TestConfiguration;
@@ -28,7 +30,7 @@ import static org.awaitility.Awaitility.await;
 @ActiveProfiles({"test", OmsProfiles.FIX_INGRESS})
 @Import(FixInJdbcSessionStoreIT.Beans.class)
 @Sql(scripts = "/db/fix-in-uat-seed.sql")
-class FixInJdbcSessionStoreIT extends AbstractPostgresIntegrationTest {
+class FixInJdbcSessionStoreIT extends FixInWireItAcceptorSupport {
 
     private static final int ACCEPT_PORT = allocatePort();
     private static final Path ACCEPTOR_STORE;
@@ -44,7 +46,7 @@ class FixInJdbcSessionStoreIT extends AbstractPostgresIntegrationTest {
     @DynamicPropertySource
     static void jdbcStoreProps(DynamicPropertyRegistry registry) {
         registry.add("oms.fix-in.enabled", () -> "true");
-        registry.add("oms.fix-in.auto-start", () -> "true");
+        registry.add("oms.fix-in.auto-start", () -> "false");
         registry.add("oms.fix-in.accept-port", () -> String.valueOf(ACCEPT_PORT));
         registry.add("oms.fix-in.bind-host", () -> "127.0.0.1");
         registry.add("oms.fix-in.file-store-path", ACCEPTOR_STORE.toAbsolutePath()::toString);
@@ -56,6 +58,18 @@ class FixInJdbcSessionStoreIT extends AbstractPostgresIntegrationTest {
 
     @Autowired FixInClientEmbeddedInitiator fixInClient;
     @Autowired JdbcTemplate jdbc;
+
+    @BeforeEach
+    void startClient() {
+        if (!fixInClient.isRunning()) {
+            fixInClient.start();
+        }
+    }
+
+    @AfterEach
+    void stopClient() {
+        fixInClient.stop();
+    }
 
     @Test
     void jdbcStore_persistsSessionSeqAfterClientLogon() {

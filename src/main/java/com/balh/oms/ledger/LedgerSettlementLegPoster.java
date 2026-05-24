@@ -1,5 +1,6 @@
 package com.balh.oms.ledger;
 
+import com.balh.oms.corporateaction.CorporateActionCashLedgerBookingService;
 import com.balh.oms.settlement.LedgerSettlementOutboxRepository;
 import com.balh.oms.settlement.SettlementFailPenaltyBookingService;
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -95,6 +96,100 @@ public final class LedgerSettlementLegPoster implements LedgerSettlementPostingC
             case LedgerSettlementOutboxRepository.LEG_PENALTY -> postPenalty(outboxId, p);
             default -> throw new LedgerSettlementPostingException("unknown legKind: " + legKind);
         }
+    }
+
+    /** Corporate-action payable-date legs ({@code corporate_action_ledger_outbox}). */
+    public void postCorporateActionOutbox(long outboxId, String legKind, String payloadJson)
+            throws LedgerSettlementPostingException {
+        com.fasterxml.jackson.databind.JsonNode p;
+        try {
+            p = objectMapper.readTree(payloadJson == null || payloadJson.isBlank() ? "{}" : payloadJson);
+        } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+            throw new LedgerSettlementPostingException("invalid CA outbox payload_json", e);
+        }
+        if (CorporateActionCashLedgerBookingService.LEG_DIVIDEND.equals(legKind)) {
+            postDividendNet(outboxId, p);
+        } else if (CorporateActionCashLedgerBookingService.LEG_WITHHOLDING.equals(legKind)) {
+            postDividendWithholding(outboxId, p);
+        } else {
+            throw new LedgerSettlementPostingException("unknown CA legKind: " + legKind);
+        }
+    }
+
+    private void postDividendNet(long outboxId, com.fasterxml.jackson.databind.JsonNode p)
+            throws LedgerSettlementPostingException {
+        String accountId = required(p, "accountId");
+        String currency = required(p, "currency");
+        java.math.BigDecimal net = bigDecimal(p, "netAmount");
+        String customerIndicator = "inv-" + accountId + "-" + currency.trim().toUpperCase();
+        String customerBalance = resolveCustomerBalanceId(customerIndicator, currency);
+        String nostro = textOrDefault(p, "nostroIndicator", "@Nostro-" + currency.trim().toUpperCase() + "-Bank");
+        String reference = "ca-dividend-" + outboxId;
+        postTransaction(reference, nostro, customerBalance, net, currency, p);
+    }
+
+    private void postDividendWithholding(long outboxId, com.fasterxml.jackson.databind.JsonNode p)
+            throws LedgerSettlementPostingException {
+        String currency = required(p, "currency");
+        java.math.BigDecimal withholding = bigDecimal(p, "withholdingAmount");
+        String nostro = textOrDefault(p, "nostroIndicator", "@Nostro-" + currency.trim().toUpperCase() + "-Bank");
+        String withholdingAcct =
+                textOrDefault(p, "withholdingIndicator", "@Withholding-Tax-" + currency.trim().toUpperCase());
+        String reference = "ca-withholding-" + outboxId;
+        postTransaction(reference, nostro, withholdingAcct, withholding, currency, p);
+    }
+
+    private void postTransaction(
+            String reference,
+            String source,
+            String destination,
+            java.math.BigDecimal amount,
+            String currency,
+            com.fasterxml.jackson.databind.JsonNode metaSource)
+            throws LedgerSettlementPostingException {
+        if (findExistingTransactionIdByReference(reference) != null) {
+            return;
+        }
+        java.util.Map<String, Object> body = new java.util.LinkedHashMap<>();
+        body.put("source", source);
+        body.put("destination", destination);
+        body.put("amount", amount);
+        body.put("currency", currency);
+        body.put("reference", reference);
+        body.put("sync", true);
+        body.put("inflight", false);
+        if (metaSource.has("iskDepositClass")) {
+            java.util.Map<String, Object> meta = new java.util.LinkedHashMap<>();
+            meta.put("iskDepositClass", metaSource.get("iskDepositClass").asText());
+            if (metaSource.has("taxWrapper")) {
+                meta.put("taxWrapper", metaSource.get("taxWrapper").asText());
+            }
+            body.put("metaData", meta);
+        }
+        try {
+            http.post()
+                    .uri("/transactions")
+                    .header(AUTHORIZATION_HEADER, BEARER_PREFIX + apiKey)
+                    .contentType(org.springframework.http.MediaType.APPLICATION_JSON)
+                    .body(objectMapper.writeValueAsString(body))
+                    .retrieve()
+                    .toBodilessEntity();
+        } catch (org.springframework.web.client.RestClientResponseException e) {
+            if (e.getStatusCode().value() == 409) {
+                return;
+            }
+            throw new LedgerSettlementPostingException(
+                    "ledger POST /transactions failed reference=" + reference + ": " + e.getResponseBodyAsString(), e);
+        } catch (Exception e) {
+            throw new LedgerSettlementPostingException("ledger POST /transactions failed reference=" + reference, e);
+        }
+    }
+
+    private static String textOrDefault(com.fasterxml.jackson.databind.JsonNode p, String field, String defaultValue) {
+        if (p.has(field) && !p.get(field).isNull()) {
+            return p.get(field).asText();
+        }
+        return defaultValue;
     }
 
     /** BUY: customer cash → bank nostro for notional. SELL: reverse. Single Ledger txn (rate=1). */

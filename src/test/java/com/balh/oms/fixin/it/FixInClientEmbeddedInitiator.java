@@ -2,7 +2,6 @@ package com.balh.oms.fixin.it;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.context.SmartLifecycle;
 import quickfix.ConfigError;
 import quickfix.DefaultMessageFactory;
 import quickfix.FileStoreFactory;
@@ -17,7 +16,6 @@ import quickfix.SessionSettings;
 import quickfix.SocketInitiator;
 import quickfix.field.BeginString;
 import quickfix.field.ClOrdID;
-import quickfix.field.MsgType;
 import quickfix.field.OrdType;
 import quickfix.field.OrderQty;
 import quickfix.field.Price;
@@ -37,7 +35,7 @@ import java.time.ZoneOffset;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /** Loopback FIX-in client initiator for integration tests (connects to {@code oms-fix-ingress} acceptor). */
-public final class FixInClientEmbeddedInitiator implements SmartLifecycle {
+public final class FixInClientEmbeddedInitiator {
 
     private static final Logger log = LoggerFactory.getLogger(FixInClientEmbeddedInitiator.class);
 
@@ -56,12 +54,6 @@ public final class FixInClientEmbeddedInitiator implements SmartLifecycle {
         this.omsCompId = omsCompId;
     }
 
-    @Override
-    public int getPhase() {
-        return 1;
-    }
-
-    @Override
     public void start() {
         if (!running.compareAndSet(false, true)) {
             return;
@@ -83,7 +75,6 @@ public final class FixInClientEmbeddedInitiator implements SmartLifecycle {
         }
     }
 
-    @Override
     public void stop() {
         if (!running.compareAndSet(true, false)) {
             return;
@@ -96,7 +87,6 @@ public final class FixInClientEmbeddedInitiator implements SmartLifecycle {
         }
     }
 
-    @Override
     public boolean isRunning() {
         return running.get();
     }

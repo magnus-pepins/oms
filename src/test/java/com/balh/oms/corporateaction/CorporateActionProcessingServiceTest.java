@@ -24,4 +24,11 @@ class CorporateActionProcessingServiceTest {
         assertThat(dates.payableDate()).hasToString("2026-06-15");
         assertThat(dates.recordDate()).hasToString("2026-06-01");
     }
+
+    @Test
+    void withholdingAmount_appliesRate() throws Exception {
+        var payload = objectMapper.readTree("{\"withholdingRate\": \"0.15\"}");
+        assertThat(CorporateActionProcessingService.withholdingAmount(new java.math.BigDecimal("100.00"), payload))
+                .isEqualByComparingTo("15.00");
+    }
 }

@@ -52,6 +52,36 @@ public class SettlementOpsMetricsRepository {
                     WHERE processed_at IS NULL
                     """;
 
+    private static final String COUNT_LATE_SETTLEMENT_EXECUTIONS =
+            """
+                    SELECT COUNT(*)::int
+                    FROM executions
+                    WHERE expected_settlement_date < CURRENT_DATE
+                      AND settlement_status NOT IN (
+                          CAST('settled' AS execution_settlement_status),
+                          CAST('failed' AS execution_settlement_status))
+                    """;
+
+    private static final String COUNT_LATE_BROKER_FILE_BATCHES =
+            """
+                    SELECT COUNT(*)::int FROM (
+                        SELECT id FROM broker_confirm_batch
+                        WHERE business_date < CURRENT_DATE - 1 AND status NOT IN ('applied', 'reconciled')
+                        UNION ALL
+                        SELECT id FROM broker_cash_statement_batch
+                        WHERE business_date < CURRENT_DATE - 1 AND status NOT IN ('applied', 'reconciled')
+                        UNION ALL
+                        SELECT id FROM broker_position_snapshot_batch
+                        WHERE business_date < CURRENT_DATE - 1 AND status NOT IN ('applied', 'reconciled')
+                        UNION ALL
+                        SELECT id FROM broker_settlement_fail_batch
+                        WHERE business_date < CURRENT_DATE - 1 AND status NOT IN ('applied', 'reconciled')
+                        UNION ALL
+                        SELECT id FROM broker_corporate_action_batch
+                        WHERE business_date < CURRENT_DATE - 1 AND status NOT IN ('applied', 'reconciled')
+                    ) late_batches
+                    """;
+
     private final NamedParameterJdbcTemplate jdbc;
 
     public SettlementOpsMetricsRepository(NamedParameterJdbcTemplate jdbc) {
@@ -89,6 +119,26 @@ public class SettlementOpsMetricsRepository {
     public int countPendingCorporateActionEvents() {
         Integer n =
                 jdbc.queryForObject(COUNT_PENDING_CORPORATE_ACTIONS, new MapSqlParameterSource(), Integer.class);
+        return n == null ? 0 : n;
+    }
+
+    public int countPositionReconciliationBreaks() {
+        return countOpenBreaksByType().getOrDefault(ReconciliationBreakRepository.BREAK_POSITION_MISMATCH, 0);
+    }
+
+    public int countCashReconciliationBreaks() {
+        return countOpenBreaksByType().getOrDefault(ReconciliationBreakRepository.BREAK_CASH_MISMATCH, 0);
+    }
+
+    public int countLateSettlementExecutions() {
+        Integer n =
+                jdbc.queryForObject(COUNT_LATE_SETTLEMENT_EXECUTIONS, new MapSqlParameterSource(), Integer.class);
+        return n == null ? 0 : n;
+    }
+
+    public int countLateBrokerFileBatches() {
+        Integer n =
+                jdbc.queryForObject(COUNT_LATE_BROKER_FILE_BATCHES, new MapSqlParameterSource(), Integer.class);
         return n == null ? 0 : n;
     }
 

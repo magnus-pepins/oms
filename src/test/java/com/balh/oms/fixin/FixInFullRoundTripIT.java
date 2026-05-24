@@ -7,6 +7,7 @@ import com.balh.oms.fixegress.EgressBrokerFillingAcceptorApplication;
 import com.balh.oms.fixegress.OmsFixEgressService;
 import com.balh.oms.fixin.it.FixInClientCollectorApplication;
 import com.balh.oms.fixin.it.FixInClientEmbeddedInitiator;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -43,7 +44,7 @@ import static org.awaitility.Awaitility.await;
 @Import(FixInFullRoundTripItBeans.class)
 @Sql(scripts = "/db/fix-in-uat-seed.sql")
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
-class FixInFullRoundTripIT extends AbstractPostgresIntegrationTest {
+class FixInFullRoundTripIT extends FixInWireItAcceptorSupport {
 
     private static final Duration LOGON_TIMEOUT = Duration.ofSeconds(45);
     private static final Duration FLOW_TIMEOUT = Duration.ofSeconds(60);
@@ -76,7 +77,7 @@ class FixInFullRoundTripIT extends AbstractPostgresIntegrationTest {
         registry.add("oms.cluster.client.aeron-directory", () -> aeronDir);
 
         registry.add("oms.fix-in.enabled", () -> "true");
-        registry.add("oms.fix-in.auto-start", () -> "true");
+        registry.add("oms.fix-in.auto-start", () -> "false");
         registry.add("oms.fix-in.accept-port", () -> String.valueOf(FIX_IN_ACCEPT_PORT));
         registry.add("oms.fix-in.bind-host", () -> "127.0.0.1");
         registry.add("oms.fix-in.file-store-path", FIX_IN_ACCEPTOR_STORE.toAbsolutePath()::toString);
@@ -103,6 +104,18 @@ class FixInFullRoundTripIT extends AbstractPostgresIntegrationTest {
     @Autowired JdbcTemplate jdbc;
 
     @BeforeEach
+    void startClientAndResetHooks() throws InterruptedException {
+        if (!fixInClient.isRunning()) {
+            fixInClient.start();
+        }
+        resetHooksAndWaitForEgressBaseline();
+    }
+
+    @AfterEach
+    void stopClient() {
+        fixInClient.stop();
+    }
+
     void resetHooksAndWaitForEgressBaseline() throws InterruptedException {
         FixInClientCollectorApplication.reset();
         EgressBrokerFillingAcceptorApplication.resetItHooks();

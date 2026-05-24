@@ -71,6 +71,8 @@ public class CorporateActionProcessingService {
         for (PositionsRepository.SettledHolder holder : holders) {
             BigDecimal gross =
                     holder.quantitySettled().multiply(dividendPerShare).setScale(MONEY_SCALE, RoundingMode.HALF_UP);
+            BigDecimal withholding = withholdingAmount(gross, payload);
+            BigDecimal net = gross.subtract(withholding).setScale(MONEY_SCALE, RoundingMode.HALF_UP);
             impacts.insertEntitlement(
                     row.id(),
                     holder.accountId(),
@@ -79,8 +81,8 @@ public class CorporateActionProcessingService {
                     null,
                     gross,
                     currency);
-            impacts.insertCashImpact(
-                    row.id(), holder.accountId(), gross, gross, currency, row.payableDate());
+            impacts.insertCashImpactWithWithholding(
+                    row.id(), holder.accountId(), gross, net, withholding, currency, row.payableDate());
         }
         log.info(
                 "corporate_action CASH_DIVIDEND processed id={} symbol={} holders={}",
@@ -113,6 +115,14 @@ public class CorporateActionProcessingService {
             return newShares.divide(oldShares, 10, RoundingMode.HALF_UP);
         }
         return decimalField(payload, "splitRatio");
+    }
+
+    static BigDecimal withholdingAmount(BigDecimal gross, JsonNode payload) {
+        BigDecimal rate = decimalField(payload, "withholdingRate");
+        if (rate == null || rate.signum() <= 0) {
+            return BigDecimal.ZERO.setScale(MONEY_SCALE);
+        }
+        return gross.multiply(rate).setScale(MONEY_SCALE, RoundingMode.HALF_UP);
     }
 
     private JsonNode parsePayload(String json) {

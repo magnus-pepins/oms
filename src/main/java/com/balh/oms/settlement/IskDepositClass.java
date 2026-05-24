@@ -16,5 +16,8 @@ public final class IskDepositClass {
     /** Commission debited from ISK cash. */
     public static final String COMMISSION = "commission";
 
+    /** Cash dividend credit on payable date — excluded from kapitalunderlag (IL 42 kap. 39 §). */
+    public static final String DIVIDEND = "dividend";
+
     private IskDepositClass() {}
 }

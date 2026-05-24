@@ -1409,6 +1409,8 @@ public class OmsConfig {
 
         /** Cluster events replay → client FIX 8/9 ({@link com.balh.oms.fixin.OmsFixInReturnService}). */
         public static class ReturnPublisher {
+            private static final long DEFAULT_RECORDING_LOOKUP_PARK_MS = 100L;
+
             private boolean enabled = true;
             private String aeronDirectory = "";
             private String archiveControlRequestChannel = "aeron:ipc?term-length=64k";
@@ -1416,6 +1418,7 @@ public class OmsConfig {
             private String replayChannel = "aeron:ipc?term-length=64k";
             private int replayStreamId = 4324;
             private long pollParkNanos = 1_000_000L;
+            private long recordingLookupParkMs = DEFAULT_RECORDING_LOOKUP_PARK_MS;
             private int fragmentLimit = 64;
 
             public boolean isEnabled() { return enabled; }
@@ -1436,6 +1439,10 @@ public class OmsConfig {
             public void setReplayStreamId(int replayStreamId) { this.replayStreamId = replayStreamId; }
             public long getPollParkNanos() { return pollParkNanos; }
             public void setPollParkNanos(long pollParkNanos) { this.pollParkNanos = pollParkNanos; }
+            public long getRecordingLookupParkMs() { return recordingLookupParkMs; }
+            public void setRecordingLookupParkMs(long recordingLookupParkMs) {
+                this.recordingLookupParkMs = Math.max(10L, recordingLookupParkMs);
+            }
             public int getFragmentLimit() { return fragmentLimit; }
             public void setFragmentLimit(int fragmentLimit) { this.fragmentLimit = Math.max(1, fragmentLimit); }
         }
@@ -1558,6 +1565,9 @@ public class OmsConfig {
          * {@code oms_ledger_settlement_outbox_stuck_total} (matches beard-admin stuck-outbox default).
          */
         private int stuckOutboxMinAttempts = 3;
+        private boolean failCustomerNotificationEnabled = false;
+        private long failCustomerNotificationIntervalMs = 3_600_000L;
+        private int failCustomerNotificationSlaBusinessDays = 3;
 
         public String getDefaultCustodyAccountId() {
             return defaultCustodyAccountId;
@@ -1884,6 +1894,30 @@ public class OmsConfig {
 
         public void setStuckOutboxMinAttempts(int stuckOutboxMinAttempts) {
             this.stuckOutboxMinAttempts = Math.max(1, stuckOutboxMinAttempts);
+        }
+
+        public boolean isFailCustomerNotificationEnabled() {
+            return failCustomerNotificationEnabled;
+        }
+
+        public void setFailCustomerNotificationEnabled(boolean failCustomerNotificationEnabled) {
+            this.failCustomerNotificationEnabled = failCustomerNotificationEnabled;
+        }
+
+        public long getFailCustomerNotificationIntervalMs() {
+            return failCustomerNotificationIntervalMs;
+        }
+
+        public void setFailCustomerNotificationIntervalMs(long failCustomerNotificationIntervalMs) {
+            this.failCustomerNotificationIntervalMs = Math.max(60_000L, failCustomerNotificationIntervalMs);
+        }
+
+        public int getFailCustomerNotificationSlaBusinessDays() {
+            return failCustomerNotificationSlaBusinessDays;
+        }
+
+        public void setFailCustomerNotificationSlaBusinessDays(int failCustomerNotificationSlaBusinessDays) {
+            this.failCustomerNotificationSlaBusinessDays = Math.max(1, failCustomerNotificationSlaBusinessDays);
         }
     }
 
@@ -2278,6 +2312,11 @@ public class OmsConfig {
         private int ingestPayloadJsonMaxChars = 16_000;
         private int listMaxLimit = 200;
         private int listDefaultLimit = 50;
+        private boolean payableDateLedgerEnabled = false;
+        private long payableDateLedgerIntervalMs = 60_000L;
+        private int payableDateLedgerBatchSize = 50;
+        private long ledgerOutboxReconcilerIntervalMs = 1_000L;
+        private int ledgerOutboxReconcilerBatchSize = 25;
 
         public boolean isProcessorEnabled() {
             return processorEnabled;
@@ -2341,6 +2380,46 @@ public class OmsConfig {
 
         public void setListDefaultLimit(int listDefaultLimit) {
             this.listDefaultLimit = Math.min(200, Math.max(1, listDefaultLimit));
+        }
+
+        public boolean isPayableDateLedgerEnabled() {
+            return payableDateLedgerEnabled;
+        }
+
+        public void setPayableDateLedgerEnabled(boolean payableDateLedgerEnabled) {
+            this.payableDateLedgerEnabled = payableDateLedgerEnabled;
+        }
+
+        public long getPayableDateLedgerIntervalMs() {
+            return payableDateLedgerIntervalMs;
+        }
+
+        public void setPayableDateLedgerIntervalMs(long payableDateLedgerIntervalMs) {
+            this.payableDateLedgerIntervalMs = Math.max(5_000L, payableDateLedgerIntervalMs);
+        }
+
+        public int getPayableDateLedgerBatchSize() {
+            return payableDateLedgerBatchSize;
+        }
+
+        public void setPayableDateLedgerBatchSize(int payableDateLedgerBatchSize) {
+            this.payableDateLedgerBatchSize = Math.min(500, Math.max(1, payableDateLedgerBatchSize));
+        }
+
+        public long getLedgerOutboxReconcilerIntervalMs() {
+            return ledgerOutboxReconcilerIntervalMs;
+        }
+
+        public void setLedgerOutboxReconcilerIntervalMs(long ledgerOutboxReconcilerIntervalMs) {
+            this.ledgerOutboxReconcilerIntervalMs = Math.max(200L, ledgerOutboxReconcilerIntervalMs);
+        }
+
+        public int getLedgerOutboxReconcilerBatchSize() {
+            return ledgerOutboxReconcilerBatchSize;
+        }
+
+        public void setLedgerOutboxReconcilerBatchSize(int ledgerOutboxReconcilerBatchSize) {
+            this.ledgerOutboxReconcilerBatchSize = Math.min(200, Math.max(1, ledgerOutboxReconcilerBatchSize));
         }
     }
 

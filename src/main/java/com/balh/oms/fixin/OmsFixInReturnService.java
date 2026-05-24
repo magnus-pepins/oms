@@ -17,6 +17,7 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Profile;
 import org.springframework.stereotype.Component;
 
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
@@ -40,6 +41,9 @@ public class OmsFixInReturnService {
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicLong lastAppliedPosition = new AtomicLong(0L);
     private final AtomicLong currentRecordingId = new AtomicLong(-1L);
+    /** Deferred until {@code orders} projection catches up; keyed by recording position. */
+    private final ConcurrentHashMap<Long, ExecutionAppliedEvent> pendingExecutionApplied =
+            new ConcurrentHashMap<>();
     private Thread replayThread;
 
     public OmsFixInReturnService(
@@ -81,7 +85,9 @@ public class OmsFixInReturnService {
 
     boolean applyExecutionAppliedForTest(ExecutionAppliedEvent ev, long newPosition) {
         boolean sent = returnPublisher.publishExecutionApplied(ev);
-        advanceCursor(newPosition);
+        if (sent) {
+            advanceCursor(newPosition);
+        }
         return sent;
     }
 
@@ -93,26 +99,36 @@ public class OmsFixInReturnService {
                                 .aeron(aeron)
                                 .controlRequestChannel(cfg.getArchiveControlRequestChannel())
                                 .controlResponseChannel(cfg.getArchiveControlResponseChannel()))) {
-            long recordingId = resolveRecordingId(archive);
+            long recordingId = waitForLatestRecordingId(archive, cfg);
             currentRecordingId.set(recordingId);
             long startPos = cursorRepository
                     .find(RETURN_EGRESS_ID)
                     .map(FixInReturnCursorRepository.RecordedCursor::position)
-                    .orElse(0L);
+                    .orElse(lastAppliedPosition.get());
+            lastAppliedPosition.set(startPos);
             try (Subscription replay = archive.replay(
                     recordingId,
                     startPos,
                     Long.MAX_VALUE,
                     cfg.getReplayChannel(),
                     cfg.getReplayStreamId())) {
+                log.info(
+                        "oms-fix-in-return replay open; recordingId={} startPos={} streamId={}",
+                        recordingId,
+                        startPos,
+                        cfg.getReplayStreamId());
                 io.aeron.logbuffer.FragmentHandler handler = (buffer, offset, length, header) -> {
                     int typeId = buffer.getInt(offset + OmsClusterWireFormat.HEADER_TYPE_ID_OFFSET);
                     long newPosition = header.position();
                     switch (typeId) {
                         case OmsClusterWireFormat.TYPE_ID_EXECUTION_APPLIED -> {
                             ExecutionAppliedEvent ev = ExecutionAppliedEvent.decode(buffer, offset, length);
-                            returnPublisher.publishExecutionApplied(ev);
-                            advanceCursor(newPosition);
+                            if (returnPublisher.publishExecutionApplied(ev)) {
+                                pendingExecutionApplied.remove(newPosition);
+                                advanceCursor(newPosition);
+                            } else {
+                                pendingExecutionApplied.put(newPosition, ev);
+                            }
                         }
                         case OmsClusterWireFormat.TYPE_ID_ORDER_ADMITTED -> {
                             OrderAdmittedEvent ev = OrderAdmittedEvent.decode(buffer, offset, length);
@@ -124,20 +140,39 @@ public class OmsFixInReturnService {
                 };
                 while (running.get()) {
                     int fragments = replay.poll(handler, cfg.getFragmentLimit());
+                    drainPendingExecutionApplied();
                     if (fragments == 0) {
                         LockSupport.parkNanos(cfg.getPollParkNanos());
                     }
                 }
             }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.info("oms-fix-in-return replay loop interrupted");
         } catch (Exception e) {
             log.error("oms-fix-in-return replay loop failed", e);
         } finally {
             running.set(false);
+            log.info("oms-fix-in-return replay loop stopped");
         }
     }
 
-    private long resolveRecordingId(AeronArchive archive) {
-        final long[] latest = {0L};
+    /** Blocks until the cluster events recording exists (mirrors fix-egress bootstrap). */
+    private long waitForLatestRecordingId(AeronArchive archive, OmsConfig.FixIn.ReturnPublisher cfg)
+            throws InterruptedException {
+        while (running.get()) {
+            Long latest = findLatestRecordingIdOrNull(archive);
+            if (latest != null) {
+                return latest;
+            }
+            Thread.sleep(cfg.getRecordingLookupParkMs());
+        }
+        throw new IllegalStateException("oms-fix-in-return shutdown before events recording appeared");
+    }
+
+    /** @return latest recording id, or {@code null} when none exist yet (recording ids may be {@code 0}). */
+    private static Long findLatestRecordingIdOrNull(AeronArchive archive) {
+        final long[] latest = {-1L};
         archive.listRecordingsForUri(
                 0L,
                 64,
@@ -159,10 +194,19 @@ public class OmsFixInReturnService {
                         strippedChannel,
                         originalChannel,
                         sourceIdentity) -> latest[0] = Math.max(latest[0], recordingId));
-        if (latest[0] == 0L) {
-            throw new IllegalStateException("no cluster events recording found for fix-in return publisher");
+        return latest[0] >= 0L ? latest[0] : null;
+    }
+
+    private void drainPendingExecutionApplied() {
+        if (pendingExecutionApplied.isEmpty()) {
+            return;
         }
-        return latest[0];
+        pendingExecutionApplied.forEach((position, ev) -> {
+            if (returnPublisher.publishExecutionApplied(ev)) {
+                pendingExecutionApplied.remove(position);
+                advanceCursor(position);
+            }
+        });
     }
 
     private void advanceCursor(long newPosition) {

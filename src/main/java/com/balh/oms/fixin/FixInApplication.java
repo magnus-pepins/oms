@@ -42,7 +42,7 @@ public class FixInApplication implements Application {
     private final FixInOpsMetrics metrics;
 
     private static final DateTimeFormatter FIX_TIME =
-            DateTimeFormatter.ofPattern("yyyyMMdd-HH:mm:ss");
+            DateTimeFormatter.ofPattern("yyyyMMdd-HH:mm:ss[.SSS][.SS][.S]");
 
     public FixInApplication(
             com.balh.oms.config.OmsConfig omsConfig,

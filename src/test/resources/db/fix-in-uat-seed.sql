@@ -28,3 +28,18 @@ VALUES (
     TRUE,
     TRUE)
 ON CONFLICT (id) DO NOTHING;
+
+-- DROP_COPY session for conformance scenario 7 (loopback probe uses LOOPBACK_DROP → BALH_OMS).
+INSERT INTO oms_fix_in_session (
+    id, counterparty_id, environment, session_mode,
+    sender_comp_id, target_comp_id, heartbeat_seconds, enabled)
+VALUES (
+    '00000002-0000-4000-8000-000000000002',
+    'c0000001-0000-4000-8000-000000000001',
+    'UAT',
+    'DROP_COPY',
+    'LOOPBACK_DROP',
+    'BALH_OMS',
+    30,
+    TRUE)
+ON CONFLICT (id) DO NOTHING;

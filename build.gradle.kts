@@ -419,6 +419,15 @@ tasks.register<JavaExec>("fixInLoopbackClient") {
     mainClass.set("com.balh.oms.fixin.dev.FixInLoopbackClientMain")
 }
 
+/** One-shot FIX-in conformance probe (scenarios 6, 7, 8, 11) against live oms-fix-ingress. */
+tasks.register<JavaExec>("fixInLoopbackConformanceProbe") {
+    group = "development"
+    description =
+        "Run FIX-in conformance scenarios 6/7/8/11. Env: OMS_INTERNAL_API_KEY, OMS_FIX_INGRESS_INTERNAL_BASE_URL, FIX_IN_CLIENT_*"
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("com.balh.oms.fixin.dev.FixInLoopbackConformanceProbeMain")
+}
+
 /**
  * Phase 4 slice 4a (operator-driven snapshot): trigger an Aeron Cluster snapshot on a running
  * cluster member. Cluster dir resolved from `OMS_AERON_CLUSTER_DIR` (preferred) or

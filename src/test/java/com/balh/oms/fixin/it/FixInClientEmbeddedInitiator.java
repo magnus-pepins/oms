@@ -9,6 +9,7 @@ import quickfix.Initiator;
 import quickfix.LogFactory;
 import quickfix.MessageStoreFactory;
 import quickfix.ScreenLogFactory;
+import quickfix.Application;
 import quickfix.Message;
 import quickfix.Session;
 import quickfix.SessionID;
@@ -22,6 +23,7 @@ import quickfix.field.OrderQty;
 import quickfix.field.OrigClOrdID;
 import quickfix.field.Price;
 import quickfix.field.SenderCompID;
+import quickfix.field.SendingTime;
 import quickfix.field.Side;
 import quickfix.field.Symbol;
 import quickfix.field.TargetCompID;
@@ -50,14 +52,23 @@ public final class FixInClientEmbeddedInitiator {
     private final Path fileStorePath;
     private final String clientCompId;
     private final String omsCompId;
+    private static final ThreadLocal<LocalDateTime> STALE_SENDING_TIME_OVERRIDE = new ThreadLocal<>();
+
+    private final Application wireApplication;
     private volatile Initiator initiator;
     private volatile SessionID sessionId;
 
     public FixInClientEmbeddedInitiator(int connectPort, Path fileStorePath, String clientCompId, String omsCompId) {
+        this(connectPort, fileStorePath, clientCompId, omsCompId, new FixInClientCollectorApplication());
+    }
+
+    public FixInClientEmbeddedInitiator(
+            int connectPort, Path fileStorePath, String clientCompId, String omsCompId, Application clientApplication) {
         this.connectPort = connectPort;
         this.fileStorePath = fileStorePath;
         this.clientCompId = clientCompId;
         this.omsCompId = omsCompId;
+        this.wireApplication = new StaleSendingTimeApplication(clientApplication);
     }
 
     public void start() {
@@ -67,11 +78,10 @@ public final class FixInClientEmbeddedInitiator {
         try {
             Files.createDirectories(fileStorePath);
             SessionSettings settings = initiatorSettings();
-            FixInClientCollectorApplication app = new FixInClientCollectorApplication();
             MessageStoreFactory storeFactory = new FileStoreFactory(settings);
             LogFactory logFactory = new ScreenLogFactory(settings);
             initiator = new SocketInitiator(
-                    app, storeFactory, settings, logFactory, new DefaultMessageFactory());
+                    wireApplication, storeFactory, settings, logFactory, new DefaultMessageFactory());
             initiator.start();
             sessionId = new SessionID(new BeginString("FIX.4.4"), new SenderCompID(clientCompId), new TargetCompID(omsCompId));
             log.info("FIX-in IT client initiator started → {}:{}", "127.0.0.1", connectPort);
@@ -176,6 +186,20 @@ public final class FixInClientEmbeddedInitiator {
     }
 
     public void sendNewOrderSingle(String clOrdId, String symbol, double qty, double price) {
+        sendNewOrderSingleInternal(clOrdId, symbol, qty, price);
+    }
+
+    public void sendNewOrderSingleWithSendingTime(
+            String clOrdId, String symbol, double qty, double price, LocalDateTime sendingTimeUtc) {
+        STALE_SENDING_TIME_OVERRIDE.set(sendingTimeUtc);
+        try {
+            sendNewOrderSingleInternal(clOrdId, symbol, qty, price);
+        } finally {
+            STALE_SENDING_TIME_OVERRIDE.remove();
+        }
+    }
+
+    private void sendNewOrderSingleInternal(String clOrdId, String symbol, double qty, double price) {
         SessionID sid = requireSession();
         NewOrderSingle nos = new NewOrderSingle();
         nos.set(new ClOrdID(clOrdId));
@@ -209,5 +233,65 @@ public final class FixInClientEmbeddedInitiator {
         s.setString(sid, "TargetCompID", omsCompId);
         s.setString(sid, "ResetOnLogon", "Y");
         return s;
+    }
+
+    /**
+     * QuickFIX overwrites {@code SendingTime} on send; override in {@code toApp} so stale-time
+     * conformance probes reach the acceptor unchanged.
+     */
+    private static final class StaleSendingTimeApplication implements Application {
+
+        private final Application delegate;
+
+        private StaleSendingTimeApplication(Application delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public void onCreate(SessionID sessionId) {
+            delegate.onCreate(sessionId);
+        }
+
+        @Override
+        public void onLogon(SessionID sessionId) {
+            delegate.onLogon(sessionId);
+        }
+
+        @Override
+        public void onLogout(SessionID sessionId) {
+            delegate.onLogout(sessionId);
+        }
+
+        @Override
+        public void toAdmin(Message message, SessionID sessionId) {
+            delegate.toAdmin(message, sessionId);
+        }
+
+        @Override
+        public void fromAdmin(Message message, SessionID sessionId)
+                throws quickfix.FieldNotFound,
+                        quickfix.IncorrectDataFormat,
+                        quickfix.IncorrectTagValue,
+                        quickfix.RejectLogon {
+            delegate.fromAdmin(message, sessionId);
+        }
+
+        @Override
+        public void toApp(Message message, SessionID sessionId) throws quickfix.DoNotSend {
+            LocalDateTime stale = STALE_SENDING_TIME_OVERRIDE.get();
+            if (stale != null) {
+                message.getHeader().setField(new SendingTime(stale));
+            }
+            delegate.toApp(message, sessionId);
+        }
+
+        @Override
+        public void fromApp(Message message, SessionID sessionId)
+                throws quickfix.FieldNotFound,
+                        quickfix.IncorrectDataFormat,
+                        quickfix.IncorrectTagValue,
+                        quickfix.UnsupportedMessageType {
+            delegate.fromApp(message, sessionId);
+        }
     }
 }

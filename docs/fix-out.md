@@ -80,6 +80,32 @@ The legacy `FixRouteDispatcher` / `FixOutboundDispatchWorker` / `FixOutboundOrde
 See `application-oms-fix-egress.yaml` (`oms.fix.*` + `oms.cluster.fix-egress.*`) and `.env.example`.
 **Broker UAT soak (human checklist):** [fix-broker-uat-soak.md](fix-broker-uat-soak.md).
 
+### Operator route setup (env + send gate)
+
+FIX-out has **no** `oms_fix_out_session` catalog — configure the **`oms-fix-egress`** JVM env (`OMS_FIX_*`) and `fix_route_state.send_enabled`:
+
+```bash
+source ~/.oms-bench.env
+cd ~/system-documentation
+
+# Checklist + broker TCP probe + fix_route_state rows
+bash scripts/oms-fix-out-route-setup.sh --inspect
+
+# Print ecosystem/.env snippet for a new broker UAT session
+bash scripts/oms-fix-out-route-setup.sh --print-env-snippet \
+  --sender OMS_UAT --target BROKER_UAT --host broker.example --port 9876
+
+# Dry-run then apply route send gate (Postgres)
+bash scripts/oms-fix-out-route-setup.sh --send-enabled true --route-key default \
+  --note "Broker UAT onboarded" --updated-by ops
+
+bash scripts/oms-fix-out-route-setup.sh --commit --send-enabled true --route-key default \
+  --note "Broker UAT onboarded" --updated-by ops
+# then: pm2 restart oms-fix-egress  (after OMS_FIX_* env is set)
+```
+
+HTTP alternative (no script): `GET/PATCH /internal/v1/fix/route-state/{routeKey}` on `oms-ingress` (requires `X-OMS-Internal-Key`).
+
 ### Manual mass cancel (trading-ops / §9.3)
 
 Internal HTTP **`POST /internal/v1/fix/mass-cancel-request`** (JSON: **`requestedBy`**, optional

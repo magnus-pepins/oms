@@ -66,6 +66,8 @@ Integrated into soak when `FIX_SOAK_CONFORMANCE=1` or `FIX_SOAK_RUN_GRADLE=1` (s
 
 ## Drop copy (scenario 7 and production)
 
+Operator script: `system-documentation/scripts/oms-fix-in-provision-session.sh --session-mode DROP_COPY` (wrapper: `oms-fix-in-add-drop-copy-session.sh`). See [oms-fix-ingress runbook](./runbooks/oms-fix-ingress.md#drop-copy-session).
+
 1. Insert `oms_fix_in_session` with `session_mode=DROP_COPY` (seed: `LOOPBACK_DROP` → `BALH_OMS`, UUID `00000002-…`).
 2. Restart **`oms-fix-ingress`** so the acceptor registers the session.
 3. Start client initiator with drop-copy CompIDs and **separate file store** (see runbook).

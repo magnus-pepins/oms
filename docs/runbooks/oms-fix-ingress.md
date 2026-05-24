@@ -34,6 +34,35 @@ Ops Console: `/api/oms-trading/fix/*` and `/api/oms-trading/fix-in/*`. Set `OMS_
 
 UAT soak (read-only + JSON report): `system-documentation/scripts/smoke/fix-in-uat-soak.sh`. Conformance checklist: [fix-in-conformance-pack.md](../fix-in-conformance-pack.md).
 
+## FIX-in session provisioning (operator)
+
+External counterparties (non-loopback) use **`system-documentation/scripts/oms-fix-in-provision-session.sh`**:
+
+```bash
+source ~/.oms-bench.env
+cd ~/system-documentation
+
+# List all FIX-in sessions (ORDER_ENTRY + DROP_COPY)
+bash scripts/oms-fix-in-provision-session.sh --list
+
+# Order-entry session + account binding (required for D/F/G)
+bash scripts/oms-fix-in-provision-session.sh --session-mode ORDER_ENTRY \
+  --sender CLIENT_OE --counterparty-name "Client Legal Name" \
+  --bind-account a0000001-0000-4000-8000-000000000001
+
+bash scripts/oms-fix-in-provision-session.sh --commit --session-mode ORDER_ENTRY \
+  --sender CLIENT_OE --counterparty-name "Client Legal Name" \
+  --bind-account a0000001-0000-4000-8000-000000000001
+
+# Extra account binding on an existing order-entry session
+bash scripts/oms-fix-in-provision-session.sh --commit --bind-only \
+  --session-id <uuid> --bind-account <oms_account_uuid> [--fix-account-tag TAG]
+```
+
+Dry-run by default; `--commit` applies SQL. Restart **`oms-fix-ingress`** after a **new** session row. Prod guard: `FIX_IN_SESSION_PROD_OVERRIDE=1`.
+
+Legacy alias: `oms-fix-in-add-drop-copy-session.sh` (wrapper → `--session-mode DROP_COPY`).
+
 ## Loopback counterparty (bench / pop UAT)
 
 Seed file: `src/test/resources/db/fix-in-uat-seed.sql` defines:
@@ -129,6 +158,35 @@ Requires `oms-fix-in-loopback-client` PM2 for reconnect probes. Conformance prob
 Drop copy is a **separate** FIX-in session (`session_mode=DROP_COPY`), not a flag on order entry. The client is still a FIX 4.4 **initiator**; the acceptor rejects inbound order entry and may **fan out** eligible `ExecutionReport` / `OrderCancelReject` copies to entitled sessions.
 
 ### Provision (operator)
+
+**Script (recommended):** `system-documentation/scripts/oms-fix-in-provision-session.sh --session-mode DROP_COPY` (or legacy wrapper `oms-fix-in-add-drop-copy-session.sh`):
+
+```bash
+source ~/.oms-bench.env
+
+# List drop-copy sessions only
+bash scripts/oms-fix-in-provision-session.sh --list --session-mode DROP_COPY
+
+# Dry-run then apply (creates counterparty + session + optional entitlements)
+bash scripts/oms-fix-in-provision-session.sh --session-mode DROP_COPY \
+  --sender CLIENT_DC_SENDER \
+  --counterparty-name "Client Legal Name" \
+  --entitle-account a0000001-0000-4000-8000-000000000001
+
+bash scripts/oms-fix-in-provision-session.sh --commit --session-mode DROP_COPY \
+  --sender CLIENT_DC_SENDER \
+  --counterparty-name "Client Legal Name" \
+  --entitle-account a0000001-0000-4000-8000-000000000001
+
+# Entitlements only (session already provisioned)
+bash scripts/oms-fix-in-provision-session.sh --commit --entitle-only \
+  --session-id <drop_copy_session_uuid> \
+  --entitle-account <oms_account_uuid>
+```
+
+Dry-run by default; `--commit` applies SQL. The script prints `pm2 restart oms-fix-ingress` as the next step — **not** run automatically. Prod guard: `FIX_IN_SESSION_PROD_OVERRIDE=1` (legacy alias: `DROP_COPY_SESSION_PROD_OVERRIDE=1`).
+
+**Manual SQL** (same tables):
 
 1. **Counterparty** — reuse or insert `oms_fix_in_counterparty`.
 2. **Session row** — `oms_fix_in_session` with `session_mode=DROP_COPY`, unique `(sender_comp_id, target_comp_id)`:

@@ -8,6 +8,7 @@ This is a **human-run** checklist for validating the OMS QuickFIX/J initiator ag
 
 - `OMS_ROUTING_BACKEND=fix`, `OMS_FIX_AUTO_START=true` in the soak environment only.
 - `OMS_INTERNAL_API_KEY` set; route gate defaults to send enabled (`fix_route_state`) unless you intentionally halt.
+- Optional setup helper: `system-documentation/scripts/oms-fix-out-route-setup.sh --inspect` (env checklist, TCP probe, `fix_route_state` rows).
 - Broker UAT host/port, comp IDs, and **TLS** material (`OMS_FIX_SOCKET_USE_SSL`, keystores/truststores) match the venue worksheet.
 - **Session store:** `OMS_FIX_SESSION_STORE_TYPE=file` or `jdbc`. If `jdbc`, Flyway **V9** has been applied (`oms_fix_sessions` / `oms_fix_messages`) on the database QuickFIX will use (application DB by default, or the DB behind **`OMS_FIX_SESSION_JDBC_URL`** when **`OMS_FIX_SESSION_JDBC_DATASOURCE_ENABLED=true`**). **Optional isolation:** second Postgres — [fix-session-store-isolation.md](fix-session-store-isolation.md).
 

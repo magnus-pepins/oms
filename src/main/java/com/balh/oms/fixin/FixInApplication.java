@@ -83,7 +83,13 @@ public class FixInApplication implements Application {
     @Override
     public void onLogout(SessionID sessionId) {
         sessionRegistry.unregister(sessionId);
-        log.info("FIX-in logout {}", sessionId);
+        Session session = Session.lookupSession(sessionId);
+        if (session != null) {
+            // QFJ disables the acceptor Session on logout(); reset after disconnect so
+            // the counterparty initiator can log on again (operator force-logout soak).
+            session.reset();
+        }
+        log.info("FIX-in logout {} (acceptor reset for re-logon)", sessionId);
     }
 
     @Override

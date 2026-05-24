@@ -67,10 +67,6 @@ public class FixInSessionAdminService {
         if (session != null && session.isLoggedOn()) {
             session.logout("operator_requested");
         }
-        // QFJ disables the Session on logout(); reset re-opens the acceptor for counterparty re-logon.
-        if (session != null) {
-            session.reset();
-        }
         sessionRegistry.unregister(wireId);
         recordAdminAction(row, "FORCE_LOGOUT", requestedBy, null, reason, null, Map.of("wireSession", wireId.toString()));
         metrics.adminActionSucceeded();

@@ -1,7 +1,6 @@
 package com.balh.oms.fixin.persistence;
 
 import org.springframework.dao.EmptyResultDataAccessException;
-import org.springframework.dao.EmptyResultDataAccessException;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.stereotype.Repository;
@@ -33,9 +32,9 @@ public class FixInMessageAuditRepository {
             SELECT id, direction, session_role, fix_session_id, msg_type, msg_seq_num,
                    cl_ord_id, orig_cl_ord_id, oms_order_id, exec_id, raw_store_ref, summary, created_at
               FROM oms_fix_message_audit
-             WHERE (:fix_session_id IS NULL OR fix_session_id = :fix_session_id)
-               AND (:cl_ord_id IS NULL OR cl_ord_id = :cl_ord_id)
-               AND (:oms_order_id IS NULL OR oms_order_id = :oms_order_id)
+             WHERE (CAST(:fix_session_id AS uuid) IS NULL OR fix_session_id = :fix_session_id)
+               AND (CAST(:cl_ord_id AS text) IS NULL OR cl_ord_id = :cl_ord_id)
+               AND (CAST(:oms_order_id AS uuid) IS NULL OR oms_order_id = :oms_order_id)
              ORDER BY created_at DESC
              LIMIT :limit
             """;

@@ -31,7 +31,7 @@ public class FixInSessionAdminActionRepository {
             SELECT id, session_role, fix_session_id, broker_route_key, action_type,
                    requested_by, approved_by, reason, counterparty_reference, payload_json, created_at
               FROM oms_fix_session_admin_actions
-             WHERE (:fix_session_id IS NULL OR fix_session_id = :fix_session_id)
+             WHERE (CAST(:fix_session_id AS uuid) IS NULL OR fix_session_id = :fix_session_id)
              ORDER BY created_at DESC
              LIMIT :limit
             """;

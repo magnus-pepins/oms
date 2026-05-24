@@ -22,6 +22,18 @@ public class CashReconciliationLookupRepository {
             BigDecimal expectedCashAmount,
             String currency) {}
 
+    /**
+     * Pre-2026-05-24 this hardcoded {@code 'SEK' AS currency}, which short-circuited
+     * cash recon for any non-SEK execution: a USD/EUR/GBP/POINTS execution would
+     * hit {@code currencyMatches(batchCurrency, movementCurrency, 'SEK')} in
+     * {@link CashReconciliationService} and raise a false "currency mismatch"
+     * break even when broker and OMS amounts were identical. The fix derives the
+     * currency per-execution from {@code instrument_settlement_profile} via the
+     * order's {@code instrument_symbol} (same lookup
+     * {@link SettlementDateCalculator} uses for the expected settlement date),
+     * with a {@code COALESCE} to {@code 'SEK'} to preserve behaviour when the
+     * profile is missing — same fallback contract as the calendar.
+     */
     private static final String FIND_BY_BROKER_VENUE_REF =
             """
                     SELECT e.id AS execution_id,
@@ -29,7 +41,16 @@ public class CashReconciliationLookupRepository {
                            e.venue_exec_ref,
                            o.side,
                            (e.last_quantity * e.last_price) AS gross,
-                           'SEK' AS currency
+                           COALESCE(
+                               (SELECT isp.settlement_currency
+                                FROM instrument_settlement_profile isp
+                                WHERE isp.symbol = o.instrument_symbol
+                                  AND isp.effective_from <= COALESCE(e.trade_date, CAST(e.venue_ts AS DATE))
+                                  AND (isp.effective_to IS NULL
+                                       OR isp.effective_to > COALESCE(e.trade_date, CAST(e.venue_ts AS DATE)))
+                                ORDER BY isp.effective_from DESC
+                                LIMIT 1),
+                               'SEK') AS currency
                     FROM executions e
                     JOIN orders o ON o.id = e.order_id
                     WHERE e.venue_exec_ref = :venueRef
@@ -51,7 +72,16 @@ public class CashReconciliationLookupRepository {
                            e.venue_exec_ref,
                            o.side,
                            (e.last_quantity * e.last_price) AS gross,
-                           'SEK' AS currency
+                           COALESCE(
+                               (SELECT isp.settlement_currency
+                                FROM instrument_settlement_profile isp
+                                WHERE isp.symbol = o.instrument_symbol
+                                  AND isp.effective_from <= COALESCE(e.trade_date, CAST(e.venue_ts AS DATE))
+                                  AND (isp.effective_to IS NULL
+                                       OR isp.effective_to > COALESCE(e.trade_date, CAST(e.venue_ts AS DATE)))
+                                ORDER BY isp.effective_from DESC
+                                LIMIT 1),
+                               'SEK') AS currency
                     FROM executions e
                     JOIN orders o ON o.id = e.order_id
                     WHERE e.settlement_status = CAST('settled' AS execution_settlement_status)
@@ -59,7 +89,17 @@ public class CashReconciliationLookupRepository {
                       AND e.expected_settlement_date = :businessDate
                       AND e.venue_exec_ref IS NOT NULL
                       AND e.venue_exec_ref <> ''
-                      AND (CAST(:currency AS TEXT) IS NULL OR CAST(:currency AS TEXT) = 'SEK')
+                      AND (CAST(:currency AS TEXT) IS NULL
+                           OR CAST(:currency AS TEXT) = COALESCE(
+                               (SELECT isp.settlement_currency
+                                FROM instrument_settlement_profile isp
+                                WHERE isp.symbol = o.instrument_symbol
+                                  AND isp.effective_from <= COALESCE(e.trade_date, CAST(e.venue_ts AS DATE))
+                                  AND (isp.effective_to IS NULL
+                                       OR isp.effective_to > COALESCE(e.trade_date, CAST(e.venue_ts AS DATE)))
+                                ORDER BY isp.effective_from DESC
+                                LIMIT 1),
+                               'SEK'))
                       AND EXISTS (
                           SELECT 1
                           FROM positions p

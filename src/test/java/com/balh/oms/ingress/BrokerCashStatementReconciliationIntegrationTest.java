@@ -68,6 +68,40 @@ class BrokerCashStatementReconciliationIntegrationTest extends AbstractPostgresI
                 .isZero();
     }
 
+    /**
+     * Regression guard for the 2026-05-24 cash recon currency bug. The lookup SQL
+     * used to hardcode {@code 'SEK' AS currency}, so a USD broker movement against
+     * a USD execution would mismatch on currency even when the amounts agreed and
+     * the OMS account's underlying instrument was USD-settled. The fix derives
+     * currency per-execution from {@code instrument_settlement_profile}; this test
+     * proves a USD-settled execution matches a USD broker movement instead of
+     * raising a "currency mismatch" break with delta 0.
+     */
+    @Test
+    void reconcile_usdInstrument_matchesUsdMovement_noCurrencyMismatch() {
+        UUID accountId = UUID.randomUUID();
+        UUID custodyId = UUID.randomUUID();
+        String venueRef = "EX-SETTLE-USD";
+        seedCustody(custodyId);
+        seedInstrumentProfile("AAPL", "USD");
+        seedBuyExecution(accountId, custodyId, venueRef, "AAPL", "1", "100.50", "2026-05-22");
+
+        long batchId = ingestUsdBatch("-100.50", venueRef);
+        ResponseEntity<SettlementController.CashReconciliationResponse> recon = postReconcile(batchId);
+
+        assertThat(recon.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(recon.getBody()).isNotNull();
+        assertThat(recon.getBody().matchedCount()).as("USD movement against USD execution must match").isEqualTo(1);
+        assertThat(recon.getBody().mismatchCount()).isZero();
+        assertThat(jdbc.queryForObject(
+                        "SELECT COUNT(*)::int FROM cash_reconciliation_report_row "
+                                + "WHERE outcome = 'mismatch' "
+                                + "AND diff_json ->> 'reason' = 'currency mismatch'",
+                        Integer.class))
+                .as("no rows must be flagged 'currency mismatch' for a non-SEK instrument")
+                .isZero();
+    }
+
     @Test
     void reconcile_whenAmountMismatch_opensCashBreak() {
         UUID accountId = UUID.randomUUID();
@@ -91,6 +125,13 @@ class BrokerCashStatementReconciliationIntegrationTest extends AbstractPostgresI
     private long ingestBatch(String amount, String executionRef) {
         ResponseEntity<SettlementController.BrokerCashStatementImportResponse> res =
                 postIngest(envelope("CASH-" + UUID.randomUUID(), amount, executionRef));
+        assertThat(res.getBody()).isNotNull();
+        return res.getBody().batchId();
+    }
+
+    private long ingestUsdBatch(String amount, String executionRef) {
+        ResponseEntity<SettlementController.BrokerCashStatementImportResponse> res =
+                postIngest(usdEnvelope("CASH-" + UUID.randomUUID(), amount, executionRef));
         assertThat(res.getBody()).isNotNull();
         return res.getBody().batchId();
     }
@@ -147,6 +188,46 @@ class BrokerCashStatementReconciliationIntegrationTest extends AbstractPostgresI
                 .formatted(fileId, executionRef, amount);
     }
 
+    private static String usdEnvelope(String fileId, String amount, String executionRef) {
+        return """
+                {
+                  "schemaVersion": 1,
+                  "brokerId": "broker_x",
+                  "businessDate": "2026-05-22",
+                  "fileId": "%s",
+                  "currency": "USD",
+                  "openingBalance": "100.50",
+                  "closingBalance": "0.00",
+                  "movements": [
+                    {
+                      "brokerMovementId": "CM-USD-1",
+                      "type": "buy_settlement",
+                      "executionRef": "%s",
+                      "amount": "%s",
+                      "currency": "USD",
+                      "valueDate": "2026-05-22"
+                    }
+                  ]
+                }
+                """
+                .formatted(fileId, executionRef, amount);
+    }
+
+    private void seedInstrumentProfile(String symbol, String settlementCurrency) {
+        jdbc.update(
+                """
+                        INSERT INTO instrument_settlement_profile (
+                          instrument_id, symbol, isin, primary_mic, settlement_calendar_id,
+                          settlement_cycle, settlement_currency, isk_eligible, effective_from
+                        ) VALUES (
+                          ?, ?, NULL, 'XNAS', 'XNAS', 'T+2', ?, FALSE, DATE '2000-01-01'
+                        )
+                        """,
+                symbol,
+                symbol,
+                settlementCurrency);
+    }
+
     private void seedCustody(UUID custodyId) {
         jdbc.update(
                 """
@@ -163,6 +244,17 @@ class BrokerCashStatementReconciliationIntegrationTest extends AbstractPostgresI
             String qty,
             String price,
             String expectedSettlementDate) {
+        seedBuyExecution(accountId, custodyId, venueRef, "ERIC-B.ST", qty, price, expectedSettlementDate);
+    }
+
+    private void seedBuyExecution(
+            UUID accountId,
+            UUID custodyId,
+            String venueRef,
+            String instrumentSymbol,
+            String qty,
+            String price,
+            String expectedSettlementDate) {
         UUID orderId = UUID.randomUUID();
         jdbc.update(
                 """
@@ -171,13 +263,14 @@ class BrokerCashStatementReconciliationIntegrationTest extends AbstractPostgresI
                           status, side, instrument_symbol, quantity, limit_price, time_in_force,
                           received_at, accepted_at, account_id_hash, cum_filled_quantity
                         ) VALUES (
-                          ?, ?, ?, 0, 2, 'FILLED', 'BUY', 'ERIC-B.ST', ?, ?, 'DAY',
+                          ?, ?, ?, 0, 2, 'FILLED', 'BUY', ?, ?, ?, 'DAY',
                           NOW(), NOW(), 'h', ?
                         )
                         """,
                 orderId,
                 accountId,
                 "cash-recon-" + orderId,
+                instrumentSymbol,
                 new java.math.BigDecimal(qty),
                 new java.math.BigDecimal(price),
                 new java.math.BigDecimal(qty));
@@ -186,12 +279,13 @@ class BrokerCashStatementReconciliationIntegrationTest extends AbstractPostgresI
                         INSERT INTO executions (
                           order_id, account_id, venue_id, venue_ts, venue_exec_ref,
                           last_quantity, last_price, leaves_quantity, cum_quantity_after,
-                          exec_type, raw_envelope_json, settlement_status, expected_settlement_date
+                          exec_type, raw_envelope_json, settlement_status, expected_settlement_date,
+                          trade_date
                         ) VALUES (
                           ?, ?, 'SIM', NOW(), ?,
                           ?, ?, 0, ?,
                           CAST('TRADE' AS execution_exec_type), CAST('{}' AS JSONB),
-                          CAST('settled' AS execution_settlement_status), ?
+                          CAST('settled' AS execution_settlement_status), ?, ?
                         )
                         """,
                 orderId,
@@ -200,15 +294,17 @@ class BrokerCashStatementReconciliationIntegrationTest extends AbstractPostgresI
                 new java.math.BigDecimal(qty),
                 new java.math.BigDecimal(price),
                 new java.math.BigDecimal(qty),
+                java.sql.Date.valueOf(expectedSettlementDate),
                 java.sql.Date.valueOf(expectedSettlementDate));
         jdbc.update(
                 """
                         INSERT INTO positions (
                           account_id, instrument_symbol, custody_account_id, currency,
                           quantity_total, quantity_settled, quantity_pending_buy_settle, quantity_pending_sell_settle
-                        ) VALUES (?, 'ERIC-B.ST', ?, 'SEK', ?, ?, 0, 0)
+                        ) VALUES (?, ?, ?, 'SEK', ?, ?, 0, 0)
                         """,
                 accountId,
+                instrumentSymbol,
                 custodyId,
                 new java.math.BigDecimal(qty),
                 new java.math.BigDecimal(qty));

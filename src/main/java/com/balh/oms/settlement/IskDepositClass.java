@@ -19,5 +19,8 @@ public final class IskDepositClass {
     /** Cash dividend credit on payable date — excluded from kapitalunderlag (IL 42 kap. 39 §). */
     public static final String DIVIDEND = "dividend";
 
+    /** Cross-currency settlement leg inside ISK — excluded from kapitalunderlag. */
+    public static final String FX_CONVERSION = "fx_conversion";
+
     private IskDepositClass() {}
 }

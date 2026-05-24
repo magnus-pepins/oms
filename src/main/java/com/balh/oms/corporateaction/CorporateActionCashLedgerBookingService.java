@@ -74,7 +74,7 @@ public class CorporateActionCashLedgerBookingService {
             payload.put("netAmount", row.netAmount().toPlainString());
             payload.put("currency", row.currency());
             payload.put("nostroIndicator", "@Nostro-" + row.currency().trim().toUpperCase() + "-Bank");
-            enrichIsk(payload, row.accountId());
+            enrichIsk(payload, row.accountId(), row.actionType());
             return outbox.insertIgnore(row.id(), LEG_DIVIDEND, objectMapper.writeValueAsString(payload));
         } catch (JsonProcessingException e) {
             throw new IllegalStateException("serialize CA dividend payload cashImpactId=" + row.id(), e);
@@ -110,7 +110,7 @@ public class CorporateActionCashLedgerBookingService {
         return payload;
     }
 
-    private void enrichIsk(ObjectNode payload, UUID accountId) {
+    private void enrichIsk(ObjectNode payload, UUID accountId, String actionType) {
         taxWrapper.findByAccountId(accountId).ifPresent(w -> {
             if (!OmsAccountTaxWrapperRepository.TAX_WRAPPER_ISK.equals(w.taxWrapper())) {
                 return;
@@ -122,7 +122,14 @@ public class CorporateActionCashLedgerBookingService {
             if (w.ledgerBalanceId() != null) {
                 payload.put("ledgerBalanceId", w.ledgerBalanceId());
             }
-            payload.put("iskDepositClass", IskDepositClass.DIVIDEND);
+            payload.put("iskDepositClass", iskDepositClassFor(actionType));
         });
+    }
+
+    static String iskDepositClassFor(String actionType) {
+        if (CorporateActionProcessingService.ACTION_TENDER_OFFER.equalsIgnoreCase(actionType)) {
+            return IskDepositClass.SALE_PROCEEDS_EXCLUDED;
+        }
+        return IskDepositClass.DIVIDEND;
     }
 }

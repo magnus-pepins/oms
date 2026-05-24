@@ -14,6 +14,7 @@ import org.springframework.web.client.RestClientResponseException;
 
 import java.math.BigDecimal;
 import java.util.LinkedHashMap;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -121,8 +122,7 @@ public final class LedgerSettlementLegPoster implements LedgerSettlementPostingC
         String accountId = required(p, "accountId");
         String currency = required(p, "currency");
         java.math.BigDecimal net = bigDecimal(p, "netAmount");
-        String customerIndicator = "inv-" + accountId + "-" + currency.trim().toUpperCase();
-        String customerBalance = resolveCustomerBalanceId(customerIndicator, currency);
+        String customerBalance = resolveCustomerBalanceId(p, accountId, currency);
         String nostro = textOrDefault(p, "nostroIndicator", "@Nostro-" + currency.trim().toUpperCase() + "-Bank");
         String reference = "ca-dividend-" + outboxId;
         postTransaction(reference, nostro, customerBalance, net, currency, p);
@@ -204,8 +204,7 @@ public final class LedgerSettlementLegPoster implements LedgerSettlementPostingC
                             + "for cross-currency (got cash=" + cashCurrency + " trade=" + tradeCurrency + ")");
         }
         BigDecimal notional = bigDecimal(p, "notional");
-        String customerIndicator = "inv-" + accountId + "-" + cashCurrency;
-        String customerBalance = resolveCustomerBalanceId(customerIndicator, cashCurrency);
+        String customerBalance = resolveCustomerBalanceId(p, accountId, cashCurrency);
         String nostroBalance = "@Nostro-" + tradeCurrency + "-Bank";
 
         String src, dst;
@@ -239,8 +238,7 @@ public final class LedgerSettlementLegPoster implements LedgerSettlementPostingC
         String side = required(p, "side");
         String cashCurrency = required(p, "cashCurrency");
         String tradeCurrency = required(p, "tradeCurrency");
-        String customerIndicator = "inv-" + accountId + "-" + cashCurrency;
-        String customerBalance = resolveCustomerBalanceId(customerIndicator, cashCurrency);
+        String customerBalance = resolveCustomerBalanceId(p, accountId, cashCurrency);
         String fxSuspenseCash = "@FX-Suspense-" + cashCurrency;
         String fxSuspenseTrade = "@FX-Suspense-" + tradeCurrency;
         String nostro = "@Nostro-" + tradeCurrency + "-Bank";
@@ -291,8 +289,7 @@ public final class LedgerSettlementLegPoster implements LedgerSettlementPostingC
             log.debug("fee leg skipped (amount<=0) outboxId={}", outboxId);
             return;
         }
-        String customerIndicator = "inv-" + accountId + "-" + feeCurrency;
-        String customerBalance = resolveCustomerBalanceId(customerIndicator, feeCurrency);
+        String customerBalance = resolveCustomerBalanceId(p, accountId, feeCurrency);
         String feeBalance = normalizeFeeBalanceIndicator(
                 p.has("feeBalanceIndicator") && p.get("feeBalanceIndicator").isTextual()
                         ? p.get("feeBalanceIndicator").asText()
@@ -467,6 +464,22 @@ public final class LedgerSettlementLegPoster implements LedgerSettlementPostingC
             log.debug("ledger settlement response parse failed: {}", e.getMessage());
         }
         return null;
+    }
+
+    /**
+     * Prefers {@code ledgerBalanceId} from the outbox payload (ISK accounts) before falling back
+     * to {@code inv-<accountId>-<ccy>} indicator resolution.
+     */
+    private String resolveCustomerBalanceId(JsonNode p, String accountId, String currency)
+            throws LedgerSettlementPostingException {
+        if (p != null && p.has("ledgerBalanceId") && p.get("ledgerBalanceId").isTextual()) {
+            String ledgerBalanceId = p.get("ledgerBalanceId").asText();
+            if (ledgerBalanceId != null && !ledgerBalanceId.isBlank()) {
+                return ledgerBalanceId.trim();
+            }
+        }
+        String indicator = "inv-" + accountId + "-" + currency.trim().toUpperCase(Locale.ROOT);
+        return resolveCustomerBalanceId(indicator, currency);
     }
 
     /**

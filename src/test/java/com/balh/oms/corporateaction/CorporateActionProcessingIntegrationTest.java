@@ -141,6 +141,70 @@ class CorporateActionProcessingIntegrationTest extends AbstractPostgresIntegrati
                 .isEqualTo("ERIC.RT");
     }
 
+    @Test
+    void processor_stockDividend_multipliesPosition() {
+        UUID accountId = UUID.randomUUID();
+        insertPosition(accountId, "VOLV", 20);
+        long eventId =
+                jdbc.queryForObject(
+                        """
+                                INSERT INTO corporate_action_event (
+                                  instrument_symbol, action_type, effective_date, payload_json, record_date
+                                ) VALUES (
+                                  'VOLV', 'STOCK_DIVIDEND', '2026-06-01',
+                                  CAST('{"sharesPerShare":"0.1"}' AS JSONB),
+                                  '2026-05-01'
+                                ) RETURNING id
+                                """,
+                        Long.class);
+        snapshotService.captureForEvent(eventId, "VOLV", java.time.LocalDate.of(2026, 5, 1));
+
+        processorJob.processBatch();
+
+        assertThat(jdbc.queryForObject(
+                        "SELECT quantity_settled FROM positions WHERE account_id = ? AND instrument_symbol = 'VOLV'",
+                        BigDecimal.class,
+                        accountId))
+                .isEqualByComparingTo("22");
+        assertThat(jdbc.queryForObject(
+                        "SELECT quantity_after FROM corporate_action_position_impact WHERE corporate_action_event_id = ?",
+                        BigDecimal.class,
+                        eventId))
+                .isEqualByComparingTo("22");
+    }
+
+    @Test
+    void processor_symbolChange_renamesPosition() {
+        UUID accountId = UUID.randomUUID();
+        insertPosition(accountId, "VOLV.B", 15);
+        long eventId =
+                jdbc.queryForObject(
+                        """
+                                INSERT INTO corporate_action_event (
+                                  instrument_symbol, action_type, effective_date, payload_json, record_date
+                                ) VALUES (
+                                  'VOLV.B', 'SYMBOL_CHANGE', '2026-06-01',
+                                  CAST('{"newSymbol":"VOLV"}' AS JSONB),
+                                  '2026-05-01'
+                                ) RETURNING id
+                                """,
+                        Long.class);
+        snapshotService.captureForEvent(eventId, "VOLV.B", java.time.LocalDate.of(2026, 5, 1));
+
+        processorJob.processBatch();
+
+        assertThat(jdbc.queryForObject(
+                        "SELECT COUNT(*)::int FROM positions WHERE account_id = ? AND instrument_symbol = 'VOLV'",
+                        Integer.class,
+                        accountId))
+                .isEqualTo(1);
+        assertThat(jdbc.queryForObject(
+                        "SELECT instrument_symbol FROM corporate_action_position_impact WHERE corporate_action_event_id = ?",
+                        String.class,
+                        eventId))
+                .isEqualTo("VOLV");
+    }
+
     private void insertPosition(UUID accountId, String symbol, int qty) {
         jdbc.update(
                 """

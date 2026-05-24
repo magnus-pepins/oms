@@ -25,6 +25,9 @@ public class CorporateActionProcessingService {
     public static final String ACTION_STOCK_SPLIT = "STOCK_SPLIT";
     public static final String ACTION_TENDER_OFFER = "TENDER_OFFER";
     public static final String ACTION_RIGHTS_ISSUE = "RIGHTS_ISSUE";
+    public static final String ACTION_STOCK_DIVIDEND = "STOCK_DIVIDEND";
+    public static final String ACTION_SYMBOL_CHANGE = "SYMBOL_CHANGE";
+    public static final String ACTION_ISIN_CHANGE = "ISIN_CHANGE";
 
     private static final int MONEY_SCALE = 2;
 
@@ -66,6 +69,8 @@ public class CorporateActionProcessingService {
             case ACTION_STOCK_SPLIT -> processStockSplit(row, custody, holders, payload);
             case ACTION_TENDER_OFFER -> processTenderOffer(row, holders, payload);
             case ACTION_RIGHTS_ISSUE -> processRightsIssue(row, holders, payload);
+            case ACTION_STOCK_DIVIDEND -> processStockDividend(row, custody, holders, payload);
+            case ACTION_SYMBOL_CHANGE, ACTION_ISIN_CHANGE -> processSymbolChange(row, custody, holders, payload);
             default -> throw new UnsupportedCorporateActionException("unsupported actionType: " + action);
         }
     }
@@ -208,6 +213,59 @@ public class CorporateActionProcessingService {
             processed++;
         }
         log.info("corporate_action RIGHTS_ISSUE processed id={} symbol={} participants={}", row.id(), symbol, processed);
+    }
+
+    private void processStockDividend(
+            CorporateActionEventRepository.ProcessingRow row,
+            UUID custody,
+            java.util.List<CorporateActionRecordDateSnapshotService.ResolvedHolder> holders,
+            JsonNode payload) {
+        BigDecimal ratio = stockDividendRatio(payload);
+        if (ratio == null || ratio.signum() <= 0) {
+            throw new UnsupportedCorporateActionException("STOCK_DIVIDEND missing sharesPerShare or newShares/oldShares");
+        }
+        String symbol = row.instrumentSymbol().trim().toUpperCase(Locale.ROOT);
+        for (CorporateActionRecordDateSnapshotService.ResolvedHolder holder : holders) {
+            BigDecimal before = holder.quantitySettled();
+            BigDecimal after = before.multiply(ratio).setScale(10, RoundingMode.HALF_UP);
+            positions.applyCorporateActionSplit(holder.accountId(), symbol, custody, ratio);
+            impacts.insertEntitlement(row.id(), holder.accountId(), symbol, before, after, null, null);
+            impacts.insertPositionImpact(row.id(), holder.accountId(), symbol, before, after);
+        }
+        log.info("corporate_action STOCK_DIVIDEND processed id={} symbol={} ratio={} holders={}",
+                row.id(), symbol, ratio, holders.size());
+    }
+
+    private void processSymbolChange(
+            CorporateActionEventRepository.ProcessingRow row,
+            UUID custody,
+            java.util.List<CorporateActionRecordDateSnapshotService.ResolvedHolder> holders,
+            JsonNode payload) {
+        String oldSymbol = row.instrumentSymbol().trim().toUpperCase(Locale.ROOT);
+        String newSymbol = textField(payload, "newSymbol");
+        if (newSymbol == null || newSymbol.isBlank()) {
+            newSymbol = textField(payload, "newInstrumentSymbol");
+        }
+        if (newSymbol == null || newSymbol.isBlank()) {
+            throw new UnsupportedCorporateActionException("SYMBOL_CHANGE missing newSymbol");
+        }
+        newSymbol = newSymbol.trim().toUpperCase(Locale.ROOT);
+        for (CorporateActionRecordDateSnapshotService.ResolvedHolder holder : holders) {
+            BigDecimal qty = holder.quantitySettled();
+            positions.applyCorporateActionSymbolRename(holder.accountId(), oldSymbol, newSymbol, custody);
+            impacts.insertEntitlement(row.id(), holder.accountId(), oldSymbol, qty, qty, null, null);
+            impacts.insertPositionImpact(row.id(), holder.accountId(), newSymbol, qty, qty);
+        }
+        log.info("corporate_action SYMBOL_CHANGE processed id={} {} -> {} holders={}",
+                row.id(), oldSymbol, newSymbol, holders.size());
+    }
+
+    static BigDecimal stockDividendRatio(JsonNode payload) {
+        BigDecimal sharesPerShare = decimalField(payload, "sharesPerShare");
+        if (sharesPerShare != null && sharesPerShare.signum() > 0) {
+            return BigDecimal.ONE.add(sharesPerShare);
+        }
+        return splitRatio(payload);
     }
 
     static BigDecimal splitRatio(JsonNode payload) {

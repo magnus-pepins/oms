@@ -334,6 +334,21 @@ class LedgerSettlementLegPosterTest {
     }
 
     @Test
+    void caDividendUsesLedgerBalanceIdFromPayload() throws Exception {
+        String payload = """
+                {"schemaVersion":1,"leg":"dividend","accountId":"a0000000-0000-4000-8000-000000000004",
+                 "currency":"SEK","netAmount":"12.50","ledgerBalanceId":"balance_isk_sek_1",
+                 "iskDepositClass":"dividend","nostroIndicator":"@Nostro-SEK"}""";
+
+        poster.postCorporateActionOutbox(55L, "dividend", payload);
+
+        ledger.verify(0, getRequestedFor(urlPathEqualTo("/balances")));
+        ledger.verify(1, postWith()
+                .withRequestBody(containing("\"destination\":\"balance_isk_sek_1\""))
+                .withRequestBody(containing("\"reference\":\"ca-dividend-55\"")));
+    }
+
+    @Test
     void missingApiKeyAtConstructionIsRejected() {
         assertThatThrownBy(() ->
                         new LedgerSettlementLegPoster(

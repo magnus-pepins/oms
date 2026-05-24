@@ -15,8 +15,10 @@ public class CorporateActionCashImpactRepository {
             """
                     SELECT c.id, c.corporate_action_event_id, c.account_id, c.gross_amount, c.net_amount,
                            c.withholding_amount, c.currency, c.payable_date,
-                           COALESCE(c.ledger_outbox_enqueued_at IS NOT NULL, FALSE) AS ledger_outbox_enqueued
+                           COALESCE(c.ledger_outbox_enqueued_at IS NOT NULL, FALSE) AS ledger_outbox_enqueued,
+                           e.action_type
                     FROM corporate_action_cash_impact c
+                    JOIN corporate_action_event e ON e.id = c.corporate_action_event_id
                     WHERE c.ledger_outbox_enqueued_at IS NULL
                       AND (c.payable_date IS NULL OR c.payable_date <= CURRENT_DATE)
                     ORDER BY c.id
@@ -53,7 +55,8 @@ public class CorporateActionCashImpactRepository {
             BigDecimal withholdingAmount,
             String currency,
             LocalDate payableDate,
-            boolean ledgerOutboxEnqueued) {}
+            boolean ledgerOutboxEnqueued,
+            String actionType) {}
 
     public List<DueCashImpactRow> listDueForLedgerBooking(int limit) {
         return jdbc.query(
@@ -71,7 +74,8 @@ public class CorporateActionCashImpactRepository {
                                 rs.getDate("payable_date") == null
                                         ? null
                                         : rs.getDate("payable_date").toLocalDate(),
-                                rs.getBoolean("ledger_outbox_enqueued")));
+                                rs.getBoolean("ledger_outbox_enqueued"),
+                                rs.getString("action_type")));
     }
 
     public int markLedgerOutboxEnqueued(long cashImpactId) {

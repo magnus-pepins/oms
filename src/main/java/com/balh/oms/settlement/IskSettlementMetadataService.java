@@ -38,9 +38,11 @@ public class IskSettlementMetadataService {
         if (LedgerSettlementOutboxRepository.LEG_FEE.equals(legKind)) {
             return IskDepositClass.COMMISSION;
         }
-        if (LedgerSettlementOutboxRepository.LEG_CASH.equals(legKind)
-                || LedgerSettlementOutboxRepository.LEG_CASH_BASE.equals(legKind)
+        if (LedgerSettlementOutboxRepository.LEG_CASH_BASE.equals(legKind)
                 || LedgerSettlementOutboxRepository.LEG_CASH_QUOTE.equals(legKind)) {
+            return IskDepositClass.FX_CONVERSION;
+        }
+        if (LedgerSettlementOutboxRepository.LEG_CASH.equals(legKind)) {
             if (side != null && Side.SELL.name().equalsIgnoreCase(side)) {
                 return IskDepositClass.SALE_PROCEEDS_EXCLUDED;
             }

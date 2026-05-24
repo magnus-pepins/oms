@@ -31,4 +31,11 @@ class CorporateActionProcessingServiceTest {
         assertThat(CorporateActionProcessingService.withholdingAmount(new java.math.BigDecimal("100.00"), payload))
                 .isEqualByComparingTo("15.00");
     }
+
+    @Test
+    void stockDividendRatio_fromSharesPerShare() throws Exception {
+        var payload = objectMapper.readTree("{\"sharesPerShare\": \"0.1\"}");
+        assertThat(CorporateActionProcessingService.stockDividendRatio(payload))
+                .isEqualByComparingTo("1.1");
+    }
 }

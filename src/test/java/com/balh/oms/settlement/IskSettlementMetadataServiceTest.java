@@ -40,6 +40,18 @@ class IskSettlementMetadataServiceTest {
     }
 
     @Test
+    void depositClassForCrossCurrencyLeg_isFxConversion() {
+        assertThat(
+                        IskSettlementMetadataService.depositClassFor(
+                                Side.BUY.name(), LedgerSettlementOutboxRepository.LEG_CASH_BASE))
+                .isEqualTo(IskDepositClass.FX_CONVERSION);
+        assertThat(
+                        IskSettlementMetadataService.depositClassFor(
+                                Side.SELL.name(), LedgerSettlementOutboxRepository.LEG_CASH_QUOTE))
+                .isEqualTo(IskDepositClass.FX_CONVERSION);
+    }
+
+    @Test
     void enrich_addsIskFieldsForIskAccount() throws Exception {
         when(accountTaxWrapper.findByAccountId(ACCOUNT_ID))
                 .thenReturn(

@@ -369,6 +369,31 @@ public class PositionsRepository {
         }
     }
 
+    /** Renames {@code instrument_symbol} for all settled quantity (gap plan §5.9 mandatory symbol change). */
+    public void applyCorporateActionSymbolRename(
+            UUID accountId, String oldSymbol, String newSymbol, UUID custodyAccountId) {
+        String from = oldSymbol == null ? "" : oldSymbol.trim().toUpperCase(Locale.ROOT);
+        String to = newSymbol == null ? "" : newSymbol.trim().toUpperCase(Locale.ROOT);
+        int updated =
+                jdbc.update(
+                        """
+                                UPDATE positions
+                                SET instrument_symbol = :newSymbol, updated_at = NOW()
+                                WHERE account_id = :accountId
+                                  AND instrument_symbol = :oldSymbol
+                                  AND custody_account_id = :custody
+                                """,
+                        new MapSqlParameterSource()
+                                .addValue("newSymbol", to)
+                                .addValue("accountId", accountId)
+                                .addValue("oldSymbol", from)
+                                .addValue("custody", custodyAccountId));
+        if (updated != 1) {
+            throw new IllegalStateException(
+                    "corporate action symbol rename expected 1 position row, got " + updated);
+        }
+    }
+
     /**
      * Read-side projection: positions joined with a lifetime-BUY cost aggregation derived from
      * {@code executions} so the customer "My positions" view can show a real "Invested" value.

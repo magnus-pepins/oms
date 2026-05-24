@@ -3,6 +3,7 @@ package com.balh.oms.settlement;
 import com.balh.oms.config.OmsConfig;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -37,18 +38,21 @@ public class BrokerCashStatementIngestService {
     private final ObjectMapper objectMapper;
     private final OmsConfig config;
     private final TransactionTemplate transactionTemplate;
+    private final MeterRegistry meterRegistry;
 
     public BrokerCashStatementIngestService(
             BrokerCashStatementBatchRepository batches,
             BrokerCashStatementMovementRepository movements,
             ObjectMapper objectMapper,
             OmsConfig config,
-            PlatformTransactionManager transactionManager) {
+            PlatformTransactionManager transactionManager,
+            MeterRegistry meterRegistry) {
         this.batches = batches;
         this.movements = movements;
         this.objectMapper = objectMapper;
         this.config = config;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
+        this.meterRegistry = meterRegistry;
     }
 
     public Result ingest(String source, String originalFilename, byte[] fileBytes) {
@@ -67,6 +71,7 @@ public class BrokerCashStatementIngestService {
         try {
             header = parseHeader(fileBytes);
         } catch (Exception e) {
+            recordIngest("rejected");
             return new Result(false, -1L, "rejected", null, truncate(e.getMessage(), st), 0, 0);
         }
 
@@ -90,6 +95,7 @@ public class BrokerCashStatementIngestService {
             }
             BrokerCashStatementBatchRepository.BatchRow row =
                     existing.orElseThrow(() -> new IllegalStateException("batch row missing after conflict"));
+            recordIngest("duplicate");
             return new Result(
                     true,
                     row.id(),
@@ -107,12 +113,14 @@ public class BrokerCashStatementIngestService {
             if (movementsNode == null || !movementsNode.isArray() || movementsNode.isEmpty()) {
                 String summary = truncate("empty movements", st);
                 batches.updateStatus(batchId, "failed", null, summary);
+                recordIngest("failed");
                 return new Result(false, batchId, "failed", null, summary, 0, 0);
             }
             if (movementsNode.size() > st.getFileImportMaxRows()) {
                 String summary = truncate(
                         "movement count " + movementsNode.size() + " exceeds max " + st.getFileImportMaxRows(), st);
                 batches.updateStatus(batchId, "failed", null, summary);
+                recordIngest("failed");
                 return new Result(false, batchId, "failed", null, summary, 0, 0);
             }
 
@@ -133,12 +141,18 @@ public class BrokerCashStatementIngestService {
             }
 
             batches.updateStatus(batchId, "parsed", parsedCount, null);
+            recordIngest("parsed");
             return new Result(false, batchId, "parsed", parsedCount, null, totalInserted, totalSkipped);
         } catch (RuntimeException | java.io.IOException e) {
             String summary = truncate(e.getMessage(), st);
             batches.updateStatus(batchId, "failed", null, summary);
+            recordIngest("failed");
             return new Result(false, batchId, "failed", null, summary, 0, 0);
         }
+    }
+
+    private void recordIngest(String status) {
+        BrokerFileIngestMetrics.record(meterRegistry, BrokerFileIngestMetrics.FILE_CASH_STATEMENT, status);
     }
 
     private int[] insertSlice(long batchId, EnvelopeHeader header, JsonNode movementsNode, int from, int to) {

@@ -3,6 +3,7 @@ package com.balh.oms.settlement;
 import com.balh.oms.config.OmsConfig;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -39,18 +40,21 @@ public class BrokerPositionSnapshotIngestService {
     private final ObjectMapper objectMapper;
     private final OmsConfig config;
     private final TransactionTemplate transactionTemplate;
+    private final MeterRegistry meterRegistry;
 
     public BrokerPositionSnapshotIngestService(
             BrokerPositionSnapshotBatchRepository batches,
             BrokerPositionSnapshotRowRepository rows,
             ObjectMapper objectMapper,
             OmsConfig config,
-            PlatformTransactionManager transactionManager) {
+            PlatformTransactionManager transactionManager,
+            MeterRegistry meterRegistry) {
         this.batches = batches;
         this.rows = rows;
         this.objectMapper = objectMapper;
         this.config = config;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
+        this.meterRegistry = meterRegistry;
     }
 
     public Result ingest(String source, String originalFilename, byte[] fileBytes) {
@@ -69,6 +73,7 @@ public class BrokerPositionSnapshotIngestService {
         try {
             header = parseHeader(fileBytes);
         } catch (Exception e) {
+            recordIngest("rejected");
             return new Result(false, -1L, "rejected", null, truncate(e.getMessage(), st), 0, 0);
         }
 
@@ -88,6 +93,7 @@ public class BrokerPositionSnapshotIngestService {
             }
             BrokerPositionSnapshotBatchRepository.BatchRow row =
                     existing.orElseThrow(() -> new IllegalStateException("batch row missing after conflict"));
+            recordIngest("duplicate");
             return new Result(
                     true,
                     row.id(),
@@ -105,12 +111,14 @@ public class BrokerPositionSnapshotIngestService {
             if (rowsNode == null || !rowsNode.isArray() || rowsNode.isEmpty()) {
                 String summary = truncate("empty rows", st);
                 batches.updateStatus(batchId, "failed", null, summary);
+                recordIngest("failed");
                 return new Result(false, batchId, "failed", null, summary, 0, 0);
             }
             if (rowsNode.size() > st.getFileImportMaxRows()) {
                 String summary = truncate(
                         "row count " + rowsNode.size() + " exceeds max " + st.getFileImportMaxRows(), st);
                 batches.updateStatus(batchId, "failed", null, summary);
+                recordIngest("failed");
                 return new Result(false, batchId, "failed", null, summary, 0, 0);
             }
 
@@ -133,12 +141,18 @@ public class BrokerPositionSnapshotIngestService {
             }
 
             batches.updateStatus(batchId, "parsed", parsedRowCount, null);
+            recordIngest("parsed");
             return new Result(false, batchId, "parsed", parsedRowCount, null, totalInserted, totalSkipped);
         } catch (RuntimeException | java.io.IOException e) {
             String summary = truncate(e.getMessage(), st);
             batches.updateStatus(batchId, "failed", null, summary);
+            recordIngest("failed");
             return new Result(false, batchId, "failed", null, summary, 0, 0);
         }
+    }
+
+    private void recordIngest(String status) {
+        BrokerFileIngestMetrics.record(meterRegistry, BrokerFileIngestMetrics.FILE_POSITION_SNAPSHOT, status);
     }
 
     private int[] insertSlice(long batchId, String brokerId, JsonNode rowsNode, int from, int to) {

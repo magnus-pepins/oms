@@ -285,11 +285,17 @@ oms:
     processor-enabled: ${OMS_CORPORATE_ACTION_PROCESSOR_ENABLED:false}
     processor-interval-ms: ${OMS_CORPORATE_ACTION_PROCESSOR_INTERVAL_MS:60000}
     processor-batch-size: ${OMS_CORPORATE_ACTION_PROCESSOR_BATCH_SIZE:50}
+    record-date-snapshot-job-enabled: ${OMS_CORPORATE_ACTION_RECORD_DATE_SNAPSHOT_JOB_ENABLED:false}
+    record-date-snapshot-batch-size: ${OMS_CORPORATE_ACTION_RECORD_DATE_SNAPSHOT_BATCH_SIZE:50}
+    record-date-snapshot-cron: ${OMS_CORPORATE_ACTION_RECORD_DATE_SNAPSHOT_CRON:0 30 23 * * *}
     ingest-instrument-symbol-max-length: ${OMS_CORPORATE_ACTION_INGEST_INSTRUMENT_SYMBOL_MAX_LENGTH:64}
     ingest-action-type-max-length: ${OMS_CORPORATE_ACTION_INGEST_ACTION_TYPE_MAX_LENGTH:64}
     ingest-payload-json-max-chars: ${OMS_CORPORATE_ACTION_INGEST_PAYLOAD_JSON_MAX_CHARS:16000}
     list-max-limit: ${OMS_CORPORATE_ACTION_LIST_MAX_LIMIT:200}
     list-default-limit: ${OMS_CORPORATE_ACTION_LIST_DEFAULT_LIMIT:50}
+  isk-tax:
+    default-fx-to-sek-rate: ${OMS_ISK_TAX_DEFAULT_FX_TO_SEK_RATE:10.00}
+    statslaneranta-override: ${OMS_ISK_TAX_STATSLANERANTA_OVERRIDE:}
   fix:
     # When routing.backend=fix and auto-start=true, starts SocketInitiator (oms-fix-egress drives outbound replay).
     auto-start: ${OMS_FIX_AUTO_START:false}

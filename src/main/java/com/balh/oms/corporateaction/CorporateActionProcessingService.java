@@ -28,19 +28,22 @@ public class CorporateActionProcessingService {
 
     private final CorporateActionImpactRepository impacts;
     private final PositionsRepository positions;
-    private final CorporateActionEventRepository events;
+    private final CorporateActionRecordDateSnapshotService recordDateSnapshots;
+    private final CorporateActionElectionService elections;
     private final ObjectMapper objectMapper;
     private final OmsConfig config;
 
     public CorporateActionProcessingService(
             CorporateActionImpactRepository impacts,
             PositionsRepository positions,
-            CorporateActionEventRepository events,
+            CorporateActionRecordDateSnapshotService recordDateSnapshots,
+            CorporateActionElectionService elections,
             ObjectMapper objectMapper,
             OmsConfig config) {
         this.impacts = impacts;
         this.positions = positions;
-        this.events = events;
+        this.recordDateSnapshots = recordDateSnapshots;
+        this.elections = elections;
         this.objectMapper = objectMapper;
         this.config = config;
     }
@@ -49,15 +52,22 @@ public class CorporateActionProcessingService {
         String action = row.actionType() == null ? "" : row.actionType().trim().toUpperCase(Locale.ROOT);
         UUID custody = UUID.fromString(config.getSettlement().getDefaultCustodyAccountId());
         JsonNode payload = parsePayload(row.payloadJson());
+        var holders = recordDateSnapshots.resolveHolders(row);
+        if (VoluntaryCorporateActionTypes.requiresElection(action)) {
+            elections.requireAllApproved(row.id(), holders);
+            throw new UnsupportedCorporateActionException("voluntary action processor not yet automated: " + action);
+        }
         switch (action) {
-            case ACTION_CASH_DIVIDEND -> processCashDividend(row, custody, payload);
-            case ACTION_STOCK_SPLIT -> processStockSplit(row, custody, payload);
+            case ACTION_CASH_DIVIDEND -> processCashDividend(row, holders, payload);
+            case ACTION_STOCK_SPLIT -> processStockSplit(row, custody, holders, payload);
             default -> throw new UnsupportedCorporateActionException("unsupported actionType: " + action);
         }
     }
 
     private void processCashDividend(
-            CorporateActionEventRepository.ProcessingRow row, UUID custody, JsonNode payload) {
+            CorporateActionEventRepository.ProcessingRow row,
+            java.util.List<CorporateActionRecordDateSnapshotService.ResolvedHolder> holders,
+            JsonNode payload) {
         BigDecimal dividendPerShare = decimalField(payload, "dividendPerShare");
         if (dividendPerShare == null || dividendPerShare.signum() <= 0) {
             throw new UnsupportedCorporateActionException("CASH_DIVIDEND missing dividendPerShare");
@@ -67,8 +77,7 @@ public class CorporateActionProcessingService {
             currency = "USD";
         }
         String symbol = row.instrumentSymbol().trim().toUpperCase(Locale.ROOT);
-        var holders = positions.listSettledHolders(symbol, custody);
-        for (PositionsRepository.SettledHolder holder : holders) {
+        for (CorporateActionRecordDateSnapshotService.ResolvedHolder holder : holders) {
             BigDecimal gross =
                     holder.quantitySettled().multiply(dividendPerShare).setScale(MONEY_SCALE, RoundingMode.HALF_UP);
             BigDecimal withholding = withholdingAmount(gross, payload);
@@ -92,13 +101,16 @@ public class CorporateActionProcessingService {
     }
 
     private void processStockSplit(
-            CorporateActionEventRepository.ProcessingRow row, UUID custody, JsonNode payload) {
+            CorporateActionEventRepository.ProcessingRow row,
+            UUID custody,
+            java.util.List<CorporateActionRecordDateSnapshotService.ResolvedHolder> holders,
+            JsonNode payload) {
         BigDecimal ratio = splitRatio(payload);
         if (ratio == null || ratio.compareTo(BigDecimal.ZERO) <= 0) {
             throw new UnsupportedCorporateActionException("STOCK_SPLIT missing split ratio");
         }
         String symbol = row.instrumentSymbol().trim().toUpperCase(Locale.ROOT);
-        for (PositionsRepository.SettledHolder holder : positions.listSettledHolders(symbol, custody)) {
+        for (CorporateActionRecordDateSnapshotService.ResolvedHolder holder : holders) {
             BigDecimal before = holder.quantitySettled();
             BigDecimal after = before.multiply(ratio);
             positions.applyCorporateActionSplit(holder.accountId(), symbol, custody, ratio);

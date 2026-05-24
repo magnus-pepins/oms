@@ -3,6 +3,7 @@ package com.balh.oms.settlement;
 import com.balh.oms.config.OmsConfig;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -63,6 +64,7 @@ public class BrokerTradeConfirmIngestService {
     private final OmsConfig config;
     private final TransactionTemplate transactionTemplate;
     private final BrokerTradeConfirmBatchLifecycleService brokerTradeConfirmBatchLifecycle;
+    private final MeterRegistry meterRegistry;
 
     public BrokerTradeConfirmIngestService(
             BrokerConfirmBatchRepository batches,
@@ -71,7 +73,8 @@ public class BrokerTradeConfirmIngestService {
             ObjectMapper objectMapper,
             OmsConfig config,
             PlatformTransactionManager transactionManager,
-            BrokerTradeConfirmBatchLifecycleService brokerTradeConfirmBatchLifecycle) {
+            BrokerTradeConfirmBatchLifecycleService brokerTradeConfirmBatchLifecycle,
+            MeterRegistry meterRegistry) {
         this.batches = batches;
         this.confirms = confirms;
         this.fees = fees;
@@ -79,6 +82,7 @@ public class BrokerTradeConfirmIngestService {
         this.config = config;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
         this.brokerTradeConfirmBatchLifecycle = brokerTradeConfirmBatchLifecycle;
+        this.meterRegistry = meterRegistry;
     }
 
     public Result ingest(String source, String originalFilename, byte[] fileBytes) {
@@ -97,6 +101,7 @@ public class BrokerTradeConfirmIngestService {
         try {
             header = parseHeader(fileBytes);
         } catch (Exception e) {
+            recordIngest("rejected");
             return new Result(false, -1L, "rejected", null, truncate(e.getMessage(), st), 0, 0, 0);
         }
 
@@ -116,6 +121,7 @@ public class BrokerTradeConfirmIngestService {
             }
             BrokerConfirmBatchRepository.BatchRow row =
                     existing.orElseThrow(() -> new IllegalStateException("batch row missing after conflict"));
+            recordIngest("duplicate");
             return new Result(
                     true,
                     row.id(),
@@ -134,12 +140,14 @@ public class BrokerTradeConfirmIngestService {
             if (rowsNode == null || !rowsNode.isArray() || rowsNode.isEmpty()) {
                 String summary = truncate("empty rows", st);
                 batches.updateStatus(batchId, "failed", null, summary);
+                recordIngest("failed");
                 return new Result(false, batchId, "failed", null, summary, 0, 0, 0);
             }
             if (rowsNode.size() > st.getFileImportMaxRows()) {
                 String summary = truncate(
                         "row count " + rowsNode.size() + " exceeds max " + st.getFileImportMaxRows(), st);
                 batches.updateStatus(batchId, "failed", null, summary);
+                recordIngest("failed");
                 return new Result(false, batchId, "failed", null, summary, 0, 0, 0);
             }
 
@@ -170,6 +178,7 @@ public class BrokerTradeConfirmIngestService {
             }
             String finalStatus =
                     batches.findById(batchId).map(BrokerConfirmBatchRepository.BatchRow::status).orElse("parsed");
+            recordIngest("parsed");
             return new Result(
                     false,
                     batchId,
@@ -182,8 +191,13 @@ public class BrokerTradeConfirmIngestService {
         } catch (RuntimeException | java.io.IOException e) {
             String summary = truncate(e.getMessage(), st);
             batches.updateStatus(batchId, "failed", null, summary);
+            recordIngest("failed");
             return new Result(false, batchId, "failed", null, summary, 0, 0, 0);
         }
+    }
+
+    private void recordIngest(String status) {
+        BrokerFileIngestMetrics.record(meterRegistry, BrokerFileIngestMetrics.FILE_TRADE_CONFIRM, status);
     }
 
     private int[] insertSlice(long batchId, String brokerId, JsonNode rowsNode, int from, int to) {

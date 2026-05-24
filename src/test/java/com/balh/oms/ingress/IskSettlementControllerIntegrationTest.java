@@ -7,6 +7,9 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
@@ -21,16 +24,19 @@ class IskSettlementControllerIntegrationTest extends AbstractPostgresIntegration
 
     UUID accountId;
     UUID iskAccountId;
+    HttpHeaders internalHeaders;
 
     @BeforeEach
     void seedIskAccount() {
         accountId = UUID.randomUUID();
         iskAccountId = UUID.randomUUID();
+        internalHeaders = new HttpHeaders();
+        internalHeaders.set("X-OMS-Internal-Key", "test-key");
         jdbc.update(
                 """
                         INSERT INTO oms_account_tax_wrapper (
                             account_id, tax_wrapper, isk_account_id, ledger_balance_id
-                        ) VALUES (:accountId, 'SE_ISK', :iskAccountId, 'balance_test_isk')
+                        ) VALUES (:accountId, 'isk', :iskAccountId, 'balance_test_isk')
                         ON CONFLICT (account_id) DO NOTHING
                         """,
                 new MapSqlParameterSource()
@@ -41,9 +47,10 @@ class IskSettlementControllerIntegrationTest extends AbstractPostgresIntegration
     @Test
     void captureValuationSnapshots_returnsQuarterSummary() {
         ResponseEntity<IskSettlementController.ValuationCaptureResponse> resp =
-                rest.postForEntity(
+                rest.exchange(
                         "/internal/v1/settlement/isk/valuation-snapshots/capture?asOf=2026-03-15",
-                        null,
+                        HttpMethod.POST,
+                        new HttpEntity<>(internalHeaders),
                         IskSettlementController.ValuationCaptureResponse.class);
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(resp.getBody()).isNotNull();
@@ -60,15 +67,17 @@ class IskSettlementControllerIntegrationTest extends AbstractPostgresIntegration
 
     @Test
     void exportKu30Draft_writesTaxYearExportRow() {
-        rest.postForEntity(
+        rest.exchange(
                 "/internal/v1/settlement/isk/valuation-snapshots/capture?asOf=2026-06-01",
-                null,
+                HttpMethod.POST,
+                new HttpEntity<>(internalHeaders),
                 IskSettlementController.ValuationCaptureResponse.class);
 
         ResponseEntity<IskSettlementController.Ku30ExportResponse> resp =
-                rest.postForEntity(
+                rest.exchange(
                         "/internal/v1/settlement/isk/ku30-export/2026",
-                        null,
+                        HttpMethod.POST,
+                        new HttpEntity<>(internalHeaders),
                         IskSettlementController.Ku30ExportResponse.class);
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(resp.getBody()).isNotNull();

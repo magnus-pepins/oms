@@ -38,6 +38,7 @@ public class OmsConfig {
     private final Settlement settlement = new Settlement();
     private final Marketdata marketdata = new Marketdata();
     private final CorporateAction corporateAction = new CorporateAction();
+    private final IskTax iskTax = new IskTax();
     private final Desk desk = new Desk();
     private final Fx fx = new Fx();
     private final Otel otel = new Otel();
@@ -59,6 +60,7 @@ public class OmsConfig {
     public Settlement getSettlement() { return settlement; }
     public Marketdata getMarketdata() { return marketdata; }
     public CorporateAction getCorporateAction() { return corporateAction; }
+    public IskTax getIskTax() { return iskTax; }
     public Desk getDesk() { return desk; }
     public Fx getFx() { return fx; }
     public Otel getOtel() { return otel; }
@@ -2388,6 +2390,8 @@ public class OmsConfig {
         private int payableDateLedgerBatchSize = 50;
         private long ledgerOutboxReconcilerIntervalMs = 1_000L;
         private int ledgerOutboxReconcilerBatchSize = 25;
+        private boolean recordDateSnapshotJobEnabled = false;
+        private int recordDateSnapshotBatchSize = 50;
 
         public boolean isProcessorEnabled() {
             return processorEnabled;
@@ -2491,6 +2495,61 @@ public class OmsConfig {
 
         public void setLedgerOutboxReconcilerBatchSize(int ledgerOutboxReconcilerBatchSize) {
             this.ledgerOutboxReconcilerBatchSize = Math.min(200, Math.max(1, ledgerOutboxReconcilerBatchSize));
+        }
+
+        public boolean isRecordDateSnapshotJobEnabled() {
+            return recordDateSnapshotJobEnabled;
+        }
+
+        public void setRecordDateSnapshotJobEnabled(boolean recordDateSnapshotJobEnabled) {
+            this.recordDateSnapshotJobEnabled = recordDateSnapshotJobEnabled;
+        }
+
+        public int getRecordDateSnapshotBatchSize() {
+            return recordDateSnapshotBatchSize;
+        }
+
+        public void setRecordDateSnapshotBatchSize(int recordDateSnapshotBatchSize) {
+            this.recordDateSnapshotBatchSize = Math.min(500, Math.max(1, recordDateSnapshotBatchSize));
+        }
+    }
+
+    /** ISK tax / valuation parameters (gap plan §5.10 Phase E). */
+    public static class IskTax {
+        private BigDecimal defaultFxToSekRate = new BigDecimal("10.00");
+        private BigDecimal statslanerantaOverride;
+        private java.util.Map<String, BigDecimal> fxToSekRates = new java.util.HashMap<>();
+
+        public BigDecimal getDefaultFxToSekRate() {
+            return defaultFxToSekRate;
+        }
+
+        public void setDefaultFxToSekRate(BigDecimal defaultFxToSekRate) {
+            if (defaultFxToSekRate != null && defaultFxToSekRate.signum() > 0) {
+                this.defaultFxToSekRate = defaultFxToSekRate;
+            }
+        }
+
+        public BigDecimal getStatslanerantaOverride() {
+            return statslanerantaOverride;
+        }
+
+        public void setStatslanerantaOverride(BigDecimal statslanerantaOverride) {
+            this.statslanerantaOverride = statslanerantaOverride;
+        }
+
+        public java.util.Map<String, BigDecimal> getFxToSekRates() {
+            if (fxToSekRates == null || fxToSekRates.isEmpty()) {
+                java.util.Map<String, BigDecimal> defaults = new java.util.HashMap<>();
+                defaults.put("USD", defaultFxToSekRate);
+                defaults.put("EUR", new BigDecimal("11.00"));
+                return defaults;
+            }
+            return fxToSekRates;
+        }
+
+        public void setFxToSekRates(java.util.Map<String, BigDecimal> fxToSekRates) {
+            this.fxToSekRates = fxToSekRates;
         }
     }
 

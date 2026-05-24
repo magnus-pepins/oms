@@ -153,6 +153,8 @@ public class BrokerSettlementFailIngestService {
 
     private void recordIngest(String status) {
         meterRegistry.counter(METRIC_INGEST, java.util.List.of(Tag.of("status", status))).increment();
+        BrokerFileIngestMetrics.record(
+                meterRegistry, BrokerFileIngestMetrics.FILE_SETTLEMENT_FAIL, status);
     }
 
     private int[] insertSlice(long batchId, EnvelopeHeader header, JsonNode failsNode, int from, int to) {

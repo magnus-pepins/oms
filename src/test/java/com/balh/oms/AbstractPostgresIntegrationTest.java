@@ -155,6 +155,8 @@ public abstract class AbstractPostgresIntegrationTest {
                     + " execution_settlement_lot, oms_account_tax_wrapper,"
                     + " corporate_action_entitlement, corporate_action_position_impact,"
                     + " corporate_action_cash_impact, corporate_action_ledger_outbox,"
+                    + " corporate_action_record_date_snapshot, corporate_action_election,"
+                    + " isk_tax_parameters,"
                     + " settlement_customer_notification_outbox,"
                     + " isk_valuation_snapshot, isk_tax_year_export,"
                     + " position_reconciliation_report_row, position_reconciliation_report,"

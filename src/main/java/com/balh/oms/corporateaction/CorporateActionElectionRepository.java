@@ -127,6 +127,22 @@ public class CorporateActionElectionRepository {
         return count == null ? 0 : count;
     }
 
+    public java.util.Optional<String> findApprovedChoice(long eventId, UUID accountId) {
+        return jdbc.query(
+                        """
+                                SELECT election_choice FROM corporate_action_election
+                                WHERE corporate_action_event_id = :eventId
+                                  AND account_id = :accountId
+                                  AND approved_at IS NOT NULL
+                                """,
+                        new MapSqlParameterSource()
+                                .addValue("eventId", eventId)
+                                .addValue("accountId", accountId),
+                        (rs, rowNum) -> rs.getString("election_choice"))
+                .stream()
+                .findFirst();
+    }
+
     private static ElectionRow mapRow(java.sql.ResultSet rs) throws java.sql.SQLException {
         var approvedAt = rs.getTimestamp("approved_at");
         return new ElectionRow(

@@ -22,6 +22,7 @@ public class IskKu30ExportService {
     private final OmsAccountTaxWrapperRepository taxWrappers;
     private final IskTaxYearExportRepository exports;
     private final IskSchablonTaxService schablonTax;
+    private final IskKapitalunderlagDepositService kapitalunderlagDeposits;
     private final ObjectMapper objectMapper;
 
     public IskKu30ExportService(
@@ -29,11 +30,13 @@ public class IskKu30ExportService {
             OmsAccountTaxWrapperRepository taxWrappers,
             IskTaxYearExportRepository exports,
             IskSchablonTaxService schablonTax,
+            IskKapitalunderlagDepositService kapitalunderlagDeposits,
             ObjectMapper objectMapper) {
         this.snapshots = snapshots;
         this.taxWrappers = taxWrappers;
         this.exports = exports;
         this.schablonTax = schablonTax;
+        this.kapitalunderlagDeposits = kapitalunderlagDeposits;
         this.objectMapper = objectMapper;
     }
 
@@ -86,9 +89,13 @@ public class IskKu30ExportService {
             perAccount.put("kapitalunderlagSek", kapital.toPlainString());
             perAccount.put("schablonintaktSek", schablon.toPlainString());
             perAccount.put("schablonRate", schablonTax.schablonRateForYear(taxYear).toPlainString());
+            BigDecimal depositsSek = kapitalunderlagDeposits.sumDepositsSek(iskId, taxYear);
+            perAccount.put("depositsTowardKapitalunderlagSek", depositsSek.toPlainString());
             perAccount.put(
                     "note",
-                    "Draft — deposit exclusions from ledger isk_deposit_events require elevated ledger read (I5 tail)");
+                    depositsSek.signum() > 0
+                            ? "Draft includes ledger isk_deposit_events toward kapitalunderlag"
+                            : "Draft — no qualifying ledger deposits read for this account/year");
 
             exports.upsertDraft(
                     taxYear,
@@ -133,7 +140,9 @@ public class IskKu30ExportService {
                                     .map(IskValuationSnapshotRepository.SnapshotRow::totalSek)
                                     .reduce(BigDecimal.ZERO, BigDecimal::add));
         }
+        BigDecimal deposits = kapitalunderlagDeposits.sumDepositsSek(iskAccountId, taxYear);
         return quarterSum
+                .add(deposits)
                 .divide(new BigDecimal("4"), MONEY_SCALE, RoundingMode.HALF_UP);
     }
 

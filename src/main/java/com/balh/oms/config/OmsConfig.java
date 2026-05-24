@@ -236,6 +236,10 @@ public class OmsConfig {
         private int inflightReservationPrecision = 100;
         private String baseUrl = "http://localhost:5001";
         private String apiKey = "";
+        /** Bearer token for elevated ISK read API ({@code /internal/v1/isk/*}). */
+        private String elevatedApiKey = "";
+        /** When true with {@link #elevatedApiKey}, wires {@link com.balh.oms.ledger.LedgerIskReadClient}. */
+        private boolean iskReadEnabled = false;
         private long connectTimeoutMs = 2000L;
         private long readTimeoutMs = 5000L;
         /**
@@ -481,6 +485,10 @@ public class OmsConfig {
         public void setBaseUrl(String v) { this.baseUrl = v; }
         public String getApiKey() { return apiKey; }
         public void setApiKey(String v) { this.apiKey = v; }
+        public String getElevatedApiKey() { return elevatedApiKey; }
+        public void setElevatedApiKey(String v) { this.elevatedApiKey = v; }
+        public boolean isIskReadEnabled() { return iskReadEnabled; }
+        public void setIskReadEnabled(boolean v) { this.iskReadEnabled = v; }
         public long getConnectTimeoutMs() { return connectTimeoutMs; }
         public void setConnectTimeoutMs(long v) { this.connectTimeoutMs = v; }
         public long getReadTimeoutMs() { return readTimeoutMs; }

@@ -23,6 +23,8 @@ public class CorporateActionProcessingService {
 
     public static final String ACTION_CASH_DIVIDEND = "CASH_DIVIDEND";
     public static final String ACTION_STOCK_SPLIT = "STOCK_SPLIT";
+    public static final String ACTION_TENDER_OFFER = "TENDER_OFFER";
+    public static final String ACTION_RIGHTS_ISSUE = "RIGHTS_ISSUE";
 
     private static final int MONEY_SCALE = 2;
 
@@ -30,6 +32,7 @@ public class CorporateActionProcessingService {
     private final PositionsRepository positions;
     private final CorporateActionRecordDateSnapshotService recordDateSnapshots;
     private final CorporateActionElectionService elections;
+    private final CorporateActionElectionRepository electionRepository;
     private final ObjectMapper objectMapper;
     private final OmsConfig config;
 
@@ -38,12 +41,14 @@ public class CorporateActionProcessingService {
             PositionsRepository positions,
             CorporateActionRecordDateSnapshotService recordDateSnapshots,
             CorporateActionElectionService elections,
+            CorporateActionElectionRepository electionRepository,
             ObjectMapper objectMapper,
             OmsConfig config) {
         this.impacts = impacts;
         this.positions = positions;
         this.recordDateSnapshots = recordDateSnapshots;
         this.elections = elections;
+        this.electionRepository = electionRepository;
         this.objectMapper = objectMapper;
         this.config = config;
     }
@@ -55,11 +60,12 @@ public class CorporateActionProcessingService {
         var holders = recordDateSnapshots.resolveHolders(row);
         if (VoluntaryCorporateActionTypes.requiresElection(action)) {
             elections.requireAllApproved(row.id(), holders);
-            throw new UnsupportedCorporateActionException("voluntary action processor not yet automated: " + action);
         }
         switch (action) {
             case ACTION_CASH_DIVIDEND -> processCashDividend(row, holders, payload);
             case ACTION_STOCK_SPLIT -> processStockSplit(row, custody, holders, payload);
+            case ACTION_TENDER_OFFER -> processTenderOffer(row, holders, payload);
+            case ACTION_RIGHTS_ISSUE -> processRightsIssue(row, holders, payload);
             default -> throw new UnsupportedCorporateActionException("unsupported actionType: " + action);
         }
     }
@@ -118,6 +124,90 @@ public class CorporateActionProcessingService {
             impacts.insertPositionImpact(row.id(), holder.accountId(), symbol, before, after);
         }
         log.info("corporate_action STOCK_SPLIT processed id={} symbol={} ratio={}", row.id(), symbol, ratio);
+    }
+
+    private void processTenderOffer(
+            CorporateActionEventRepository.ProcessingRow row,
+            java.util.List<CorporateActionRecordDateSnapshotService.ResolvedHolder> holders,
+            JsonNode payload) {
+        BigDecimal tenderPrice = decimalField(payload, "tenderPricePerShare");
+        if (tenderPrice == null || tenderPrice.signum() <= 0) {
+            tenderPrice = decimalField(payload, "offerPricePerShare");
+        }
+        if (tenderPrice == null || tenderPrice.signum() <= 0) {
+            throw new UnsupportedCorporateActionException("TENDER_OFFER missing tenderPricePerShare");
+        }
+        String currency = textField(payload, "currency");
+        if (currency == null || currency.isBlank()) {
+            currency = "USD";
+        }
+        String symbol = row.instrumentSymbol().trim().toUpperCase(Locale.ROOT);
+        int processed = 0;
+        for (CorporateActionRecordDateSnapshotService.ResolvedHolder holder : holders) {
+            String choice =
+                    electionRepository
+                            .findApprovedChoice(row.id(), holder.accountId())
+                            .orElse("");
+            if (CorporateActionElectionChoices.isDecline(choice)) {
+                continue;
+            }
+            if (!CorporateActionElectionChoices.isParticipate(choice)) {
+                throw new UnsupportedCorporateActionException(
+                        "TENDER_OFFER holder missing participate election: " + holder.accountId());
+            }
+            BigDecimal gross =
+                    holder.quantitySettled().multiply(tenderPrice).setScale(MONEY_SCALE, RoundingMode.HALF_UP);
+            impacts.insertEntitlement(
+                    row.id(), holder.accountId(), symbol, holder.quantitySettled(), null, gross, currency);
+            impacts.insertCashImpactWithWithholding(
+                    row.id(), holder.accountId(), gross, gross, null, currency, row.payableDate());
+            processed++;
+        }
+        log.info("corporate_action TENDER_OFFER processed id={} symbol={} participants={}", row.id(), symbol, processed);
+    }
+
+    private void processRightsIssue(
+            CorporateActionEventRepository.ProcessingRow row,
+            java.util.List<CorporateActionRecordDateSnapshotService.ResolvedHolder> holders,
+            JsonNode payload) {
+        BigDecimal rightsPerShare = decimalField(payload, "rightsPerShare");
+        if (rightsPerShare == null || rightsPerShare.signum() <= 0) {
+            BigDecimal newRights = decimalField(payload, "newRights");
+            BigDecimal oldShares = decimalField(payload, "oldShares");
+            if (newRights != null && oldShares != null && oldShares.signum() > 0) {
+                rightsPerShare = newRights.divide(oldShares, 10, RoundingMode.HALF_UP);
+            }
+        }
+        if (rightsPerShare == null || rightsPerShare.signum() <= 0) {
+            throw new UnsupportedCorporateActionException("RIGHTS_ISSUE missing rightsPerShare");
+        }
+        String symbol = row.instrumentSymbol().trim().toUpperCase(Locale.ROOT);
+        String rightsSymbol = textField(payload, "rightsSymbol");
+        if (rightsSymbol == null || rightsSymbol.isBlank()) {
+            rightsSymbol = symbol + ".RT";
+        } else {
+            rightsSymbol = rightsSymbol.trim().toUpperCase(Locale.ROOT);
+        }
+        int processed = 0;
+        for (CorporateActionRecordDateSnapshotService.ResolvedHolder holder : holders) {
+            String choice =
+                    electionRepository
+                            .findApprovedChoice(row.id(), holder.accountId())
+                            .orElse("");
+            if (CorporateActionElectionChoices.isDecline(choice)) {
+                continue;
+            }
+            if (!CorporateActionElectionChoices.isParticipate(choice)) {
+                throw new UnsupportedCorporateActionException(
+                        "RIGHTS_ISSUE holder missing participate election: " + holder.accountId());
+            }
+            BigDecimal rightsQty =
+                    holder.quantitySettled().multiply(rightsPerShare).setScale(10, RoundingMode.HALF_UP);
+            impacts.insertEntitlement(row.id(), holder.accountId(), symbol, holder.quantitySettled(), rightsQty, null, null);
+            impacts.insertPositionImpact(row.id(), holder.accountId(), rightsSymbol, BigDecimal.ZERO, rightsQty);
+            processed++;
+        }
+        log.info("corporate_action RIGHTS_ISSUE processed id={} symbol={} participants={}", row.id(), symbol, processed);
     }
 
     static BigDecimal splitRatio(JsonNode payload) {

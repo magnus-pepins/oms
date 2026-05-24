@@ -85,6 +85,8 @@ oms:
     enabled: ${OMS_LEDGER_ENABLED:false}
     base-url: ${OMS_LEDGER_BASE_URL:http://localhost:5001}
     api-key: ${OMS_LEDGER_API_KEY:}
+    elevated-api-key: ${OMS_LEDGER_ELEVATED_API_KEY:}
+    isk-read-enabled: ${OMS_LEDGER_ISK_READ_ENABLED:false}
     connect-timeout-ms: ${OMS_LEDGER_CONNECT_TIMEOUT_MS:2000}
     read-timeout-ms: ${OMS_LEDGER_READ_TIMEOUT_MS:5000}
     inflight-reservation-enabled: ${OMS_LEDGER_INFLIGHT_RESERVATION_ENABLED:false}

@@ -9,6 +9,8 @@ import com.balh.oms.ledger.RestLedgerBalanceClient;
 import com.balh.oms.ledger.RestLedgerInflightBulkDispatcher;
 import com.balh.oms.ledger.LedgerInflightLifecycleClient;
 import com.balh.oms.ledger.RestLedgerInflightLifecycleClient;
+import com.balh.oms.ledger.LedgerIskReadClient;
+import com.balh.oms.ledger.RestLedgerIskReadClient;
 import com.balh.oms.ledger.RestLedgerInflightReservationClient;
 import com.balh.oms.persistence.LedgerInflightOutboxRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -75,6 +77,18 @@ public class LedgerConfiguration {
                 cacheConfig.getTtlSeconds(),
                 cacheConfig.getMaxSize(),
                 meterRegistry);
+    }
+
+    @Bean
+    @ConditionalOnProperty(prefix = "oms.ledger", name = "isk-read-enabled", havingValue = "true")
+    LedgerIskReadClient ledgerIskReadClient(
+            RestClient omsLedgerRestClient, OmsConfig config, ObjectMapper objectMapper) {
+        String token = config.getLedger().getElevatedApiKey();
+        if (token == null || token.isBlank()) {
+            throw new IllegalStateException(
+                    "oms.ledger.elevated-api-key is required when oms.ledger.isk-read-enabled=true");
+        }
+        return new RestLedgerIskReadClient(omsLedgerRestClient, token.trim(), objectMapper);
     }
 
     @Bean

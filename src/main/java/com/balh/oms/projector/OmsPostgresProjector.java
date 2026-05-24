@@ -5,6 +5,8 @@ import com.balh.oms.cluster.AcceptOrderCommand;
 import com.balh.oms.cluster.ApplyExecutionReportCommand;
 import com.balh.oms.cluster.ExecutionAppliedEvent;
 import com.balh.oms.cluster.OmsAdmissionClusteredService;
+import com.balh.oms.cluster.OmsClusterEventsRecordingSupport;
+import com.balh.oms.cluster.OmsClusterEventsRecordingSupport.BootstrapPick;
 import com.balh.oms.cluster.OmsClusterWireFormat;
 import com.balh.oms.cluster.OrderAdmittedEvent;
 import com.balh.oms.cluster.OrderCancelAppliedEvent;
@@ -339,8 +341,8 @@ public class OmsPostgresProjector {
                     OmsClusterWireFormat.EVENTS_STREAM_ID);
         } else {
             log.info(
-                    "oms-postgres-projector starting fresh (no saved cursor); will bootstrap from the oldest available"
-                            + " events recording at position 0 (projectorId={}, streamId={})",
+                    "oms-postgres-projector starting fresh (no saved cursor); will bootstrap from the first"
+                            + " non-empty events recording at its start position (projectorId={}, streamId={})",
                     PROJECTOR_ID,
                     OmsClusterWireFormat.EVENTS_STREAM_ID);
         }
@@ -399,8 +401,10 @@ public class OmsPostgresProjector {
      *
      * <ol>
      *   <li>Bootstraps {@link #currentRecordingId} from {@link #startupCursor} (loaded by
-     *       {@link #init}) or, on a first-ever start, picks the oldest available recording and
-     *       persists {@code (oldestId, 0)} via {@link AeronProjectorCursorRepository#resetWithRecording}.</li>
+     *       {@link #init}) or, on a first-ever start, picks the lowest-id <em>non-empty</em>
+     *       events recording and persists {@code (id, startPosition)} via
+     *       {@link AeronProjectorCursorRepository#resetWithRecording} (empty tombstones such as
+     *       recording {@code 0} after a cluster wipe are skipped).</li>
      *   <li>Re-lists recordings, finds the descriptor for {@code currentRecordingId}, and
      *       opens a replay subscription at the saved position. <b>Fails loud</b> if the saved
      *       recording id is no longer in the Archive — this is an operator-fix-it condition,
@@ -461,9 +465,10 @@ public class OmsPostgresProjector {
     }
 
     /**
-     * First-ever-start path: picks the oldest events recording on the channel/stream, persists
-     * {@code (oldestId, 0)} as the initial cursor, and seeds {@link #currentRecordingId} and
-     * {@link #lastAppliedPosition}.
+     * First-ever-start path: picks the lowest-id <em>non-empty</em> events recording on the
+     * channel/stream (skipping empty tombstones such as recording {@code 0} after a cluster
+     * wipe), persists {@code (id, startPosition)} as the initial cursor, and seeds
+     * {@link #currentRecordingId} and {@link #lastAppliedPosition}.
      *
      * @return {@code true} if a recording was found and persisted; {@code false} if shutdown was
      *         requested before any recording appeared.
@@ -471,20 +476,35 @@ public class OmsPostgresProjector {
     private boolean bootstrapFromOldestRecording(AeronArchive archive, long parkMs) {
         while (running.get()) {
             List<RecordingDescriptor> recordings = listEventsRecordingsSorted(archive);
-            if (!recordings.isEmpty()) {
-                RecordingDescriptor oldest = recordings.get(0);
-                log.info(
-                        "oms-postgres-projector bootstrap: persisting initial cursor (recordingId={}, position={})"
-                                + " — first start on this projector, no prior cursor row.",
-                        oldest.recordingId(),
-                        oldest.startPosition());
+            Optional<BootstrapPick> bootstrapPick = OmsClusterEventsRecordingSupport.pickBootstrapRecording(
+                    archive,
+                    recordings.stream()
+                            .map(d -> new BootstrapPick(d.recordingId(), d.startPosition(), d.stopPosition()))
+                            .toList());
+            if (bootstrapPick.isPresent()) {
+                BootstrapPick target = bootstrapPick.get();
+                if (target.skippedEmptyTombstones() > 0) {
+                    log.info(
+                            "oms-postgres-projector bootstrap: skipped {} empty events recording tombstone(s);"
+                                    + " persisting initial cursor (recordingId={}, position={})"
+                                    + " — first start on this projector, no prior cursor row.",
+                            target.skippedEmptyTombstones(),
+                            target.recordingId(),
+                            target.startPosition());
+                } else {
+                    log.info(
+                            "oms-postgres-projector bootstrap: persisting initial cursor (recordingId={}, position={})"
+                                    + " — first start on this projector, no prior cursor row.",
+                            target.recordingId(),
+                            target.startPosition());
+                }
                 cursorRepository.resetWithRecording(
                         PROJECTOR_ID,
                         OmsClusterWireFormat.EVENTS_STREAM_ID,
-                        oldest.recordingId(),
-                        oldest.startPosition());
-                currentRecordingId.set(oldest.recordingId());
-                lastAppliedPosition.set(oldest.startPosition());
+                        target.recordingId(),
+                        target.startPosition());
+                currentRecordingId.set(target.recordingId());
+                lastAppliedPosition.set(target.startPosition());
                 return true;
             }
             try {
@@ -543,14 +563,76 @@ public class OmsPostgresProjector {
                 savedPosition = descriptor.startPosition();
             }
 
+            // Empty tombstone recordings (post-wipe id=0 with stop=start=0) cannot be replayed.
+            // Walk forward across any consecutive empty ids; park on a live empty tail until the
+            // cluster writes its first event.
+            while (running.get()
+                    && OmsClusterEventsRecordingSupport.isEmptyRecording(
+                            archive,
+                            descriptor.recordingId(),
+                            descriptor.startPosition(),
+                            descriptor.stopPosition())) {
+                RecordingDescriptor successor = findNextRecording(archive, recordingIdNow);
+                if (successor != null) {
+                    log.info(
+                            "Projector skipping empty events recordingId={}; rolling forward to"
+                                    + " recordingId={} startPosition={}.",
+                            recordingIdNow,
+                            successor.recordingId(),
+                            successor.startPosition());
+                    cursorRepository.resetWithRecording(
+                            PROJECTOR_ID,
+                            OmsClusterWireFormat.EVENTS_STREAM_ID,
+                            successor.recordingId(),
+                            successor.startPosition());
+                    currentRecordingId.set(successor.recordingId());
+                    lastAppliedPosition.set(successor.startPosition());
+                    recordingIdNow = successor.recordingId();
+                    descriptor = successor;
+                    savedPosition = successor.startPosition();
+                    continue;
+                }
+                LockSupport.parkNanos(projectorCfg.getPollParkNanos());
+                descriptor = findRecordingById(archive, recordingIdNow);
+                requireRecordingPresent(recordingIdNow, descriptor);
+            }
+            if (!running.get()) {
+                return;
+            }
+            savedPosition = lastAppliedPosition.get();
+            upperBound = recordingUpperBound(archive, descriptor);
+
             Subscription replay = null;
             try {
-                replay = archive.replay(
-                        descriptor.recordingId(),
-                        savedPosition,
-                        /* length = */ Long.MAX_VALUE,
-                        projectorCfg.getReplayChannel(),
-                        projectorCfg.getReplayStreamId());
+                try {
+                    replay = archive.replay(
+                            descriptor.recordingId(),
+                            savedPosition,
+                            /* length = */ Long.MAX_VALUE,
+                            projectorCfg.getReplayChannel(),
+                            projectorCfg.getReplayStreamId());
+                } catch (RuntimeException e) {
+                    if (OmsClusterEventsRecordingSupport.isEmptyRecordingReplayArchiveException(e)) {
+                        RecordingDescriptor successor = findNextRecording(archive, recordingIdNow);
+                        if (successor != null) {
+                            log.warn(
+                                    "Projector Archive rejected replay on empty recordingId={}; rolling forward"
+                                            + " to recordingId={} startPosition={}.",
+                                    recordingIdNow,
+                                    successor.recordingId(),
+                                    successor.startPosition());
+                            cursorRepository.resetWithRecording(
+                                    PROJECTOR_ID,
+                                    OmsClusterWireFormat.EVENTS_STREAM_ID,
+                                    successor.recordingId(),
+                                    successor.startPosition());
+                            currentRecordingId.set(successor.recordingId());
+                            lastAppliedPosition.set(successor.startPosition());
+                            continue;
+                        }
+                    }
+                    throw e;
+                }
                 log.info(
                         "Projector replay open; recordingId={} startPos={} (recordingStart={}, recordingStop={},"
                                 + " upperBound={}) channel={} streamId={}",
@@ -689,15 +771,8 @@ public class OmsPostgresProjector {
      * neither is available (active recording with no events yet).
      */
     private long recordingUpperBound(AeronArchive archive, RecordingDescriptor descriptor) {
-        long stop = descriptor.stopPosition();
-        if (stop != io.aeron.archive.client.AeronArchive.NULL_POSITION) {
-            return stop;
-        }
-        long head = archive.getRecordingPosition(descriptor.recordingId());
-        if (head == io.aeron.archive.client.AeronArchive.NULL_POSITION) {
-            return descriptor.startPosition();
-        }
-        return head;
+        return OmsClusterEventsRecordingSupport.recordingUpperBound(
+                archive, descriptor.recordingId(), descriptor.startPosition(), descriptor.stopPosition());
     }
 
     /**

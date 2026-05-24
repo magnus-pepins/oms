@@ -1,5 +1,7 @@
 package com.balh.oms.fixegress;
 
+import com.balh.oms.cluster.OmsClusterEventsRecordingSupport;
+import com.balh.oms.cluster.OmsClusterEventsRecordingSupport.BootstrapPick;
 import com.balh.oms.cluster.OmsClusterWireFormat;
 import com.balh.oms.cluster.OrderAdmittedEvent;
 import com.balh.oms.cluster.OrderCancelRequestedEvent;
@@ -463,8 +465,9 @@ public class OmsFixEgressService {
     }
 
     /**
-     * First-ever-start path: picks the oldest events recording on the channel/stream, persists
-     * {@code (oldestId, startPosition)} as the initial cursor, and seeds
+     * First-ever-start path: picks the lowest-id <em>non-empty</em> events recording on the
+     * channel/stream (skipping empty tombstones such as recording {@code 0} after a cluster
+     * wipe), persists {@code (id, startPosition)} as the initial cursor, and seeds
      * {@link #currentRecordingId} + {@link #lastAppliedPosition} + the batch-flush bookkeeping.
      *
      * @return {@code true} if a recording was found and persisted; {@code false} if shutdown was
@@ -473,21 +476,36 @@ public class OmsFixEgressService {
     private boolean bootstrapFromOldestRecording(AeronArchive archive, long parkMs) {
         while (running.get()) {
             List<RecordingDescriptor> recordings = listEventsRecordingsSorted(archive);
-            if (!recordings.isEmpty()) {
-                RecordingDescriptor oldest = recordings.get(0);
-                log.info(
-                        "oms-fix-egress bootstrap: persisting initial cursor (recordingId={}, position={})"
-                                + " — first start on this egress, no prior cursor row.",
-                        oldest.recordingId(),
-                        oldest.startPosition());
+            Optional<BootstrapPick> bootstrapPick = OmsClusterEventsRecordingSupport.pickBootstrapRecording(
+                    archive,
+                    recordings.stream()
+                            .map(d -> new BootstrapPick(d.recordingId(), d.startPosition(), d.stopPosition()))
+                            .toList());
+            if (bootstrapPick.isPresent()) {
+                BootstrapPick target = bootstrapPick.get();
+                if (target.skippedEmptyTombstones() > 0) {
+                    log.info(
+                            "oms-fix-egress bootstrap: skipped {} empty events recording tombstone(s);"
+                                    + " persisting initial cursor (recordingId={}, position={})"
+                                    + " — first start on this egress, no prior cursor row.",
+                            target.skippedEmptyTombstones(),
+                            target.recordingId(),
+                            target.startPosition());
+                } else {
+                    log.info(
+                            "oms-fix-egress bootstrap: persisting initial cursor (recordingId={}, position={})"
+                                    + " — first start on this egress, no prior cursor row.",
+                            target.recordingId(),
+                            target.startPosition());
+                }
                 cursorRepository.resetWithRecording(
                         EGRESS_ID,
                         OmsClusterWireFormat.EVENTS_STREAM_ID,
-                        oldest.recordingId(),
-                        oldest.startPosition());
-                currentRecordingId.set(oldest.recordingId());
-                lastAppliedPosition.set(oldest.startPosition());
-                pendingCursorPosition = oldest.startPosition();
+                        target.recordingId(),
+                        target.startPosition());
+                currentRecordingId.set(target.recordingId());
+                lastAppliedPosition.set(target.startPosition());
+                pendingCursorPosition = target.startPosition();
                 eventsSinceCursorFlush = 0;
                 return true;
             }
@@ -554,14 +572,80 @@ public class OmsFixEgressService {
                 savedPosition = descriptor.startPosition();
             }
 
+            // Empty tombstone recordings (post-wipe id=0 with stop=start=0) cannot be replayed.
+            while (running.get()
+                    && OmsClusterEventsRecordingSupport.isEmptyRecording(
+                            archive,
+                            descriptor.recordingId(),
+                            descriptor.startPosition(),
+                            descriptor.stopPosition())) {
+                RecordingDescriptor successor = findNextRecording(archive, recordingIdNow);
+                if (successor != null) {
+                    log.info(
+                            "Egress skipping empty events recordingId={}; rolling forward to recordingId={}"
+                                    + " startPosition={}.",
+                            recordingIdNow,
+                            successor.recordingId(),
+                            successor.startPosition());
+                    flushPendingCursorAdvance("empty recording tombstone skip");
+                    cursorRepository.resetWithRecording(
+                            EGRESS_ID,
+                            OmsClusterWireFormat.EVENTS_STREAM_ID,
+                            successor.recordingId(),
+                            successor.startPosition());
+                    currentRecordingId.set(successor.recordingId());
+                    lastAppliedPosition.set(successor.startPosition());
+                    pendingCursorPosition = successor.startPosition();
+                    eventsSinceCursorFlush = 0;
+                    recordingIdNow = successor.recordingId();
+                    descriptor = successor;
+                    savedPosition = successor.startPosition();
+                    continue;
+                }
+                LockSupport.parkNanos(cfg.getPollParkNanos());
+                descriptor = findRecordingById(archive, recordingIdNow);
+                requireRecordingPresent(recordingIdNow, descriptor);
+            }
+            if (!running.get()) {
+                return;
+            }
+            savedPosition = lastAppliedPosition.get();
+            upperBound = recordingUpperBound(archive, descriptor);
+
             Subscription replay = null;
             try {
-                replay = archive.replay(
-                        descriptor.recordingId(),
-                        savedPosition,
-                        /* length = */ Long.MAX_VALUE,
-                        cfg.getReplayChannel(),
-                        cfg.getReplayStreamId());
+                try {
+                    replay = archive.replay(
+                            descriptor.recordingId(),
+                            savedPosition,
+                            /* length = */ Long.MAX_VALUE,
+                            cfg.getReplayChannel(),
+                            cfg.getReplayStreamId());
+                } catch (RuntimeException e) {
+                    if (OmsClusterEventsRecordingSupport.isEmptyRecordingReplayArchiveException(e)) {
+                        RecordingDescriptor successor = findNextRecording(archive, recordingIdNow);
+                        if (successor != null) {
+                            log.warn(
+                                    "Egress Archive rejected replay on empty recordingId={}; rolling forward to"
+                                            + " recordingId={} startPosition={}.",
+                                    recordingIdNow,
+                                    successor.recordingId(),
+                                    successor.startPosition());
+                            flushPendingCursorAdvance("empty recording ArchiveException skip");
+                            cursorRepository.resetWithRecording(
+                                    EGRESS_ID,
+                                    OmsClusterWireFormat.EVENTS_STREAM_ID,
+                                    successor.recordingId(),
+                                    successor.startPosition());
+                            currentRecordingId.set(successor.recordingId());
+                            lastAppliedPosition.set(successor.startPosition());
+                            pendingCursorPosition = successor.startPosition();
+                            eventsSinceCursorFlush = 0;
+                            continue;
+                        }
+                    }
+                    throw e;
+                }
                 log.info(
                         "oms-fix-egress replay open; recordingId={} startPos={} (recordingStart={},"
                                 + " recordingStop={}, upperBound={}) channel={} streamId={}",
@@ -702,15 +786,8 @@ public class OmsFixEgressService {
      * write-head position. Returns {@code startPosition} when neither is available.
      */
     private long recordingUpperBound(AeronArchive archive, RecordingDescriptor descriptor) {
-        long stop = descriptor.stopPosition();
-        if (stop != AeronArchive.NULL_POSITION) {
-            return stop;
-        }
-        long head = archive.getRecordingPosition(descriptor.recordingId());
-        if (head == AeronArchive.NULL_POSITION) {
-            return descriptor.startPosition();
-        }
-        return head;
+        return OmsClusterEventsRecordingSupport.recordingUpperBound(
+                archive, descriptor.recordingId(), descriptor.startPosition(), descriptor.stopPosition());
     }
 
     /**

@@ -34,6 +34,7 @@ public class OmsConfig {
     private final Risk risk = new Risk();
     private final Routing routing = new Routing();
     private final Fix fix = new Fix();
+    private final FixIn fixIn = new FixIn();
     private final Settlement settlement = new Settlement();
     private final Marketdata marketdata = new Marketdata();
     private final CorporateAction corporateAction = new CorporateAction();
@@ -54,6 +55,7 @@ public class OmsConfig {
     public Risk getRisk() { return risk; }
     public Routing getRouting() { return routing; }
     public Fix getFix() { return fix; }
+    public FixIn getFixIn() { return fixIn; }
     public Settlement getSettlement() { return settlement; }
     public Marketdata getMarketdata() { return marketdata; }
     public CorporateAction getCorporateAction() { return corporateAction; }
@@ -705,6 +707,12 @@ public class OmsConfig {
          * is below order quantity ({@link com.balh.oms.domain.RejectCode#RISK_INSUFFICIENT_POSITION}).
          */
         private boolean sellPositionCheckEnabled = true;
+        /**
+         * When {@code true}, ISK tax-wrapper accounts reject orders on instruments whose active
+         * {@code instrument_settlement_profile.isk_eligible} is false
+         * ({@link com.balh.oms.domain.RejectCode#RISK_ISK_INSTRUMENT_NOT_ELIGIBLE}).
+         */
+        private boolean iskInstrumentEligibilityCheckEnabled = false;
 
         public boolean isInstrumentAllowlistEnabled() { return instrumentAllowlistEnabled; }
         public void setInstrumentAllowlistEnabled(boolean v) { this.instrumentAllowlistEnabled = v; }
@@ -881,6 +889,14 @@ public class OmsConfig {
 
         public void setSellPositionCheckEnabled(boolean sellPositionCheckEnabled) {
             this.sellPositionCheckEnabled = sellPositionCheckEnabled;
+        }
+
+        public boolean isIskInstrumentEligibilityCheckEnabled() {
+            return iskInstrumentEligibilityCheckEnabled;
+        }
+
+        public void setIskInstrumentEligibilityCheckEnabled(boolean iskInstrumentEligibilityCheckEnabled) {
+            this.iskInstrumentEligibilityCheckEnabled = iskInstrumentEligibilityCheckEnabled;
         }
 
         /** Uppercased symbols from {@link #allowedInstrumentSymbols}, comma-separated. */
@@ -1289,6 +1305,142 @@ public class OmsConfig {
         }
     }
 
+    /** QuickFIX/J acceptor for external FIX-in clients ({@code oms-fix-ingress} profile). */
+    public static class FixIn {
+        private boolean enabled = false;
+        private boolean autoStart = false;
+        private String bindHost = "0.0.0.0";
+        private int acceptPort = 9877;
+        /** Our acceptor {@code SenderCompID} on the wire (client's {@code TargetCompID}). */
+        private String acceptorCompId = "BALH_OMS";
+        private String fileStorePath = "./queues/fix-in";
+        private String sessionStoreType = "file";
+        private int heartBtInt = 30;
+        private boolean useDataDictionary = false;
+        private String symbolMapJson = "{}";
+        private boolean requireLogonCredentials = false;
+        private String fileStoreSync = "Y";
+        private final ReturnPublisher returnPublisher = new ReturnPublisher();
+        /** Reject app messages older than this (SendingTime vs wall clock). 0 = disabled. */
+        private long maxMessageAgeMs = 120_000L;
+        private int maxClientClOrdIdLength = 64;
+        /** Per-session app-message rate limit (token bucket). 0 = disabled. */
+        private int maxAppMessagesPerSecond = 200;
+        /** Retention hint for {@code oms_fix_message_audit} (operator cleanup job). */
+        private int messageAuditRetentionDays = 90;
+        /**
+         * When {@code true} with {@link #sessionStoreType} {@code jdbc}, QuickFIX {@link quickfix.JdbcStoreFactory}
+         * uses a dedicated pool ({@link #sessionJdbcUrl}) instead of the application {@link javax.sql.DataSource}.
+         */
+        private boolean sessionJdbcDatasourceEnabled = false;
+        private String sessionJdbcUrl = "";
+        private String sessionJdbcUser = "";
+        private String sessionJdbcPassword = "";
+        private int sessionJdbcPoolMaxSize = 5;
+        private int sessionJdbcPoolMinIdle = 1;
+        private long sessionJdbcConnectionTimeoutMs = 2000L;
+
+        public boolean isEnabled() { return enabled; }
+        public void setEnabled(boolean enabled) { this.enabled = enabled; }
+        public boolean isAutoStart() { return autoStart; }
+        public void setAutoStart(boolean autoStart) { this.autoStart = autoStart; }
+        public String getBindHost() { return bindHost == null ? "0.0.0.0" : bindHost; }
+        public void setBindHost(String bindHost) { this.bindHost = bindHost; }
+        public int getAcceptPort() { return acceptPort; }
+        public void setAcceptPort(int acceptPort) { this.acceptPort = Math.max(1, acceptPort); }
+        public String getAcceptorCompId() { return acceptorCompId == null ? "BALH_OMS" : acceptorCompId; }
+        public void setAcceptorCompId(String acceptorCompId) { this.acceptorCompId = acceptorCompId; }
+        public String getFileStorePath() { return fileStorePath == null ? "./queues/fix-in" : fileStorePath; }
+        public void setFileStorePath(String fileStorePath) { this.fileStorePath = fileStorePath; }
+        public String getSessionStoreType() { return sessionStoreType == null ? "file" : sessionStoreType; }
+        public void setSessionStoreType(String sessionStoreType) { this.sessionStoreType = sessionStoreType; }
+        public boolean isJdbcSessionStore() { return "jdbc".equalsIgnoreCase(sessionStoreType); }
+        public int getHeartBtInt() { return heartBtInt; }
+        public void setHeartBtInt(int heartBtInt) { this.heartBtInt = Math.max(1, heartBtInt); }
+        public boolean isUseDataDictionary() { return useDataDictionary; }
+        public void setUseDataDictionary(boolean useDataDictionary) { this.useDataDictionary = useDataDictionary; }
+        public String getSymbolMapJson() { return symbolMapJson == null ? "{}" : symbolMapJson; }
+        public void setSymbolMapJson(String symbolMapJson) { this.symbolMapJson = symbolMapJson; }
+        public boolean isRequireLogonCredentials() { return requireLogonCredentials; }
+        public void setRequireLogonCredentials(boolean requireLogonCredentials) {
+            this.requireLogonCredentials = requireLogonCredentials;
+        }
+        public String getFileStoreSync() { return fileStoreSync == null ? "Y" : fileStoreSync; }
+        public void setFileStoreSync(String fileStoreSync) { this.fileStoreSync = fileStoreSync; }
+        public long getMaxMessageAgeMs() { return maxMessageAgeMs; }
+        public void setMaxMessageAgeMs(long maxMessageAgeMs) { this.maxMessageAgeMs = Math.max(0L, maxMessageAgeMs); }
+        public int getMaxClientClOrdIdLength() { return maxClientClOrdIdLength; }
+        public void setMaxClientClOrdIdLength(int maxClientClOrdIdLength) {
+            this.maxClientClOrdIdLength = Math.max(1, maxClientClOrdIdLength);
+        }
+        public int getMaxAppMessagesPerSecond() { return maxAppMessagesPerSecond; }
+        public void setMaxAppMessagesPerSecond(int maxAppMessagesPerSecond) {
+            this.maxAppMessagesPerSecond = Math.max(0, maxAppMessagesPerSecond);
+        }
+        public int getMessageAuditRetentionDays() { return messageAuditRetentionDays; }
+        public void setMessageAuditRetentionDays(int messageAuditRetentionDays) {
+            this.messageAuditRetentionDays = Math.max(1, messageAuditRetentionDays);
+        }
+        public boolean isSessionJdbcDatasourceEnabled() { return sessionJdbcDatasourceEnabled; }
+        public void setSessionJdbcDatasourceEnabled(boolean sessionJdbcDatasourceEnabled) {
+            this.sessionJdbcDatasourceEnabled = sessionJdbcDatasourceEnabled;
+        }
+        public String getSessionJdbcUrl() { return sessionJdbcUrl == null ? "" : sessionJdbcUrl; }
+        public void setSessionJdbcUrl(String sessionJdbcUrl) { this.sessionJdbcUrl = sessionJdbcUrl; }
+        public String getSessionJdbcUser() { return sessionJdbcUser == null ? "" : sessionJdbcUser; }
+        public void setSessionJdbcUser(String sessionJdbcUser) { this.sessionJdbcUser = sessionJdbcUser; }
+        public String getSessionJdbcPassword() { return sessionJdbcPassword == null ? "" : sessionJdbcPassword; }
+        public void setSessionJdbcPassword(String sessionJdbcPassword) {
+            this.sessionJdbcPassword = sessionJdbcPassword;
+        }
+        public int getSessionJdbcPoolMaxSize() { return sessionJdbcPoolMaxSize; }
+        public void setSessionJdbcPoolMaxSize(int sessionJdbcPoolMaxSize) {
+            this.sessionJdbcPoolMaxSize = Math.max(1, sessionJdbcPoolMaxSize);
+        }
+        public int getSessionJdbcPoolMinIdle() { return sessionJdbcPoolMinIdle; }
+        public void setSessionJdbcPoolMinIdle(int sessionJdbcPoolMinIdle) {
+            this.sessionJdbcPoolMinIdle = Math.max(0, sessionJdbcPoolMinIdle);
+        }
+        public long getSessionJdbcConnectionTimeoutMs() { return sessionJdbcConnectionTimeoutMs; }
+        public void setSessionJdbcConnectionTimeoutMs(long sessionJdbcConnectionTimeoutMs) {
+            this.sessionJdbcConnectionTimeoutMs = Math.max(500L, sessionJdbcConnectionTimeoutMs);
+        }
+        public ReturnPublisher getReturnPublisher() { return returnPublisher; }
+
+        /** Cluster events replay → client FIX 8/9 ({@link com.balh.oms.fixin.OmsFixInReturnService}). */
+        public static class ReturnPublisher {
+            private boolean enabled = true;
+            private String aeronDirectory = "";
+            private String archiveControlRequestChannel = "aeron:ipc?term-length=64k";
+            private String archiveControlResponseChannel = "aeron:ipc?term-length=64k";
+            private String replayChannel = "aeron:ipc?term-length=64k";
+            private int replayStreamId = 4324;
+            private long pollParkNanos = 1_000_000L;
+            private int fragmentLimit = 64;
+
+            public boolean isEnabled() { return enabled; }
+            public void setEnabled(boolean enabled) { this.enabled = enabled; }
+            public String getAeronDirectory() { return aeronDirectory == null ? "" : aeronDirectory; }
+            public void setAeronDirectory(String aeronDirectory) { this.aeronDirectory = aeronDirectory; }
+            public String getArchiveControlRequestChannel() { return archiveControlRequestChannel; }
+            public void setArchiveControlRequestChannel(String archiveControlRequestChannel) {
+                this.archiveControlRequestChannel = archiveControlRequestChannel;
+            }
+            public String getArchiveControlResponseChannel() { return archiveControlResponseChannel; }
+            public void setArchiveControlResponseChannel(String archiveControlResponseChannel) {
+                this.archiveControlResponseChannel = archiveControlResponseChannel;
+            }
+            public String getReplayChannel() { return replayChannel; }
+            public void setReplayChannel(String replayChannel) { this.replayChannel = replayChannel; }
+            public int getReplayStreamId() { return replayStreamId; }
+            public void setReplayStreamId(int replayStreamId) { this.replayStreamId = replayStreamId; }
+            public long getPollParkNanos() { return pollParkNanos; }
+            public void setPollParkNanos(long pollParkNanos) { this.pollParkNanos = pollParkNanos; }
+            public int getFragmentLimit() { return fragmentLimit; }
+            public void setFragmentLimit(int fragmentLimit) { this.fragmentLimit = Math.max(1, fragmentLimit); }
+        }
+    }
+
     /**
      * Post-trade settlement / custody (slice 6). Defaults align with Flyway {@code V11__settlement_positions.sql}.
      */
@@ -1311,6 +1463,21 @@ public class OmsConfig {
         private boolean brokerConfirmReconcilerEnabled = false;
         private long brokerConfirmReconcilerIntervalMs = 10_000L;
         private int brokerConfirmReconcilerBatchSize = 50;
+        /**
+         * When {@code true}, {@link BrokerTradeConfirmBatchLifecycleService} runs immediately after
+         * a v2 economic confirm file reaches {@code parsed} (HTTP ingest path).
+         */
+        private boolean brokerConfirmMatchOnIngestEnabled = false;
+        /**
+         * When {@code true}, {@link BrokerTradeConfirmMatchScheduler} advances {@code parsed}
+         * {@code broker_confirm_batch} rows through matching to {@code applied}.
+         */
+        private boolean brokerTradeConfirmMatcherSchedulerEnabled = false;
+        private long brokerTradeConfirmMatcherIntervalMs = 10_000L;
+        /** Max parsed batches the matcher scheduler picks up per tick. */
+        private int brokerTradeConfirmMatcherSchedulerBatchSize = 10;
+        /** Absolute tolerance when comparing broker {@code grossAmount} to {@code quantity × price}. */
+        private java.math.BigDecimal brokerConfirmGrossAmountTolerance = new java.math.BigDecimal("0.01");
         private int brokerConfirmHttpMaxExecutionIds = 100;
         /** Max bytes accepted for {@code POST …/settlement/file-import} body (before SHA + parse). */
         private long fileImportMaxBytes = 10_000_000L;
@@ -1324,6 +1491,10 @@ public class OmsConfig {
         private int fileImportListMaxLimit = 200;
         /** Default page size for file import batch list. */
         private int fileImportListDefaultLimit = 50;
+        /** Max rows returned by {@code GET /internal/v1/settlement/reconciliation-breaks/export}. */
+        private int reconciliationBreakExportMaxRows = 2_000;
+        /** Max chars for reconciliation break workflow notes (assign / resolve / waive). */
+        private int reconciliationBreakNoteMaxChars = 2_000;
         /** Max rows returned by {@code GET /internal/v1/settlement/manual-actions}. */
         private int manualActionListMaxLimit = 200;
         /** Default page size for manual settlement action list. */
@@ -1375,6 +1546,18 @@ public class OmsConfig {
          * once and stops selecting the execution until an operator resets it.
          */
         private int autoStepSchedulerMaxAdvanceFailures = 5;
+        /**
+         * When {@code true}, {@link SettlementOpsMetricsPublisher} polls Postgres for settlement
+         * ops gauges (gap plan §5.18).
+         */
+        private boolean opsMetricsPublisherEnabled = true;
+        /** Poll interval for {@link SettlementOpsMetricsPublisher}. */
+        private long opsMetricsPollIntervalMs = 30_000L;
+        /**
+         * Minimum {@code ledger_settlement_outbox.attempts} before a row counts as stuck in
+         * {@code oms_ledger_settlement_outbox_stuck_total} (matches beard-admin stuck-outbox default).
+         */
+        private int stuckOutboxMinAttempts = 3;
 
         public String getDefaultCustodyAccountId() {
             return defaultCustodyAccountId;
@@ -1434,6 +1617,51 @@ public class OmsConfig {
             this.brokerConfirmReconcilerBatchSize = Math.max(1, brokerConfirmReconcilerBatchSize);
         }
 
+        public boolean isBrokerConfirmMatchOnIngestEnabled() {
+            return brokerConfirmMatchOnIngestEnabled;
+        }
+
+        public void setBrokerConfirmMatchOnIngestEnabled(boolean brokerConfirmMatchOnIngestEnabled) {
+            this.brokerConfirmMatchOnIngestEnabled = brokerConfirmMatchOnIngestEnabled;
+        }
+
+        public boolean isBrokerTradeConfirmMatcherSchedulerEnabled() {
+            return brokerTradeConfirmMatcherSchedulerEnabled;
+        }
+
+        public void setBrokerTradeConfirmMatcherSchedulerEnabled(boolean brokerTradeConfirmMatcherSchedulerEnabled) {
+            this.brokerTradeConfirmMatcherSchedulerEnabled = brokerTradeConfirmMatcherSchedulerEnabled;
+        }
+
+        public long getBrokerTradeConfirmMatcherIntervalMs() {
+            return brokerTradeConfirmMatcherIntervalMs;
+        }
+
+        public void setBrokerTradeConfirmMatcherIntervalMs(long brokerTradeConfirmMatcherIntervalMs) {
+            this.brokerTradeConfirmMatcherIntervalMs = Math.max(100L, brokerTradeConfirmMatcherIntervalMs);
+        }
+
+        public int getBrokerTradeConfirmMatcherSchedulerBatchSize() {
+            return brokerTradeConfirmMatcherSchedulerBatchSize;
+        }
+
+        public void setBrokerTradeConfirmMatcherSchedulerBatchSize(int brokerTradeConfirmMatcherSchedulerBatchSize) {
+            this.brokerTradeConfirmMatcherSchedulerBatchSize = Math.max(1, brokerTradeConfirmMatcherSchedulerBatchSize);
+        }
+
+        public java.math.BigDecimal getBrokerConfirmGrossAmountTolerance() {
+            return brokerConfirmGrossAmountTolerance;
+        }
+
+        public void setBrokerConfirmGrossAmountTolerance(java.math.BigDecimal brokerConfirmGrossAmountTolerance) {
+            if (brokerConfirmGrossAmountTolerance == null
+                    || brokerConfirmGrossAmountTolerance.signum() < 0) {
+                this.brokerConfirmGrossAmountTolerance = new java.math.BigDecimal("0.01");
+            } else {
+                this.brokerConfirmGrossAmountTolerance = brokerConfirmGrossAmountTolerance;
+            }
+        }
+
         public int getBrokerConfirmHttpMaxExecutionIds() {
             return brokerConfirmHttpMaxExecutionIds;
         }
@@ -1488,6 +1716,22 @@ public class OmsConfig {
 
         public void setFileImportListDefaultLimit(int fileImportListDefaultLimit) {
             this.fileImportListDefaultLimit = Math.min(getFileImportListMaxLimit(), Math.max(1, fileImportListDefaultLimit));
+        }
+
+        public int getReconciliationBreakExportMaxRows() {
+            return reconciliationBreakExportMaxRows;
+        }
+
+        public void setReconciliationBreakExportMaxRows(int reconciliationBreakExportMaxRows) {
+            this.reconciliationBreakExportMaxRows = Math.min(10_000, Math.max(1, reconciliationBreakExportMaxRows));
+        }
+
+        public int getReconciliationBreakNoteMaxChars() {
+            return reconciliationBreakNoteMaxChars;
+        }
+
+        public void setReconciliationBreakNoteMaxChars(int reconciliationBreakNoteMaxChars) {
+            this.reconciliationBreakNoteMaxChars = Math.min(10_000, Math.max(64, reconciliationBreakNoteMaxChars));
         }
 
         public int getManualActionListMaxLimit() {
@@ -1616,6 +1860,30 @@ public class OmsConfig {
 
         public void setAutoStepSchedulerMaxAdvanceFailures(int autoStepSchedulerMaxAdvanceFailures) {
             this.autoStepSchedulerMaxAdvanceFailures = Math.max(1, autoStepSchedulerMaxAdvanceFailures);
+        }
+
+        public boolean isOpsMetricsPublisherEnabled() {
+            return opsMetricsPublisherEnabled;
+        }
+
+        public void setOpsMetricsPublisherEnabled(boolean opsMetricsPublisherEnabled) {
+            this.opsMetricsPublisherEnabled = opsMetricsPublisherEnabled;
+        }
+
+        public long getOpsMetricsPollIntervalMs() {
+            return opsMetricsPollIntervalMs;
+        }
+
+        public void setOpsMetricsPollIntervalMs(long opsMetricsPollIntervalMs) {
+            this.opsMetricsPollIntervalMs = Math.max(5_000L, opsMetricsPollIntervalMs);
+        }
+
+        public int getStuckOutboxMinAttempts() {
+            return stuckOutboxMinAttempts;
+        }
+
+        public void setStuckOutboxMinAttempts(int stuckOutboxMinAttempts) {
+            this.stuckOutboxMinAttempts = Math.max(1, stuckOutboxMinAttempts);
         }
     }
 

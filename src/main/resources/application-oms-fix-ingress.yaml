@@ -1,0 +1,54 @@
+# oms-fix-ingress role: QuickFIX/J SocketAcceptor for external FIX 4.4 clients.
+#
+# Submits AcceptOrderCommand via OmsClusterIngressClient; synchronous ExecutionReport
+# (NEW/REJECTED) on admission. Session/counterparty config lives in oms_fix_in_* Postgres tables.
+#
+# Example: SPRING_PROFILES_ACTIVE=oms-fix-ingress
+
+oms:
+  grpc:
+    enabled: false
+  cluster:
+    client:
+      enabled: ${OMS_FIX_INGRESS_CLUSTER_CLIENT_ENABLED:true}
+      aeron-directory: ${OMS_FIX_INGRESS_CLUSTER_CLIENT_AERON_DIR:${OMS_FIX_INGRESS_AERON_DIR:}}
+      ingress-endpoints: ${OMS_FIX_INGRESS_CLUSTER_CLIENT_INGRESS_ENDPOINTS:0=localhost:20110}
+      ingress-channel: ${OMS_FIX_INGRESS_CLUSTER_CLIENT_INGRESS_CHANNEL:aeron:udp?endpoint=localhost:0}
+      egress-channel: ${OMS_FIX_INGRESS_CLUSTER_CLIENT_EGRESS_CHANNEL:aeron:udp?endpoint=localhost:0}
+  fix-in:
+    enabled: ${OMS_FIX_IN_ENABLED:true}
+    auto-start: ${OMS_FIX_IN_AUTO_START:true}
+    bind-host: ${OMS_FIX_IN_BIND_HOST:0.0.0.0}
+    accept-port: ${OMS_FIX_IN_ACCEPT_PORT:9877}
+    acceptor-comp-id: ${OMS_FIX_IN_ACCEPTOR_COMP_ID:BALH_OMS}
+    file-store-path: ${OMS_FIX_IN_FILE_STORE_PATH:./queues/fix-in}
+    session-store-type: ${OMS_FIX_IN_SESSION_STORE_TYPE:file}
+    session-jdbc-datasource-enabled: ${OMS_FIX_IN_SESSION_JDBC_DATASOURCE_ENABLED:false}
+    session-jdbc-url: ${OMS_FIX_IN_SESSION_JDBC_URL:}
+    session-jdbc-user: ${OMS_FIX_IN_SESSION_JDBC_USER:}
+    session-jdbc-password: ${OMS_FIX_IN_SESSION_JDBC_PASSWORD:}
+    session-jdbc-pool-max-size: ${OMS_FIX_IN_SESSION_JDBC_POOL_MAX_SIZE:5}
+    session-jdbc-pool-min-idle: ${OMS_FIX_IN_SESSION_JDBC_POOL_MIN_IDLE:1}
+    session-jdbc-connection-timeout-ms: ${OMS_FIX_IN_SESSION_JDBC_CONNECTION_TIMEOUT_MS:2000}
+    heart-bt-int: ${OMS_FIX_IN_HEART_BT_INT:30}
+    use-data-dictionary: ${OMS_FIX_IN_USE_DATA_DICTIONARY:false}
+    require-logon-credentials: ${OMS_FIX_IN_REQUIRE_LOGON_CREDENTIALS:false}
+    symbol-map-json: ${OMS_FIX_IN_SYMBOL_MAP_JSON:{}}
+    max-message-age-ms: ${OMS_FIX_IN_MAX_MESSAGE_AGE_MS:120000}
+    max-client-cl-ord-id-length: ${OMS_FIX_IN_MAX_CL_ORD_ID_LEN:64}
+    max-app-messages-per-second: ${OMS_FIX_IN_MAX_APP_MSG_PER_SEC:200}
+    message-audit-retention-days: ${OMS_FIX_IN_MESSAGE_AUDIT_RETENTION_DAYS:90}
+    return-publisher:
+      enabled: ${OMS_FIX_IN_RETURN_PUBLISHER_ENABLED:true}
+      aeron-directory: ${OMS_FIX_IN_RETURN_AERON_DIR:${OMS_FIX_INGRESS_CLUSTER_CLIENT_AERON_DIR:${OMS_FIX_INGRESS_AERON_DIR:}}}
+      replay-stream-id: ${OMS_FIX_IN_RETURN_REPLAY_STREAM_ID:4324}
+      replay-channel: ${OMS_FIX_IN_RETURN_REPLAY_CHANNEL:aeron:ipc?term-length=64k}
+      archive-control-request-channel: ${OMS_FIX_IN_RETURN_ARCHIVE_CONTROL_REQUEST_CHANNEL:aeron:ipc?term-length=64k}
+      archive-control-response-channel: ${OMS_FIX_IN_RETURN_ARCHIVE_CONTROL_RESPONSE_CHANNEL:aeron:ipc?term-length=64k}
+
+server:
+  port: ${OMS_FIX_INGRESS_HTTP_PORT:8095}
+
+management:
+  server:
+    port: ${OMS_FIX_INGRESS_MANAGEMENT_SERVER_PORT:8092}

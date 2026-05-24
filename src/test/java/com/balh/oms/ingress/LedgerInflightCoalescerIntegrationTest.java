@@ -41,9 +41,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  *   <li>The dispatcher actually POSTs to {@code /transactions/bulk?inflight=true&atomic=false}
  *       (route + body shape match what {@code ledger/src/api/routes/transaction.routes.ts}
  *       parses).</li>
- *   <li>On 2xx success the {@code ledger_inflight_outbox} stays empty — the slice 4q win is
- *       gated on this invariant; if a stray outbox row appeared we'd be paying for both
- *       paths.</li>
+ *   <li>On 2xx success the coalescer posts via {@code /transactions/bulk} and the per-order
+ *       {@code /transactions} reconciler path has not run yet ({@code published_at} still
+ *       null). D-9 also materialises a projector-owned {@code ledger_inflight_outbox} row as
+ *       belt-and-suspenders — the slice 4q "empty outbox" invariant no longer applies.</li>
  *   <li>On a 5xx whole-batch failure the row appears in {@code ledger_inflight_outbox} so the
  *       existing reconciler (slice 4p) drives Ledger on retry.</li>
  * </ul>
@@ -93,10 +94,11 @@ class LedgerInflightCoalescerIntegrationTest extends AbstractPostgresIntegration
     @BeforeEach
     void resetStubs() {
         ledgerWireMock.resetAll();
+        jdbc.update("DELETE FROM ledger_inflight_outbox");
     }
 
     @Test
-    void coalescerPath_routesBuyHoldThroughBulkEndpoint_noOutboxRow() {
+    void coalescerPath_routesBuyHoldThroughBulkEndpoint_projectorOutboxUnpublished() {
         // Verify path sends with_queued=false so it hits Ledger's Redis cache (Tier 2.5 phase C-3,
         // see RestLedgerBalanceClient Javadoc).
         ledgerWireMock.stubFor(get(urlPathEqualTo("/balances/cust_balance_coalescer"))
@@ -128,13 +130,22 @@ class LedgerInflightCoalescerIntegrationTest extends AbstractPostgresIntegration
                 ledgerWireMock.verify(1, postRequestedFor(urlPathEqualTo("/transactions/bulk"))));
         ledgerWireMock.verify(0, postRequestedFor(urlPathEqualTo("/transactions")));
 
-        // Slice 4q invariant: happy path leaves the outbox empty (no critical-path Postgres
-        // write for the hold). The slice 4p outbox path is the FALLBACK only.
+        // Phase 4 Tier 2.5 D-9: the test projector daemon always materialises
+        // ledger_inflight_outbox from OrderAdmittedEvent when inflight-async-enabled=true,
+        // even on the coalescer happy path (ingress/coalescer no longer write it). Slice 4q
+        // invariant narrows to: bulk hold succeeded and the slice-4p reconciler has not yet
+        // posted via /transactions (published_at still null).
+        Awaitility.await().atMost(Duration.ofSeconds(2)).untilAsserted(() ->
+                assertThat(jdbc.queryForObject(
+                        "SELECT COUNT(*) FROM ledger_inflight_outbox WHERE order_id = ?",
+                        Long.class,
+                        orderId))
+                        .isEqualTo(1L));
         assertThat(jdbc.queryForObject(
-                "SELECT COUNT(*) FROM ledger_inflight_outbox WHERE order_id = ?",
+                "SELECT COUNT(*) FROM ledger_inflight_outbox WHERE order_id = ? AND published_at IS NULL",
                 Long.class,
                 orderId))
-                .isEqualTo(0L);
+                .isEqualTo(1L);
     }
 
     @Test

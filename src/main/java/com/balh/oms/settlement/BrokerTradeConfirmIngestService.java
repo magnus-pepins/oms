@@ -62,6 +62,7 @@ public class BrokerTradeConfirmIngestService {
     private final ObjectMapper objectMapper;
     private final OmsConfig config;
     private final TransactionTemplate transactionTemplate;
+    private final BrokerTradeConfirmBatchLifecycleService brokerTradeConfirmBatchLifecycle;
 
     public BrokerTradeConfirmIngestService(
             BrokerConfirmBatchRepository batches,
@@ -69,13 +70,15 @@ public class BrokerTradeConfirmIngestService {
             BrokerTradeConfirmFeeRepository fees,
             ObjectMapper objectMapper,
             OmsConfig config,
-            PlatformTransactionManager transactionManager) {
+            PlatformTransactionManager transactionManager,
+            BrokerTradeConfirmBatchLifecycleService brokerTradeConfirmBatchLifecycle) {
         this.batches = batches;
         this.confirms = confirms;
         this.fees = fees;
         this.objectMapper = objectMapper;
         this.config = config;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
+        this.brokerTradeConfirmBatchLifecycle = brokerTradeConfirmBatchLifecycle;
     }
 
     public Result ingest(String source, String originalFilename, byte[] fileBytes) {
@@ -162,10 +165,15 @@ public class BrokerTradeConfirmIngestService {
             }
 
             batches.updateStatus(batchId, "parsed", parsedRowCount, null);
+            if (config.getSettlement().isBrokerConfirmMatchOnIngestEnabled()) {
+                brokerTradeConfirmBatchLifecycle.processBatchMatches(batchId);
+            }
+            String finalStatus =
+                    batches.findById(batchId).map(BrokerConfirmBatchRepository.BatchRow::status).orElse("parsed");
             return new Result(
                     false,
                     batchId,
-                    "parsed",
+                    finalStatus,
                     parsedRowCount,
                     null,
                     totalInsertedRows,
@@ -231,6 +239,11 @@ public class BrokerTradeConfirmIngestService {
                 && !"bust".equals(correction)) {
             throw new IllegalArgumentException("row " + rowIndex + ": correctionType invalid: " + correction);
         }
+        if (!"new".equals(correction)
+                && (row.originalBrokerTradeId() == null || row.originalBrokerTradeId().isBlank())) {
+            throw new IllegalArgumentException(
+                    "row " + rowIndex + ": originalBrokerTradeId required for correctionType " + correction);
+        }
     }
 
     private BrokerTradeConfirmRepository.InsertCommand toInsertCommand(
@@ -264,6 +277,7 @@ public class BrokerTradeConfirmIngestService {
                 settlementCurrency,
                 row.status(),
                 correction,
+                row.originalBrokerTradeId(),
                 rawNode.toString());
     }
 

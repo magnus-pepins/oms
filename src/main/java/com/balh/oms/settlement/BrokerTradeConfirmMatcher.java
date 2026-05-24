@@ -1,5 +1,6 @@
 package com.balh.oms.settlement;
 
+import com.balh.oms.config.OmsConfig;
 import com.balh.oms.persistence.ExecutionsRepository;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -59,22 +60,28 @@ public class BrokerTradeConfirmMatcher {
     private static final int MATCHER_BATCH_MAX = 200;
 
     private final BrokerTradeConfirmRepository confirms;
+    private final BrokerTradeConfirmFeeRepository confirmFees;
     private final ExecutionsRepository executions;
     private final ReconciliationBreakRepository breaks;
     private final SettlementConfirmProcessor settlementProcessor;
     private final ObjectMapper objectMapper;
+    private final OmsConfig config;
 
     public BrokerTradeConfirmMatcher(
             BrokerTradeConfirmRepository confirms,
+            BrokerTradeConfirmFeeRepository confirmFees,
             ExecutionsRepository executions,
             ReconciliationBreakRepository breaks,
             SettlementConfirmProcessor settlementProcessor,
-            ObjectMapper objectMapper) {
+            ObjectMapper objectMapper,
+            OmsConfig config) {
         this.confirms = confirms;
+        this.confirmFees = confirmFees;
         this.executions = executions;
         this.breaks = breaks;
         this.settlementProcessor = settlementProcessor;
         this.objectMapper = objectMapper;
+        this.config = config;
     }
 
     public enum Outcome {
@@ -94,6 +101,14 @@ public class BrokerTradeConfirmMatcher {
         return batch.stream().map(this::matchOne).toList();
     }
 
+    /** Process pending confirms scoped to a single ingest batch. */
+    @Transactional
+    public List<MatchResult> processPendingForBatch(long batchId, int maxRows) {
+        int cap = Math.min(Math.max(1, maxRows), MATCHER_BATCH_MAX);
+        List<BrokerTradeConfirmRepository.MatchableRow> batch = confirms.lockPendingForBatch(batchId, cap);
+        return batch.stream().map(this::matchOne).toList();
+    }
+
     /** Match a single pending confirm by id; for ops manual trigger or test. */
     @Transactional
     public Optional<MatchResult> matchById(long confirmId) {
@@ -101,8 +116,17 @@ public class BrokerTradeConfirmMatcher {
     }
 
     private MatchResult matchOne(BrokerTradeConfirmRepository.MatchableRow confirm) {
-        Optional<Long> executionId = resolveExecution(confirm);
-        if (executionId.isEmpty()) {
+        String correction = normalizeCorrection(confirm.correctionType());
+        return switch (correction) {
+            case "cancel", "bust" -> matchCancelOrBust(confirm, correction);
+            case "amend" -> matchAmend(confirm);
+            default -> matchNewTrade(confirm);
+        };
+    }
+
+    private MatchResult matchNewTrade(BrokerTradeConfirmRepository.MatchableRow confirm) {
+        Optional<ResolvedExecution> resolved = resolveExecution(confirm);
+        if (resolved.isEmpty()) {
             String diff = unresolvedDiff(confirm);
             int updated = confirms.markUnresolved(confirm.id(), diff);
             if (updated == 0) {
@@ -120,15 +144,113 @@ public class BrokerTradeConfirmMatcher {
                     "system"));
             return new MatchResult(confirm.id(), null, Outcome.UNRESOLVED, diff);
         }
-        long execId = executionId.get();
+        return compareAndDecide(confirm, resolved.get().executionId(), resolved.get().resolvedBy());
+    }
+
+    private MatchResult matchCancelOrBust(BrokerTradeConfirmRepository.MatchableRow confirm, String correction) {
+        Optional<Long> target = resolveCorrectionTarget(confirm);
+        if (target.isEmpty()) {
+            String diff = unresolvedCorrectionDiff(confirm, "prior_matched_confirm_not_found");
+            int updated = confirms.markUnresolved(confirm.id(), diff);
+            if (updated == 0) {
+                return new MatchResult(confirm.id(), null, Outcome.ALREADY_DECIDED, diff);
+            }
+            breaks.insert(new ReconciliationBreakRepository.InsertCommand(
+                    ReconciliationBreakRepository.BREAK_UNRESOLVED_CONFIRM,
+                    ReconciliationBreakRepository.SEVERITY_HIGH,
+                    ReconciliationBreakRepository.SOURCE_BROKER,
+                    confirm.id(),
+                    null,
+                    confirm.accountId(),
+                    confirm.tradeDate(),
+                    diff,
+                    "system"));
+            return new MatchResult(confirm.id(), null, Outcome.UNRESOLVED, diff);
+        }
+        long execId = target.get();
+        MarkTradeFailedResult markResult = settlementProcessor.markTradeFailed(execId);
+        String diffJson = correctionAppliedDiff(confirm, correction, markResult, execId);
+        if (markResult == MarkTradeFailedResult.NOT_FOUND || markResult == MarkTradeFailedResult.NOT_TRADE) {
+            confirms.markUnresolved(confirm.id(), diffJson);
+            breaks.insert(new ReconciliationBreakRepository.InsertCommand(
+                    ReconciliationBreakRepository.BREAK_UNRESOLVED_CONFIRM,
+                    ReconciliationBreakRepository.SEVERITY_HIGH,
+                    ReconciliationBreakRepository.SOURCE_BROKER,
+                    confirm.id(),
+                    execId,
+                    confirm.accountId(),
+                    confirm.tradeDate(),
+                    diffJson,
+                    "system"));
+            return new MatchResult(confirm.id(), execId, Outcome.UNRESOLVED, diffJson);
+        }
+        if (markResult == MarkTradeFailedResult.ALREADY_SETTLED) {
+            int updated = confirms.markMismatch(confirm.id(), execId, diffJson);
+            if (updated == 0) {
+                return new MatchResult(confirm.id(), execId, Outcome.ALREADY_DECIDED, diffJson);
+            }
+            breaks.insert(new ReconciliationBreakRepository.InsertCommand(
+                    ReconciliationBreakRepository.BREAK_TRADE_MISMATCH,
+                    ReconciliationBreakRepository.SEVERITY_HIGH,
+                    ReconciliationBreakRepository.SOURCE_BROKER,
+                    confirm.id(),
+                    execId,
+                    confirm.accountId(),
+                    confirm.tradeDate(),
+                    diffJson,
+                    "system"));
+            return new MatchResult(confirm.id(), execId, Outcome.MISMATCH, diffJson);
+        }
+        int updated = confirms.markMatched(confirm.id(), execId, diffJson);
+        if (updated == 0) {
+            return new MatchResult(confirm.id(), execId, Outcome.ALREADY_DECIDED, diffJson);
+        }
+        return new MatchResult(confirm.id(), execId, Outcome.MATCHED, diffJson);
+    }
+
+    private MatchResult matchAmend(BrokerTradeConfirmRepository.MatchableRow confirm) {
+        Optional<Long> target = resolveCorrectionTarget(confirm);
+        if (target.isEmpty()) {
+            String diff = unresolvedCorrectionDiff(confirm, "prior_matched_confirm_not_found");
+            int updated = confirms.markUnresolved(confirm.id(), diff);
+            if (updated == 0) {
+                return new MatchResult(confirm.id(), null, Outcome.ALREADY_DECIDED, diff);
+            }
+            breaks.insert(new ReconciliationBreakRepository.InsertCommand(
+                    ReconciliationBreakRepository.BREAK_UNRESOLVED_CONFIRM,
+                    ReconciliationBreakRepository.SEVERITY_HIGH,
+                    ReconciliationBreakRepository.SOURCE_BROKER,
+                    confirm.id(),
+                    null,
+                    confirm.accountId(),
+                    confirm.tradeDate(),
+                    diff,
+                    "system"));
+            return new MatchResult(confirm.id(), null, Outcome.UNRESOLVED, diff);
+        }
+        return compareAndDecide(confirm, target.get(), "(originalBrokerTradeId)");
+    }
+
+    private MatchResult compareAndDecide(
+            BrokerTradeConfirmRepository.MatchableRow confirm, long execId, String resolvedBy) {
         Optional<SettlementExecutionRow> snapshot = executions.findSettlementRow(execId);
         if (snapshot.isEmpty()) {
-            String diff = unresolvedDiff(confirm); // race: row vanished between resolve & read
+            String diff = unresolvedDiff(confirm);
             confirms.markUnresolved(confirm.id(), diff);
             return new MatchResult(confirm.id(), null, Outcome.UNRESOLVED, diff);
         }
         Optional<LocalDate> omsExpectedSettlementDate = executions.findExpectedSettlementDate(execId);
-        DiffPayload diff = compare(confirm, snapshot.get(), omsExpectedSettlementDate);
+        Optional<LocalDate> omsTradeDate = executions.findTradeDate(execId);
+        BigDecimal brokerFeeTotal = confirmFees.sumCustomerFeeAmount(confirm.id());
+        BigDecimal grossTolerance = config.getSettlement().getBrokerConfirmGrossAmountTolerance();
+        DiffPayload diff = compare(
+                confirm,
+                snapshot.get(),
+                omsExpectedSettlementDate,
+                omsTradeDate,
+                brokerFeeTotal,
+                grossTolerance,
+                resolvedBy);
         String diffJson = serialize(diff.node);
         if (diff.allMatch) {
             int updated = confirms.markMatched(confirm.id(), execId, diffJson);
@@ -164,19 +286,76 @@ public class BrokerTradeConfirmMatcher {
         return new MatchResult(confirm.id(), execId, Outcome.MISMATCH, diffJson);
     }
 
-    private Optional<Long> resolveExecution(BrokerTradeConfirmRepository.MatchableRow confirm) {
-        if (confirm.accountId() == null
-                || confirm.venueExecRef() == null
-                || confirm.venueExecRef().isBlank()) {
+    private Optional<Long> resolveCorrectionTarget(BrokerTradeConfirmRepository.MatchableRow confirm) {
+        String lookup = confirm.originalBrokerTradeId();
+        if (lookup == null || lookup.isBlank()) {
             return Optional.empty();
         }
-        return executions.findTradeExecutionIdByAccountAndVenueRef(confirm.accountId(), confirm.venueExecRef());
+        if (confirm.brokerId() == null || confirm.brokerId().isBlank()) {
+            return Optional.empty();
+        }
+        return confirms.findMatchedExecutionIdByBrokerTrade(confirm.brokerId(), lookup.trim());
     }
 
-    private static DiffPayload compare(
+    private static String normalizeCorrection(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return "new";
+        }
+        return raw.trim().toLowerCase(Locale.ROOT);
+    }
+
+    private String correctionAppliedDiff(
+            BrokerTradeConfirmRepository.MatchableRow confirm,
+            String correction,
+            MarkTradeFailedResult markResult,
+            long execId) {
+        ObjectNode root = JSON.objectNode();
+        root.put("correctionType", correction);
+        root.put("originalBrokerTradeId", confirm.originalBrokerTradeId());
+        root.put("targetExecutionId", execId);
+        root.put("markTradeFailed", markResult.name());
+        return serialize(root);
+    }
+
+    private String unresolvedCorrectionDiff(BrokerTradeConfirmRepository.MatchableRow confirm, String reason) {
+        ObjectNode root = JSON.objectNode();
+        root.put("reason", reason);
+        root.put("correctionType", confirm.correctionType());
+        root.put("originalBrokerTradeId", confirm.originalBrokerTradeId());
+        root.put("brokerTradeId", confirm.brokerTradeId());
+        root.put("brokerId", confirm.brokerId());
+        return serialize(root);
+    }
+
+    private record ResolvedExecution(long executionId, String resolvedBy) {}
+
+    private Optional<ResolvedExecution> resolveExecution(BrokerTradeConfirmRepository.MatchableRow confirm) {
+        if (confirm.venueExecRef() == null || confirm.venueExecRef().isBlank()) {
+            return Optional.empty();
+        }
+        if (confirm.brokerId() != null && !confirm.brokerId().isBlank()) {
+            Optional<Long> byBroker =
+                    executions.findTradeExecutionIdByBrokerAndVenueRef(confirm.brokerId(), confirm.venueExecRef());
+            if (byBroker.isPresent()) {
+                return Optional.of(new ResolvedExecution(byBroker.get(), "(brokerId,venueExecRef)"));
+            }
+        }
+        if (confirm.accountId() != null) {
+            return executions
+                    .findTradeExecutionIdByAccountAndVenueRef(confirm.accountId(), confirm.venueExecRef())
+                    .map(id -> new ResolvedExecution(id, "(accountId,venueExecRef)"));
+        }
+        return Optional.empty();
+    }
+
+    private DiffPayload compare(
             BrokerTradeConfirmRepository.MatchableRow confirm,
             SettlementExecutionRow snapshot,
-            Optional<LocalDate> omsExpectedSettlementDate) {
+            Optional<LocalDate> omsExpectedSettlementDate,
+            Optional<LocalDate> omsTradeDate,
+            BigDecimal brokerFeeTotal,
+            BigDecimal grossTolerance,
+            String resolvedBy) {
         ObjectNode fields = JSON.objectNode();
         boolean allMatch = true;
         allMatch &= addField(fields, "side", confirm.side(), snapshot.side(), Objects::equals);
@@ -186,7 +365,16 @@ public class BrokerTradeConfirmMatcher {
                 confirm.instrumentSymbol(),
                 snapshot.instrumentSymbol(),
                 Objects::equals);
-        allMatch &= addField(fields, "accountId", str(confirm.accountId()), str(snapshot.accountId()), Objects::equals);
+        if (confirm.accountId() != null) {
+            allMatch &= addField(fields, "accountId", str(confirm.accountId()), str(snapshot.accountId()), Objects::equals);
+        } else {
+            addInformationalField(
+                    fields,
+                    "accountId",
+                    null,
+                    str(snapshot.accountId()),
+                    true);
+        }
         allMatch &= addField(
                 fields,
                 "quantity",
@@ -199,12 +387,103 @@ public class BrokerTradeConfirmMatcher {
                 plain(confirm.price()),
                 plain(snapshot.lastPrice()),
                 BrokerTradeConfirmMatcher::numericEquals);
+        allMatch &= addTradeDateField(fields, confirm.tradeDate(), omsTradeDate);
+        allMatch &= addGrossAmountField(fields, confirm, grossTolerance);
+        addInformationalField(
+                fields,
+                "instrumentIsin",
+                confirm.instrumentIsin(),
+                null,
+                confirm.instrumentIsin() == null || confirm.instrumentIsin().isBlank());
+        addInformationalField(
+                fields,
+                "brokerFeeTotal",
+                plain(brokerFeeTotal),
+                null,
+                brokerFeeTotal.signum() == 0);
+        addInformationalField(
+                fields,
+                "settlementCurrency",
+                confirm.settlementCurrency(),
+                confirm.instrumentCurrency(),
+                Objects.equals(
+                        normCurrency(confirm.settlementCurrency()),
+                        normCurrency(confirm.instrumentCurrency())));
         SettlementDateAxis dateAxis = settlementDateAxis(confirm.settlementDate(), omsExpectedSettlementDate);
         fields.set("settlementDate", dateAxis.node());
         ObjectNode root = JSON.objectNode();
-        root.put("resolvedBy", "(accountId,venueExecRef)");
+        root.put("resolvedBy", resolvedBy);
         root.set("fields", fields);
         return new DiffPayload(root, allMatch, dateAxis);
+    }
+
+    private static boolean addTradeDateField(
+            ObjectNode fields, LocalDate brokerTradeDate, Optional<LocalDate> omsTradeDate) {
+        if (brokerTradeDate == null || omsTradeDate.isEmpty()) {
+            addInformationalField(
+                    fields,
+                    "tradeDate",
+                    brokerTradeDate == null ? null : brokerTradeDate.toString(),
+                    omsTradeDate.map(LocalDate::toString).orElse(null),
+                    brokerTradeDate == null || omsTradeDate.isEmpty());
+            return true;
+        }
+        return addField(
+                fields,
+                "tradeDate",
+                brokerTradeDate.toString(),
+                omsTradeDate.get().toString(),
+                Objects::equals);
+    }
+
+    private static boolean addGrossAmountField(
+            ObjectNode fields, BrokerTradeConfirmRepository.MatchableRow confirm, BigDecimal tolerance) {
+        if (confirm.grossAmount() == null) {
+            addInformationalField(fields, "grossAmount", null, null, true);
+            return true;
+        }
+        if (confirm.quantity() == null || confirm.price() == null) {
+            addInformationalField(
+                    fields,
+                    "grossAmount",
+                    plain(confirm.grossAmount()),
+                    null,
+                    false);
+            return false;
+        }
+        BigDecimal computed = confirm.quantity().multiply(confirm.price());
+        String brokerGross = plain(confirm.grossAmount());
+        String omsComputed = computed.toPlainString();
+        boolean withinTolerance = grossAmountWithinTolerance(confirm.grossAmount(), computed, tolerance);
+        ObjectNode node = JSON.objectNode();
+        node.put("broker", brokerGross);
+        node.put("omsComputed", omsComputed);
+        node.put("match", withinTolerance);
+        fields.set("grossAmount", node);
+        return withinTolerance;
+    }
+
+    /** Visible for unit tests. */
+    static boolean grossAmountWithinTolerance(BigDecimal brokerGross, BigDecimal omsComputed, BigDecimal tolerance) {
+        if (brokerGross == null || omsComputed == null) {
+            return Objects.equals(brokerGross, omsComputed);
+        }
+        BigDecimal tol = tolerance == null ? BigDecimal.ZERO : tolerance;
+        return brokerGross.subtract(omsComputed).abs().compareTo(tol) <= 0;
+    }
+
+    private static void addInformationalField(
+            ObjectNode fields, String name, String brokerVal, String omsVal, boolean match) {
+        ObjectNode node = JSON.objectNode();
+        node.put("broker", brokerVal);
+        node.put("oms", omsVal);
+        node.put("match", match);
+        node.put("informational", true);
+        fields.set(name, node);
+    }
+
+    private static String normCurrency(String ccy) {
+        return ccy == null ? null : ccy.trim().toUpperCase(Locale.ROOT);
     }
 
     /**

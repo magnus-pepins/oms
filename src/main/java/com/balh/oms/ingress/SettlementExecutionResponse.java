@@ -3,6 +3,7 @@ package com.balh.oms.ingress;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.util.UUID;
 
 /** JSON row for {@code GET /internal/v1/settlement/executions}. */
@@ -23,4 +24,6 @@ public record SettlementExecutionResponse(
         Instant createdAt,
         String orderStatus,
         String side,
-        String instrumentSymbol) {}
+        String instrumentSymbol,
+        LocalDate tradeDate,
+        LocalDate expectedSettlementDate) {}

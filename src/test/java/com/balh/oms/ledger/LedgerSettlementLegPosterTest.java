@@ -275,6 +275,65 @@ class LedgerSettlementLegPosterTest {
     }
 
     @Test
+    void duplicateReferencePreCheckSkipsPost() throws Exception {
+        stubCustomerResolution(
+                "inv-a0000000-0000-4000-8000-000000000001-USD", "USD", "balance_cust_001_usd");
+        ledger.stubFor(get(urlPathEqualTo("/transactions"))
+                .withQueryParam("reference", equalTo("settlement-42-cash"))
+                .willReturn(aResponse()
+                        .withStatus(200)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\"transactionId\":\"txn-existing\"}")));
+        String payload = """
+                {"schemaVersion":2,"leg":"cash","executionId":111,
+                 "accountId":"a0000000-0000-4000-8000-000000000001","side":"BUY",
+                 "instrumentSymbol":"AAPL","market":"US","quantity":"10","price":"5.50",
+                 "tradeCurrency":"USD","cashCurrency":"USD","notional":"55.00"}""";
+
+        poster.postSettlementOutbox(42L, 111L, "settled", LedgerSettlementOutboxRepository.LEG_CASH, payload);
+
+        ledger.verify(1, getRequestedFor(urlPathEqualTo("/transactions"))
+                .withQueryParam("reference", equalTo("settlement-42-cash")));
+        ledger.verify(0, postRequestedFor(urlPathEqualTo("/transactions")));
+    }
+
+    @Test
+    void duplicateReference409IsTreatedAsSuccess() throws Exception {
+        stubCustomerResolution(
+                "inv-a0000000-0000-4000-8000-000000000001-USD", "USD", "balance_cust_001_usd");
+        ledger.stubFor(get(urlPathEqualTo("/transactions"))
+                .withQueryParam("reference", equalTo("settlement-42-cash"))
+                .inScenario("dup409")
+                .whenScenarioStateIs("Started")
+                .willReturn(aResponse().withStatus(404))
+                .willSetStateTo("Posted"));
+        ledger.stubFor(get(urlPathEqualTo("/transactions"))
+                .withQueryParam("reference", equalTo("settlement-42-cash"))
+                .inScenario("dup409")
+                .whenScenarioStateIs("Posted")
+                .willReturn(aResponse()
+                        .withStatus(200)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\"transactionId\":\"txn-existing\"}")));
+        ledger.stubFor(post(urlPathEqualTo("/transactions"))
+                .willReturn(aResponse()
+                        .withStatus(409)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\"code\":\"CONFLICT\",\"error\":\"Reference already used\"}")));
+        String payload = """
+                {"schemaVersion":2,"leg":"cash","executionId":111,
+                 "accountId":"a0000000-0000-4000-8000-000000000001","side":"BUY",
+                 "instrumentSymbol":"AAPL","market":"US","quantity":"10","price":"5.50",
+                 "tradeCurrency":"USD","cashCurrency":"USD","notional":"55.00"}""";
+
+        poster.postSettlementOutbox(42L, 111L, "settled", LedgerSettlementOutboxRepository.LEG_CASH, payload);
+
+        ledger.verify(2, getRequestedFor(urlPathEqualTo("/transactions"))
+                .withQueryParam("reference", equalTo("settlement-42-cash")));
+        ledger.verify(1, postRequestedFor(urlPathEqualTo("/transactions")));
+    }
+
+    @Test
     void missingApiKeyAtConstructionIsRejected() {
         assertThatThrownBy(() ->
                         new LedgerSettlementLegPoster(

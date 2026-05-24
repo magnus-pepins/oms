@@ -35,6 +35,11 @@ public enum RejectCode {
     RISK_CONCENTRATION_LIMIT,
     /** SELL quantity exceeds {@code positions.quantity_total} for account+symbol+custody. */
     RISK_INSUFFICIENT_POSITION,
+    /**
+     * ISK tax-wrapper account trading an instrument whose active settlement profile has
+     * {@code isk_eligible=false} (gap plan §5.10 / Phase E Slice 12a).
+     */
+    RISK_ISK_INSTRUMENT_NOT_ELIGIBLE,
     /** Reserved for session / calendar gates (slice 5 catalogue). */
     RISK_MARKET_SESSION_CLOSED,
     /** Sanctions / PEP cache stale or screening failed when execution-time re-check is enabled (slice 8). */

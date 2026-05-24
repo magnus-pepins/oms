@@ -32,7 +32,8 @@ public record BrokerTradeConfirmRow(
         LocalDate settlementDate,
         String settlementCurrency,
         String status,
-        String correctionType) {
+        String correctionType,
+        String originalBrokerTradeId) {
 
     /**
      * Instrument identification block. Symbol is required; ISIN / MIC / currency are

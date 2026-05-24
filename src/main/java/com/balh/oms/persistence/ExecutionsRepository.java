@@ -276,6 +276,31 @@ public class ExecutionsRepository {
                 (rs, rowNum) -> rs.getString("settlement_status"));
     }
 
+    private static final String MAX_OPEN_TRADE_EXPECTED_SETTLEMENT_DATE = """
+            SELECT MAX(expected_settlement_date) AS max_date
+            FROM executions
+            WHERE order_id = :order_id
+              AND exec_type = CAST('TRADE' AS execution_exec_type)
+              AND settlement_status NOT IN (
+                  CAST('settled' AS execution_settlement_status),
+                  CAST('failed' AS execution_settlement_status))
+              AND expected_settlement_date IS NOT NULL
+            """;
+
+    /**
+     * Latest expected settlement date among open {@code TRADE} legs for an order. Returns empty
+     * when every leg is settled/failed or pre-V58 rows have no date populated.
+     */
+    public Optional<java.time.LocalDate> maxExpectedSettlementDateForOpenTradeLegs(UUID orderId) {
+        var params = new MapSqlParameterSource("order_id", orderId);
+        java.sql.Date max =
+                jdbc.queryForObject(
+                        MAX_OPEN_TRADE_EXPECTED_SETTLEMENT_DATE,
+                        params,
+                        (rs, rowNum) -> rs.getDate("max_date"));
+        return max == null ? Optional.empty() : Optional.of(max.toLocalDate());
+    }
+
     private static final String SELECT_SETTLEMENT_ROW = """
             SELECT e.id AS execution_id, e.order_id, e.settlement_status::text AS settlement_status, e.exec_type::text AS exec_type,
                    e.last_quantity, e.last_price, e.account_id, o.instrument_symbol, o.side::text AS side,
@@ -333,6 +358,22 @@ public class ExecutionsRepository {
             LIMIT 1
             """;
 
+    /** At most two ids returned so callers can detect ambiguity. */
+    private static final String SELECT_ID_BY_BROKER_VENUE_REF = """
+            SELECT DISTINCT e.id
+            FROM executions e
+            WHERE e.venue_exec_ref = :venue_ref
+              AND e.exec_type = CAST('TRADE' AS execution_exec_type)
+              AND EXISTS (
+                  SELECT 1
+                  FROM positions p
+                  JOIN custody_accounts ca ON ca.id = p.custody_account_id
+                  WHERE p.account_id = e.account_id
+                    AND ca.broker_id = :broker_id
+              )
+            LIMIT 2
+            """;
+
     private static final String FAIL_TRADE_SETTLEMENT_SQL = """
             UPDATE executions SET settlement_status = CAST('failed' AS execution_settlement_status)
             WHERE id = :id
@@ -368,6 +409,28 @@ public class ExecutionsRepository {
         return Optional.of(dates.getFirst());
     }
 
+    private static final String SELECT_TRADE_DATE =
+            """
+            SELECT trade_date
+            FROM executions
+            WHERE id = :id
+              AND exec_type = CAST('TRADE' AS execution_exec_type)
+            """;
+
+    public Optional<LocalDate> findTradeDate(long executionId) {
+        List<LocalDate> dates = jdbc.query(
+                SELECT_TRADE_DATE,
+                new MapSqlParameterSource("id", executionId),
+                (rs, rowNum) -> {
+                    java.sql.Date d = rs.getDate("trade_date");
+                    return d == null ? null : d.toLocalDate();
+                });
+        if (dates.isEmpty() || dates.getFirst() == null) {
+            return Optional.empty();
+        }
+        return Optional.of(dates.getFirst());
+    }
+
     public Optional<Long> findTradeExecutionIdByAccountAndVenueRef(UUID accountId, String venueExecRef) {
         if (accountId == null || venueExecRef == null || venueExecRef.isBlank()) {
             return Optional.empty();
@@ -379,6 +442,23 @@ public class ExecutionsRepository {
                         .addValue("venue_ref", venueExecRef.trim()),
                 (rs, rowNum) -> rs.getLong("id"));
         return ids.isEmpty() ? Optional.empty() : Optional.of(ids.getFirst());
+    }
+
+    /**
+     * Resolves a broker-scoped venue execution reference when {@code accountId} is absent
+     * on the confirm row (gap plan §5.1). Returns empty when zero or ambiguous matches.
+     */
+    public Optional<Long> findTradeExecutionIdByBrokerAndVenueRef(String brokerId, String venueExecRef) {
+        if (brokerId == null || brokerId.isBlank() || venueExecRef == null || venueExecRef.isBlank()) {
+            return Optional.empty();
+        }
+        List<Long> ids = jdbc.query(
+                SELECT_ID_BY_BROKER_VENUE_REF,
+                new MapSqlParameterSource()
+                        .addValue("broker_id", brokerId.trim())
+                        .addValue("venue_ref", venueExecRef.trim()),
+                (rs, rowNum) -> rs.getLong("id"));
+        return ids.size() == 1 ? Optional.of(ids.getFirst()) : Optional.empty();
     }
 
     /**

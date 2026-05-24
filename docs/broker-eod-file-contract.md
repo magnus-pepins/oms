@@ -145,17 +145,43 @@ Schema version `1` is the first version of the **economic** envelope; the existi
 | `tradeDate` / `settlementDate` | yes | ISO dates; matcher compares `settlementDate` against the per-instrument calendar (gap plan §5.3). |
 | `settlementCurrency` | no | Defaults to `instrument.currency` if absent. |
 | `status` | no | Broker lifecycle hint (e.g. `confirmed`, `settled`, `failed`); informational until the broker-side state-machine work in gap plan §5.8. |
-| `correctionType` | yes | `new`, `amend`, `cancel`, or `bust`. Amends/cancels reference the original via `(brokerId, brokerTradeId)`. |
+| `correctionType` | yes | `new`, `amend`, `cancel`, or `bust`. Non-`new` rows require `originalBrokerTradeId` pointing at a **prior matched** `brokerTradeId` under the same `brokerId`. |
+| `originalBrokerTradeId` | yes when correcting | Broker trade id of the row being amended/cancelled/busted (not the new row's id). |
 
 ### Persistence (Flyway `V54__broker_trade_confirms.sql`)
 
-- `broker_confirm_batch` — one row per ingested file; unique on `file_sha256_hex` **and** on `(broker_id, broker_file_id)`. Status lifecycle: `received → parsing → parsed → matching → applied | failed`.
+- `broker_confirm_batch` — one row per ingested file; unique on `file_sha256_hex` **and** on `(broker_id, broker_file_id)`. Status lifecycle: `received → parsing → parsed → matching → applied | failed`. Matcher updates `matched_row_count` / `break_row_count` when a batch reaches `applied`.
 - `broker_trade_confirm` — one row per broker trade; unique on `(broker_id, broker_trade_id)`. `match_status` lifecycle: `pending → matched | mismatch | unresolved | waived`. `resolved_execution_id` links to `executions` once the matcher resolves the row.
 - `broker_trade_confirm_fee` — typed fee rows per confirm; `charged_to` is `customer | bank | tax_authority`.
 
-### Out of this slice
+### HTTP surface (landed)
 
-The v2 envelope **parser**, the `POST /internal/v1/settlement/broker-trade-confirms/import-json` endpoint, the file-import path, the matcher (gap plan §5.2), and the `reconciliation_breaks` table are tracked as follow-up slices of Phase A.
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /broker-trade-confirms/import-json` | JSON ingest → `parsed` (optional auto-match when `OMS_BROKER_CONFIRM_MATCH_ON_INGEST_ENABLED=true`) |
+| `POST /broker-trade-confirms/file-import` | Multipart ingest |
+| `POST /broker-trade-confirms/batches/{batchId}/process-matches` | Match all pending rows in one batch → `applied` |
+| `POST /broker-trade-confirms/process-pending-matches` | Global pending matcher (cross-batch) |
+| `GET /broker-trade-confirms/batches` | Ops batch listing |
+| `GET /reconciliation-breaks` | Open break queue (optional `breakType`, `severity`, `status`, pagination) |
+| `GET /reconciliation-breaks/summary` | Counts by break type and severity |
+| `GET /reconciliation-breaks/export` | CSV export for audit (Beard Admin **Export open breaks**) |
+| `GET /reconciliation-breaks/{id}/events` | Append-only workflow audit trail |
+| `POST /reconciliation-breaks/{id}/assign` | `open` → `investigating` |
+| `POST /reconciliation-breaks/{id}/resolve` | Close with resolution code + note |
+| `POST /reconciliation-breaks/{id}/waive` | Close as waived |
+
+Matcher compares side, symbol, account, quantity, price, **trade date**, and **gross amount** (within `OMS_BROKER_CONFIRM_GROSS_AMOUNT_TOLERANCE`, default `0.01`). Settlement date disagreements open a **side break** without blocking match. ISIN and fee totals are informational in the diff JSON until OMS fee snapshots land.
+
+**Landed (Slice 6b):** `cancel`/`bust` rows call `markTradeFailed` on the execution linked from the prior matched `originalBrokerTradeId`; `amend` rows re-compare economics against that execution.
+
+**Landed (Slice 7b):** ops assign (`open`→`investigating`), resolve, or waive with append-only `reconciliation_break_events`.
+
+**Landed (Slice 7a):** Beard Admin `/settlement-recon` lists open breaks, summary cards, CSV export.
+
+**Landed (Slice 6c):** drop-folder and `POST /file-import` route v2 economic envelopes to the broker confirm ingest pipeline; v0 fixture rows still use the legacy confirm queue importer.
+
+**Landed (Slice 6a):** confirms with `brokerId` + `venueExecRef` but no `accountId` resolve via `custody_accounts.broker_id` linkage on the account's positions; ambiguous matches stay `unresolved`.
 
 ## Related
 

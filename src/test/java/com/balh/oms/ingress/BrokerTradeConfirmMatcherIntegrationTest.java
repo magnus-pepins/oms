@@ -1,6 +1,7 @@
 package com.balh.oms.ingress;
 
 import com.balh.oms.AbstractPostgresIntegrationTest;
+import com.balh.oms.settlement.ReconciliationBreakRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -17,6 +18,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDate;
+import java.math.BigDecimal;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -282,6 +284,426 @@ class BrokerTradeConfirmMatcherIntegrationTest extends AbstractPostgresIntegrati
     }
 
     @Test
+    void processBatchMatches_advancesBatchToAppliedWithCounts() {
+        UUID accountId = UUID.randomUUID();
+        String venueExecRef = "EX-BATCH-" + UUID.randomUUID();
+        seedTradeExecution(accountId, venueExecRef, "AAPL", "BUY", "10", "5.00");
+
+        long batchId = ingestSingleConfirm(accountId, venueExecRef, "AAPL", "BUY", "10", "5.00", "BT-BATCH-1");
+
+        HttpHeaders h = new HttpHeaders();
+        h.set(ApiKeyFilter.HEADER, "test-key");
+        ResponseEntity<SettlementController.BrokerConfirmBatchMatchResponse> res = http.exchange(
+                base() + "/broker-trade-confirms/batches/" + batchId + "/process-matches",
+                HttpMethod.POST,
+                new HttpEntity<>(h),
+                new ParameterizedTypeReference<>() {});
+
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(res.getBody()).isNotNull();
+        assertThat(res.getBody().batchId()).isEqualTo(batchId);
+        assertThat(res.getBody().status()).isEqualTo("applied");
+        assertThat(res.getBody().matchedRows()).isEqualTo(1);
+        assertThat(res.getBody().breakRows()).isZero();
+
+        assertThat(jdbc.queryForObject(
+                        "SELECT status FROM broker_confirm_batch WHERE id = ?", String.class, batchId))
+                .isEqualTo("applied");
+        assertThat(jdbc.queryForObject(
+                        "SELECT matched_row_count FROM broker_confirm_batch WHERE id = ?", Integer.class, batchId))
+                .isEqualTo(1);
+    }
+
+    @Test
+    void processPendingMatches_grossAmountMismatch_opensTradeMismatchBreak() {
+        UUID accountId = UUID.randomUUID();
+        String venueExecRef = "EX-GA-" + UUID.randomUUID();
+        seedTradeExecution(accountId, venueExecRef, "AAPL", "BUY", "10", "5.00");
+
+        String json = buildConfirmJson(
+                accountId,
+                venueExecRef,
+                "AAPL",
+                "BUY",
+                "10",
+                "5.00",
+                "BT-GA-1",
+                "2026-05-23",
+                "2026-05-27",
+                "60.00",
+                null);
+        postIngest(json);
+        postProcessPending();
+
+        assertThat(jdbc.queryForObject(
+                        "SELECT COUNT(*)::int FROM reconciliation_breaks WHERE break_type = 'trade_mismatch'",
+                        Integer.class))
+                .isEqualTo(1);
+    }
+
+    @Test
+    void processPendingMatches_tradeDateMismatch_opensTradeMismatchBreak() {
+        UUID accountId = UUID.randomUUID();
+        String venueExecRef = "EX-TD-" + UUID.randomUUID();
+        seedTradeExecution(accountId, venueExecRef, "AAPL", "BUY", "10", "5.00");
+
+        String json = buildConfirmJson(
+                accountId,
+                venueExecRef,
+                "AAPL",
+                "BUY",
+                "10",
+                "5.00",
+                "BT-TD-1",
+                "2026-05-24",
+                "2026-05-27",
+                "50.00",
+                null);
+        postIngest(json);
+        postProcessPending();
+
+        assertThat(jdbc.queryForObject(
+                        "SELECT COUNT(*)::int FROM reconciliation_breaks WHERE break_type = 'trade_mismatch'",
+                        Integer.class))
+                .isEqualTo(1);
+    }
+
+    @Test
+    void listBrokerConfirmBatches_returnsRecentIngest() {
+        UUID accountId = UUID.randomUUID();
+        String venueExecRef = "EX-LB-" + UUID.randomUUID();
+        ingestSingleConfirm(accountId, venueExecRef, "AAPL", "BUY", "10", "5.00", "BT-LB-1");
+
+        HttpHeaders h = new HttpHeaders();
+        h.set(ApiKeyFilter.HEADER, "test-key");
+        ResponseEntity<SettlementController.BrokerConfirmBatchListResponse> list = http.exchange(
+                base() + "/broker-trade-confirms/batches?limit=10&offset=0",
+                HttpMethod.GET,
+                new HttpEntity<>(h),
+                new ParameterizedTypeReference<>() {});
+        assertThat(list.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(list.getBody()).isNotNull();
+        assertThat(list.getBody().items()).isNotEmpty();
+        assertThat(list.getBody().items().getFirst().status()).isEqualTo("parsed");
+    }
+
+    @Test
+    void processPendingMatches_cancelAfterOriginalMatch_marksExecutionFailed() {
+        UUID accountId = UUID.randomUUID();
+        String venueExecRef = "EX-CANCEL-" + UUID.randomUUID();
+        seedTradeExecution(accountId, venueExecRef, "AAPL", "BUY", "10", "5.00");
+        seedBuyPosition(accountId, "AAPL", "10");
+        String originalTradeId = "BT-ORIG-CANCEL-1";
+        ingestSingleConfirm(accountId, venueExecRef, "AAPL", "BUY", "10", "5.00", originalTradeId);
+        postProcessPending();
+
+        Long executionId = jdbc.queryForObject(
+                "SELECT resolved_execution_id FROM broker_trade_confirm WHERE broker_trade_id = ?",
+                Long.class,
+                originalTradeId);
+        assertThat(executionId).isNotNull();
+
+        ingestCorrectionConfirm(
+                accountId, venueExecRef, "AAPL", "BUY", "10", "5.00", "BT-CANCEL-1", originalTradeId, "cancel");
+        var matchRes = postProcessPending();
+        assertThat(matchRes.getBody()).isNotNull();
+        assertThat(matchRes.getBody().items().getFirst().outcome()).isEqualTo("matched");
+
+        assertThat(jdbc.queryForObject(
+                        "SELECT settlement_status::text FROM executions WHERE id = ?",
+                        String.class,
+                        executionId))
+                .isEqualTo("failed");
+        assertThat(jdbc.queryForObject(
+                        "SELECT match_status FROM broker_trade_confirm WHERE broker_trade_id = ?",
+                        String.class,
+                        "BT-CANCEL-1"))
+                .isEqualTo("matched");
+    }
+
+    @Test
+    void processPendingMatches_amendAfterOriginalMatch_rematchesExecution() {
+        UUID accountId = UUID.randomUUID();
+        String venueExecRef = "EX-AMEND-" + UUID.randomUUID();
+        seedTradeExecution(accountId, venueExecRef, "AAPL", "BUY", "10", "5.00");
+        String originalTradeId = "BT-ORIG-AMEND-1";
+        ingestSingleConfirm(accountId, venueExecRef, "AAPL", "BUY", "10", "5.00", originalTradeId);
+        postProcessPending();
+
+        ingestCorrectionConfirm(
+                accountId, venueExecRef, "AAPL", "BUY", "10", "5.00", "BT-AMEND-1", originalTradeId, "amend");
+        var matchRes = postProcessPending();
+        assertThat(matchRes.getBody()).isNotNull();
+        assertThat(matchRes.getBody().items().getFirst().outcome()).isEqualTo("matched");
+
+        assertThat(jdbc.queryForObject(
+                        "SELECT match_status FROM broker_trade_confirm WHERE broker_trade_id = ?",
+                        String.class,
+                        "BT-AMEND-1"))
+                .isEqualTo("matched");
+        Long executionId = jdbc.queryForObject(
+                "SELECT resolved_execution_id FROM broker_trade_confirm WHERE broker_trade_id = ?",
+                Long.class,
+                "BT-AMEND-1");
+        assertThat(jdbc.queryForObject(
+                        "SELECT COUNT(*)::int FROM broker_settlement_confirm WHERE execution_id = ?",
+                        Integer.class,
+                        executionId))
+                .isGreaterThanOrEqualTo(1);
+    }
+
+    @Test
+    void processPendingMatches_cancelWithoutPriorMatch_opensUnresolvedBreak() {
+        UUID accountId = UUID.randomUUID();
+        String venueExecRef = "EX-CANCEL-NX-" + UUID.randomUUID();
+        ingestCorrectionConfirm(
+                accountId,
+                venueExecRef,
+                "AAPL",
+                "BUY",
+                "10",
+                "5.00",
+                "BT-CANCEL-NX-1",
+                "BT-MISSING-ORIG",
+                "cancel");
+        postProcessPending();
+
+        assertThat(jdbc.queryForObject(
+                        "SELECT match_status FROM broker_trade_confirm WHERE broker_trade_id = ?",
+                        String.class,
+                        "BT-CANCEL-NX-1"))
+                .isEqualTo("unresolved");
+        assertThat(jdbc.queryForObject(
+                        "SELECT COUNT(*)::int FROM reconciliation_breaks WHERE break_type = 'unresolved_confirm'",
+                        Integer.class))
+                .isEqualTo(1);
+    }
+
+    private void ingestCorrectionConfirm(
+            UUID accountId,
+            String venueExecRef,
+            String symbol,
+            String side,
+            String quantity,
+            String price,
+            String brokerTradeId,
+            String originalBrokerTradeId,
+            String correctionType) {
+        String json = buildConfirmJson(
+                accountId,
+                venueExecRef,
+                symbol,
+                side,
+                quantity,
+                price,
+                brokerTradeId,
+                "2026-05-23",
+                "2026-05-27",
+                new BigDecimal(quantity).multiply(new BigDecimal(price)).toPlainString(),
+                null,
+                correctionType,
+                originalBrokerTradeId);
+        postIngest(json);
+    }
+
+    private void postIngest(String json) {
+        HttpHeaders h = new HttpHeaders();
+        h.setContentType(MediaType.APPLICATION_JSON);
+        h.set(ApiKeyFilter.HEADER, "test-key");
+        ResponseEntity<SettlementController.BrokerTradeConfirmImportResponse> ingestRes = http.exchange(
+                base() + "/broker-trade-confirms/import-json?source=it-matcher",
+                HttpMethod.POST,
+                new HttpEntity<>(json.getBytes(StandardCharsets.UTF_8), h),
+                new ParameterizedTypeReference<>() {});
+        assertThat(ingestRes.getStatusCode()).isEqualTo(HttpStatus.OK);
+    }
+
+    @Test
+    void matchByBrokerIdAndVenueRef_whenAccountIdOmitted() {
+        UUID accountId = UUID.randomUUID();
+        UUID custodyId = UUID.randomUUID();
+        jdbc.update(
+                """
+                        INSERT INTO custody_accounts (id, broker_id, account_type, csd_or_book_ref, currency_class)
+                        VALUES (?, 'broker_x', 'omnibus', '', 'MULTI')
+                        """,
+                custodyId);
+        String venueExecRef = "EX-BROKER-ONLY-" + UUID.randomUUID();
+        seedTradeExecution(accountId, venueExecRef, "AAPL", "BUY", "10", "5.00");
+        jdbc.update(
+                """
+                        INSERT INTO positions (
+                          account_id, instrument_symbol, custody_account_id, currency,
+                          quantity_total, quantity_settled, quantity_pending_buy_settle, quantity_pending_sell_settle
+                        ) VALUES (?, 'AAPL', ?, 'USD', 10, 10, 0, 0)
+                        """,
+                accountId,
+                custodyId);
+
+        long confirmId = ingestSingleConfirmWithoutAccount(
+                venueExecRef, "AAPL", "BUY", "10", "5.00", "BT-BROKER-ONLY-1");
+        postProcessPending();
+
+        String status = jdbc.queryForObject(
+                "SELECT match_status FROM broker_trade_confirm WHERE id = ?",
+                String.class,
+                confirmId);
+        assertThat(status).isEqualTo("matched");
+    }
+
+    private long ingestSingleConfirmWithoutAccount(
+            String venueExecRef, String symbol, String side, String quantity, String price, String brokerTradeId) {
+        String json = buildConfirmJsonWithoutAccount(
+                venueExecRef, symbol, side, quantity, price, brokerTradeId, "2026-05-23", "2026-05-27", "50.00", null);
+        postIngest(json);
+        return jdbc.queryForObject(
+                "SELECT id FROM broker_trade_confirm WHERE broker_trade_id = ?",
+                Long.class,
+                brokerTradeId);
+    }
+
+    private String buildConfirmJsonWithoutAccount(
+            String venueExecRef,
+            String symbol,
+            String side,
+            String quantity,
+            String price,
+            String brokerTradeId,
+            String tradeDate,
+            String settlementDate,
+            String grossAmount,
+            String feesJson) {
+        String feesBlock = feesJson == null ? "" : ", \"fees\": " + feesJson;
+        return ("""
+                {
+                  "schemaVersion": 1,
+                  "brokerId": "broker_x",
+                  "fileId": "%FILE%",
+                  "businessDate": "2026-05-23",
+                  "rows": [
+                    {
+                      "brokerTradeId": "%TRADE%",
+                      "venueExecRef": "%VREF%",
+                      "instrument": {
+                        "symbol": "%SYMBOL%",
+                        "currency": "USD"
+                      },
+                      "side": "%SIDE%",
+                      "quantity": "%QTY%",
+                      "price": "%PRICE%",
+                      "grossAmount": "%GROSS%",
+                      "tradeDate": "%TDATE%",
+                      "settlementDate": "%SDATE%",
+                      "settlementCurrency": "USD",
+                      "correctionType": "new"%FEES%
+                    }
+                  ]
+                }
+                """)
+                .replace("%FILE%", "F-" + UUID.randomUUID())
+                .replace("%TRADE%", brokerTradeId)
+                .replace("%VREF%", venueExecRef)
+                .replace("%SYMBOL%", symbol)
+                .replace("%SIDE%", side)
+                .replace("%QTY%", quantity)
+                .replace("%PRICE%", price)
+                .replace("%GROSS%", grossAmount)
+                .replace("%TDATE%", tradeDate)
+                .replace("%SDATE%", settlementDate)
+                .replace("%FEES%", feesBlock);
+    }
+
+    private String buildConfirmJson(
+            UUID accountId,
+            String venueExecRef,
+            String symbol,
+            String side,
+            String quantity,
+            String price,
+            String brokerTradeId,
+            String tradeDate,
+            String settlementDate,
+            String grossAmount,
+            String feesJson) {
+        return buildConfirmJson(
+                accountId,
+                venueExecRef,
+                symbol,
+                side,
+                quantity,
+                price,
+                brokerTradeId,
+                tradeDate,
+                settlementDate,
+                grossAmount,
+                feesJson,
+                "new",
+                null);
+    }
+
+    private String buildConfirmJson(
+            UUID accountId,
+            String venueExecRef,
+            String symbol,
+            String side,
+            String quantity,
+            String price,
+            String brokerTradeId,
+            String tradeDate,
+            String settlementDate,
+            String grossAmount,
+            String feesJson,
+            String correctionType,
+            String originalBrokerTradeId) {
+        String feesBlock = feesJson == null ? "" : ", \"fees\": " + feesJson;
+        String originalBlock =
+                originalBrokerTradeId == null
+                        ? ""
+                        : ", \"originalBrokerTradeId\": \"" + originalBrokerTradeId + "\"";
+        return ("""
+                {
+                  "schemaVersion": 1,
+                  "brokerId": "broker_x",
+                  "fileId": "%FILE%",
+                  "businessDate": "2026-05-23",
+                  "rows": [
+                    {
+                      "brokerTradeId": "%TRADE%",
+                      "venueExecRef": "%VREF%",
+                      "accountId": "%ACCT%",
+                      "instrument": {
+                        "symbol": "%SYMBOL%",
+                        "currency": "USD"
+                      },
+                      "side": "%SIDE%",
+                      "quantity": "%QTY%",
+                      "price": "%PRICE%",
+                      "grossAmount": "%GROSS%",
+                      "tradeDate": "%TDATE%",
+                      "settlementDate": "%SDATE%",
+                      "settlementCurrency": "USD",
+                      "correctionType": "%CORR%"%ORIG%%FEES%
+                    }
+                  ]
+                }
+                """)
+                .replace("%FILE%", "F-" + UUID.randomUUID())
+                .replace("%TRADE%", brokerTradeId)
+                .replace("%VREF%", venueExecRef)
+                .replace("%ACCT%", accountId.toString())
+                .replace("%SYMBOL%", symbol)
+                .replace("%SIDE%", side)
+                .replace("%QTY%", quantity)
+                .replace("%PRICE%", price)
+                .replace("%GROSS%", grossAmount)
+                .replace("%TDATE%", tradeDate)
+                .replace("%SDATE%", settlementDate)
+                .replace("%CORR%", correctionType)
+                .replace("%ORIG%", originalBlock)
+                .replace("%FEES%", feesBlock);
+    }
+
+    @Test
     void listReconciliationBreaks_returnsOpenBreaksByDefault() {
         UUID accountId = UUID.randomUUID();
         String venueExecRef = "EX-LIST-" + UUID.randomUUID();
@@ -300,6 +722,73 @@ class BrokerTradeConfirmMatcherIntegrationTest extends AbstractPostgresIntegrati
         assertThat(list.getBody().status()).isEqualTo("open");
         assertThat(list.getBody().items()).hasSize(1);
         assertThat(list.getBody().items().getFirst().breakType()).isEqualTo("unresolved_confirm");
+    }
+
+    @Test
+    void getReconciliationBreakById_returnsRowWithDiffJson() {
+        UUID accountId = UUID.randomUUID();
+        String venueExecRef = "EX-DETAIL-" + UUID.randomUUID();
+        long confirmId =
+                ingestSingleConfirm(accountId, venueExecRef, "AAPL", "BUY", "10", "5.00", "BT-DETAIL-1");
+        postProcessPending();
+
+        Long breakId = jdbc.queryForObject(
+                "SELECT id FROM reconciliation_breaks WHERE confirm_id = ?",
+                Long.class,
+                confirmId);
+        assertThat(breakId).isNotNull();
+
+        HttpHeaders h = new HttpHeaders();
+        h.set(ApiKeyFilter.HEADER, "test-key");
+        ResponseEntity<ReconciliationBreakRepository.BreakRow> res = http.exchange(
+                base() + "/reconciliation-breaks/" + breakId,
+                HttpMethod.GET,
+                new HttpEntity<>(h),
+                ReconciliationBreakRepository.BreakRow.class);
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(res.getBody()).isNotNull();
+        assertThat(res.getBody().breakType()).isEqualTo("unresolved_confirm");
+        assertThat(res.getBody().confirmId()).isEqualTo(confirmId);
+    }
+
+    @Test
+    void exportReconciliationBreaks_returnsCsvAttachment() {
+        UUID accountId = UUID.randomUUID();
+        String venueExecRef = "EX-CSV-" + UUID.randomUUID();
+        ingestSingleConfirm(accountId, venueExecRef, "AAPL", "BUY", "10", "5.00", "BT-CSV-1");
+        postProcessPending();
+
+        HttpHeaders h = new HttpHeaders();
+        h.set(ApiKeyFilter.HEADER, "test-key");
+        ResponseEntity<String> res = http.exchange(
+                base() + "/reconciliation-breaks/export?status=open",
+                HttpMethod.GET,
+                new HttpEntity<>(h),
+                String.class);
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(res.getHeaders().getFirst(HttpHeaders.CONTENT_DISPOSITION)).contains("attachment");
+        assertThat(res.getBody()).contains("break_type");
+        assertThat(res.getBody()).contains("unresolved_confirm");
+    }
+
+    @Test
+    void summarizeReconciliationBreaks_countsOpenBreaks() {
+        UUID accountId = UUID.randomUUID();
+        String venueExecRef = "EX-SUM-" + UUID.randomUUID();
+        ingestSingleConfirm(accountId, venueExecRef, "AAPL", "BUY", "10", "5.00", "BT-SUM-1");
+        postProcessPending();
+
+        HttpHeaders h = new HttpHeaders();
+        h.set(ApiKeyFilter.HEADER, "test-key");
+        ResponseEntity<SettlementController.ReconciliationBreakSummaryResponse> res = http.exchange(
+                base() + "/reconciliation-breaks/summary?status=open",
+                HttpMethod.GET,
+                new HttpEntity<>(h),
+                new ParameterizedTypeReference<>() {});
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(res.getBody()).isNotNull();
+        assertThat(res.getBody().total()).isGreaterThanOrEqualTo(1);
+        assertThat(res.getBody().byBreakType()).containsKey("unresolved_confirm");
     }
 
     private ResponseEntity<SettlementController.BrokerTradeMatchBatchResponse> postProcessPending() {
@@ -330,54 +819,19 @@ class BrokerTradeConfirmMatcherIntegrationTest extends AbstractPostgresIntegrati
             String quantity,
             String price,
             String brokerTradeId) {
-        String json = ("""
-                {
-                  "schemaVersion": 1,
-                  "brokerId": "broker_x",
-                  "fileId": "%FILE%",
-                  "businessDate": "2026-05-23",
-                  "rows": [
-                    {
-                      "brokerTradeId": "%TRADE%",
-                      "venueExecRef": "%VREF%",
-                      "accountId": "%ACCT%",
-                      "instrument": {
-                        "symbol": "%SYMBOL%",
-                        "currency": "USD"
-                      },
-                      "side": "%SIDE%",
-                      "quantity": "%QTY%",
-                      "price": "%PRICE%",
-                      "tradeDate": "2026-05-23",
-                      "settlementDate": "2026-05-27",
-                      "settlementCurrency": "USD",
-                      "correctionType": "new"
-                    }
-                  ]
-                }
-                """)
-                .replace("%FILE%", "F-" + UUID.randomUUID())
-                .replace("%TRADE%", brokerTradeId)
-                .replace("%VREF%", venueExecRef)
-                .replace("%ACCT%", accountId.toString())
-                .replace("%SYMBOL%", symbol)
-                .replace("%SIDE%", side)
-                .replace("%QTY%", quantity)
-                .replace("%PRICE%", price);
-
-        HttpHeaders h = new HttpHeaders();
-        h.setContentType(MediaType.APPLICATION_JSON);
-        h.set(ApiKeyFilter.HEADER, "test-key");
-        ResponseEntity<SettlementController.BrokerTradeConfirmImportResponse> ingestRes = http.exchange(
-                base() + "/broker-trade-confirms/import-json?source=it-matcher",
-                HttpMethod.POST,
-                new HttpEntity<>(json.getBytes(StandardCharsets.UTF_8), h),
-                new ParameterizedTypeReference<>() {});
-        assertThat(ingestRes.getStatusCode()).isEqualTo(HttpStatus.OK);
-        assertThat(ingestRes.getBody()).isNotNull();
-        assertThat(ingestRes.getBody().status()).isEqualTo("parsed");
-        assertThat(ingestRes.getBody().insertedRows()).isEqualTo(1);
-
+        String json = buildConfirmJson(
+                accountId,
+                venueExecRef,
+                symbol,
+                side,
+                quantity,
+                price,
+                brokerTradeId,
+                "2026-05-23",
+                "2026-05-27",
+                new BigDecimal(quantity).multiply(new BigDecimal(price)).toPlainString(),
+                null);
+        postIngest(json);
         return jdbc.queryForObject(
                 "SELECT id FROM broker_trade_confirm WHERE broker_trade_id = ?",
                 Long.class,
@@ -391,6 +845,21 @@ class BrokerTradeConfirmMatcherIntegrationTest extends AbstractPostgresIntegrati
      * settlement-date axis pass an explicit value (or {@code null}) via the overload.
      */
     private static final LocalDate DEFAULT_EXPECTED_SETTLEMENT_DATE = LocalDate.of(2026, 5, 27);
+
+    private void seedBuyPosition(UUID accountId, String symbol, String quantity) {
+        jdbc.update(
+                """
+                        INSERT INTO positions (
+                          account_id, instrument_symbol, custody_account_id, currency,
+                          quantity_total, quantity_settled, quantity_pending_buy_settle, quantity_pending_sell_settle
+                        ) VALUES (?, ?, CAST(? AS UUID), 'USD', CAST(? AS NUMERIC), 0, CAST(? AS NUMERIC), 0)
+                        """,
+                accountId,
+                symbol,
+                "a0000001-0000-4000-8000-000000000001",
+                quantity,
+                quantity);
+    }
 
     private void seedTradeExecution(
             UUID accountId, String venueExecRef, String symbol, String side, String quantity, String price) {
@@ -444,9 +913,7 @@ class BrokerTradeConfirmMatcherIntegrationTest extends AbstractPostgresIntegrati
                 quantity,
                 price,
                 quantity,
-                expectedSettlementDate == null
-                        ? null
-                        : java.sql.Date.valueOf(expectedSettlementDate.minusDays(4)),
+                java.sql.Date.valueOf(LocalDate.of(2026, 5, 23)),
                 expectedSettlementDate == null ? null : java.sql.Date.valueOf(expectedSettlementDate));
     }
 

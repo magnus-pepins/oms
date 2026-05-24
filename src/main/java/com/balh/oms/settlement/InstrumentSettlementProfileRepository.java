@@ -68,6 +68,35 @@ public class InstrumentSettlementProfileRepository implements SettlementProfileL
                     )
                     """;
 
+    private static final String UPSERT =
+            """
+                    INSERT INTO instrument_settlement_profile (
+                        instrument_id, symbol, isin, primary_mic,
+                        settlement_calendar_id, settlement_cycle, settlement_currency,
+                        isk_eligible, effective_from, effective_to
+                    ) VALUES (
+                        :instrumentId, :symbol, :isin, :primaryMic,
+                        :settlementCalendarId, :settlementCycle, :settlementCurrency,
+                        :iskEligible, :effectiveFrom, :effectiveTo
+                    )
+                    ON CONFLICT (instrument_id, effective_from) DO UPDATE
+                    SET symbol = EXCLUDED.symbol,
+                        isin = EXCLUDED.isin,
+                        primary_mic = EXCLUDED.primary_mic,
+                        settlement_calendar_id = EXCLUDED.settlement_calendar_id,
+                        settlement_cycle = EXCLUDED.settlement_cycle,
+                        settlement_currency = EXCLUDED.settlement_currency,
+                        isk_eligible = EXCLUDED.isk_eligible,
+                        effective_to = EXCLUDED.effective_to
+                    """;
+
+    private static final String COUNT_BY_KEY =
+            """
+                    SELECT COUNT(*)::int
+                    FROM instrument_settlement_profile
+                    WHERE instrument_id = :instrumentId AND effective_from = :effectiveFrom
+                    """;
+
     private final NamedParameterJdbcTemplate jdbc;
 
     public InstrumentSettlementProfileRepository(NamedParameterJdbcTemplate jdbc) {
@@ -109,6 +138,50 @@ public class InstrumentSettlementProfileRepository implements SettlementProfileL
             throw new IllegalStateException("instrument_settlement_profile insert returned no id");
         }
         return key.longValue();
+    }
+
+    /**
+     * Operator-only upsert keyed on the V61 UNIQUE {@code (instrument_id, effective_from)}.
+     * Returns {@code true} when a new row was inserted, {@code false} when an existing row
+     * was updated. The natural key is checked with a pre-count rather than RETURNING
+     * {@code xmax = 0} so the response stays driver-portable.
+     *
+     * <p>Updates intentionally do <em>not</em> rewrite {@code effective_from} (it's the key
+     * half) nor the surrogate {@code id}. Everything else on the row is rewritten from the
+     * incoming command — this matches operator expectation when re-importing a corrected
+     * CSV ("the file is the source of truth for this key").
+     */
+    public boolean upsert(InsertCommand cmd) {
+        if (cmd == null
+                || cmd.instrumentId() == null || cmd.instrumentId().isBlank()
+                || cmd.symbol() == null || cmd.symbol().isBlank()
+                || cmd.primaryMic() == null || cmd.primaryMic().isBlank()
+                || cmd.settlementCalendarId() == null || cmd.settlementCalendarId().isBlank()
+                || cmd.settlementCycle() == null || cmd.settlementCycle().isBlank()
+                || cmd.settlementCurrency() == null || cmd.settlementCurrency().isBlank()
+                || cmd.effectiveFrom() == null) {
+            throw new IllegalArgumentException(
+                    "instrumentId, symbol, primaryMic, settlementCalendarId, settlementCycle, settlementCurrency, effectiveFrom are required");
+        }
+        Integer existing = jdbc.queryForObject(
+                COUNT_BY_KEY,
+                new MapSqlParameterSource()
+                        .addValue("instrumentId", cmd.instrumentId())
+                        .addValue("effectiveFrom", Date.valueOf(cmd.effectiveFrom())),
+                Integer.class);
+        var params = new MapSqlParameterSource()
+                .addValue("instrumentId", cmd.instrumentId())
+                .addValue("symbol", cmd.symbol())
+                .addValue("isin", cmd.isin())
+                .addValue("primaryMic", cmd.primaryMic())
+                .addValue("settlementCalendarId", cmd.settlementCalendarId())
+                .addValue("settlementCycle", cmd.settlementCycle())
+                .addValue("settlementCurrency", cmd.settlementCurrency())
+                .addValue("iskEligible", cmd.iskEligible())
+                .addValue("effectiveFrom", Date.valueOf(cmd.effectiveFrom()))
+                .addValue("effectiveTo", cmd.effectiveTo() == null ? null : Date.valueOf(cmd.effectiveTo()));
+        jdbc.update(UPSERT, params);
+        return existing != null && existing == 0;
     }
 
     public record InsertCommand(

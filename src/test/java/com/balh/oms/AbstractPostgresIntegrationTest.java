@@ -9,6 +9,7 @@ import com.balh.oms.persistence.LedgerInflightOutboxRepository;
 import com.balh.oms.persistence.OrdersRepository;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 import io.aeron.Aeron;
@@ -85,6 +86,13 @@ import java.util.concurrent.locks.LockSupport;
  * {@code @PreDestroy} <em>before</em> the JVM hook fires the cluster node shutdown, so client
  * close always sees a live driver (no {@code DriverTimeoutException} on graceful shutdown).
  *
+ * <p><strong>Readiness gate.</strong> Phase 2.3's {@code OmsClusterReadinessFilter} blocks
+ * cluster-mutating ingress POSTs until the {@code oms-cluster-ready} Aeron counter is READY.
+ * A fresh test cluster has empty replay, which stays NOT_READY unless
+ * {@code OMS_READINESS_ALLOW_EMPTY_REPLAY=true} (set in {@code build.gradle.kts}
+ * {@code tasks.withType<Test>}). Without it, {@code OrdersControllerIntegrationTest} and any
+ * other order-accept IT sees {@code 503 OMS_CLUSTER_NOT_READY} on every {@code POST /orders}.
+ *
  * <p>Tests that need their own cluster (cluster-internal smoke tests, or this same class boot
  * coverage like {@code OmsClusterNodeBootstrapSmokeIT}) keep their own boot logic on different
  * ports — see individual classes.
@@ -140,6 +148,15 @@ public abstract class AbstractPostgresIntegrationTest {
                     + " ledger_inflight_outbox, executions, market_context,"
                     + " corporate_action_event, manual_settlement_actions, ledger_settlement_outbox,"
                     + " broker_settlement_confirm, settlement_file_import_batch, position_history,"
+                    + " cash_reconciliation_report_row, cash_reconciliation_report,"
+                    + " broker_cash_statement_movement, broker_cash_statement_batch,"
+                    + " broker_settlement_fail_row, broker_settlement_fail_batch,"
+                    + " broker_corporate_action_row, broker_corporate_action_batch,"
+                    + " execution_settlement_lot, oms_account_tax_wrapper,"
+                    + " corporate_action_entitlement, corporate_action_position_impact,"
+                    + " corporate_action_cash_impact, isk_valuation_snapshot, isk_tax_year_export,"
+                    + " position_reconciliation_report_row, position_reconciliation_report,"
+                    + " broker_position_snapshot_row, broker_position_snapshot_batch,"
                     + " reconciliation_breaks,"
                     + " broker_trade_confirm_fee, broker_trade_confirm, broker_confirm_batch,"
                     + " positions, orders, fx_stub_leg_group CASCADE";
@@ -547,9 +564,12 @@ public abstract class AbstractPostgresIntegrationTest {
             NamedParameterJdbcTemplate jdbc = new NamedParameterJdbcTemplate(ds);
             OrdersRepository orders = new OrdersRepository(jdbc);
             DomainEventOutboxRepository domainEventOutbox = new DomainEventOutboxRepository(jdbc);
-            DomainEventEnvelopeCodec domainEventCodec = new DomainEventEnvelopeCodec(new ObjectMapper());
+            ObjectMapper domainEventObjectMapper = new ObjectMapper();
+            domainEventObjectMapper.registerModule(new JavaTimeModule());
+            DomainEventEnvelopeCodec domainEventCodec = new DomainEventEnvelopeCodec(domainEventObjectMapper);
             LedgerInflightOutboxRepository ledgerInflightOutbox = new LedgerInflightOutboxRepository(jdbc);
             ObjectMapper inflightObjectMapper = new ObjectMapper();
+            inflightObjectMapper.registerModule(new JavaTimeModule());
 
             Aeron aeron = Aeron.connect(new Aeron.Context().aeronDirectoryName(aeronDir));
             AeronArchive archive = AeronArchive.connect(new AeronArchive.Context()

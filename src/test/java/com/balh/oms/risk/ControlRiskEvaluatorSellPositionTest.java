@@ -38,7 +38,14 @@ class ControlRiskEvaluatorSellPositionTest {
         FixRouteStateRepository fixRoutes = mock(FixRouteStateRepository.class);
 
         ControlRiskEvaluator evaluator =
-                new ControlRiskEvaluator(cfg, flags, cache, new SanctionsExecutionGate(cfg), positions, fixRoutes);
+                new ControlRiskEvaluator(
+                        cfg,
+                        flags,
+                        cache,
+                        new SanctionsExecutionGate(cfg),
+                        positions,
+                        fixRoutes,
+                        disabledIskGate(cfg));
 
         Instant now = Instant.now();
         Order sell =
@@ -64,5 +71,12 @@ class ControlRiskEvaluatorSellPositionTest {
 
         Optional<RejectCode> code = evaluator.evaluate(sell);
         assertThat(code).contains(RejectCode.RISK_INSUFFICIENT_POSITION);
+    }
+
+    private static IskInstrumentEligibilityGate disabledIskGate(OmsConfig cfg) {
+        return new IskInstrumentEligibilityGate(
+                cfg,
+                mock(com.balh.oms.settlement.OmsAccountTaxWrapperRepository.class),
+                mock(com.balh.oms.settlement.InstrumentSettlementProfileRepository.class));
     }
 }

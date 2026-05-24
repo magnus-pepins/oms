@@ -114,7 +114,9 @@ class OrderIngressLedgerInflightIntegrationTest extends AbstractPostgresIntegrat
         assertThat(res.getStatusCode()).isEqualTo(HttpStatus.CREATED);
 
         ledgerWireMock.verify(1, postRequestedFor(urlPathEqualTo("/transactions")));
-        ledgerWireMock.verify(1, getRequestedFor(urlPathEqualTo("/balances/cust_balance_1")));
+        // Two GETs by design: (1) maybeVerifyLedgerBalanceBinding identity check pre-admit;
+        // (2) RestLedgerInflightReservationClient currency lookup for the sync hold POST.
+        ledgerWireMock.verify(2, getRequestedFor(urlPathEqualTo("/balances/cust_balance_1")));
     }
 
     private static HttpHeaders authHeaders() {

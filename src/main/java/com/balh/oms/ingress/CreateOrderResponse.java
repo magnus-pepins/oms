@@ -5,6 +5,7 @@ import com.balh.oms.domain.OrderStatus;
 
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.util.UUID;
 
 public record CreateOrderResponse(
@@ -30,6 +31,12 @@ public record CreateOrderResponse(
          */
         String settlementStatus,
         /**
+         * Latest {@code expected_settlement_date} among open {@code TRADE} legs for this order;
+         * {@code null} when every leg is settled/failed or dates were never populated (pre-V58).
+         * Populated on {@code GET /internal/v1/orders/{id}} and list — drives customer "Settles on …".
+         */
+        LocalDate expectedSettlementDate,
+        /**
          * Wed-demo (d1_read_dto_qtys): cumulative filled quantity from venue execution reports.
          * Always populated when the order has been seen (0 on a freshly-admitted order). Drives
          * the trader-desk + customer-FE progress bar and the "Partially filled" toast.
@@ -50,10 +57,14 @@ public record CreateOrderResponse(
         String ordType
 ) {
     public static CreateOrderResponse from(Order o) {
-        return from(o, null);
+        return from(o, null, null);
     }
 
     public static CreateOrderResponse from(Order o, String settlementStatus) {
+        return from(o, settlementStatus, null);
+    }
+
+    public static CreateOrderResponse from(Order o, String settlementStatus, LocalDate expectedSettlementDate) {
         BigDecimal cumFilled = o.cumFilledQuantity() == null ? BigDecimal.ZERO : o.cumFilledQuantity();
         BigDecimal qty = o.quantity() == null ? BigDecimal.ZERO : o.quantity();
         // Subtract cum from total and clamp at zero. The clamp is defensive: the cluster guards
@@ -73,6 +84,7 @@ public record CreateOrderResponse(
                 o.timeInForce(), o.receivedAt(), o.acceptedAt(), o.terminalAt(),
                 o.ledgerBalanceId(),
                 settlementStatus,
+                expectedSettlementDate,
                 cumFilled,
                 leaves,
                 o.ordType() == null ? "MARKET" : o.ordType()

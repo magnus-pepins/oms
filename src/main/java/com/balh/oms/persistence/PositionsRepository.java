@@ -11,6 +11,7 @@ import org.springframework.stereotype.Repository;
 
 import java.math.BigDecimal;
 import java.util.List;
+import java.util.Locale;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -321,6 +322,53 @@ public class PositionsRepository {
         insertHistory(accountId, sym, custodyAccountId, "SETTLEMENT_SELL_SETTLED", settleQuantity, executionId);
     }
 
+    public record SettledHolder(UUID accountId, BigDecimal quantitySettled) {}
+
+    /** Holders with settled quantity on record date (corporate-action entitlement calc). */
+    public List<SettledHolder> listSettledHolders(String instrumentSymbol, UUID custodyAccountId) {
+        String sym = instrumentSymbol == null ? "" : instrumentSymbol.trim().toUpperCase(Locale.ROOT);
+        return jdbc.query(
+                """
+                        SELECT account_id, quantity_settled
+                        FROM positions
+                        WHERE instrument_symbol = :symbol
+                          AND custody_account_id = :custody
+                          AND quantity_settled > 0
+                        """,
+                new MapSqlParameterSource()
+                        .addValue("symbol", sym)
+                        .addValue("custody", custodyAccountId),
+                (rs, rowNum) ->
+                        new SettledHolder(
+                                (UUID) rs.getObject("account_id"), rs.getBigDecimal("quantity_settled")));
+    }
+
+    /** Applies forward split ratio to settled and total quantities (gap plan §5.9). */
+    public void applyCorporateActionSplit(
+            UUID accountId, String instrumentSymbol, UUID custodyAccountId, BigDecimal ratio) {
+        String sym = instrumentSymbol == null ? "" : instrumentSymbol.trim().toUpperCase(Locale.ROOT);
+        int updated =
+                jdbc.update(
+                        """
+                                UPDATE positions
+                                SET quantity_total = quantity_total * :ratio,
+                                    quantity_settled = quantity_settled * :ratio,
+                                    updated_at = NOW()
+                                WHERE account_id = :accountId
+                                  AND instrument_symbol = :symbol
+                                  AND custody_account_id = :custody
+                                """,
+                        new MapSqlParameterSource()
+                                .addValue("ratio", ratio)
+                                .addValue("accountId", accountId)
+                                .addValue("symbol", sym)
+                                .addValue("custody", custodyAccountId));
+        if (updated != 1) {
+            throw new IllegalStateException(
+                    "corporate action split expected 1 position row, got " + updated);
+        }
+    }
+
     /**
      * Read-side projection: positions joined with a lifetime-BUY cost aggregation derived from
      * {@code executions} so the customer "My positions" view can show a real "Invested" value.
@@ -445,6 +493,47 @@ public class PositionsRepository {
             java.time.Instant updatedAt,
             BigDecimal averageFillPrice,
             BigDecimal investedAmount) {}
+
+    public record AccountPositionKeyRow(
+            UUID accountId,
+            String instrumentSymbol,
+            UUID custodyAccountId,
+            BigDecimal quantityTotal,
+            BigDecimal quantitySettled,
+            BigDecimal quantityPendingBuySettle,
+            BigDecimal quantityPendingSellSettle) {}
+
+    private static final String SELECT_NONZERO_BY_ACCOUNTS =
+            """
+                    SELECT account_id, instrument_symbol, custody_account_id,
+                           quantity_total, quantity_settled,
+                           quantity_pending_buy_settle, quantity_pending_sell_settle
+                    FROM positions
+                    WHERE account_id IN (:account_ids)
+                      AND (quantity_total <> 0
+                           OR quantity_settled <> 0
+                           OR quantity_pending_buy_settle <> 0
+                           OR quantity_pending_sell_settle <> 0)
+                    """;
+
+    /** Non-zero positions for accounts included in a broker snapshot reconcile pass. */
+    public List<AccountPositionKeyRow> findNonZeroPositionsForAccounts(java.util.Collection<UUID> accountIds) {
+        if (accountIds == null || accountIds.isEmpty()) {
+            return List.of();
+        }
+        return jdbc.query(
+                SELECT_NONZERO_BY_ACCOUNTS,
+                new MapSqlParameterSource("account_ids", accountIds),
+                (rs, rowNum) ->
+                        new AccountPositionKeyRow(
+                                (UUID) rs.getObject("account_id"),
+                                rs.getString("instrument_symbol"),
+                                (UUID) rs.getObject("custody_account_id"),
+                                rs.getBigDecimal("quantity_total"),
+                                rs.getBigDecimal("quantity_settled"),
+                                rs.getBigDecimal("quantity_pending_buy_settle"),
+                                rs.getBigDecimal("quantity_pending_sell_settle")));
+    }
 
     public BigDecimal findQuantityTotal(UUID accountId, String instrumentSymbol, UUID custodyAccountId) {
         String sym = instrumentSymbol == null ? "" : instrumentSymbol.trim();

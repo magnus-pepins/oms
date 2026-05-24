@@ -1,5 +1,6 @@
 package com.balh.oms.persistence;
 
+import java.sql.Date;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.List;
@@ -39,6 +40,8 @@ public class SettlementExecutionsRepository {
                            o.status::text AS order_status,
                            o.side::text AS side,
                            o.instrument_symbol,
+                           e.trade_date,
+                           e.expected_settlement_date,
                            COALESCE(e.raw_envelope_json::text, '{}') AS raw_envelope_json
                     FROM executions e
                     INNER JOIN orders o ON o.id = e.order_id
@@ -78,25 +81,30 @@ public class SettlementExecutionsRepository {
                 jdbc.query(
                         DETAIL_SELECT,
                         params,
-                        (rs, rowNum) ->
-                                new SettlementExecutionDetailRow(
-                                        rs.getLong("id"),
-                                        rs.getObject("order_id", UUID.class),
-                                        rs.getObject("account_id", UUID.class),
-                                        rs.getString("venue_id"),
-                                        rs.getTimestamp("venue_ts").toInstant(),
-                                        rs.getString("venue_exec_ref"),
-                                        rs.getBigDecimal("last_quantity"),
-                                        rs.getBigDecimal("last_price"),
-                                        rs.getBigDecimal("leaves_quantity"),
-                                        rs.getBigDecimal("cum_quantity_after"),
-                                        rs.getString("exec_type"),
-                                        rs.getString("settlement_status"),
-                                        rs.getTimestamp("created_at").toInstant(),
-                                        rs.getString("order_status"),
-                                        rs.getString("side"),
-                                        rs.getString("instrument_symbol"),
-                                        rs.getString("raw_envelope_json")));
+                        (rs, rowNum) -> {
+                            Date tradeDate = rs.getDate("trade_date");
+                            Date expectedSettlementDate = rs.getDate("expected_settlement_date");
+                            return new SettlementExecutionDetailRow(
+                                    rs.getLong("id"),
+                                    rs.getObject("order_id", UUID.class),
+                                    rs.getObject("account_id", UUID.class),
+                                    rs.getString("venue_id"),
+                                    rs.getTimestamp("venue_ts").toInstant(),
+                                    rs.getString("venue_exec_ref"),
+                                    rs.getBigDecimal("last_quantity"),
+                                    rs.getBigDecimal("last_price"),
+                                    rs.getBigDecimal("leaves_quantity"),
+                                    rs.getBigDecimal("cum_quantity_after"),
+                                    rs.getString("exec_type"),
+                                    rs.getString("settlement_status"),
+                                    rs.getTimestamp("created_at").toInstant(),
+                                    rs.getString("order_status"),
+                                    rs.getString("side"),
+                                    rs.getString("instrument_symbol"),
+                                    tradeDate == null ? null : tradeDate.toLocalDate(),
+                                    expectedSettlementDate == null ? null : expectedSettlementDate.toLocalDate(),
+                                    rs.getString("raw_envelope_json"));
+                        });
         if (list.isEmpty()) {
             return Optional.empty();
         }
@@ -126,7 +134,9 @@ public class SettlementExecutionsRepository {
                                e.created_at,
                                o.status::text AS order_status,
                                o.side::text AS side,
-                               o.instrument_symbol
+                               o.instrument_symbol,
+                               e.trade_date,
+                               e.expected_settlement_date
                         FROM executions e
                         INNER JOIN orders o ON o.id = e.order_id
                         WHERE 1 = 1
@@ -154,23 +164,28 @@ public class SettlementExecutionsRepository {
         return jdbc.query(
                 sql.toString(),
                 params,
-                (rs, rowNum) ->
-                        new SettlementExecutionRow(
-                                rs.getLong("id"),
-                                rs.getObject("order_id", UUID.class),
-                                rs.getObject("account_id", UUID.class),
-                                rs.getString("venue_id"),
-                                rs.getTimestamp("venue_ts").toInstant(),
-                                rs.getString("venue_exec_ref"),
-                                rs.getBigDecimal("last_quantity"),
-                                rs.getBigDecimal("last_price"),
-                                rs.getBigDecimal("leaves_quantity"),
-                                rs.getBigDecimal("cum_quantity_after"),
-                                rs.getString("exec_type"),
-                                rs.getString("settlement_status"),
-                                rs.getTimestamp("created_at").toInstant(),
-                                rs.getString("order_status"),
-                                rs.getString("side"),
-                                rs.getString("instrument_symbol")));
+                (rs, rowNum) -> {
+                    Date tradeDate = rs.getDate("trade_date");
+                    Date expectedSettlementDate = rs.getDate("expected_settlement_date");
+                    return new SettlementExecutionRow(
+                            rs.getLong("id"),
+                            rs.getObject("order_id", UUID.class),
+                            rs.getObject("account_id", UUID.class),
+                            rs.getString("venue_id"),
+                            rs.getTimestamp("venue_ts").toInstant(),
+                            rs.getString("venue_exec_ref"),
+                            rs.getBigDecimal("last_quantity"),
+                            rs.getBigDecimal("last_price"),
+                            rs.getBigDecimal("leaves_quantity"),
+                            rs.getBigDecimal("cum_quantity_after"),
+                            rs.getString("exec_type"),
+                            rs.getString("settlement_status"),
+                            rs.getTimestamp("created_at").toInstant(),
+                            rs.getString("order_status"),
+                            rs.getString("side"),
+                            rs.getString("instrument_symbol"),
+                            tradeDate == null ? null : tradeDate.toLocalDate(),
+                            expectedSettlementDate == null ? null : expectedSettlementDate.toLocalDate());
+                });
     }
 }

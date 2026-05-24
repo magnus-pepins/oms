@@ -83,8 +83,9 @@ class LedgerInflightOutboxIntegrationTest extends AbstractPostgresIntegrationTes
     @Autowired LedgerInflightOutboxReconciler ledgerInflightOutboxReconciler;
 
     @BeforeEach
-    void resetStubs() {
+    void reset() {
         ledgerWireMock.resetAll();
+        jdbc.update("DELETE FROM ledger_inflight_outbox");
     }
 
     @Test

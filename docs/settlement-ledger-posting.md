@@ -100,7 +100,7 @@ Each `POST /transactions` uses a deterministic `reference`:
 - `LEG_CASH_QUOTE` → `settlement-<outboxId>-cash-quote`
 - `LEG_FEE` → `settlement-<outboxId>-fee`
 
-Ledger does not enforce `reference` uniqueness in HEAD; the outbox `uq_…_leg_kind` index plus the `posted_at IS NULL` reconciler filter keep duplicates from being submitted in the happy path. A Ledger-side pre-check (`GET /transactions?reference=…` before submit) is tracked as a follow-up for J-7 — accepted risk for the demo.
+Ledger enforces `reference` uniqueness on the Postgres API path (`@unique` in Prisma; duplicate POST returns `409 CONFLICT`). Settlement leg posting uses a deterministic reference (`settlement-<outboxId>-<leg>`) and idempotency via `GET /transactions?reference=…` before submit plus treating `409` as success when the reference already exists (`LedgerSettlementLegPoster`). The outbox `uq_…_leg_kind` index plus the `posted_at IS NULL` reconciler filter keep duplicates from being submitted in the happy path.
 
 ### Bank-side balances the demo needs seeded
 

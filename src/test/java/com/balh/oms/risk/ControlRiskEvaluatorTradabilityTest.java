@@ -85,7 +85,15 @@ class ControlRiskEvaluatorTradabilityTest {
         when(positions.findQuantityTotal(any(), anyString(), any())).thenReturn(BigDecimal.ZERO);
         FixRouteStateRepository fixRoutes = mock(FixRouteStateRepository.class);
         when(fixRoutes.findByRouteKey(anyString())).thenReturn(Optional.empty());
-        return new ControlRiskEvaluator(cfg, flags, cache, new SanctionsExecutionGate(cfg), positions, fixRoutes);
+        return new ControlRiskEvaluator(
+                cfg, flags, cache, new SanctionsExecutionGate(cfg), positions, fixRoutes, disabledIskGate(cfg));
+    }
+
+    private static IskInstrumentEligibilityGate disabledIskGate(OmsConfig cfg) {
+        return new IskInstrumentEligibilityGate(
+                cfg,
+                mock(com.balh.oms.settlement.OmsAccountTaxWrapperRepository.class),
+                mock(com.balh.oms.settlement.InstrumentSettlementProfileRepository.class));
     }
 
     private static MarketdataInstrumentsCache emptyMarketdataCache() {

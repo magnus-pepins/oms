@@ -27,6 +27,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -96,7 +97,9 @@ class SettlementConfirmProcessorFeeSnapshotTest {
         objectMapper = new ObjectMapper();
         processor = new SettlementConfirmProcessor(
                 confirms, executions, positions, outbox, feeSnapshots,
-                objectMapper, config, new SimpleMeterRegistry());
+                objectMapper, config, new SimpleMeterRegistry(),
+                new IskSettlementMetadataService(
+                        mock(com.balh.oms.settlement.OmsAccountTaxWrapperRepository.class)));
         // SettlementConfirmProcessor.applyTransition is called directly from
         // advanceOneSettlementStep (no @Transactional proxy needed here), so
         // self is irrelevant — but advanceOneSettlementStep doesn't dispatch

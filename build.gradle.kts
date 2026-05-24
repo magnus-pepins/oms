@@ -194,6 +194,10 @@ protobuf {
 tasks.withType<Test> {
     useJUnitPlatform()
     jvmArgs(lowLatencyJvmModuleOpens)
+    // Phase 2.3 readiness gate (b753368): fresh AbstractPostgresIntegrationTest cluster has empty
+    // replay by design. Without this, OmsClusterReadinessFilter returns 503 on every POST
+    // /internal/v1/orders — chicken-and-egg with maybePromoteReadinessAfterAdmission().
+    environment("OMS_READINESS_ALLOW_EMPTY_REPLAY", "true")
     // Keep test logs deterministic: do not run integration suites in parallel until we enable Postgres pooling.
     systemProperty("junit.jupiter.execution.parallel.enabled", "false")
     systemProperty("spring.test.context.cache.maxSize", springTestContextCacheMaxSize.toString())
@@ -367,6 +371,32 @@ tasks.register<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJarF
 }
 
 tasks.named<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJarFixEgress").configure {
+    shouldRunAfter(tasks.named("bootJar"))
+    duplicatesStrategy = org.gradle.api.file.DuplicatesStrategy.EXCLUDE
+}
+
+/** FIX-in acceptor role (`oms-fix-ingress` profile). */
+tasks.register<org.springframework.boot.gradle.tasks.run.BootRun>("bootRunFixIngress") {
+    group = "application"
+    description =
+        "Run OMS with oms-fix-ingress profile (QuickFIX acceptor → AcceptOrderCommand; application-oms-fix-ingress.yaml)."
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.balh.oms.OmsFixIngressBootstrap")
+    jvmArgs(lowLatencyJvmModuleOpens)
+}
+
+tasks.register<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJarFixIngress") {
+    group = "build"
+    description =
+        "Executable JAR for fix-ingress entry (Start-Class OmsFixIngressBootstrap; classifier fix-ingress)."
+    mainClass.set("com.balh.oms.OmsFixIngressBootstrap")
+    archiveClassifier.set("fix-ingress")
+    archiveBaseName.set("oms")
+    targetJavaVersion.set(JavaVersion.VERSION_21)
+    classpath = sourceSets["main"].runtimeClasspath
+}
+
+tasks.named<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJarFixIngress").configure {
     shouldRunAfter(tasks.named("bootJar"))
     duplicatesStrategy = org.gradle.api.file.DuplicatesStrategy.EXCLUDE
 }

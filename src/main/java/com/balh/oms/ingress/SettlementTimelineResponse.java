@@ -1,6 +1,7 @@
 package com.balh.oms.ingress;
 
 import java.time.Instant;
+import java.time.LocalDate;
 import java.util.List;
 
 /**
@@ -16,12 +17,24 @@ import java.util.List;
  *       successfully posted to Ledger, or {@code null} if pending / failed).
  * </ul>
  *
+ * <p>{@code tradeDate} and {@code expectedSettlementDate} pull through the columns
+ * populated by {@link com.balh.oms.settlement.SettlementDateCalculator} at TRADE insert
+ * time (gap plan §5.3 Slice 1 / 2b). Both are {@code null} on CANCEL / REJECT / REPLACE
+ * rows and on legacy executions written before V58 / V62; consumers must therefore
+ * render "—" rather than guess. The customer-frontend BFF surfaces
+ * {@code expectedSettlementDate} as "Settles on …" in the order detail screen.
+ *
  * <p>Phases that don't yield a recorded timestamp (e.g. {@code settling} is advanced in
  * the same DB transaction as {@code settled} on the auto-step path) are omitted rather
  * than guessed. The beard-admin Detail panel renders this as a vertical timeline.
  */
 public record SettlementTimelineResponse(
-        long executionId, String currentSettlementStatus, List<Phase> phases, List<LedgerLeg> ledgerLegs) {
+        long executionId,
+        String currentSettlementStatus,
+        LocalDate tradeDate,
+        LocalDate expectedSettlementDate,
+        List<Phase> phases,
+        List<LedgerLeg> ledgerLegs) {
 
     /**
      * One step in the lifecycle. {@code source} is a free-form provenance string
@@ -31,8 +44,15 @@ public record SettlementTimelineResponse(
     public record Phase(String phase, Instant occurredAt, String source) {}
 
     /**
-     * One Ledger posting attempt for a settlement leg. {@code postedAt == null} means
-     * the reconciler hasn't successfully posted yet (still retrying or hard-failed).
+     * One Ledger posting attempt for a settlement leg.
+     *
+     * <p>{@code postedAt == null} means the reconciler hasn't successfully posted yet
+     * (still retrying or hard-failed). {@code attempts} / {@code lastErrorText} /
+     * {@code lastAttemptAt} expose the per-row forensic state added by V42 so operators
+     * can see how many times the row has been retried and what the last error was.
+     * {@code skippedAt} / {@code skipReason} are set by the reconciler's V43 tombstone
+     * path when the row is no longer retriable (operator/data gap, e.g. unfunded
+     * balance or indicator-not-found — distinct from a transient Ledger 503).
      */
     public record LedgerLeg(
             long outboxId,
@@ -40,5 +60,10 @@ public record SettlementTimelineResponse(
             String toSettlementStatus,
             Instant enqueuedAt,
             Instant postedAt,
+            int attempts,
+            String lastErrorText,
+            Instant lastAttemptAt,
+            Instant skippedAt,
+            String skipReason,
             String payloadJson) {}
 }

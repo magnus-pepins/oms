@@ -2,6 +2,7 @@ package com.balh.oms.persistence;
 
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.util.UUID;
 
 /** One row from {@link SettlementExecutionsRepository#findByFilters}. */
@@ -21,4 +22,6 @@ public record SettlementExecutionRow(
         Instant createdAt,
         String orderStatus,
         String side,
-        String instrumentSymbol) {}
+        String instrumentSymbol,
+        LocalDate tradeDate,
+        LocalDate expectedSettlementDate) {}

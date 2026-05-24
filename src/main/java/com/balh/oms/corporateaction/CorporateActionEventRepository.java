@@ -19,6 +19,38 @@ public class CorporateActionEventRepository {
             RETURNING id
             """;
 
+    private static final String INSERT_FROM_BROKER_IF_NEW =
+            """
+                    INSERT INTO corporate_action_event (
+                        broker_id, broker_event_id, instrument_symbol, action_type, effective_date,
+                        record_date, payable_date, payload_json
+                    ) VALUES (
+                        :brokerId, :brokerEventId, :instrumentSymbol, :actionType,
+                        CAST(:effectiveDate AS DATE), CAST(:recordDate AS DATE), CAST(:payableDate AS DATE),
+                        CAST(:payloadJson AS JSONB)
+                    )
+                    ON CONFLICT (broker_id, broker_event_id) DO NOTHING
+                    RETURNING id
+                    """;
+
+    private static final String SELECT_UNPROCESSED_FOR_PROCESSING =
+            """
+                    SELECT id, instrument_symbol, action_type, effective_date::text AS effective_date,
+                           payload_json::text AS payload_json, record_date, payable_date
+                    FROM corporate_action_event
+                    WHERE processed_at IS NULL
+                    ORDER BY id ASC
+                    LIMIT :limit
+                    FOR UPDATE SKIP LOCKED
+                    """;
+
+    private static final String MARK_PROCESSING_ERROR =
+            """
+                    UPDATE corporate_action_event
+                    SET processing_error = :error
+                    WHERE id = :id AND processed_at IS NULL
+                    """;
+
     /**
      * {@code FOR UPDATE SKIP LOCKED} — callers must run inside a Spring transaction that spans this fetch and
      * {@link #markProcessedIfPending(long)} (see {@link CorporateActionProcessorJob}).
@@ -72,6 +104,46 @@ public class CorporateActionEventRepository {
         return ids.getFirst();
     }
 
+    /** Idempotent broker-file apply (gap plan §5.9). Returns empty when broker event already ingested. */
+    public Optional<Long> insertFromBrokerIfNew(
+            String brokerId,
+            String brokerEventId,
+            String instrumentSymbol,
+            String actionType,
+            LocalDate effectiveDate,
+            LocalDate recordDate,
+            LocalDate payableDate,
+            String payloadJson) {
+        List<Long> ids =
+                jdbc.query(
+                        INSERT_FROM_BROKER_IF_NEW,
+                        new MapSqlParameterSource()
+                                .addValue("brokerId", brokerId)
+                                .addValue("brokerEventId", brokerEventId)
+                                .addValue("instrumentSymbol", instrumentSymbol)
+                                .addValue("actionType", actionType)
+                                .addValue("effectiveDate", effectiveDate.toString())
+                                .addValue(
+                                        "recordDate", recordDate == null ? null : recordDate.toString())
+                                .addValue(
+                                        "payableDate", payableDate == null ? null : payableDate.toString())
+                                .addValue("payloadJson", payloadJson),
+                        (rs, rowNum) -> rs.getLong("id"));
+        return ids.isEmpty() ? Optional.empty() : Optional.of(ids.getFirst());
+    }
+
+    /** Backwards-compatible broker insert without record/payable dates. */
+    public Optional<Long> insertFromBrokerIfNew(
+            String brokerId,
+            String brokerEventId,
+            String instrumentSymbol,
+            String actionType,
+            LocalDate effectiveDate,
+            String payloadJson) {
+        return insertFromBrokerIfNew(
+                brokerId, brokerEventId, instrumentSymbol, actionType, effectiveDate, null, null, payloadJson);
+    }
+
     public List<UnprocessedRow> findUnprocessedForUpdateSkipLocked(int limit) {
         return jdbc.query(
                 SELECT_UNPROCESSED_SQL,
@@ -82,6 +154,32 @@ public class CorporateActionEventRepository {
                                 rs.getString("instrument_symbol"),
                                 rs.getString("action_type"),
                                 LocalDate.parse(rs.getString("effective_date"))));
+    }
+
+    public List<ProcessingRow> findUnprocessedForProcessing(int limit) {
+        return jdbc.query(
+                SELECT_UNPROCESSED_FOR_PROCESSING,
+                new MapSqlParameterSource("limit", limit),
+                (rs, rowNum) -> {
+                    java.sql.Date recordDate = rs.getDate("record_date");
+                    java.sql.Date payableDate = rs.getDate("payable_date");
+                    return new ProcessingRow(
+                            rs.getLong("id"),
+                            rs.getString("instrument_symbol"),
+                            rs.getString("action_type"),
+                            LocalDate.parse(rs.getString("effective_date")),
+                            rs.getString("payload_json"),
+                            recordDate == null ? null : recordDate.toLocalDate(),
+                            payableDate == null ? null : payableDate.toLocalDate());
+                });
+    }
+
+    public void markProcessingError(long id, String error) {
+        String err = error;
+        if (err != null && err.length() > 500) {
+            err = err.substring(0, 500);
+        }
+        jdbc.update(MARK_PROCESSING_ERROR, new MapSqlParameterSource("id", id).addValue("error", err));
     }
 
     /**
@@ -144,4 +242,13 @@ public class CorporateActionEventRepository {
     }
 
     public record UnprocessedRow(long id, String instrumentSymbol, String actionType, LocalDate effectiveDate) {}
+
+    public record ProcessingRow(
+            long id,
+            String instrumentSymbol,
+            String actionType,
+            LocalDate effectiveDate,
+            String payloadJson,
+            LocalDate recordDate,
+            LocalDate payableDate) {}
 }

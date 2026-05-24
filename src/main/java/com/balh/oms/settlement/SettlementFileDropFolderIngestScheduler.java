@@ -16,7 +16,7 @@ import java.util.stream.Stream;
 
 /**
  * Optional poll of a host directory for {@code .json} broker confirm files. Same ingest semantics as
- * {@link SettlementFileImportService#ingestMultipart}; processed files are moved under {@code .oms-done/} or
+ * {@link SettlementFileIngestRouter}; processed files are moved under {@code .oms-done/} or
  * {@code .oms-failed/} under the watch directory. SFTP/S3 are out of scope here — copy files into this folder
  * with rclone or a broker sidecar (see docs/broker-eod-file-contract.md).
  */
@@ -30,11 +30,12 @@ public class SettlementFileDropFolderIngestScheduler {
     private static final String SUB_FAILED = ".oms-failed";
 
     private final OmsConfig config;
-    private final SettlementFileImportService settlementFileImportService;
+    private final SettlementFileIngestRouter settlementFileIngestRouter;
 
-    public SettlementFileDropFolderIngestScheduler(OmsConfig config, SettlementFileImportService settlementFileImportService) {
+    public SettlementFileDropFolderIngestScheduler(
+            OmsConfig config, SettlementFileIngestRouter settlementFileIngestRouter) {
         this.config = config;
-        this.settlementFileImportService = settlementFileImportService;
+        this.settlementFileIngestRouter = settlementFileIngestRouter;
     }
 
     @Scheduled(fixedDelayString = "${oms.settlement.file-import-drop-folder-poll-interval-ms:30000}")
@@ -87,14 +88,15 @@ public class SettlementFileDropFolderIngestScheduler {
         String name = file.getFileName().toString();
         try {
             byte[] bytes = Files.readAllBytes(file);
-            SettlementFileImportService.Result r =
-                    settlementFileImportService.ingestMultipart(SOURCE_TAG, name, bytes);
-            Path destDir = "failed".equals(r.status()) ? failedDir : doneDir;
+            SettlementFileIngestRouter.RoutedResult r =
+                    settlementFileIngestRouter.ingest(SOURCE_TAG, name, bytes);
+            Path destDir = isFailedStatus(r.status()) ? failedDir : doneDir;
             Path dest = uniqueDest(destDir, name);
             Files.move(file, dest, StandardCopyOption.REPLACE_EXISTING);
             log.info(
-                    "Drop-folder ingest {} batchId={} status={} duplicate={}",
+                    "Drop-folder ingest {} format={} batchId={} status={} duplicate={}",
                     name,
+                    r.format(),
                     r.batchId(),
                     r.status(),
                     r.duplicate());
@@ -105,6 +107,10 @@ public class SettlementFileDropFolderIngestScheduler {
             log.warn("Drop-folder ingest failed for {}", name, e);
             moveQuietly(file, failedDir, name);
         }
+    }
+
+    private static boolean isFailedStatus(String status) {
+        return "failed".equals(status) || "rejected".equals(status);
     }
 
     private static Path uniqueDest(Path dir, String originalName) {

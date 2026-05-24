@@ -15,11 +15,18 @@ public final class OmsProfiles {
     public static final String INGRESS_REPLICA = "oms-ingress-replica";
 
     /**
+     * FIX-in acceptor — QuickFIX/J {@code SocketAcceptor} for external clients; submits
+     * {@code AcceptOrderCommand} and returns synchronous admission {@code ExecutionReport}s.
+     * Exactly one replica per listen port / session set.
+     */
+    public static final String FIX_INGRESS = "oms-fix-ingress";
+
+    /**
      * Spring {@code @Profile} expression: load order-accept beans only on ingress JVMs (not on
-     * {@value #POSTGRES_PROJECTOR} or {@value #FIX_EGRESS}).
+     * {@value #POSTGRES_PROJECTOR}, {@value #FIX_EGRESS}, or {@value #FIX_INGRESS}).
      */
     public static final String ORDER_ACCEPT_PROFILE =
-            "!oms-postgres-projector & !oms-fix-egress";
+            "!oms-postgres-projector & !oms-fix-egress & !oms-fix-ingress";
 
     /**
      * Spring {@code @Profile} expression: JVMs that submit commands through {@code OmsClusterIngressClient}.

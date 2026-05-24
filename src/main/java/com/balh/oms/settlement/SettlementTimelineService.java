@@ -85,11 +85,21 @@ public class SettlementTimelineService {
                                 l.toSettlementStatus(),
                                 l.createdAt(),
                                 l.postedAt(),
+                                l.attempts(),
+                                l.lastErrorText(),
+                                l.lastAttemptAt(),
+                                l.skippedAt(),
+                                l.skipReason(),
                                 l.payloadJson()))
                 .toList();
 
         return Optional.of(
                 new SettlementTimelineResponse(
-                        executionId, exec.settlementStatus(), phases, ledgerLegs));
+                        executionId,
+                        exec.settlementStatus(),
+                        exec.tradeDate(),
+                        exec.expectedSettlementDate(),
+                        phases,
+                        ledgerLegs));
     }
 }

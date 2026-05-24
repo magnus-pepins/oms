@@ -46,6 +46,61 @@ class AcceptOrderCommandCodecTest {
     }
 
     @Test
+    void roundTrip_withFixInIngressMetadata_decodesIdenticalRecord() {
+        UUID fixSessionId = UUID.fromString("b2c3d4e5-f6a7-4890-b123-456789abcdef");
+        FixInIngressMetadata metadata = new FixInIngressMetadata(fixSessionId, "CLIENT-ORD-001", "ACC1");
+        AcceptOrderCommand original = new AcceptOrderCommand(
+                99L,
+                UUID.fromString("a1b2c3d4-e5f6-4789-9abc-def012345678"),
+                1_700_000_000_000_000_000L,
+                10_500_000_000L,
+                123_456_000L,
+                3,
+                AcceptOrderCommand.SIDE_BUY,
+                AcceptOrderCommand.TIF_DAY,
+                AcceptOrderCommand.ORD_TYPE_LIMIT,
+                "acct-fix-in",
+                "fixin:" + fixSessionId + ":CLIENT-ORD-001",
+                "hash-fix-in",
+                "AAPL",
+                "ledger-bal-fix",
+                metadata);
+
+        ExpandableArrayBuffer buf = new ExpandableArrayBuffer(ENCODE_BUFFER_CAPACITY);
+        int written = original.encode(buf, DECODE_OFFSET);
+
+        AcceptOrderCommand decoded = AcceptOrderCommand.decode(buf, DECODE_OFFSET, written);
+
+        assertThat(decoded.fixInIngressMetadataOrNull()).isEqualTo(metadata);
+        assertThat(decoded).isEqualTo(original);
+    }
+
+    @Test
+    void roundTrip_legacyFrameWithoutFixInTail_decodesNullMetadata() {
+        AcceptOrderCommand original = new AcceptOrderCommand(
+                1L,
+                UUID.randomUUID(),
+                1L,
+                1L,
+                0L,
+                0,
+                AcceptOrderCommand.SIDE_BUY,
+                AcceptOrderCommand.TIF_DAY,
+                "acct",
+                "idem",
+                "hash",
+                "AAPL",
+                null);
+
+        ExpandableArrayBuffer buf = new ExpandableArrayBuffer(ENCODE_BUFFER_CAPACITY);
+        int written = original.encode(buf, DECODE_OFFSET);
+
+        AcceptOrderCommand decoded = AcceptOrderCommand.decode(buf, DECODE_OFFSET, written);
+
+        assertThat(decoded.fixInIngressMetadataOrNull()).isNull();
+    }
+
+    @Test
     void roundTrip_marketOrderWithNoLedgerBalanceId_decodesNullField() {
         AcceptOrderCommand original = new AcceptOrderCommand(
                 42L,

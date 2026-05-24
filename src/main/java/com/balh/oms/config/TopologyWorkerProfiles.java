@@ -19,6 +19,9 @@ public final class TopologyWorkerProfiles {
         // replay loop, neither of which can share a JVM with the other roles.
         rejectPair(environment, OmsProfiles.FIX_EGRESS, OmsProfiles.INGRESS_REPLICA);
         rejectPair(environment, OmsProfiles.FIX_EGRESS, OmsProfiles.POSTGRES_PROJECTOR);
+        rejectPair(environment, OmsProfiles.FIX_INGRESS, OmsProfiles.INGRESS_REPLICA);
+        rejectPair(environment, OmsProfiles.FIX_INGRESS, OmsProfiles.POSTGRES_PROJECTOR);
+        rejectPair(environment, OmsProfiles.FIX_INGRESS, OmsProfiles.FIX_EGRESS);
     }
 
     private static void rejectPair(Environment environment, String profileA, String profileB) {

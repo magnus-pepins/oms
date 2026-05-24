@@ -1,6 +1,7 @@
 package com.balh.oms.ledger;
 
 import com.balh.oms.settlement.LedgerSettlementOutboxRepository;
+import com.balh.oms.settlement.SettlementFailPenaltyBookingService;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -35,9 +36,9 @@ import java.util.concurrent.ConcurrentHashMap;
  * </ul>
  *
  * <p>Idempotency uses the Ledger transaction {@code reference} field
- * (deterministic {@code settlement-<outboxId>-<leg>}); Ledger does not enforce
- * uniqueness today, so retries after partial failure may dupe — accepted for
- * demo, deferred follow-up to add a guard via pre-check.
+ * (deterministic {@code settlement-<outboxId>-<leg>}). Before POST the poster
+ * checks {@code GET /transactions?reference=…}; duplicate POSTs that return
+ * {@code 409 CONFLICT} are treated as success when the reference already exists.
  */
 public final class LedgerSettlementLegPoster implements LedgerSettlementPostingClient {
 
@@ -91,6 +92,7 @@ public final class LedgerSettlementLegPoster implements LedgerSettlementPostingC
             case LedgerSettlementOutboxRepository.LEG_CASH_BASE -> postCashCrossCurrency(outboxId, p, true);
             case LedgerSettlementOutboxRepository.LEG_CASH_QUOTE -> postCashCrossCurrency(outboxId, p, false);
             case LedgerSettlementOutboxRepository.LEG_FEE -> postFee(outboxId, p);
+            case LedgerSettlementOutboxRepository.LEG_PENALTY -> postPenalty(outboxId, p);
             default -> throw new LedgerSettlementPostingException("unknown legKind: " + legKind);
         }
     }
@@ -210,6 +212,30 @@ public final class LedgerSettlementLegPoster implements LedgerSettlementPostingC
         postLeg(body, outboxId, "fee");
     }
 
+    /** Penalty leg: bank nostro → settlement penalty P&L (v1 bank absorbs). */
+    private void postPenalty(long outboxId, JsonNode p) throws LedgerSettlementPostingException {
+        String currency = required(p, "penaltyCurrency");
+        BigDecimal amount = bigDecimal(p, "penaltyAmount");
+        if (amount.signum() <= 0) {
+            log.debug("penalty leg skipped (amount<=0) outboxId={}", outboxId);
+            return;
+        }
+        String penaltyIndicator =
+                p.has("penaltyBalanceIndicator") && p.get("penaltyBalanceIndicator").isTextual()
+                        ? p.get("penaltyBalanceIndicator").asText()
+                        : SettlementFailPenaltyBookingService.PENALTY_BALANCE_PREFIX + currency;
+        String nostro = "@Nostro-" + currency + "-Bank";
+        Map<String, Object> body = legBody(
+                nostro,
+                penaltyIndicator,
+                amount,
+                currency,
+                "settlement-" + outboxId + "-penalty",
+                "Settlement fail penalty execution=" + p.get("executionId").asText());
+        addLegMetaData(body, p, "penalty");
+        postLeg(body, outboxId, "penalty");
+    }
+
     private static Map<String, Object> legBody(
             String src, String dst, BigDecimal amount, String ccy, String reference, String description) {
         Map<String, Object> body = new LinkedHashMap<>();
@@ -237,11 +263,27 @@ public final class LedgerSettlementLegPoster implements LedgerSettlementPostingC
         if (payload.has("side")) meta.put("side", payload.get("side").asText());
         if (payload.has("quantity")) meta.put("quantity", payload.get("quantity").asText());
         if (payload.has("price")) meta.put("price", payload.get("price").asText());
+        if (payload.has("taxWrapper")) meta.put("taxWrapper", payload.get("taxWrapper").asText());
+        if (payload.has("iskDepositClass")) meta.put("iskDepositClass", payload.get("iskDepositClass").asText());
         body.put("metaData", meta);
     }
 
     private void postLeg(Map<String, Object> body, long outboxId, String legLabel)
             throws LedgerSettlementPostingException {
+        Object refObj = body.get("reference");
+        String reference = refObj instanceof String s ? s : null;
+        if (reference != null && !reference.isBlank()) {
+            String existingTxnId = findExistingTransactionIdByReference(reference);
+            if (existingTxnId != null) {
+                log.info(
+                        "ledger settlement leg already posted outboxId={} leg={} reference={} txn={}",
+                        outboxId,
+                        legLabel,
+                        reference,
+                        existingTxnId);
+                return;
+            }
+        }
         try {
             String resp = http.post()
                     .uri("/transactions")
@@ -250,10 +292,7 @@ public final class LedgerSettlementLegPoster implements LedgerSettlementPostingC
                     .body(body)
                     .retrieve()
                     .body(String.class);
-            JsonNode root = objectMapper.readTree(resp == null ? "{}" : resp);
-            String txnId = root.has("transactionId") ? root.get("transactionId").asText()
-                    : root.has("transaction_id") ? root.get("transaction_id").asText()
-                    : root.has("id") ? root.get("id").asText() : null;
+            String txnId = parseTransactionIdFromBody(resp);
             if (txnId == null || txnId.isBlank()) {
                 throw new LedgerSettlementPostingException(
                         "ledger settlement leg=" + legLabel + " missing transactionId; body=" + resp);
@@ -263,6 +302,18 @@ public final class LedgerSettlementLegPoster implements LedgerSettlementPostingC
             String b = e.getResponseBodyAsString();
             int status = e.getStatusCode().value();
             String snippet = b.substring(0, Math.min(300, b.length()));
+            if (status == 409 && reference != null && !reference.isBlank()) {
+                String existingTxnId = findExistingTransactionIdByReference(reference);
+                if (existingTxnId != null) {
+                    log.info(
+                            "ledger settlement leg duplicate reference treated as success outboxId={} leg={} reference={} txn={}",
+                            outboxId,
+                            legLabel,
+                            reference,
+                            existingTxnId);
+                    return;
+                }
+            }
             if (status == 404 && isIndicatorNotFoundBody(b)) {
                 throw new LedgerSettlementPostingException(
                         LedgerSettlementPostingException.Reason.SKIPPED_INDICATOR_NOT_FOUND,
@@ -276,6 +327,51 @@ public final class LedgerSettlementLegPoster implements LedgerSettlementPostingC
             throw new LedgerSettlementPostingException(
                     "ledger settlement leg=" + legLabel + " unexpected: " + e.getMessage(), e);
         }
+    }
+
+    /**
+     * Returns the Ledger transaction id when {@code reference} already exists, else {@code null}.
+     * Used for idempotent settlement leg posting (§5.5).
+     */
+    private String findExistingTransactionIdByReference(String reference) {
+        try {
+            String resp = http.get()
+                    .uri(b -> b.path("/transactions").queryParam("reference", reference).build())
+                    .header(AUTHORIZATION_HEADER, BEARER_PREFIX + apiKey)
+                    .retrieve()
+                    .body(String.class);
+            return parseTransactionIdFromBody(resp);
+        } catch (RestClientResponseException e) {
+            if (e.getStatusCode().value() == 404) {
+                return null;
+            }
+            log.debug(
+                    "ledger settlement reference lookup failed reference={} status={}",
+                    reference,
+                    e.getStatusCode().value());
+            return null;
+        } catch (Exception e) {
+            log.debug("ledger settlement reference lookup unexpected reference={}: {}", reference, e.getMessage());
+            return null;
+        }
+    }
+
+    private String parseTransactionIdFromBody(String resp) {
+        try {
+            JsonNode root = objectMapper.readTree(resp == null ? "{}" : resp);
+            if (root.has("transactionId")) {
+                return root.get("transactionId").asText();
+            }
+            if (root.has("transaction_id")) {
+                return root.get("transaction_id").asText();
+            }
+            if (root.has("id")) {
+                return root.get("id").asText();
+            }
+        } catch (JsonProcessingException e) {
+            log.debug("ledger settlement response parse failed: {}", e.getMessage());
+        }
+        return null;
     }
 
     /**

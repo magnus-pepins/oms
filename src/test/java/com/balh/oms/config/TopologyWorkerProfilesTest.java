@@ -53,4 +53,22 @@ class TopologyWorkerProfilesTest {
         assertThatCode(() -> TopologyWorkerProfiles.validateNoConflictingWorkerProfiles(env))
                 .doesNotThrowAnyException();
     }
+
+    @Test
+    void fixIngress_andIngressReplica_throws() {
+        MockEnvironment env = new MockEnvironment();
+        env.setActiveProfiles(OmsProfiles.FIX_INGRESS, OmsProfiles.INGRESS_REPLICA);
+        assertThatThrownBy(() -> TopologyWorkerProfiles.validateNoConflictingWorkerProfiles(env))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining(OmsProfiles.FIX_INGRESS)
+                .hasMessageContaining(OmsProfiles.INGRESS_REPLICA);
+    }
+
+    @Test
+    void fixIngress_only_ok() {
+        MockEnvironment env = new MockEnvironment();
+        env.setActiveProfiles(OmsProfiles.FIX_INGRESS);
+        assertThatCode(() -> TopologyWorkerProfiles.validateNoConflictingWorkerProfiles(env))
+                .doesNotThrowAnyException();
+    }
 }

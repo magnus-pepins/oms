@@ -202,6 +202,19 @@ Used when `OMS_ROUTING_BACKEND=fix`. See [fix-out.md](fix-out.md) for session ma
 | `OMS_FIX_SOCKET_TRUST_STORE_PASSWORD` | (empty) | Truststore password. |
 | `OMS_FIX_ENABLED_SSL_PROTOCOLS` | (empty) | Optional; passed to QuickFIX **`EnabledProtocols`** (e.g. `TLSv1.2`). |
 
+### FIX-in acceptor (`oms-fix-ingress` profile)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OMS_FIX_IN_SESSION_STORE_TYPE` | `file` | **`file`** or **`jdbc`** (Flyway **V9** tables on app DB). Bench/prod PM2 sets **`jdbc`**. |
+| `OMS_FIX_IN_SESSION_JDBC_DATASOURCE_ENABLED` | `false` | Dedicated pool for QuickFIX JDBC store (isolation from app Hikari). |
+| `OMS_FIX_IN_SESSION_JDBC_URL` | (empty) | Required when dedicated FIX-in JDBC pool enabled. |
+| `OMS_FIX_IN_SESSION_JDBC_USER` / `PASSWORD` | (empty) | Dedicated pool credentials. |
+| `OMS_FIX_IN_ACCEPT_PORT` | `9877` | SocketAcceptor listen port. |
+| `OMS_FIX_INGRESS_HTTP_PORT` | `8095` | Admin HTTP (`/internal/v1/fix-in/*`). |
+
+See [runbooks/oms-fix-ingress.md](runbooks/oms-fix-ingress.md) and [fix-in-conformance-pack.md](fix-in-conformance-pack.md).
+
 ## Outbox / reconciler
 
 Phase 3 of [`oms-aeron-cluster-substrate`](../../system-documentation/plans/oms-aeron-cluster-substrate.md) deleted the legacy `control_outbox` + `OutboxReconciler` (slice 3f) and the entire Chronicle module + `ControlTailer` + `oms-control-worker` / `oms-fix-worker` JVMs (slice 3g). The cluster's events recording is now the durable handoff between admission and downstream consumers (Postgres projector, FIX egress); there is no Postgres → Chronicle drain path. The corresponding `OMS_OUTBOX_RECONCILER_*`, `OMS_CONTROL_POSTGRES_WRITE_PATH`, `OMS_CHRONICLE_*`, and `OMS_TAILER_BATCH_SIZE` environment variables are gone, along with `oms_control_outbox_appended_total` and `oms.pipeline.control.outbox_to_chronicle_lag` metrics. Domain / ledger outboxes remain on their own reconcilers (sections below).

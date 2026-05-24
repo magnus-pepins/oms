@@ -65,7 +65,8 @@ public record OrderAdmittedEvent(
         String clientIdempotencyKey,
         String accountIdHash,
         String instrumentSymbol,
-        String ledgerBalanceIdOrNull) {
+        String ledgerBalanceIdOrNull,
+        FixInIngressMetadata fixInIngressMetadataOrNull) {
 
     public OrderAdmittedEvent {
         Objects.requireNonNull(orderId, "orderId");
@@ -99,7 +100,31 @@ public record OrderAdmittedEvent(
             String ledgerBalanceIdOrNull) {
         this(orderId, clientTimestampNanos, acceptedAtMillis, quantityScaled, limitPriceScaledOrZero,
                 shardId, version, side, timeInForceCode, AcceptOrderCommand.ORD_TYPE_MARKET,
-                accountId, clientIdempotencyKey, accountIdHash, instrumentSymbol, ledgerBalanceIdOrNull);
+                accountId, clientIdempotencyKey, accountIdHash, instrumentSymbol, ledgerBalanceIdOrNull,
+                /* fixInIngressMetadataOrNull = */ null);
+    }
+
+    /** Back-compat constructor with explicit {@code ordTypeCode} and no FIX-in metadata. */
+    public OrderAdmittedEvent(
+            UUID orderId,
+            long clientTimestampNanos,
+            long acceptedAtMillis,
+            long quantityScaled,
+            long limitPriceScaledOrZero,
+            int shardId,
+            int version,
+            byte side,
+            byte timeInForceCode,
+            byte ordTypeCode,
+            String accountId,
+            String clientIdempotencyKey,
+            String accountIdHash,
+            String instrumentSymbol,
+            String ledgerBalanceIdOrNull) {
+        this(orderId, clientTimestampNanos, acceptedAtMillis, quantityScaled, limitPriceScaledOrZero,
+                shardId, version, side, timeInForceCode, ordTypeCode,
+                accountId, clientIdempotencyKey, accountIdHash, instrumentSymbol, ledgerBalanceIdOrNull,
+                /* fixInIngressMetadataOrNull = */ null);
     }
 
     /**
@@ -122,7 +147,8 @@ public record OrderAdmittedEvent(
                 cmd.clientIdempotencyKey(),
                 cmd.accountIdHash(),
                 cmd.instrumentSymbol(),
-                cmd.ledgerBalanceIdOrNull());
+                cmd.ledgerBalanceIdOrNull(),
+                cmd.fixInIngressMetadataOrNull());
     }
 
     public int encode(MutableDirectBuffer buffer, int offset) {
@@ -159,6 +185,9 @@ public record OrderAdmittedEvent(
         p = writeString(buffer, p, instrumentSymbol);
         if (ledgerBalanceIdOrNull != null) {
             p = writeString(buffer, p, ledgerBalanceIdOrNull);
+        }
+        if (fixInIngressMetadataOrNull != null) {
+            p += FixInIngressMetadata.writeFixInTail(buffer, p, fixInIngressMetadataOrNull);
         }
 
         int written = p - offset;
@@ -218,7 +247,10 @@ public record OrderAdmittedEvent(
         String ledgerBalanceId = null;
         if (hasLedgerBalanceId == 1) {
             ledgerBalanceId = readString(buffer, p);
+            p += stringByteLenAt(buffer, p);
         }
+        FixInIngressMetadata fixInIngressMetadata =
+                FixInIngressMetadata.readFixInTailIfPresent(buffer, p, offset + length);
 
         return new OrderAdmittedEvent(
                 new UUID(msb, lsb),
@@ -235,7 +267,8 @@ public record OrderAdmittedEvent(
                 clientIdempotencyKey,
                 accountIdHash,
                 instrumentSymbol,
-                ledgerBalanceId);
+                ledgerBalanceId,
+                fixInIngressMetadata);
     }
 
     private static int writeString(MutableDirectBuffer buffer, int offset, String s) {

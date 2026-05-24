@@ -46,6 +46,7 @@ public class SettlementConfirmProcessor {
     private final ObjectMapper objectMapper;
     private final OmsConfig config;
     private final MeterRegistry meterRegistry;
+    private final IskSettlementMetadataService iskSettlementMetadata;
     private final Counter processedCounter;
     private SettlementConfirmProcessor self;
 
@@ -57,7 +58,8 @@ public class SettlementConfirmProcessor {
             OrderFeeSnapshotRepository orderFeeSnapshots,
             ObjectMapper objectMapper,
             OmsConfig config,
-            MeterRegistry meterRegistry) {
+            MeterRegistry meterRegistry,
+            IskSettlementMetadataService iskSettlementMetadata) {
         this.confirms = confirms;
         this.executions = executions;
         this.positions = positions;
@@ -66,6 +68,7 @@ public class SettlementConfirmProcessor {
         this.objectMapper = objectMapper;
         this.config = config;
         this.meterRegistry = meterRegistry;
+        this.iskSettlementMetadata = iskSettlementMetadata;
         this.processedCounter = meterRegistry.counter(METRIC_PROCESSED);
     }
 
@@ -172,8 +175,7 @@ public class SettlementConfirmProcessor {
         }
         String next = SettlementStateMachine.next(cur)
                 .orElseThrow(() -> new IllegalStateException("no settlement transition from " + cur));
-        applyTransition(snap, cur, next);
-        return next;
+        return applyTransition(snap, cur, next);
     }
 
     private void advanceSingleExecution(long executionId) {
@@ -191,12 +193,27 @@ public class SettlementConfirmProcessor {
             final String curState = cur;
             String next = SettlementStateMachine.next(curState)
                     .orElseThrow(() -> new IllegalStateException("no settlement transition from " + curState));
-            applyTransition(snapshot, curState, next);
-            cur = next;
+            // applyTransition's return value is the *actual* end state, which may differ from
+            // `next` when the missing-position-on-settle branch reroutes settling -> failed.
+            // Using the returned value here is what lets the loop exit cleanly on that
+            // reroute (`failed` is terminal) without re-reading the snapshot.
+            cur = applyTransition(snapshot, curState, next);
         }
     }
 
-    private void applyTransition(SettlementExecutionRow snapshot, String cur, String next) {
+    /**
+     * Applies the state-machine step {@code cur -> next} and returns the *actual* end state.
+     *
+     * <p>The return value differs from the caller's {@code next} parameter in exactly one case:
+     * when {@code next == "settled"} and the position-settle leg discovers no matching
+     * {@code positions} row, this method calls {@link #markTradeFailed(long)} (which writes
+     * {@code settlement_status = 'failed'} inside the same {@code @Transactional} boundary)
+     * and returns {@code "failed"}. Callers — {@link #advanceOneSettlementStep(long)} for
+     * its HTTP/manual-action return value, {@link #advanceSingleExecution(long)} for the
+     * while-loop termination — must therefore use the returned value, not their pre-call
+     * {@code next}, to stay consistent with the row state on disk.
+     */
+    private String applyTransition(SettlementExecutionRow snapshot, String cur, String next) {
         if ("settled".equals(next)) {
             try {
                 applyPositionSettleLeg(snapshot);
@@ -209,7 +226,7 @@ public class SettlementConfirmProcessor {
                             snapshot.instrumentSymbol(),
                             e.getMessage());
                     markTradeFailed(snapshot.executionId());
-                    return;
+                    return "failed";
                 }
                 throw e;
             }
@@ -223,6 +240,7 @@ public class SettlementConfirmProcessor {
         if (config.getLedger().isSettlementOutboxEnabled() && "settled".equals(next)) {
             enqueueSettlementLegs(snapshot);
         }
+        return next;
     }
 
     /**
@@ -338,6 +356,8 @@ public class SettlementConfirmProcessor {
                 cash.put("cashCurrency", cashCurrency);
                 cash.put("notional", notional.toPlainString());
                 cash.put("settledAt", Instant.now().toString());
+                iskSettlementMetadata.enrich(
+                        cash, snapshot.accountId(), snapshot.side(), LedgerSettlementOutboxRepository.LEG_CASH);
                 cashInserted = ledgerSettlementOutbox.insertIgnore(
                         snapshot.executionId(),
                         "settled",
@@ -371,6 +391,8 @@ public class SettlementConfirmProcessor {
                 fee.put("feeSource", feeSource);
                 fee.put("notional", notional.toPlainString());
                 fee.put("settledAt", Instant.now().toString());
+                iskSettlementMetadata.enrich(
+                        fee, snapshot.accountId(), snapshot.side(), LedgerSettlementOutboxRepository.LEG_FEE);
                 feeInserted = ledgerSettlementOutbox.insertIgnore(
                         snapshot.executionId(),
                         "settled",
@@ -430,6 +452,8 @@ public class SettlementConfirmProcessor {
             cash.put("cashCurrency", tradeCurrency);
             cash.put("notional", notional.toPlainString());
             cash.put("settledAt", Instant.now().toString());
+            iskSettlementMetadata.enrich(
+                    cash, snapshot.accountId(), snapshot.side(), LedgerSettlementOutboxRepository.LEG_CASH);
             return ledgerSettlementOutbox.insertIgnore(
                     snapshot.executionId(),
                     "settled",
@@ -455,6 +479,8 @@ public class SettlementConfirmProcessor {
         base.put("notional", notional.toPlainString());
         base.put("fxRate", fxRate.toPlainString());
         base.put("settledAt", Instant.now().toString());
+        iskSettlementMetadata.enrich(
+                base, snapshot.accountId(), snapshot.side(), LedgerSettlementOutboxRepository.LEG_CASH_BASE);
 
         // cash-quote: @FX-Suspense-<tradeCcy> ↔ @Nostro-<tradeCcy>-Bank, amount in tradeCurrency.
         ObjectNode quote = objectMapper.createObjectNode();
@@ -474,6 +500,8 @@ public class SettlementConfirmProcessor {
         quote.put("notional", notional.toPlainString());
         quote.put("fxRate", fxRate.toPlainString());
         quote.put("settledAt", Instant.now().toString());
+        iskSettlementMetadata.enrich(
+                quote, snapshot.accountId(), snapshot.side(), LedgerSettlementOutboxRepository.LEG_CASH_QUOTE);
 
         int baseInserted = ledgerSettlementOutbox.insertIgnore(
                 snapshot.executionId(),

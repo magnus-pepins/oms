@@ -6,6 +6,7 @@ import java.time.LocalDate;
 import java.time.ZoneId;
 import java.util.Locale;
 import java.util.Optional;
+import java.util.Set;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -48,11 +49,21 @@ import org.springframework.stereotype.Component;
  * for unit-test callers that do not want to construct a lookup; production code paths
  * (projector) should call the symbol-aware overload.
  *
+ * <p><b>Slice 2b-3 (V63):</b> when the resolved profile carries a
+ * {@code settlement_calendar_id} and a {@link SettlementCalendarLookup} bean is wired, the
+ * T+N walk now also skips dates listed in {@code settlement_calendar} for that calendar
+ * id. Holidays are pulled once per call as a bounded range
+ * ({@code [tradeDate, tradeDate + cycleDays*2 + 14]}) — small enough to be effectively
+ * constant-time given the V63 PK on {@code (calendar_id, holiday_date)}. The legacy compute
+ * paths (no profile / no lookup / no calendar id on profile) continue to use weekend-only
+ * skipping, identical to Slice 1.
+ *
  * <p>The matcher (Slice 2a) already treats any execution row whose
  * {@code expected_settlement_date} disagrees with the broker's {@code settlementDate} as a
  * {@code settlement_date_mismatch} break — so populating {@code instrument_settlement_profile}
- * with the wrong cycle will surface as a break, not as a silent calendar drift. That is the
- * intentional safety net for skeleton-stage data.</p>
+ * with the wrong cycle, or {@code settlement_calendar} with the wrong holidays, will surface
+ * as a break, not as silent calendar drift. That is the intentional safety net for
+ * skeleton-stage data.</p>
  */
 @Component
 public class SettlementDateCalculator {
@@ -85,6 +96,16 @@ public class SettlementDateCalculator {
     @Nullable
     private SettlementProfileLookup profileLookup;
 
+    /**
+     * Optional dependency wired by Spring via {@link #setCalendarLookup(SettlementCalendarLookup)}.
+     * {@code null} when no {@link SettlementCalendarLookup} bean is present, or when the
+     * resolved profile has no {@code settlement_calendar_id}. Holiday awareness is gated on
+     * BOTH the profile carrying a calendar id AND this dependency being wired — either
+     * absent reverts to weekend-only skipping (Slice 1 behaviour).
+     */
+    @Nullable
+    private SettlementCalendarLookup calendarLookup;
+
     public SettlementDateCalculator(
             @Value("${" + DEFAULT_CYCLE_PROPERTY + ":" + DEFAULT_CYCLE_FALLBACK + "}") String defaultCycle) {
         this.defaultCycleDays = parseCycleDays(defaultCycle);
@@ -102,6 +123,16 @@ public class SettlementDateCalculator {
     }
 
     /**
+     * Spring wiring entry point for the calendar lookup. Same reasoning as
+     * {@link #setProfileLookup}: {@code required=false} keeps the Slice-1 unit-test
+     * constructor compatible, production binds {@link SettlementCalendarRepository}.
+     */
+    @Autowired(required = false)
+    public void setCalendarLookup(SettlementCalendarLookup calendarLookup) {
+        this.calendarLookup = calendarLookup;
+    }
+
+    /**
      * Returns the calendar date (currently UTC, see class Javadoc) for the venue-supplied
      * timestamp.
      */
@@ -113,42 +144,53 @@ public class SettlementDateCalculator {
     }
 
     /**
+     * Holiday-window padding used when pulling holidays from the calendar lookup. Worst
+     * case for T+3 with a long weekend + back-to-back Boxing-Day/Christmas-Eve stretches
+     * over ~10 calendar days; +14 keeps headroom without making the range query expensive.
+     */
+    private static final int HOLIDAY_WINDOW_PADDING_DAYS = 14;
+
+    /**
      * Returns {@code tradeDate} advanced by the configured default cycle's worth of business
      * days, rolling Saturdays and Sundays forward to the next Monday. No holiday calendar.
      *
      * <p>Kept for the Slice-1 unit tests that drive the pure compute path without a profile
      * lookup. Production callers (projector) should use
-     * {@link #resolveExpectedSettlementDate(LocalDate, String)} so per-instrument cycles are
-     * honoured.
+     * {@link #resolveExpectedSettlementDate(LocalDate, String)} so per-instrument cycles and
+     * holiday calendars are honoured.
      */
     public LocalDate computeExpectedSettlementDate(LocalDate tradeDate) {
         if (tradeDate == null) {
             throw new IllegalArgumentException("tradeDate must not be null");
         }
-        return advanceByBusinessDays(tradeDate, defaultCycleDays);
+        return advanceByBusinessDays(tradeDate, defaultCycleDays, Set.of());
     }
 
     /**
      * Symbol-aware compute: looks up the active {@code instrument_settlement_profile} for
      * {@code instrumentSymbol} at {@code tradeDate} and uses its
-     * {@code settlement_cycle}. Falls back to the configured default cycle when the lookup
-     * is empty, the symbol is null/blank, or no {@link SettlementProfileLookup} is wired.
+     * {@code settlement_cycle} plus the holidays from its {@code settlement_calendar_id}.
+     * Falls back to the configured default cycle when the lookup is empty, the symbol is
+     * null/blank, or no {@link SettlementProfileLookup} is wired. Falls back to
+     * weekend-only skipping when the resolved profile has no calendar id or no
+     * {@link SettlementCalendarLookup} is wired.
      *
-     * <p>The fallback path is logged at DEBUG so operators can see — in a production tail —
-     * which symbols still need profile rows. We deliberately do not log at INFO because the
-     * skeleton table starts empty and a noisy log here would drown out real signal.
+     * <p>Both fallback paths log at DEBUG so operators can see — in a production tail —
+     * which symbols / calendars still need data. We deliberately do not log at INFO because
+     * the skeleton tables start empty and a noisy log here would drown out real signal.
      */
     public LocalDate resolveExpectedSettlementDate(LocalDate tradeDate, String instrumentSymbol) {
         if (tradeDate == null) {
             throw new IllegalArgumentException("tradeDate must not be null");
         }
-        int cycleDays = resolveCycleDaysForSymbol(tradeDate, instrumentSymbol);
-        return advanceByBusinessDays(tradeDate, cycleDays);
+        ResolvedSettlementInputs inputs = resolveSettlementInputs(tradeDate, instrumentSymbol);
+        Set<LocalDate> holidays = resolveHolidaysForWindow(tradeDate, inputs.cycleDays(), inputs.calendarId());
+        return advanceByBusinessDays(tradeDate, inputs.cycleDays(), holidays);
     }
 
-    private int resolveCycleDaysForSymbol(LocalDate tradeDate, String instrumentSymbol) {
+    private ResolvedSettlementInputs resolveSettlementInputs(LocalDate tradeDate, String instrumentSymbol) {
         if (profileLookup == null || instrumentSymbol == null || instrumentSymbol.isBlank()) {
-            return defaultCycleDays;
+            return new ResolvedSettlementInputs(defaultCycleDays, null);
         }
         Optional<InstrumentSettlementProfile> profile;
         try {
@@ -159,20 +201,20 @@ public class SettlementDateCalculator {
             // trade-projection writer reports the actual SQLException at the executions
             // insert if there's a real problem, not at an unrelated profile read.
             log.warn(
-                    "instrument_settlement_profile lookup failed for symbol={} tradeDate={}; falling back to default cycle ({} days)",
+                    "instrument_settlement_profile lookup failed for symbol={} tradeDate={}; falling back to default cycle ({} days), no calendar",
                     instrumentSymbol,
                     tradeDate,
                     defaultCycleDays,
                     e);
-            return defaultCycleDays;
+            return new ResolvedSettlementInputs(defaultCycleDays, null);
         }
         if (profile.isEmpty()) {
             log.debug(
-                    "instrument_settlement_profile miss for symbol={} tradeDate={}; using default cycle ({} days)",
+                    "instrument_settlement_profile miss for symbol={} tradeDate={}; using default cycle ({} days), no calendar",
                     instrumentSymbol,
                     tradeDate,
                     defaultCycleDays);
-            return defaultCycleDays;
+            return new ResolvedSettlementInputs(defaultCycleDays, null);
         }
         int parsed;
         try {
@@ -183,32 +225,60 @@ public class SettlementDateCalculator {
             // adds a new cycle value but forgets to widen the parser, fall back rather than
             // hard-crash the trade-projection writer.
             log.warn(
-                    "instrument_settlement_profile carried unparseable cycle={} for symbol={} (profileId={}); falling back to default ({} days)",
+                    "instrument_settlement_profile carried unparseable cycle={} for symbol={} (profileId={}); falling back to default ({} days), no calendar",
                     profile.get().settlementCycle(),
                     instrumentSymbol,
                     profile.get().id(),
                     defaultCycleDays);
-            return defaultCycleDays;
+            return new ResolvedSettlementInputs(defaultCycleDays, null);
         }
-        return parsed;
+        return new ResolvedSettlementInputs(parsed, profile.get().settlementCalendarId());
     }
+
+    private Set<LocalDate> resolveHolidaysForWindow(LocalDate tradeDate, int cycleDays, @Nullable String calendarId) {
+        if (calendarLookup == null || calendarId == null || calendarId.isBlank()) {
+            return Set.of();
+        }
+        // Range covers `cycleDays` business days plus weekend bumps plus a fixed padding
+        // for back-to-back holiday stretches (e.g. Christmas Eve + Christmas Day + Boxing
+        // Day). The upper bound is intentionally generous; the calendar table is small and
+        // the V63 PK lookup is constant-time on the range.
+        LocalDate to = tradeDate.plusDays((long) cycleDays * 2L + HOLIDAY_WINDOW_PADDING_DAYS);
+        try {
+            return calendarLookup.findHolidaysInRange(calendarId, tradeDate, to);
+        } catch (RuntimeException e) {
+            log.warn(
+                    "settlement_calendar lookup failed for calendarId={} window=[{}..{}]; falling back to weekend-only skipping",
+                    calendarId,
+                    tradeDate,
+                    to,
+                    e);
+            return Set.of();
+        }
+    }
+
+    /** Resolution result: settlement cycle (in business days) + optional calendar id. */
+    private record ResolvedSettlementInputs(int cycleDays, @Nullable String calendarId) {}
 
     /**
      * Pure business-day advance. Extracted so both
      * {@link #computeExpectedSettlementDate(LocalDate)} and
      * {@link #resolveExpectedSettlementDate(LocalDate, String)} share one implementation.
+     * Pass an empty set for {@code holidays} to get weekend-only skipping (Slice 1
+     * behaviour); pass a populated set for holiday-aware skipping (Slice 2b-3).
      */
-    private static LocalDate advanceByBusinessDays(LocalDate tradeDate, int cycleDays) {
+    private static LocalDate advanceByBusinessDays(LocalDate tradeDate, int cycleDays, Set<LocalDate> holidays) {
         LocalDate d = tradeDate;
-        // T+0 still rolls a weekend trade-date forward to the next business day, which is the
-        // standard same-day-settle convention when the calendar lands on a weekend.
+        // T+0 still rolls a weekend/holiday trade-date forward to the next business day,
+        // which is the standard same-day-settle convention when the calendar lands on a
+        // non-business day.
         if (cycleDays == 0) {
-            return rollForwardToBusinessDay(d);
+            return rollForwardToBusinessDay(d, holidays);
         }
         int remaining = cycleDays;
         while (remaining > 0) {
             d = d.plusDays(1);
-            if (isBusinessDay(d)) {
+            if (isBusinessDay(d, holidays)) {
                 remaining--;
             }
         }
@@ -243,14 +313,17 @@ public class SettlementDateCalculator {
         return days;
     }
 
-    private static boolean isBusinessDay(LocalDate d) {
+    private static boolean isBusinessDay(LocalDate d, Set<LocalDate> holidays) {
         DayOfWeek dow = d.getDayOfWeek();
-        return dow != DayOfWeek.SATURDAY && dow != DayOfWeek.SUNDAY;
+        if (dow == DayOfWeek.SATURDAY || dow == DayOfWeek.SUNDAY) {
+            return false;
+        }
+        return !holidays.contains(d);
     }
 
-    private static LocalDate rollForwardToBusinessDay(LocalDate d) {
+    private static LocalDate rollForwardToBusinessDay(LocalDate d, Set<LocalDate> holidays) {
         LocalDate cur = d;
-        while (!isBusinessDay(cur)) {
+        while (!isBusinessDay(cur, holidays)) {
             cur = cur.plusDays(1);
         }
         return cur;

@@ -18,7 +18,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * End-to-end drop-folder ingest: {@link SettlementFileDropFolderIngestScheduler} reads {@code *.json} from a host
- * directory and delegates to {@link SettlementFileImportService} (same path as HTTP multipart ingest).
+ * directory and delegates to {@link SettlementFileIngestRouter} (v0 fixture or v2 economic envelope).
  */
 class SettlementFileDropFolderIngestSchedulerIntegrationTest extends AbstractPostgresIntegrationTest {
 
@@ -85,6 +85,98 @@ class SettlementFileDropFolderIngestSchedulerIntegrationTest extends AbstractPos
                         Integer.class,
                         exId))
                 .isEqualTo(1);
+    }
+
+    @Test
+    void pollDropFolder_ingestsV2EconomicJsonAndArchivesToDone() throws Exception {
+        UUID accountId = UUID.randomUUID();
+        String venueExecRef = "EX-V2-DF-" + UUID.randomUUID();
+        seedTradeExecutionWithVenueRef(accountId, venueExecRef);
+        String json =
+                """
+                        {
+                          "schemaVersion": 1,
+                          "brokerId": "broker_x",
+                          "fileId": "F-%s",
+                          "businessDate": "2026-05-23",
+                          "rows": [
+                            {
+                              "brokerTradeId": "BT-V2-DF-1",
+                              "venueExecRef": "%s",
+                              "accountId": "%s",
+                              "instrument": { "symbol": "AAPL", "currency": "USD" },
+                              "side": "BUY",
+                              "quantity": "10",
+                              "price": "5",
+                              "grossAmount": "50",
+                              "tradeDate": "2026-05-23",
+                              "settlementDate": "2026-05-27",
+                              "settlementCurrency": "USD",
+                              "correctionType": "new"
+                            }
+                          ]
+                        }
+                        """
+                        .formatted(UUID.randomUUID(), venueExecRef, accountId);
+        Path incoming = DROP_ROOT.resolve("eod-v2-drop.json");
+        Files.writeString(incoming, json, StandardCharsets.UTF_8);
+
+        scheduler.pollDropFolder();
+
+        assertThat(Files.exists(incoming)).isFalse();
+        assertThat(Files.list(DROP_ROOT.resolve(".oms-done")).anyMatch(p -> p.getFileName().toString().startsWith("eod-v2-drop")))
+                .isTrue();
+        assertThat(jdbc.queryForObject(
+                        "SELECT COUNT(*)::int FROM broker_confirm_batch WHERE broker_id = 'broker_x'",
+                        Integer.class))
+                .isEqualTo(1);
+        assertThat(jdbc.queryForObject(
+                        "SELECT COUNT(*)::int FROM broker_trade_confirm WHERE broker_trade_id = 'BT-V2-DF-1'",
+                        Integer.class))
+                .isEqualTo(1);
+    }
+
+    private void seedTradeExecutionWithVenueRef(UUID accountId, String venueExecRef) {
+        UUID orderId = UUID.randomUUID();
+        jdbc.update(
+                """
+                        INSERT INTO orders (
+                          id, account_id, client_idempotency_key, shard_id, version,
+                          status, side, instrument_symbol, quantity, limit_price, time_in_force,
+                          received_at, accepted_at, account_id_hash, ledger_balance_id, cum_filled_quantity
+                        ) VALUES (
+                          ?, ?, ?, 0, 2, 'FILLED', 'BUY', 'AAPL', 10, 5, 'DAY',
+                          NOW(), NOW(), 'h', NULL, 10
+                        )
+                        """,
+                orderId,
+                accountId,
+                "drop-folder-v2-" + orderId);
+        jdbc.update(
+                """
+                        INSERT INTO executions (
+                          order_id, account_id, venue_id, venue_ts, venue_exec_ref,
+                          last_quantity, last_price, leaves_quantity, cum_quantity_after,
+                          exec_type, raw_envelope_json, trade_date, expected_settlement_date
+                        ) VALUES (
+                          ?, ?, 'SIM', NOW(), ?,
+                          10, 5, 0, 10,
+                          CAST('TRADE' AS execution_exec_type), CAST('{}' AS JSONB),
+                          '2026-05-23', '2026-05-27'
+                        )
+                        """,
+                orderId,
+                accountId,
+                venueExecRef);
+        jdbc.update(
+                """
+                        INSERT INTO positions (
+                          account_id, instrument_symbol, custody_account_id,
+                          quantity_total, quantity_settled, quantity_pending_buy_settle, quantity_pending_sell_settle
+                        ) VALUES (?, 'AAPL', CAST(? AS UUID), 10, 0, 10, 0)
+                        """,
+                accountId,
+                "a0000001-0000-4000-8000-000000000001");
     }
 
     private long seedTradeExecution() {

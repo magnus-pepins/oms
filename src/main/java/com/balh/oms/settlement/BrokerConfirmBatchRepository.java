@@ -33,8 +33,12 @@ public class BrokerConfirmBatchRepository {
             String fileName,
             Instant generatedAt,
             Instant receivedAt,
+            Instant parsedAt,
+            Instant appliedAt,
             String status,
             Integer rowCount,
+            Integer matchedRowCount,
+            Integer breakRowCount,
             String errorSummary) {}
 
     private static final String INSERT_RECEIVED =
@@ -53,7 +57,8 @@ public class BrokerConfirmBatchRepository {
             """
                     SELECT id, broker_id, broker_file_id, business_date, schema_version,
                            file_sha256_hex, source, file_name, generated_at, received_at,
-                           status, row_count, error_summary
+                           parsed_at, applied_at,
+                           status, row_count, matched_row_count, break_row_count, error_summary
                     FROM broker_confirm_batch
                     """;
 
@@ -61,6 +66,19 @@ public class BrokerConfirmBatchRepository {
 
     private static final String SELECT_BY_BROKER_FILE =
             COMMON_SELECT + " WHERE broker_id = :brokerId AND broker_file_id = :brokerFileId LIMIT 1";
+
+    private static final String SELECT_BY_ID = COMMON_SELECT + " WHERE id = :id LIMIT 1";
+
+    private static final String LIST_RECENT =
+            COMMON_SELECT + " ORDER BY received_at DESC, id DESC LIMIT :lim OFFSET :off";
+
+    private static final String UPDATE_MATCH_OUTCOMES =
+            """
+                    UPDATE broker_confirm_batch
+                    SET matched_row_count = :matched,
+                        break_row_count = :breaks
+                    WHERE id = :id
+                    """;
 
     private static final String UPDATE_STATUS =
             """
@@ -119,6 +137,33 @@ public class BrokerConfirmBatchRepository {
                 new MapSqlParameterSource().addValue("brokerId", brokerId).addValue("brokerFileId", brokerFileId));
     }
 
+    public Optional<BatchRow> findById(long id) {
+        return queryOne(SELECT_BY_ID, new MapSqlParameterSource("id", id));
+    }
+
+    public List<BatchRow> listRecent(int limit, int offset) {
+        return jdbc.query(
+                LIST_RECENT,
+                new MapSqlParameterSource().addValue("lim", limit).addValue("off", offset),
+                BATCH_ROW_MAPPER);
+    }
+
+    public List<Long> findIdsByStatus(String status, int limit) {
+        return jdbc.query(
+                "SELECT id FROM broker_confirm_batch WHERE status = :status ORDER BY received_at, id LIMIT :lim",
+                new MapSqlParameterSource().addValue("status", status).addValue("lim", limit),
+                (rs, i) -> rs.getLong("id"));
+    }
+
+    public void updateMatchOutcomes(long id, int matchedRowCount, int breakRowCount) {
+        jdbc.update(
+                UPDATE_MATCH_OUTCOMES,
+                new MapSqlParameterSource()
+                        .addValue("id", id)
+                        .addValue("matched", matchedRowCount)
+                        .addValue("breaks", breakRowCount));
+    }
+
     public void updateStatus(long id, String status, Integer rowCount, String errorSummary) {
         jdbc.update(
                 UPDATE_STATUS,
@@ -130,23 +175,31 @@ public class BrokerConfirmBatchRepository {
     }
 
     private Optional<BatchRow> queryOne(String sql, MapSqlParameterSource params) {
-        List<BatchRow> rows = jdbc.query(sql, params, (rs, i) -> {
-            Timestamp generatedAt = rs.getTimestamp("generated_at");
-            return new BatchRow(
-                    rs.getLong("id"),
-                    rs.getString("broker_id"),
-                    rs.getString("broker_file_id"),
-                    rs.getDate("business_date").toLocalDate(),
-                    rs.getInt("schema_version"),
-                    rs.getString("file_sha256_hex"),
-                    rs.getString("source"),
-                    rs.getString("file_name"),
-                    generatedAt == null ? null : generatedAt.toInstant(),
-                    rs.getTimestamp("received_at").toInstant(),
-                    rs.getString("status"),
-                    (Integer) rs.getObject("row_count"),
-                    rs.getString("error_summary"));
-        });
+        List<BatchRow> rows = jdbc.query(sql, params, BATCH_ROW_MAPPER);
         return rows.isEmpty() ? Optional.empty() : Optional.of(rows.getFirst());
     }
+
+    private static final org.springframework.jdbc.core.RowMapper<BatchRow> BATCH_ROW_MAPPER = (rs, i) -> {
+        Timestamp generatedAt = rs.getTimestamp("generated_at");
+        Timestamp parsedAt = rs.getTimestamp("parsed_at");
+        Timestamp appliedAt = rs.getTimestamp("applied_at");
+        return new BatchRow(
+                rs.getLong("id"),
+                rs.getString("broker_id"),
+                rs.getString("broker_file_id"),
+                rs.getDate("business_date").toLocalDate(),
+                rs.getInt("schema_version"),
+                rs.getString("file_sha256_hex"),
+                rs.getString("source"),
+                rs.getString("file_name"),
+                generatedAt == null ? null : generatedAt.toInstant(),
+                rs.getTimestamp("received_at").toInstant(),
+                parsedAt == null ? null : parsedAt.toInstant(),
+                appliedAt == null ? null : appliedAt.toInstant(),
+                rs.getString("status"),
+                (Integer) rs.getObject("row_count"),
+                (Integer) rs.getObject("matched_row_count"),
+                (Integer) rs.getObject("break_row_count"),
+                rs.getString("error_summary"));
+    };
 }

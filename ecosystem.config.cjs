@@ -243,6 +243,9 @@ const COMMON_ENV = {
   // Cap on how old an execution can be before the auto-step scheduler ignores it (default
   // 3600s = 1h). Bumped to 24h so we can run the demo on yesterday's fills if needed.
   OMS_SETTLEMENT_AUTO_STEP_SCHEDULER_MAX_EXECUTION_AGE_SECONDS: '86400',
+  // FIX session stores: JDBC on bench/prod (Flyway V9). Override to file in ~/.oms-bench.env for local file-store dev.
+  OMS_FIX_SESSION_STORE_TYPE: process.env.OMS_FIX_SESSION_STORE_TYPE || 'jdbc',
+  OMS_FIX_IN_SESSION_STORE_TYPE: process.env.OMS_FIX_IN_SESSION_STORE_TYPE || 'jdbc',
   // Slice-4p bench applied V31 via launch-bench-stack.sh before V32 existed; this
   // PM2 stack now adds V32 alongside V31. On rebuild after we changed V31 (dropped
   // CONCURRENTLY for pgbouncer, see V31 source header), the DB checksum from the
@@ -427,7 +430,9 @@ const apps = [
       SPRING_PROFILES_ACTIVE: 'oms-fix-egress',
       OMS_FIX_EGRESS_AERON_DIR: AERON_MEDIA_DRIVER,
       OMS_FIX_EGRESS_CLUSTER_CLIENT_AERON_DIR: AERON_MEDIA_DRIVER,
+      OMS_FIX_EGRESS_CLUSTER_CLIENT_AERON_DIR: AERON_MEDIA_DRIVER,
       OMS_FIX_AUTO_START: 'true',
+      OMS_FIX_SESSION_STORE_TYPE: process.env.OMS_FIX_SESSION_STORE_TYPE || 'jdbc',
     },
     ...COMMON_PM2,
   },
@@ -454,6 +459,25 @@ const apps = [
       // reconciler) all activate normally under this profile.
       SPRING_PROFILES_ACTIVE: 'oms-ingress-replica',
       OMS_CLUSTER_CLIENT_AERON_DIRECTORY: AERON_MEDIA_DRIVER,
+    },
+    ...COMMON_PM2,
+  },
+  {
+    name: 'oms-fix-ingress',
+    script: JAVA,
+    args: [...LOW_LATENCY_JVM_FLAGS, '-jar', ROLE_JAR('fix-ingress')],
+    max_memory_restart: '2G',
+    min_uptime: '30s',
+    output: logPath('oms-fix-ingress-out', '.log'),
+    error: logPath('oms-fix-ingress-err', '.log'),
+    log: logPath('oms-fix-ingress-combined', '.log'),
+    env: {
+      ...COMMON_ENV,
+      SPRING_PROFILES_ACTIVE: 'oms-fix-ingress',
+      OMS_FIX_INGRESS_AERON_DIR: AERON_MEDIA_DRIVER,
+      OMS_FIX_INGRESS_CLUSTER_CLIENT_AERON_DIR: AERON_MEDIA_DRIVER,
+      OMS_FIX_IN_AUTO_START: 'true',
+      OMS_FIX_IN_SESSION_STORE_TYPE: process.env.OMS_FIX_IN_SESSION_STORE_TYPE || 'jdbc',
     },
     ...COMMON_PM2,
   },

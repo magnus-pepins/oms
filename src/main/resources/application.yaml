@@ -161,6 +161,7 @@ oms:
     max-aggregate-position-quantity-check-enabled: ${OMS_RISK_MAX_AGGREGATE_POSITION_QUANTITY_CHECK_ENABLED:false}
     max-aggregate-position-quantity: ${OMS_RISK_MAX_AGGREGATE_POSITION_QUANTITY:0}
     sell-position-check-enabled: ${OMS_RISK_SELL_POSITION_CHECK_ENABLED:true}
+    isk-instrument-eligibility-check-enabled: ${OMS_RISK_ISK_INSTRUMENT_ELIGIBILITY_CHECK_ENABLED:false}
   routing:
     # noop | fix (fix: QuickFIX/J initiator when oms.fix.auto-start=true — see docs/fix-out.md).
     # The legacy `simulated` backend was removed in Phase 3 slice 3g-2 of the Aeron Cluster substrate plan.
@@ -184,6 +185,9 @@ oms:
     auto-step-scheduler-batch-size: ${OMS_SETTLEMENT_AUTO_STEP_SCHEDULER_BATCH_SIZE:50}
     auto-step-scheduler-max-execution-age-seconds: ${OMS_SETTLEMENT_AUTO_STEP_SCHEDULER_MAX_EXECUTION_AGE_SECONDS:3600}
     auto-step-scheduler-max-advance-failures: ${OMS_SETTLEMENT_AUTO_STEP_SCHEDULER_MAX_ADVANCE_FAILURES:5}
+    ops-metrics-publisher-enabled: ${OMS_SETTLEMENT_OPS_METRICS_PUBLISHER_ENABLED:true}
+    ops-metrics-poll-interval-ms: ${OMS_SETTLEMENT_OPS_METRICS_POLL_INTERVAL_MS:30000}
+    stuck-outbox-min-attempts: ${OMS_SETTLEMENT_STUCK_OUTBOX_MIN_ATTEMPTS:3}
     file-import-max-bytes: ${OMS_SETTLEMENT_FILE_IMPORT_MAX_BYTES:10000000}
     file-import-max-rows: ${OMS_SETTLEMENT_FILE_IMPORT_MAX_ROWS:10000}
     file-import-register-slice-size: ${OMS_SETTLEMENT_FILE_IMPORT_REGISTER_SLICE_SIZE:50}

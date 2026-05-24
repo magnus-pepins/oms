@@ -63,4 +63,17 @@ public class BrokerTradeConfirmFeeRepository {
         }
         return total;
     }
+
+    /** Sum of customer-charged fee amounts for matcher diff (OMS fee snapshot not wired yet). */
+    public java.math.BigDecimal sumCustomerFeeAmount(long confirmId) {
+        java.math.BigDecimal sum = jdbc.queryForObject(
+                """
+                        SELECT COALESCE(SUM(amount), 0)
+                        FROM broker_trade_confirm_fee
+                        WHERE confirm_id = :confirmId AND charged_to = 'customer'
+                        """,
+                new MapSqlParameterSource("confirmId", confirmId),
+                java.math.BigDecimal.class);
+        return sum == null ? java.math.BigDecimal.ZERO : sum;
+    }
 }

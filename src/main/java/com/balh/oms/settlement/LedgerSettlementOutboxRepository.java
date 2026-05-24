@@ -26,6 +26,9 @@ public class LedgerSettlementOutboxRepository {
     /** Commission revenue leg. */
     public static final String LEG_FEE = "fee";
 
+    /** CSDR / broker settlement penalty (bank P&L leg — gap plan §5.8). */
+    public static final String LEG_PENALTY = "penalty";
+
     private static final String INSERT_IGNORE = """
             INSERT INTO ledger_settlement_outbox (execution_id, to_settlement_status, leg_kind, payload_json)
             VALUES (:eid, :st, :leg, CAST(:payload AS JSONB))
@@ -80,7 +83,10 @@ public class LedgerSettlementOutboxRepository {
     // pending / failed). Ordered by (leg_kind, id) so cash always comes before fee.
     private static final String FIND_BY_EXECUTION_SQL = """
             SELECT id, execution_id, to_settlement_status, leg_kind,
-                   payload_json::text AS payload_json, created_at, posted_at
+                   payload_json::text AS payload_json,
+                   created_at, posted_at,
+                   attempts, last_error_text, last_attempt_at,
+                   skipped_at, skip_reason
             FROM ledger_settlement_outbox
             WHERE execution_id = :eid
             ORDER BY leg_kind, id
@@ -94,7 +100,22 @@ public class LedgerSettlementOutboxRepository {
             String payloadJson,
             int attempts) {}
 
-    /** Timeline projection — includes timestamps so the UI can show the lifecycle. */
+    /**
+     * Timeline projection — includes timestamps + forensic per-leg state so the UI can
+     * show the full lifecycle (enqueued → attempted N times → posted | skipped | failing).
+     *
+     * <p>Fields beyond {@code postedAt} are populated by:
+     * <ul>
+     *   <li>{@code attempts} / {@code lastErrorText} / {@code lastAttemptAt} — V42, written
+     *       by {@code LedgerSettlementOutboxReconciler} on every delivery attempt.
+     *   <li>{@code skippedAt} / {@code skipReason} — V43, written by the reconciler when
+     *       a row is tombstoned (operator/data gap, not a Ledger post — e.g. customer
+     *       balance not found, indicator never resolved).
+     * </ul>
+     *
+     * <p>Either subset may be NULL: {@code attempts == 0} for a freshly enqueued row,
+     * {@code skippedAt == null} for a row still in the active retry corridor.
+     */
     public record OutboxTimelineRow(
             long id,
             long executionId,
@@ -102,7 +123,12 @@ public class LedgerSettlementOutboxRepository {
             String legKind,
             String payloadJson,
             Instant createdAt,
-            Instant postedAt) {}
+            Instant postedAt,
+            int attempts,
+            String lastErrorText,
+            Instant lastAttemptAt,
+            Instant skippedAt,
+            String skipReason) {}
 
     /** Ops read path — unposted rows with delivery attempt history (beard-admin stuck-outbox panel). */
     public record StuckOutboxRow(
@@ -237,6 +263,8 @@ public class LedgerSettlementOutboxRepository {
                 new MapSqlParameterSource("eid", executionId),
                 (rs, rowNum) -> {
                     Timestamp posted = rs.getTimestamp("posted_at");
+                    Timestamp lastAttempt = rs.getTimestamp("last_attempt_at");
+                    Timestamp skipped = rs.getTimestamp("skipped_at");
                     return new OutboxTimelineRow(
                             rs.getLong("id"),
                             rs.getLong("execution_id"),
@@ -244,7 +272,12 @@ public class LedgerSettlementOutboxRepository {
                             rs.getString("leg_kind"),
                             rs.getString("payload_json"),
                             rs.getTimestamp("created_at").toInstant(),
-                            posted == null ? null : posted.toInstant());
+                            posted == null ? null : posted.toInstant(),
+                            rs.getInt("attempts"),
+                            rs.getString("last_error_text"),
+                            lastAttempt == null ? null : lastAttempt.toInstant(),
+                            skipped == null ? null : skipped.toInstant(),
+                            rs.getString("skip_reason"));
                 });
     }
 }

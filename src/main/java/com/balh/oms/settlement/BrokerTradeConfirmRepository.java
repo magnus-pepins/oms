@@ -34,14 +34,14 @@ public class BrokerTradeConfirmRepository {
                         instrument_symbol, instrument_isin, instrument_mic, instrument_currency,
                         side, quantity, price, gross_amount,
                         trade_date, settlement_date, settlement_currency,
-                        broker_status, correction_type, raw_row_json
+                        broker_status, correction_type, original_broker_trade_id, raw_row_json
                     ) VALUES (
                         :batchId, :brokerId, :brokerTradeId, :venueExecRef,
                         :accountId, :brokerAccount, :custodyAccountId,
                         :instrumentSymbol, :instrumentIsin, :instrumentMic, :instrumentCurrency,
                         :side, :quantity, :price, :grossAmount,
                         :tradeDate, :settlementDate, :settlementCurrency,
-                        :brokerStatus, :correctionType, CAST(:rawRowJson AS JSONB)
+                        :brokerStatus, :correctionType, :originalBrokerTradeId, CAST(:rawRowJson AS JSONB)
                     )
                     ON CONFLICT (broker_id, broker_trade_id) DO NOTHING
                     """;
@@ -80,6 +80,7 @@ public class BrokerTradeConfirmRepository {
                 .addValue("settlementCurrency", cmd.settlementCurrency())
                 .addValue("brokerStatus", cmd.brokerStatus())
                 .addValue("correctionType", cmd.correctionType())
+                .addValue("originalBrokerTradeId", cmd.originalBrokerTradeId())
                 .addValue("rawRowJson", cmd.rawRowJson());
         var kh = new GeneratedKeyHolder();
         jdbc.update(INSERT_IGNORE, params, kh, new String[] {"id"});
@@ -108,6 +109,7 @@ public class BrokerTradeConfirmRepository {
             String settlementCurrency,
             String brokerStatus,
             String correctionType,
+            String originalBrokerTradeId,
             String rawRowJson) {}
 
     /**
@@ -117,26 +119,33 @@ public class BrokerTradeConfirmRepository {
      */
     public record MatchableRow(
             long id,
+            long batchId,
             String brokerId,
             String brokerTradeId,
             String venueExecRef,
             UUID accountId,
             String instrumentSymbol,
             String instrumentIsin,
+            String instrumentCurrency,
+            String settlementCurrency,
             String side,
             BigDecimal quantity,
             BigDecimal price,
             BigDecimal grossAmount,
             LocalDate tradeDate,
             LocalDate settlementDate,
-            String correctionType) {}
+            String correctionType,
+            String originalBrokerTradeId) {}
+
+    public record BatchMatchCounts(int matched, int breakRows) {}
 
     private static final String SELECT_MATCHABLE_COLUMNS =
             """
-                    SELECT id, broker_id, broker_trade_id, venue_exec_ref,
-                           account_id, instrument_symbol, instrument_isin, side,
+                    SELECT id, batch_id, broker_id, broker_trade_id, venue_exec_ref,
+                           account_id, instrument_symbol, instrument_isin, instrument_currency,
+                           settlement_currency, side,
                            quantity, price, gross_amount,
-                           trade_date, settlement_date, correction_type
+                           trade_date, settlement_date, correction_type, original_broker_trade_id
                     """;
 
     private static final String LOCK_PENDING_BATCH =
@@ -155,6 +164,31 @@ public class BrokerTradeConfirmRepository {
                     FROM broker_trade_confirm
                     WHERE id = :id AND match_status = 'pending'
                     FOR UPDATE
+                    """;
+
+    private static final String LOCK_PENDING_FOR_BATCH =
+            SELECT_MATCHABLE_COLUMNS
+                    + """
+                    FROM broker_trade_confirm
+                    WHERE batch_id = :batchId AND match_status = 'pending'
+                    ORDER BY created_at, id
+                    LIMIT :lim
+                    FOR UPDATE SKIP LOCKED
+                    """;
+
+    private static final String COUNT_PENDING_FOR_BATCH =
+            """
+                    SELECT COUNT(*)::int FROM broker_trade_confirm
+                    WHERE batch_id = :batchId AND match_status = 'pending'
+                    """;
+
+    private static final String COUNT_OUTCOMES_FOR_BATCH =
+            """
+                    SELECT
+                      COUNT(*) FILTER (WHERE match_status = 'matched')::int AS matched,
+                      COUNT(*) FILTER (WHERE match_status IN ('mismatch', 'unresolved'))::int AS breaks
+                    FROM broker_trade_confirm
+                    WHERE batch_id = :batchId
                     """;
 
     private static final String MARK_MATCHED =
@@ -186,8 +220,88 @@ public class BrokerTradeConfirmRepository {
                     WHERE id = :id AND match_status = 'pending'
                     """;
 
+    private static final String FIND_MATCHED_EXECUTION_BY_BROKER_TRADE =
+            """
+                    SELECT resolved_execution_id
+                    FROM broker_trade_confirm
+                    WHERE broker_id = :broker_id
+                      AND broker_trade_id = :broker_trade_id
+                      AND match_status = 'matched'
+                      AND resolved_execution_id IS NOT NULL
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """;
+
+    public record ConfirmEvidenceRow(
+            long confirmId,
+            long batchId,
+            String brokerId,
+            String brokerTradeId,
+            String matchStatus,
+            String matchDiffJson,
+            String rawRowJson) {}
+
+    private static final String FIND_EVIDENCE_BY_EXECUTION =
+            """
+                    SELECT id, batch_id, broker_id, broker_trade_id, match_status,
+                           match_diff_json::text AS match_diff_json,
+                           raw_row_json::text AS raw_row_json
+                    FROM broker_trade_confirm
+                    WHERE resolved_execution_id = :executionId
+                    ORDER BY id
+                    """;
+
+    public List<ConfirmEvidenceRow> findEvidenceByResolvedExecutionId(long executionId) {
+        return jdbc.query(
+                FIND_EVIDENCE_BY_EXECUTION,
+                new MapSqlParameterSource("executionId", executionId),
+                (rs, rowNum) ->
+                        new ConfirmEvidenceRow(
+                                rs.getLong("id"),
+                                rs.getLong("batch_id"),
+                                rs.getString("broker_id"),
+                                rs.getString("broker_trade_id"),
+                                rs.getString("match_status"),
+                                rs.getString("match_diff_json"),
+                                rs.getString("raw_row_json")));
+    }
+
+    public java.util.Optional<Long> findMatchedExecutionIdByBrokerTrade(String brokerId, String brokerTradeId) {
+        if (brokerId == null || brokerId.isBlank() || brokerTradeId == null || brokerTradeId.isBlank()) {
+            return java.util.Optional.empty();
+        }
+        List<Long> ids = jdbc.query(
+                FIND_MATCHED_EXECUTION_BY_BROKER_TRADE,
+                new MapSqlParameterSource()
+                        .addValue("broker_id", brokerId.trim())
+                        .addValue("broker_trade_id", brokerTradeId.trim()),
+                (rs, rowNum) -> rs.getLong("resolved_execution_id"));
+        return ids.isEmpty() ? java.util.Optional.empty() : java.util.Optional.of(ids.getFirst());
+    }
+
     public List<MatchableRow> lockPendingBatch(int limit) {
         return jdbc.query(LOCK_PENDING_BATCH, new MapSqlParameterSource("lim", limit), MATCHABLE_ROW_MAPPER);
+    }
+
+    public List<MatchableRow> lockPendingForBatch(long batchId, int limit) {
+        return jdbc.query(
+                LOCK_PENDING_FOR_BATCH,
+                new MapSqlParameterSource().addValue("batchId", batchId).addValue("lim", limit),
+                MATCHABLE_ROW_MAPPER);
+    }
+
+    public int countPendingForBatch(long batchId) {
+        Integer n = jdbc.queryForObject(
+                COUNT_PENDING_FOR_BATCH, new MapSqlParameterSource("batchId", batchId), Integer.class);
+        return n == null ? 0 : n;
+    }
+
+    public BatchMatchCounts countMatchOutcomesByBatch(long batchId) {
+        return jdbc.queryForObject(
+                COUNT_OUTCOMES_FOR_BATCH,
+                new MapSqlParameterSource("batchId", batchId),
+                (rs, rowNum) ->
+                        new BatchMatchCounts(rs.getInt("matched"), rs.getInt("breaks")));
     }
 
     public java.util.Optional<MatchableRow> lockPendingById(long id) {
@@ -226,18 +340,22 @@ public class BrokerTradeConfirmRepository {
         Object acct = rs.getObject("account_id");
         return new MatchableRow(
                 rs.getLong("id"),
+                rs.getLong("batch_id"),
                 rs.getString("broker_id"),
                 rs.getString("broker_trade_id"),
                 rs.getString("venue_exec_ref"),
                 acct == null ? null : (UUID) acct,
                 rs.getString("instrument_symbol"),
                 rs.getString("instrument_isin"),
+                rs.getString("instrument_currency"),
+                rs.getString("settlement_currency"),
                 rs.getString("side"),
                 rs.getBigDecimal("quantity"),
                 rs.getBigDecimal("price"),
                 rs.getBigDecimal("gross_amount"),
                 td == null ? null : td.toLocalDate(),
                 sd == null ? null : sd.toLocalDate(),
-                rs.getString("correction_type"));
+                rs.getString("correction_type"),
+                rs.getString("original_broker_trade_id"));
     };
 }

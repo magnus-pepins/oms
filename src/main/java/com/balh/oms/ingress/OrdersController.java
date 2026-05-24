@@ -92,7 +92,8 @@ public class OrdersController {
                 .map(o -> {
                     var tradeStatuses = executions.listTradeSettlementStatusesForOrder(o.id());
                     String aggregate = OrderAggregateSettlementStatus.summarize(tradeStatuses);
-                    return ResponseEntity.ok(CreateOrderResponse.from(o, aggregate));
+                    var expectedDate = executions.maxExpectedSettlementDateForOpenTradeLegs(o.id()).orElse(null);
+                    return ResponseEntity.ok(CreateOrderResponse.from(o, aggregate, expectedDate));
                 })
                 .orElseGet(() -> ResponseEntity.notFound().build());
     }
@@ -118,7 +119,8 @@ public class OrdersController {
                 .map(o -> {
                     var tradeStatuses = executions.listTradeSettlementStatusesForOrder(o.id());
                     String aggregate = OrderAggregateSettlementStatus.summarize(tradeStatuses);
-                    return CreateOrderResponse.from(o, aggregate);
+                    var expectedDate = executions.maxExpectedSettlementDateForOpenTradeLegs(o.id()).orElse(null);
+                    return CreateOrderResponse.from(o, aggregate, expectedDate);
                 })
                 .toList();
         return ResponseEntity.ok(dtos);

@@ -18,9 +18,12 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
 
+import java.sql.Date;
 import java.sql.Timestamp;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -81,6 +84,33 @@ class SettlementControllerIntegrationTest extends AbstractPostgresIntegrationTes
     }
 
     @Test
+    void listExecutions_byOrderId_returnsJoinedOrderFieldsAndSettlementDates() {
+        long exId = seedTradeExecutionWithDates(
+                LocalDate.parse("2026-05-21"), LocalDate.parse("2026-05-25"));
+        UUID orderId =
+                jdbc.queryForObject("SELECT order_id FROM executions WHERE id = ?", UUID.class, exId);
+        ResponseEntity<SettlementExecutionsPageResponse> res =
+                http.exchange(
+                        base() + "/executions?orderId=" + orderId + "&limit=20",
+                        HttpMethod.GET,
+                        new HttpEntity<>(headers()),
+                        new ParameterizedTypeReference<>() {});
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(res.getBody()).isNotNull();
+        assertThat(res.getBody().items()).hasSize(1);
+        SettlementExecutionResponse row = res.getBody().items().getFirst();
+        assertThat(row.id()).isEqualTo(exId);
+        assertThat(row.orderId()).isEqualTo(orderId);
+        assertThat(row.orderStatus()).isEqualTo("FILLED");
+        assertThat(row.side()).isEqualTo("BUY");
+        assertThat(row.instrumentSymbol()).isEqualTo("AAPL");
+        assertThat(row.settlementStatus()).isEqualTo("executed");
+        assertThat(row.execType()).isEqualTo("TRADE");
+        assertThat(row.tradeDate()).isEqualTo(LocalDate.parse("2026-05-21"));
+        assertThat(row.expectedSettlementDate()).isEqualTo(LocalDate.parse("2026-05-25"));
+    }
+
+    @Test
     void listExecutions_byOrderId_returnsJoinedOrderFields() {
         long exId = seedTradeExecution();
         UUID orderId =
@@ -133,6 +163,26 @@ class SettlementControllerIntegrationTest extends AbstractPostgresIntegrationTes
     }
 
     @Test
+    void getExecution_byId_returnsDetailIncludingRawEnvelopeAndSettlementDates() {
+        long exId = seedTradeExecutionWithDates(
+                LocalDate.parse("2026-05-22"), LocalDate.parse("2026-05-26"));
+        jdbc.update("UPDATE executions SET raw_envelope_json = CAST(? AS JSONB) WHERE id = ?", "{\"fill\":1}", exId);
+        ResponseEntity<SettlementExecutionDetailResponse> res =
+                http.exchange(
+                        base() + "/executions/" + exId,
+                        HttpMethod.GET,
+                        new HttpEntity<>(headers()),
+                        new ParameterizedTypeReference<>() {});
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(res.getBody()).isNotNull();
+        assertThat(res.getBody().id()).isEqualTo(exId);
+        assertThat(res.getBody().rawEnvelopeJson()).contains("fill");
+        assertThat(res.getBody().instrumentSymbol()).isEqualTo("AAPL");
+        assertThat(res.getBody().tradeDate()).isEqualTo(LocalDate.parse("2026-05-22"));
+        assertThat(res.getBody().expectedSettlementDate()).isEqualTo(LocalDate.parse("2026-05-26"));
+    }
+
+    @Test
     void getExecution_byId_returnsDetailIncludingRawEnvelope() {
         long exId = seedTradeExecution();
         jdbc.update("UPDATE executions SET raw_envelope_json = CAST(? AS JSONB) WHERE id = ?", "{\"fill\":1}", exId);
@@ -147,6 +197,142 @@ class SettlementControllerIntegrationTest extends AbstractPostgresIntegrationTes
         assertThat(res.getBody().id()).isEqualTo(exId);
         assertThat(res.getBody().rawEnvelopeJson()).contains("fill");
         assertThat(res.getBody().instrumentSymbol()).isEqualTo("AAPL");
+    }
+
+    @Test
+    void getTimeline_returnsTradeAndExpectedSettlementDates() {
+        // Slice 3 pull-through: trade_date + expected_settlement_date are written by
+        // SettlementDateCalculator on the projector trade path. The IT seeds them
+        // directly via JDBC (cheaper than going through the projector) and asserts
+        // the GET /timeline endpoint surfaces them as ISO-8601 date strings —
+        // beard-admin Detail panel + customer-frontend BFF both consume this shape.
+        LocalDate tradeDate = LocalDate.parse("2026-05-21");
+        LocalDate expectedSettlementDate = LocalDate.parse("2026-05-25");
+        long exId = seedTradeExecutionWithDates(tradeDate, expectedSettlementDate);
+
+        ResponseEntity<Map> res = http.exchange(
+                base() + "/executions/" + exId + "/timeline",
+                HttpMethod.GET,
+                new HttpEntity<>(headers()),
+                new ParameterizedTypeReference<>() {});
+
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(res.getBody()).isNotNull();
+        assertThat(res.getBody().get("tradeDate")).isEqualTo("2026-05-21");
+        assertThat(res.getBody().get("expectedSettlementDate")).isEqualTo("2026-05-25");
+        // Currency-blind sanity: timeline still works for an executed-only row.
+        assertThat(res.getBody().get("currentSettlementStatus")).isEqualTo("executed");
+    }
+
+    @Test
+    void getTimeline_legacyExecutionWithoutDates_returnsNullDateFields() {
+        // Pre-V58 execution rows have NULL trade_date + expected_settlement_date. The
+        // matcher already treats NULL expectedSettlementDate as 'OMS expectation
+        // unknown' (no break opened); the timeline must therefore *also* expose
+        // them as JSON nulls — not crash, not fall back to a guess.
+        long exId = seedTradeExecution();
+        jdbc.update("UPDATE executions SET trade_date = NULL, expected_settlement_date = NULL WHERE id = ?", exId);
+
+        ResponseEntity<Map> res = http.exchange(
+                base() + "/executions/" + exId + "/timeline",
+                HttpMethod.GET,
+                new HttpEntity<>(headers()),
+                new ParameterizedTypeReference<>() {});
+
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(res.getBody()).isNotNull();
+        assertThat(res.getBody().get("tradeDate")).isNull();
+        assertThat(res.getBody().get("expectedSettlementDate")).isNull();
+    }
+
+    @Test
+    void getTimeline_ledgerLegExposesAttemptsAndLastError() {
+        // Slice 3 outbox enrichment: the reconciler writes attempts + last_error_text
+        // on every failed delivery. The timeline must surface them so beard-admin can
+        // show "retried 3x — last error: HTTP 503" without an extra round-trip to the
+        // stuck-outbox panel.
+        long exId = seedTradeExecution();
+        long outboxId = jdbc.queryForObject(
+                """
+                        INSERT INTO ledger_settlement_outbox (
+                          execution_id, to_settlement_status, leg_kind, payload_json,
+                          attempts, last_error_text, last_attempt_at
+                        ) VALUES (
+                          ?, 'settled', 'cash', CAST('{}' AS JSONB),
+                          3, 'ledger /transactions HTTP 503: unavailable',
+                          NOW() - interval '2 seconds'
+                        ) RETURNING id
+                        """,
+                Long.class,
+                exId);
+
+        ResponseEntity<Map> res = http.exchange(
+                base() + "/executions/" + exId + "/timeline",
+                HttpMethod.GET,
+                new HttpEntity<>(headers()),
+                new ParameterizedTypeReference<>() {});
+
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(res.getBody()).isNotNull();
+        List<Map<String, Object>> legs = (List<Map<String, Object>>) res.getBody().get("ledgerLegs");
+        assertThat(legs).hasSize(1);
+        Map<String, Object> leg = legs.getFirst();
+        assertThat(((Number) leg.get("outboxId")).longValue()).isEqualTo(outboxId);
+        assertThat(((Number) leg.get("attempts")).intValue()).isEqualTo(3);
+        assertThat((String) leg.get("lastErrorText")).contains("HTTP 503");
+        assertThat(leg.get("lastAttemptAt")).isNotNull();
+        assertThat(leg.get("postedAt")).isNull();
+        assertThat(leg.get("skippedAt")).isNull();
+        assertThat(leg.get("skipReason")).isNull();
+    }
+
+    @Test
+    void getTimeline_ledgerLegExposesSkipReason() {
+        // V43 tombstone path: when the reconciler decides a row is unrecoverable
+        // (customer balance never funded, indicator never resolved), it sets
+        // skipped_at + skip_reason and stops retrying. The timeline distinguishes
+        // this from "still failing" so operators can tell which queue to consult.
+        long exId = seedTradeExecution();
+        jdbc.update(
+                """
+                        INSERT INTO ledger_settlement_outbox (
+                          execution_id, to_settlement_status, leg_kind, payload_json,
+                          attempts, last_error_text, last_attempt_at,
+                          skipped_at, skip_reason
+                        ) VALUES (
+                          ?, 'settled', 'cash', CAST('{}' AS JSONB),
+                          5, 'customer balance not found in Ledger: indicator=inv-…',
+                          NOW() - interval '10 seconds',
+                          NOW() - interval '5 seconds', 'unfunded_balance'
+                        )
+                        """,
+                exId);
+
+        ResponseEntity<Map> res = http.exchange(
+                base() + "/executions/" + exId + "/timeline",
+                HttpMethod.GET,
+                new HttpEntity<>(headers()),
+                new ParameterizedTypeReference<>() {});
+
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(res.getBody()).isNotNull();
+        List<Map<String, Object>> legs = (List<Map<String, Object>>) res.getBody().get("ledgerLegs");
+        assertThat(legs).hasSize(1);
+        Map<String, Object> leg = legs.getFirst();
+        assertThat((String) leg.get("skipReason")).isEqualTo("unfunded_balance");
+        assertThat(leg.get("skippedAt")).isNotNull();
+        assertThat(((Number) leg.get("attempts")).intValue()).isEqualTo(5);
+    }
+
+    @Test
+    void getTimeline_notFound_returns404() {
+        ResponseEntity<String> res =
+                http.exchange(
+                        base() + "/executions/999999999/timeline",
+                        HttpMethod.GET,
+                        new HttpEntity<>(headers()),
+                        String.class);
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
     }
 
     @Test
@@ -280,6 +466,16 @@ class SettlementControllerIntegrationTest extends AbstractPostgresIntegrationTes
                         Integer.class,
                         exId))
                 .isZero();
+    }
+
+    private long seedTradeExecutionWithDates(LocalDate tradeDate, LocalDate expectedSettlementDate) {
+        long exId = seedTradeExecution();
+        jdbc.update(
+                "UPDATE executions SET trade_date = ?, expected_settlement_date = ? WHERE id = ?",
+                Date.valueOf(tradeDate),
+                Date.valueOf(expectedSettlementDate),
+                exId);
+        return exId;
     }
 
     private long seedTradeExecution() {

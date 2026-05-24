@@ -5,7 +5,9 @@ import org.junit.jupiter.api.Test;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneOffset;
+import java.util.HashSet;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -259,5 +261,136 @@ class SettlementDateCalculatorTest {
                 /* iskEligible = */ false,
                 effFrom,
                 effTo);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Slice 2b-3: holiday-aware advance via SettlementCalendarLookup
+    // ---------------------------------------------------------------------------
+
+    @Test
+    void resolve_withoutCalendarLookup_skipsOnlyWeekends() {
+        // No SettlementCalendarLookup wired → calculator falls back to weekend-only
+        // skipping even if the profile carries a calendar_id. Same as Slice 1.
+        var calc = new SettlementDateCalculator("T+2");
+        calc.setProfileLookup((symbol, asOf) -> Optional.of(stubProfile("AAPL", "T+2", LocalDate.of(2024, 1, 1), null)));
+        // 2026-04-02 Thursday → T+1 Fri 2026-04-03 (Good Friday in XSTO/XNAS) → T+2 Mon 2026-04-06.
+        // Without calendar awareness Good Friday counts as a business day, so T+2 = Mon 2026-04-06
+        // anyway (Sun rolls forward). Pick a window that proves the calendar is NOT consulted:
+        // 2026-12-23 Wed → T+1 Thu 2026-12-24 → T+2 Fri 2026-12-25. The matcher will later open
+        // a settlement_date_mismatch break if the broker disagreed, which is the intended
+        // safety net for empty-calendar deployments.
+        assertThat(calc.resolveExpectedSettlementDate(LocalDate.of(2026, 12, 23), "AAPL"))
+                .isEqualTo(LocalDate.of(2026, 12, 25));
+    }
+
+    @Test
+    void resolve_withCalendarLookup_skipsHolidaysInWindow() {
+        var calc = new SettlementDateCalculator("T+2");
+        calc.setProfileLookup((symbol, asOf) -> Optional.of(stubProfile("AAPL", "T+2", LocalDate.of(2024, 1, 1), null)));
+        calc.setCalendarLookup((calendarId, from, to) -> {
+            assertThat(calendarId).isEqualTo("XSTO-CAL");
+            Set<LocalDate> hols = new HashSet<>();
+            hols.add(LocalDate.of(2026, 12, 24)); // Christmas Eve (settlement closed)
+            hols.add(LocalDate.of(2026, 12, 25)); // Christmas Day
+            return hols;
+        });
+        // 2026-12-23 Wed trade → T+2 must skip Thu 12-24 AND Fri 12-25 (both holidays) and
+        // weekend Sat/Sun 26/27, landing on Mon 2026-12-28. Then T+2 means we still need
+        // one more business day → Tue 2026-12-29.
+        // Walk: start 12-23 Wed, +1=12-24 (holiday, remaining=2), +1=12-25 (holiday, remaining=2),
+        //   +1=12-26 (Sat, remaining=2), +1=12-27 (Sun, remaining=2),
+        //   +1=12-28 (Mon, business → remaining=1), +1=12-29 (Tue, business → remaining=0).
+        assertThat(calc.resolveExpectedSettlementDate(LocalDate.of(2026, 12, 23), "AAPL"))
+                .isEqualTo(LocalDate.of(2026, 12, 29));
+    }
+
+    @Test
+    void resolve_calendarLookupOnTplus0_rollsHolidayForwardToNextBusinessDay() {
+        var calc = new SettlementDateCalculator("T+2");
+        calc.setProfileLookup((symbol, asOf) -> Optional.of(stubProfile("USDT", "T+0", LocalDate.of(2024, 1, 1), null)));
+        calc.setCalendarLookup((calendarId, from, to) ->
+                Set.of(LocalDate.of(2026, 12, 25)));
+        // T+0 on Christmas Day → must roll forward to Mon 2026-12-28 (Sat 12-26 + Sun 12-27 skipped).
+        assertThat(calc.resolveExpectedSettlementDate(LocalDate.of(2026, 12, 25), "USDT"))
+                .isEqualTo(LocalDate.of(2026, 12, 28));
+    }
+
+    @Test
+    void resolve_calendarLookupHonoursProfileCalendarId_notADifferentOne() {
+        // Profile says XSTO-CAL; calculator must query the lookup with exactly that id,
+        // not the symbol or any other heuristic.
+        var calc = new SettlementDateCalculator("T+2");
+        calc.setProfileLookup((symbol, asOf) -> Optional.of(stubProfile("ABB", "T+2", LocalDate.of(2024, 1, 1), null)));
+        AtomicInteger calls = new AtomicInteger(0);
+        calc.setCalendarLookup((calendarId, from, to) -> {
+            calls.incrementAndGet();
+            assertThat(calendarId).isEqualTo("XSTO-CAL");
+            return Set.of();
+        });
+        calc.resolveExpectedSettlementDate(LocalDate.of(2026, 5, 20), "ABB");
+        assertThat(calls.get()).isEqualTo(1);
+    }
+
+    @Test
+    void resolve_calendarLookupQueryRangeStartsAtTradeDate() {
+        // The range query must start at tradeDate (not "today" — that would miss
+        // back-projection of historical trades) and end well past tradeDate + cycleDays.
+        var calc = new SettlementDateCalculator("T+2");
+        calc.setProfileLookup((symbol, asOf) -> Optional.of(stubProfile("AAPL", "T+2", LocalDate.of(2024, 1, 1), null)));
+        AtomicInteger lookupSeenFromYear = new AtomicInteger(-1);
+        calc.setCalendarLookup((calendarId, from, to) -> {
+            lookupSeenFromYear.set(from.getYear());
+            assertThat(to).isAfter(from);
+            return Set.of();
+        });
+        calc.resolveExpectedSettlementDate(LocalDate.of(2027, 10, 8), "AAPL");
+        assertThat(lookupSeenFromYear.get()).isEqualTo(2027);
+    }
+
+    @Test
+    void resolve_calendarLookupThrows_fallsBackToWeekendOnlySkipping() {
+        var calc = new SettlementDateCalculator("T+2");
+        calc.setProfileLookup((symbol, asOf) -> Optional.of(stubProfile("AAPL", "T+2", LocalDate.of(2024, 1, 1), null)));
+        calc.setCalendarLookup((calendarId, from, to) -> {
+            throw new RuntimeException("simulated JDBC failure on calendar read");
+        });
+        // 2026-05-20 Wed → T+2 = Fri 2026-05-22, no holidays in range. Failure must
+        // degrade gracefully.
+        assertThat(calc.resolveExpectedSettlementDate(LocalDate.of(2026, 5, 20), "AAPL"))
+                .isEqualTo(LocalDate.of(2026, 5, 22));
+    }
+
+    @Test
+    void resolve_calendarLookupNotConsultedWhenProfileHasNoCalendarId() {
+        // A profile with blank calendar id means "no calendar awareness" — calculator
+        // must not query the lookup.
+        var calc = new SettlementDateCalculator("T+2");
+        var noCalProfile = new InstrumentSettlementProfile(
+                1L, "AAPL-INST", "AAPL", null, "XNAS",
+                /* settlementCalendarId = */ "",
+                "T+2", "USD", false,
+                LocalDate.of(2024, 1, 1), null);
+        calc.setProfileLookup((symbol, asOf) -> Optional.of(noCalProfile));
+        AtomicInteger calls = new AtomicInteger(0);
+        calc.setCalendarLookup((calendarId, from, to) -> {
+            calls.incrementAndGet();
+            return Set.of();
+        });
+        calc.resolveExpectedSettlementDate(LocalDate.of(2026, 5, 20), "AAPL");
+        assertThat(calls.get()).isZero();
+    }
+
+    @Test
+    void resolve_calendarLookupNotConsultedWhenProfileMisses() {
+        // Profile miss → default-cycle fallback path → no calendar id → no calendar query.
+        var calc = new SettlementDateCalculator("T+2");
+        calc.setProfileLookup((symbol, asOf) -> Optional.empty());
+        AtomicInteger calls = new AtomicInteger(0);
+        calc.setCalendarLookup((calendarId, from, to) -> {
+            calls.incrementAndGet();
+            return Set.of();
+        });
+        calc.resolveExpectedSettlementDate(LocalDate.of(2026, 5, 20), "AAPL");
+        assertThat(calls.get()).isZero();
     }
 }

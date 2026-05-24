@@ -320,7 +320,11 @@ public final class LedgerInflightCoalescer {
         for (PendingHold pending : items) {
             try {
                 String payload = serializeOutboxPayload(pending);
-                transactionTemplate.executeWithoutResult(status -> outbox.insert(pending.orderId(), payload));
+                transactionTemplate.executeWithoutResult(status ->
+                        outbox.insertIfAbsent(pending.orderId(), payload));
+                // D-9: the projector may have already inserted this row from OrderAdmittedEvent
+                // before the coalescer fallback runs. insertIfAbsent treats that as success —
+                // the outbox safety net exists either way and the reconciler can drive Ledger.
                 meterRegistry.counter(METRIC_ITEMS_TOTAL, "outcome", "fallback_outbox", "reason", reason).increment();
                 recordSubmitLatency(pending, "fallback_outbox");
                 pending.future().complete(null);

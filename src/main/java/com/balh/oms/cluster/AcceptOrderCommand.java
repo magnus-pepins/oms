@@ -36,6 +36,11 @@ import java.util.UUID;
  *   offset N   string accountIdHash         (PII-safe; computed at edge)
  *   offset N   string instrumentSymbol
  *   offset N   string ledgerBalanceId       (only when hasLedgerBalanceId == 1)
+ *   offset N   optional FIX-in tail          (append-only; absent on legacy / REST frames)
+ *              byte ingressType              ({@link FixInIngressMetadata#INGRESS_TYPE_FIX_IN})
+ *              string fixSessionId
+ *              string externalClOrdId
+ *              string fixAccountTag
  * </pre>
  *
  * <p>Strings are length-prefixed: 4-byte int length followed by UTF-8 bytes.
@@ -55,7 +60,8 @@ public record AcceptOrderCommand(
         String clientIdempotencyKey,
         String accountIdHash,
         String instrumentSymbol,
-        String ledgerBalanceIdOrNull) {
+        String ledgerBalanceIdOrNull,
+        FixInIngressMetadata fixInIngressMetadataOrNull) {
 
     /** Quantity scale factor: store quantities as fixed-point with 9 decimal places. */
     public static final long QUANTITY_SCALE = 1_000_000_000L;
@@ -177,7 +183,33 @@ public record AcceptOrderCommand(
             String ledgerBalanceIdOrNull) {
         this(correlationId, orderId, clientTimestampNanos, quantityScaled, limitPriceScaledOrZero,
                 shardId, side, timeInForceCode, ORD_TYPE_MARKET,
-                accountId, clientIdempotencyKey, accountIdHash, instrumentSymbol, ledgerBalanceIdOrNull);
+                accountId, clientIdempotencyKey, accountIdHash, instrumentSymbol, ledgerBalanceIdOrNull,
+                /* fixInIngressMetadataOrNull = */ null);
+    }
+
+    /**
+     * Back-compat constructor for REST ingress and tests that pass explicit {@code ordTypeCode}
+     * but no FIX-in metadata.
+     */
+    public AcceptOrderCommand(
+            long correlationId,
+            UUID orderId,
+            long clientTimestampNanos,
+            long quantityScaled,
+            long limitPriceScaledOrZero,
+            int shardId,
+            byte side,
+            byte timeInForceCode,
+            byte ordTypeCode,
+            String accountId,
+            String clientIdempotencyKey,
+            String accountIdHash,
+            String instrumentSymbol,
+            String ledgerBalanceIdOrNull) {
+        this(correlationId, orderId, clientTimestampNanos, quantityScaled, limitPriceScaledOrZero,
+                shardId, side, timeInForceCode, ordTypeCode,
+                accountId, clientIdempotencyKey, accountIdHash, instrumentSymbol, ledgerBalanceIdOrNull,
+                /* fixInIngressMetadataOrNull = */ null);
     }
 
     /**
@@ -218,6 +250,9 @@ public record AcceptOrderCommand(
         p = writeString(buffer, p, instrumentSymbol);
         if (ledgerBalanceIdOrNull != null) {
             p = writeString(buffer, p, ledgerBalanceIdOrNull);
+        }
+        if (fixInIngressMetadataOrNull != null) {
+            p += FixInIngressMetadata.writeFixInTail(buffer, p, fixInIngressMetadataOrNull);
         }
 
         int written = p - offset;
@@ -279,7 +314,10 @@ public record AcceptOrderCommand(
         String ledgerBalanceId = null;
         if (hasLedgerBalanceId == 1) {
             ledgerBalanceId = readString(buffer, p);
+            p += stringByteLenAt(buffer, p);
         }
+        FixInIngressMetadata fixInIngressMetadata =
+                FixInIngressMetadata.readFixInTailIfPresent(buffer, p, offset + length);
 
         return new AcceptOrderCommand(
                 correlationId,
@@ -295,7 +333,8 @@ public record AcceptOrderCommand(
                 clientIdempotencyKey,
                 accountIdHash,
                 instrumentSymbol,
-                ledgerBalanceId);
+                ledgerBalanceId,
+                fixInIngressMetadata);
     }
 
     private static int writeString(MutableDirectBuffer buffer, int offset, String s) {

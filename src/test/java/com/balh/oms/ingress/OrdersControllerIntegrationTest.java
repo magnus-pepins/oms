@@ -66,7 +66,7 @@ class OrdersControllerIntegrationTest extends AbstractPostgresIntegrationTest {
     }
 
     @Test
-    void createsOrderAndWritesOutboxRowInsideSameTransaction() {
+    void createsOrderAndProjectorWritesDomainOutboxRow() {
         UUID accountId = UUID.randomUUID();
         ResponseEntity<Map<String, Object>> res = exchange(jsonRequest(accountId, "key-1"));
 
@@ -74,18 +74,18 @@ class OrdersControllerIntegrationTest extends AbstractPostgresIntegrationTest {
         assertThat(res.getBody()).isNotNull();
         UUID orderId = UUID.fromString((String) res.getBody().get("id"));
 
-        // The domain-fanout row is still written inside the ingress transaction (control_outbox
-        // was deleted in slice 3f); it commits before the controller returns.
-        Long domainOutboxCount = jdbc.queryForObject(
-                "SELECT COUNT(*) FROM domain_event_outbox WHERE order_id = ?", Long.class, orderId);
-        assertThat(domainOutboxCount).isEqualTo(1L);
-
-        // Phase 2 slice 2c: the orders row arrives via the test projector daemon (the production
-        // ingress no longer writes it). HTTP 201 means cluster-committed; await the projection.
+        // Phase 2 slice 2c / D-3: domain_event_outbox OrderAccepted arrives via the test
+        // projector daemon (ingress no longer writes it). HTTP 201 means cluster-committed;
+        // await both the orders row and the fanout outbox row.
         await()
                 .atMost(ORDERS_VISIBLE_TIMEOUT)
                 .pollInterval(ORDERS_VISIBLE_POLL)
                 .untilAsserted(() -> {
+                    Long domainOutboxCount = jdbc.queryForObject(
+                            "SELECT COUNT(*) FROM domain_event_outbox WHERE order_id = ?",
+                            Long.class,
+                            orderId);
+                    assertThat(domainOutboxCount).isEqualTo(1L);
                     var stored = orders.findById(orderId).orElseThrow();
                     assertThat(stored.accountId()).isEqualTo(accountId);
                 });
@@ -203,6 +203,64 @@ class OrdersControllerIntegrationTest extends AbstractPostgresIntegrationTest {
         assertThat(res.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(res.getBody()).isNotNull();
         assertThat(res.getBody().get("settlementStatus")).isEqualTo("settling");
+    }
+
+    @Test
+    void getOrder_returnsMaxExpectedSettlementDateAmongOpenTradeLegs() {
+        UUID accountId = UUID.randomUUID();
+        ResponseEntity<Map<String, Object>> created = exchange(jsonRequest(accountId, "get-key-settle-date"));
+        assertThat(created.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        UUID orderId = UUID.fromString((String) created.getBody().get("id"));
+        awaitOrderVisible(orderId);
+
+        jdbc.update(
+                """
+                        INSERT INTO executions (
+                          order_id, account_id, venue_id, venue_ts, venue_exec_ref,
+                          last_quantity, last_price, leaves_quantity, cum_quantity_after,
+                          exec_type, raw_envelope_json, settlement_status,
+                          trade_date, expected_settlement_date
+                        ) VALUES (
+                          ?, ?, 'SIM', NOW(), ?,
+                          5, 10, 5, 5,
+                          CAST('TRADE' AS execution_exec_type), CAST('{}' AS JSONB),
+                          CAST('executed' AS execution_settlement_status),
+                          DATE '2026-05-20', DATE '2026-05-22'
+                        )
+                        """,
+                orderId,
+                accountId,
+                "vref-settle-date-a-" + orderId);
+        jdbc.update(
+                """
+                        INSERT INTO executions (
+                          order_id, account_id, venue_id, venue_ts, venue_exec_ref,
+                          last_quantity, last_price, leaves_quantity, cum_quantity_after,
+                          exec_type, raw_envelope_json, settlement_status,
+                          trade_date, expected_settlement_date
+                        ) VALUES (
+                          ?, ?, 'SIM', NOW(), ?,
+                          5, 10, 0, 10,
+                          CAST('TRADE' AS execution_exec_type), CAST('{}' AS JSONB),
+                          CAST('matched' AS execution_settlement_status),
+                          DATE '2026-05-21', DATE '2026-05-23'
+                        )
+                        """,
+                orderId,
+                accountId,
+                "vref-settle-date-b-" + orderId);
+
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("X-OMS-Internal-Key", "test-key");
+        ResponseEntity<Map<String, Object>> res = http.exchange(
+                "http://localhost:" + port + "/internal/v1/orders/" + orderId,
+                HttpMethod.GET,
+                new HttpEntity<>(headers),
+                new ParameterizedTypeReference<>() {});
+
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(res.getBody()).isNotNull();
+        assertThat(res.getBody().get("expectedSettlementDate")).isEqualTo("2026-05-23");
     }
 
     /**

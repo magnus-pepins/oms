@@ -17,6 +17,8 @@ import java.util.UUID;
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
 import static com.github.tomakehurst.wiremock.client.WireMock.containing;
 import static com.github.tomakehurst.wiremock.client.WireMock.equalTo;
+import static com.github.tomakehurst.wiremock.client.WireMock.get;
+import static com.github.tomakehurst.wiremock.client.WireMock.matching;
 import static com.github.tomakehurst.wiremock.client.WireMock.post;
 import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlPathEqualTo;
@@ -72,6 +74,23 @@ class LedgerSettlementOutboxReconcilerIntegrationTest extends AbstractPostgresIn
     void reset() {
         ledgerWireMock.resetAll();
         jdbc.update(AbstractPostgresIntegrationTest.SQL_TRUNCATE_ORDERS_AND_SETTLEMENT);
+        // LedgerSettlementLegPoster resolves customer 'inv-<account>-<ccy>' indicators to a
+        // concrete balanceId via GET /balances?indicator=… before posting any leg (see
+        // commit 724e991 — Ledger's IndicatorResolver only handles indicators starting with
+        // '@', so customer balances need this client-side lookup). Without a stub, WireMock
+        // 404s on the GET, the LegPoster short-circuits to SKIPPED_INDICATOR_NOT_FOUND, and
+        // no POST /transactions is ever issued — which would make the happy-path test fail
+        // on its verify(2, postRequestedFor(...)) and would make the error-path test pass
+        // for the wrong reason (skipped-on-indicator instead of skipped-on-503).
+        // We use the BUY-side cash leg's UUID for the response balanceId; the value is
+        // opaque to these tests (POST stubs match on payload substrings, not on balanceIds).
+        ledgerWireMock.stubFor(get(urlPathEqualTo("/balances"))
+                .withHeader("Authorization", equalTo("Bearer it-key"))
+                .withQueryParam("indicator", matching("inv-.*-(USD|SEK|EUR)"))
+                .willReturn(aResponse()
+                        .withStatus(200)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("[{\"balanceId\":\"bal-it-customer-usd\",\"currency\":\"USD\"}]")));
     }
 
     @Test

@@ -30,6 +30,8 @@ VALUES (
 ON CONFLICT (id) DO NOTHING;
 
 -- DROP_COPY session for conformance scenario 7 (loopback probe uses LOOPBACK_DROP → BALH_OMS).
+-- After first insert on a running acceptor: pm2 restart oms-fix-ingress (sessions load at boot).
+-- Optional positive ER fanout: uncomment oms_fix_drop_copy_entitlement below.
 INSERT INTO oms_fix_in_session (
     id, counterparty_id, environment, session_mode,
     sender_comp_id, target_comp_id, heartbeat_seconds, enabled)
@@ -43,3 +45,10 @@ VALUES (
     30,
     TRUE)
 ON CONFLICT (id) DO NOTHING;
+
+-- Mirror ERs for the loopback custody account to LOOPBACK_DROP (positive fanout testing).
+-- INSERT INTO oms_fix_drop_copy_entitlement (drop_copy_session_id, oms_account_id)
+-- VALUES (
+--     '00000002-0000-4000-8000-000000000002',
+--     'a0000001-0000-4000-8000-000000000002')
+-- ON CONFLICT DO NOTHING;

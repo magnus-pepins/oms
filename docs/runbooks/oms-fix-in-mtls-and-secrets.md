@@ -31,6 +31,8 @@ Operator runbook for **oms-fix-ingress** acceptor TLS and staged logon secrets. 
 | `OMS_FIX_IN_MAX_CL_ORD_ID_LEN` | 64 | Reject oversized ClOrdID |
 | `OMS_FIX_IN_MAX_APP_MSG_PER_SEC` | 200 | Per-wire-session token bucket |
 
+Bench automation: `./gradlew fixInLoopbackConformanceProbe` scenario **11** uses stale `SendingTime` (~125s); QuickFIX may reject at session layer before app `message_too_old`. Burst testing requires lowering `OMS_FIX_IN_MAX_APP_MSG_PER_SEC` temporarily.
+
 Metrics: `oms_fix_in_rate_limit_rejects_total`, `oms_fix_in_audit_write_failures_total`.
 
 ## Raw message retention

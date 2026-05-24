@@ -36,21 +36,148 @@ UAT soak (read-only + JSON report): `system-documentation/scripts/smoke/fix-in-u
 
 ## Loopback counterparty (bench / pop UAT)
 
-Seed session `LOOPBACK_CLIENT` → `BALH_OMS` (`src/test/resources/db/fix-in-uat-seed.sql`). Run a persistent initiator so mutating soak can exercise logout + reconnect:
+Seed file: `src/test/resources/db/fix-in-uat-seed.sql` defines:
+
+| Session UUID | Mode | CompIDs (client → OMS) | Purpose |
+|--------------|------|------------------------|---------|
+| `00000001-0000-4000-8000-000000000001` | `ORDER_ENTRY` | `LOOPBACK_CLIENT` → `BALH_OMS` | Orders, soak reconnect, conformance 6/8/11 |
+| `00000002-0000-4000-8000-000000000002` | `DROP_COPY` | `LOOPBACK_DROP` → `BALH_OMS` | Drop-copy logon + conformance 7 |
+
+Apply on bench (idempotent):
+
+```bash
+source ~/.oms-bench.env
+pg_url="${OMS_PG_URL#jdbc:postgresql://}"
+pg_url="${pg_url%%\?*}"
+psql "postgresql://${OMS_PG_USER:-oms}:${OMS_PG_PASSWORD:-oms}@${pg_url}" \
+  -v ON_ERROR_STOP=1 -f src/test/resources/db/fix-in-uat-seed.sql
+```
+
+If the seed inserts a **new** session row (`INSERT 0 1` in psql output), restart **`oms-fix-ingress`** — the acceptor loads enabled sessions at startup only:
+
+```bash
+pm2 restart oms-fix-ingress
+```
+
+### Order-entry loopback client (persistent)
+
+Run a persistent initiator so mutating soak can exercise logout + reconnect:
 
 ```bash
 ./gradlew fixInLoopbackClient
 # or PM2: oms-fix-in-loopback-client (ecosystem.config.cjs)
 ```
 
-Env: `FIX_IN_CLIENT_CONNECT_HOST`, `FIX_IN_CLIENT_CONNECT_PORT` (default **9877**), `FIX_IN_CLIENT_SENDER`, `FIX_IN_CLIENT_TARGET`, `FIX_IN_CLIENT_FILE_STORE`.
+Env: `FIX_IN_CLIENT_CONNECT_HOST`, `FIX_IN_CLIENT_CONNECT_PORT` (default **9877**), `FIX_IN_CLIENT_SENDER` (default `LOOPBACK_CLIENT`), `FIX_IN_CLIENT_TARGET` (default `BALH_OMS`), `FIX_IN_CLIENT_FILE_STORE`.
 
-Then on pop:
+### Conformance probe (scenarios 6, 7, 8, 11)
+
+One-shot Gradle task against a **live** acceptor (not embedded Spring ITs):
 
 ```bash
-FIX_SOAK_MUTATE=1 FIX_SOAK_REQUIRE_RECONNECT=1 FIX_IN_SESSION_ID=00000001-0000-4000-8000-000000000001 \
+source ~/.oms-bench.env
+export OMS_INTERNAL_API_KEY OMS_FIX_INGRESS_INTERNAL_BASE_URL=http://127.0.0.1:8095
+
+# Avoid CompID contention with PM2 loopback client on LOOPBACK_CLIENT
+pm2 stop oms-fix-in-loopback-client
+
+./gradlew fixInLoopbackConformanceProbe
+# Report: build/fix-in-conformance-probe-report.json (override: FIX_IN_CONFORMANCE_REPORT_PATH)
+
+pm2 start oms-fix-in-loopback-client
+```
+
+| Env | Default | Purpose |
+|-----|---------|---------|
+| `OMS_INTERNAL_API_KEY` | (required) | Admin API for scenario 8 (logout + sequence-reset) |
+| `OMS_FIX_INGRESS_INTERNAL_BASE_URL` | `http://127.0.0.1:8095` | fix-ingress admin base |
+| `FIX_IN_CLIENT_CONNECT_PORT` | `9877` | Acceptor port |
+| `FIX_IN_ORDER_ENTRY_SESSION_ID` | `00000001-…0001` | Order-entry session for scenario 8 |
+| `FIX_IN_DROP_COPY_SENDER` | `LOOPBACK_DROP` | Drop-copy CompID for scenario 7 |
+| `FIX_IN_PROBE_STALE_MS` | `125000` | Stale `SendingTime` offset for scenario 11 |
+| `FIX_IN_PROBE_FILE_STORE` | `./build/fix-in-conformance-probe` | Isolated QuickFIX file stores |
+
+Scenario **11** on bench: QuickFIX may reject very stale `SendingTime` at the **session** layer (`35=3` / logout) before the app emits `BusinessMessageReject message_too_old`. The probe accepts either outcome.
+
+Via soak (applies seed, stops/restarts PM2 loopback client, merges probe JSON into soak report):
+
+```bash
+FIX_SOAK_CONFORMANCE=1 FIX_SOAK_RUN_GRADLE=1 \
   bash system-documentation/scripts/smoke/fix-in-uat-soak.sh
 ```
+
+`FIX_SOAK_RUN_GRADLE=1` runs the conformance probe by default. Spring wire ITs (`FixInFullRoundTripIT`, etc.) run only with **`FIX_SOAK_GRADLE_WIRE_IT=1`** and an **isolated** `OMS_CI_JDBC_URL` — do not point that at live pop Postgres (ITs truncate orders).
+
+### Pop soak (full internal UAT)
+
+```bash
+source ~/.oms-bench.env
+export OMS_FIX_INGRESS_INTERNAL_BASE_URL=http://127.0.0.1:8095
+export OMS_FIX_IN_SESSION_STORE_TYPE=jdbc
+export OMS_REPO=~/oms
+
+FIX_SOAK_MUTATE=1 FIX_SOAK_REQUIRE_RECONNECT=1 \
+FIX_SOAK_CONFORMANCE=1 FIX_SOAK_RUN_GRADLE=1 \
+FIX_IN_SESSION_ID=00000001-0000-4000-8000-000000000001 \
+  bash system-documentation/scripts/smoke/fix-in-uat-soak.sh
+```
+
+Requires `oms-fix-in-loopback-client` PM2 for reconnect probes. Conformance probe briefly stops that process to exclusive-use `LOOPBACK_CLIENT` / `LOOPBACK_DROP`.
+
+## Drop copy session
+
+Drop copy is a **separate** FIX-in session (`session_mode=DROP_COPY`), not a flag on order entry. The client is still a FIX 4.4 **initiator**; the acceptor rejects inbound order entry and may **fan out** eligible `ExecutionReport` / `OrderCancelReject` copies to entitled sessions.
+
+### Provision (operator)
+
+1. **Counterparty** — reuse or insert `oms_fix_in_counterparty`.
+2. **Session row** — `oms_fix_in_session` with `session_mode=DROP_COPY`, unique `(sender_comp_id, target_comp_id)`:
+
+   ```sql
+   INSERT INTO oms_fix_in_session (
+       id, counterparty_id, environment, session_mode,
+       sender_comp_id, target_comp_id, heartbeat_seconds, enabled)
+   VALUES (
+       '<uuid>', '<counterparty_uuid>', 'UAT', 'DROP_COPY',
+       'CLIENT_DC_SENDER', 'BALH_OMS', 30, TRUE);
+   ```
+
+3. **Restart `oms-fix-ingress`** after inserting a new enabled session (acceptor reads DB at boot).
+4. **Entitlements (optional, for outbound ER fanout)** — link drop-copy session to OMS accounts whose lifecycle events should be mirrored:
+
+   ```sql
+   INSERT INTO oms_fix_drop_copy_entitlement (drop_copy_session_id, oms_account_id)
+   VALUES ('<drop_copy_session_uuid>', '<oms_account_uuid>')
+   ON CONFLICT DO NOTHING;
+   ```
+
+   Without entitlements, the session can log on and reject `D/F/G` (conformance scenario 7) but **`FixInReturnPublisher` will not send ER copies** to it.
+
+5. **No account binding** on drop-copy sessions — `oms_fix_in_account_binding` is order-entry only.
+
+### Start the client (loopback example)
+
+Use a **separate QuickFIX file store** from order entry (sequence state must not be shared):
+
+```bash
+FIX_IN_CLIENT_SENDER=LOOPBACK_DROP \
+FIX_IN_CLIENT_TARGET=BALH_OMS \
+FIX_IN_CLIENT_CONNECT_PORT=9877 \
+FIX_IN_CLIENT_FILE_STORE=./build/fix-in-drop-copy-client \
+  ./gradlew fixInLoopbackClient
+```
+
+External counterparties: same CompIDs as the DB row, connect to acceptor host/port, `ResetOnLogon=Y` (matches loopback seed).
+
+### Verify
+
+| Check | How |
+|-------|-----|
+| Logged on | `GET /internal/v1/fix-in/sessions/{drop_copy_session_id}` → `runtime.loggedOn=true` |
+| Rejects order entry | Send `35=D` → `35=j` text `drop_copy_session_order_entry_forbidden` (scenario 7 / `./gradlew fixInLoopbackConformanceProbe`) |
+| Receives ER fanout | Entitlement row present; place order on **order-entry** session for entitled account; drop-copy session receives fill/cancel ERs on wire |
+
+Negative-only testing does not require entitlements. See [fix-in-conformance-pack.md](../fix-in-conformance-pack.md) scenario 7.
 
 ## Session store (JDBC)
 
@@ -62,8 +189,4 @@ Session must be **logged out** before `sequence-reset` mutates QuickFIX store se
 
 ## Return publisher
 
-`oms.fix-in.return-publisher.enabled=true` (default). Uses Aeron replay stream id `4324` (configurable). Cursor table: `oms_fix_in_return_cursor`.
-
-## Drop copy
-
-`session_mode=DROP_COPY` sessions reject `D/F/G` with `BusinessMessageReject`. Outbound copies use `oms_fix_drop_copy_entitlement` per `oms_account_id`.
+`oms.fix-in.return-publisher.enabled=true` (default). Uses Aeron replay stream id `4324` (configurable). Cursor table: `oms_fix_in_return_cursor`. Drop-copy fanout: `oms_fix_drop_copy_entitlement` + `FixInReturnPublisher` (see **Drop copy session** above).

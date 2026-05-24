@@ -1,14 +1,22 @@
 # FIX-in counterparty conformance pack
 
-Operator and certification checklist for external FIX 4.4 clients connecting to **`oms-fix-ingress`**. Run automated wire checks with `./gradlew test --tests 'com.balh.oms.fixin.FixInFullRoundTripIT'` and the soak script below.
+Operator and certification checklist for external FIX 4.4 clients connecting to **`oms-fix-ingress`**.
+
+**Automation entrypoints:**
+
+- Gradle wire ITs (dev Mac / CI): `./gradlew test --tests 'com.balh.oms.fixin.FixInFullRoundTripIT'` (and cancel/replace / JDBC / mutating soak ITs).
+- Live acceptor probe (bench/pop): `./gradlew fixInLoopbackConformanceProbe` — scenarios **6, 7, 8, 11**.
+- Soak + probe: `system-documentation/scripts/smoke/fix-in-uat-soak.sh` with `FIX_SOAK_CONFORMANCE=1` and/or `FIX_SOAK_RUN_GRADLE=1`.
+
+Runbook (loopback client, drop copy, pop commands): [runbooks/oms-fix-ingress.md](./runbooks/oms-fix-ingress.md).
 
 ## Prerequisites
 
 | Item | Expected |
 |------|----------|
-| Flyway | Through **V67** (`oms_fix_in_*`, `oms_fix_message_audit`) |
+| Flyway | Through **V67** (`oms_fix_in_*`, `oms_fix_message_audit`, `oms_fix_drop_copy_entitlement`) |
 | Session store | **JDBC** in bench/prod (`OMS_FIX_IN_SESSION_STORE_TYPE=jdbc`, Flyway **V9** tables) |
-| Seed | At least one `oms_fix_in_session` + `oms_fix_in_account_binding` row |
+| Seed | Order-entry session + binding; drop-copy session for scenario 7 — see `src/test/resources/db/fix-in-uat-seed.sql` |
 | CompIDs | Client `SenderCompID` / OMS `TargetCompID` match DB row |
 | Cluster | Aeron cluster + `oms-fix-ingress` cluster client connected |
 
@@ -29,6 +37,41 @@ Operator and certification checklist for external FIX 4.4 clients connecting to 
 | 11 | **Rate limit** | Stale `SendingTime` or burst → `BusinessMessageReject` | `fixInLoopbackConformanceProbe` (stale `SendingTime`); burst requires lowered `oms.fix-in.max-app-messages-per-second` |
 | 12 | **Message audit** | `oms_fix_message_audit` rows; redacted fetch via admin API | Soak §2 |
 
+## Loopback conformance probe (scenarios 6, 7, 8, 11)
+
+Gradle task: **`fixInLoopbackConformanceProbe`** (`FixInLoopbackConformanceProbeMain`).
+
+**Before run:** stop PM2 `oms-fix-in-loopback-client` (or any initiator using `LOOPBACK_CLIENT` / `LOOPBACK_DROP`) to avoid CompID contention.
+
+```bash
+source ~/.oms-bench.env
+export OMS_INTERNAL_API_KEY
+export OMS_FIX_INGRESS_INTERNAL_BASE_URL=http://127.0.0.1:8095
+
+pm2 stop oms-fix-in-loopback-client
+./gradlew fixInLoopbackConformanceProbe
+pm2 start oms-fix-in-loopback-client
+```
+
+| Scenario | Probe behaviour | Pass criteria |
+|----------|-----------------|---------------|
+| **6** | Two `35=D` with same `ClOrdID` on order-entry session | Two `ExecType=NEW` ERs, same `OrderID(37)` |
+| **7** | `35=D` on `DROP_COPY` session (`LOOPBACK_DROP`) | `BusinessMessageReject` ref `D`, text contains `drop_copy_session_order_entry_forbidden` |
+| **8** | HTTP force logout → `POST .../sequence-reset` → client re-logon | `SEQUENCE_RESET` in admin-actions; initiator logs on again |
+| **11** | `35=D` with stale `SendingTime` (~125s) | `BusinessMessageReject message_too_old` **or** session `Reject` / logout for `SendingTime accuracy problem` (QuickFIX session guard) |
+
+Report: `build/fix-in-conformance-probe-report.json` (env `FIX_IN_CONFORMANCE_REPORT_PATH`).
+
+Integrated into soak when `FIX_SOAK_CONFORMANCE=1` or `FIX_SOAK_RUN_GRADLE=1` (see runbook). Soak also applies `fix-in-uat-seed.sql` and restarts `oms-fix-ingress` when a new session row is inserted.
+
+## Drop copy (scenario 7 and production)
+
+1. Insert `oms_fix_in_session` with `session_mode=DROP_COPY` (seed: `LOOPBACK_DROP` → `BALH_OMS`, UUID `00000002-…`).
+2. Restart **`oms-fix-ingress`** so the acceptor registers the session.
+3. Start client initiator with drop-copy CompIDs and **separate file store** (see runbook).
+4. **Negative test (scenario 7):** inbound `D/F/G` → `BusinessMessageReject` — no entitlement required.
+5. **Positive fanout (optional):** insert `oms_fix_drop_copy_entitlement` linking session to `oms_account_id`; orders on order-entry session for that account mirror ERs to drop copy via `FixInReturnPublisher`.
+
 ## Message expectations (order entry)
 
 - **Inbound:** FIX 4.4 `D` / `F` / `G` with required tags per `FixInNewOrderSingleParser`.
@@ -36,6 +79,18 @@ Operator and certification checklist for external FIX 4.4 clients connecting to 
 - **Returns:** Fills/cancels via `OmsFixInReturnService` replay (no duplicate NEW when FIX-in metadata on admit).
 - **OrderID(37):** OMS order UUID string.
 - **ClOrdID(11):** Client-supplied; dedupe key `(session_id, ClOrdID)`.
+
+## Pop / bench soak flags
+
+| Flag | Effect |
+|------|--------|
+| `FIX_SOAK_MUTATE=1` | Force logout, runtime drop, reconnect, admin-action audit (scenario 9) |
+| `FIX_SOAK_REQUIRE_RECONNECT=1` | Fail if loopback client does not re-logon (needs PM2 `oms-fix-in-loopback-client`) |
+| `FIX_SOAK_CONFORMANCE=1` | Apply UAT seed, run `fixInLoopbackConformanceProbe`, merge report |
+| `FIX_SOAK_RUN_GRADLE=1` | Same conformance probe; wire ITs only if `FIX_SOAK_GRADLE_WIRE_IT=1` + isolated JDBC |
+| `FIX_IN_SESSION_ID` | Order-entry session UUID (default: first enabled session) |
+
+Pop sign-off evidence: [fix-in-conformance-sign-off-pop-2026-05-24.md](./fix-in-conformance-sign-off-pop-2026-05-24.md).
 
 ## Operator sign-off template
 

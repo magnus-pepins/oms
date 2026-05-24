@@ -410,6 +410,15 @@ tasks.register<JavaExec>("fixLoopbackAcceptor") {
     mainClass.set("com.balh.oms.fix.dev.FixLoopbackAcceptorMain")
 }
 
+/** Persistent FIX-in loopback client for bench/UAT (connects to oms-fix-ingress as LOOPBACK_CLIENT). */
+tasks.register<JavaExec>("fixInLoopbackClient") {
+    group = "development"
+    description =
+        "Start FIX-in loopback initiator. Env: FIX_IN_CLIENT_CONNECT_HOST/PORT, FIX_IN_CLIENT_SENDER/TARGET, FIX_IN_CLIENT_FILE_STORE"
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("com.balh.oms.fixin.dev.FixInLoopbackClientMain")
+}
+
 /**
  * Phase 4 slice 4a (operator-driven snapshot): trigger an Aeron Cluster snapshot on a running
  * cluster member. Cluster dir resolved from `OMS_AERON_CLUSTER_DIR` (preferred) or

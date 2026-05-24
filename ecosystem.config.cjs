@@ -518,6 +518,38 @@ const apps = [
         path.join(projectRoot, 'build', 'fix-loopback-acceptor'),
     },
   },
+  {
+    name: 'oms-fix-in-loopback-client',
+    // Gradle task — main class under src/test/java (same pattern as oms-fix-loopback-acceptor).
+    script: path.join(projectRoot, 'gradlew'),
+    args: ['--no-daemon', '-q', 'fixInLoopbackClient'],
+    interpreter: 'none',
+    exec_mode: 'fork',
+    instances: 1,
+    autorestart: true,
+    watch: false,
+    max_restarts: 10,
+    restart_delay: 5000,
+    kill_timeout: 5000,
+    time: true,
+    merge_logs: true,
+    cwd: projectRoot,
+    max_memory_restart: '512M',
+    min_uptime: '15s',
+    output: logPath('oms-fix-in-loopback-client-out', '.log'),
+    error: logPath('oms-fix-in-loopback-client-err', '.log'),
+    log: logPath('oms-fix-in-loopback-client-combined', '.log'),
+    env: {
+      FIX_IN_CLIENT_CONNECT_HOST: process.env.FIX_IN_CLIENT_CONNECT_HOST || '127.0.0.1',
+      FIX_IN_CLIENT_CONNECT_PORT: process.env.OMS_FIX_IN_ACCEPT_PORT || '9877',
+      FIX_IN_CLIENT_SENDER: process.env.FIX_IN_CLIENT_SENDER || 'LOOPBACK_CLIENT',
+      FIX_IN_CLIENT_TARGET: process.env.FIX_IN_CLIENT_TARGET || 'BALH_OMS',
+      FIX_IN_CLIENT_FILE_STORE:
+        process.env.FIX_IN_CLIENT_FILE_STORE ||
+        path.join(projectRoot, 'build', 'fix-in-loopback-client'),
+      FIX_IN_LOOPBACK_HEARTBEAT_LOG_SECS: process.env.FIX_IN_LOOPBACK_HEARTBEAT_LOG_SECS || '60',
+    },
+  },
 ];
 
 module.exports = { apps };

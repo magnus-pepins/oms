@@ -34,6 +34,24 @@ Ops Console: `/api/oms-trading/fix/*` and `/api/oms-trading/fix-in/*`. Set `OMS_
 
 UAT soak (read-only + JSON report): `system-documentation/scripts/smoke/fix-in-uat-soak.sh`. Conformance checklist: [fix-in-conformance-pack.md](../fix-in-conformance-pack.md).
 
+## Loopback counterparty (bench / pop UAT)
+
+Seed session `LOOPBACK_CLIENT` → `BALH_OMS` (`src/test/resources/db/fix-in-uat-seed.sql`). Run a persistent initiator so mutating soak can exercise logout + reconnect:
+
+```bash
+./gradlew fixInLoopbackClient
+# or PM2: oms-fix-in-loopback-client (ecosystem.config.cjs)
+```
+
+Env: `FIX_IN_CLIENT_CONNECT_HOST`, `FIX_IN_CLIENT_CONNECT_PORT` (default **9877**), `FIX_IN_CLIENT_SENDER`, `FIX_IN_CLIENT_TARGET`, `FIX_IN_CLIENT_FILE_STORE`.
+
+Then on pop:
+
+```bash
+FIX_SOAK_MUTATE=1 FIX_SOAK_REQUIRE_RECONNECT=1 FIX_IN_SESSION_ID=00000001-0000-4000-8000-000000000001 \
+  bash system-documentation/scripts/smoke/fix-in-uat-soak.sh
+```
+
 ## Session store (JDBC)
 
 Production/bench default: `OMS_FIX_IN_SESSION_STORE_TYPE=jdbc` (uses application Postgres + Flyway **V9** `oms_fix_sessions` / `oms_fix_messages`). Local dev may use `file`. Optional isolation: `OMS_FIX_IN_SESSION_JDBC_DATASOURCE_ENABLED=true` + dedicated URL — same pattern as FIX-out ([fix-session-store-isolation.md](../fix-session-store-isolation.md)).

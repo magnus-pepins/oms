@@ -32,6 +32,11 @@ public interface LedgerBalanceClient {
      */
     String fetchIdentityIdForBalance(String balanceId) throws LedgerServiceException;
 
+    /**
+     * Reads {@code availableBalance} for the balance at {@code GET /balances/indicator/{indicator}/currency/{currency}}.
+     */
+    BigDecimal fetchAvailableBalanceByIndicator(String indicator, String currency) throws LedgerServiceException;
+
     final class LedgerServiceException extends Exception {
         public LedgerServiceException(String message) {
             super(message);

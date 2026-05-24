@@ -23,6 +23,7 @@ public class CorporateActionProcessingService {
 
     public static final String ACTION_CASH_DIVIDEND = "CASH_DIVIDEND";
     public static final String ACTION_STOCK_SPLIT = "STOCK_SPLIT";
+    public static final String ACTION_REVERSE_SPLIT = "REVERSE_SPLIT";
     public static final String ACTION_TENDER_OFFER = "TENDER_OFFER";
     public static final String ACTION_RIGHTS_ISSUE = "RIGHTS_ISSUE";
     public static final String ACTION_STOCK_DIVIDEND = "STOCK_DIVIDEND";
@@ -66,7 +67,7 @@ public class CorporateActionProcessingService {
         }
         switch (action) {
             case ACTION_CASH_DIVIDEND -> processCashDividend(row, holders, payload);
-            case ACTION_STOCK_SPLIT -> processStockSplit(row, custody, holders, payload);
+            case ACTION_STOCK_SPLIT, ACTION_REVERSE_SPLIT -> processStockSplit(row, custody, holders, payload);
             case ACTION_TENDER_OFFER -> processTenderOffer(row, holders, payload);
             case ACTION_RIGHTS_ISSUE -> processRightsIssue(row, holders, payload);
             case ACTION_STOCK_DIVIDEND -> processStockDividend(row, custody, holders, payload);
@@ -121,12 +122,17 @@ public class CorporateActionProcessingService {
             throw new UnsupportedCorporateActionException("STOCK_SPLIT missing split ratio");
         }
         String symbol = row.instrumentSymbol().trim().toUpperCase(Locale.ROOT);
+        String currency = textField(payload, "currency");
+        if (currency == null || currency.isBlank()) {
+            currency = "USD";
+        }
         for (CorporateActionRecordDateSnapshotService.ResolvedHolder holder : holders) {
             BigDecimal before = holder.quantitySettled();
             BigDecimal after = before.multiply(ratio);
             positions.applyCorporateActionSplit(holder.accountId(), symbol, custody, ratio);
             impacts.insertEntitlement(row.id(), holder.accountId(), symbol, before, after, null, null);
             impacts.insertPositionImpact(row.id(), holder.accountId(), symbol, before, after);
+            applyCashInLieu(row, holder, payload, currency, before, after);
         }
         log.info("corporate_action STOCK_SPLIT processed id={} symbol={} ratio={}", row.id(), symbol, ratio);
     }
@@ -225,12 +231,17 @@ public class CorporateActionProcessingService {
             throw new UnsupportedCorporateActionException("STOCK_DIVIDEND missing sharesPerShare or newShares/oldShares");
         }
         String symbol = row.instrumentSymbol().trim().toUpperCase(Locale.ROOT);
+        String currency = textField(payload, "currency");
+        if (currency == null || currency.isBlank()) {
+            currency = "USD";
+        }
         for (CorporateActionRecordDateSnapshotService.ResolvedHolder holder : holders) {
             BigDecimal before = holder.quantitySettled();
             BigDecimal after = before.multiply(ratio).setScale(10, RoundingMode.HALF_UP);
             positions.applyCorporateActionSplit(holder.accountId(), symbol, custody, ratio);
             impacts.insertEntitlement(row.id(), holder.accountId(), symbol, before, after, null, null);
             impacts.insertPositionImpact(row.id(), holder.accountId(), symbol, before, after);
+            applyCashInLieu(row, holder, payload, currency, before, after);
         }
         log.info("corporate_action STOCK_DIVIDEND processed id={} symbol={} ratio={} holders={}",
                 row.id(), symbol, ratio, holders.size());
@@ -258,6 +269,30 @@ public class CorporateActionProcessingService {
         }
         log.info("corporate_action SYMBOL_CHANGE processed id={} {} -> {} holders={}",
                 row.id(), oldSymbol, newSymbol, holders.size());
+    }
+
+    private void applyCashInLieu(
+            CorporateActionEventRepository.ProcessingRow row,
+            CorporateActionRecordDateSnapshotService.ResolvedHolder holder,
+            JsonNode payload,
+            String currency,
+            BigDecimal before,
+            BigDecimal after) {
+        BigDecimal cashTotal = decimalField(payload, "fractionalCashTotal");
+        if (cashTotal == null) {
+            BigDecimal perShare = decimalField(payload, "cashInLieuPerShare");
+            if (perShare != null && perShare.signum() > 0 && before != null && after != null) {
+                BigDecimal whole = after.setScale(0, RoundingMode.DOWN);
+                BigDecimal fractional = after.subtract(whole);
+                if (fractional.signum() > 0) {
+                    cashTotal = fractional.multiply(perShare).setScale(MONEY_SCALE, RoundingMode.HALF_UP);
+                }
+            }
+        }
+        if (cashTotal != null && cashTotal.signum() > 0) {
+            impacts.insertCashImpactWithWithholding(
+                    row.id(), holder.accountId(), cashTotal, cashTotal, null, currency, row.payableDate());
+        }
     }
 
     static BigDecimal stockDividendRatio(JsonNode payload) {

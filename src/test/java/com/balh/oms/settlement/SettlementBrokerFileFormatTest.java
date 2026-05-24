@@ -1,71 +1,46 @@
 package com.balh.oms.settlement;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.junit.jupiter.api.Test;
-
 import java.nio.charset.StandardCharsets;
-import java.util.UUID;
+import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-class SettlementBrokerFileFormatTest {
+final class SettlementBrokerFileFormatTest {
 
-    private final ObjectMapper objectMapper = new ObjectMapper();
+    private static final ObjectMapper JSON = new ObjectMapper();
 
     @Test
-    void detect_v0Fixture_byExecutionId() {
-        byte[] bytes = """
-                {"rows":[{"executionId":42}]}
+    void detect_cashStatement() throws Exception {
+        byte[] bytes =
                 """
-                .getBytes(StandardCharsets.UTF_8);
-        assertThat(SettlementBrokerFileFormat.detect(objectMapper, bytes))
-                .isEqualTo(SettlementBrokerFileFormat.Kind.V0_FIXTURE);
+                        {"schemaVersion":1,"brokerId":"b","fileId":"f","currency":"SEK",
+                         "movements":[{"brokerMovementId":"m1","amount":"1"}]}
+                        """
+                        .getBytes(StandardCharsets.UTF_8);
+        assertThat(SettlementBrokerFileFormat.detect(JSON, bytes))
+                .isEqualTo(SettlementBrokerFileFormat.Kind.CASH_STATEMENT);
     }
 
     @Test
-    void detect_v0Fixture_byAccountVenueRef() {
-        byte[] bytes = """
-                {"rows":[{"accountId":"%s","venueExecRef":"EX-1"}]}
+    void detect_positionSnapshot() throws Exception {
+        byte[] bytes =
                 """
-                .formatted(UUID.randomUUID())
-                .getBytes(StandardCharsets.UTF_8);
-        assertThat(SettlementBrokerFileFormat.detect(objectMapper, bytes))
-                .isEqualTo(SettlementBrokerFileFormat.Kind.V0_FIXTURE);
+                        {"schemaVersion":1,"brokerId":"b","fileId":"f","rows":[{"quantityTotal":"10"}]}
+                        """
+                        .getBytes(StandardCharsets.UTF_8);
+        assertThat(SettlementBrokerFileFormat.detect(JSON, bytes))
+                .isEqualTo(SettlementBrokerFileFormat.Kind.POSITION_SNAPSHOT);
     }
 
     @Test
-    void detect_v2Economic_byEnvelopeAndRowShape() {
-        byte[] bytes = """
-                {
-                  "schemaVersion": 1,
-                  "brokerId": "broker_x",
-                  "fileId": "F-1",
-                  "businessDate": "2026-05-23",
-                  "rows": [
-                    {
-                      "brokerTradeId": "BT-1",
-                      "venueExecRef": "EX-1",
-                      "instrument": { "symbol": "AAPL", "currency": "USD" },
-                      "side": "BUY",
-                      "quantity": "10",
-                      "price": "5"
-                    }
-                  ]
-                }
+    void detect_corporateAction() throws Exception {
+        byte[] bytes =
                 """
-                .getBytes(StandardCharsets.UTF_8);
-        assertThat(SettlementBrokerFileFormat.detect(objectMapper, bytes))
-                .isEqualTo(SettlementBrokerFileFormat.Kind.V2_ECONOMIC);
-    }
-
-    @Test
-    void detect_invalid_whenEmptyOrUnrecognized() {
-        assertThat(SettlementBrokerFileFormat.detect(objectMapper, new byte[0]))
-                .isEqualTo(SettlementBrokerFileFormat.Kind.INVALID);
-        assertThat(SettlementBrokerFileFormat.detect(objectMapper, "{\"rows\":[]}".getBytes(StandardCharsets.UTF_8)))
-                .isEqualTo(SettlementBrokerFileFormat.Kind.INVALID);
-        assertThat(SettlementBrokerFileFormat.detect(
-                        objectMapper, "{\"rows\":[{\"foo\":\"bar\"}]}".getBytes(StandardCharsets.UTF_8)))
-                .isEqualTo(SettlementBrokerFileFormat.Kind.INVALID);
+                        {"schemaVersion":1,"brokerId":"b","fileId":"f","events":[{"brokerEventId":"e1"}]}
+                        """
+                        .getBytes(StandardCharsets.UTF_8);
+        assertThat(SettlementBrokerFileFormat.detect(JSON, bytes))
+                .isEqualTo(SettlementBrokerFileFormat.Kind.CORPORATE_ACTION);
     }
 }

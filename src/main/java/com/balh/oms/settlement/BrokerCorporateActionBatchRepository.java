@@ -106,6 +106,23 @@ public class BrokerCorporateActionBatchRepository {
                 (rs, rowNum) -> mapRow(rs));
     }
 
+    /** Parsed (or applied but not yet reconciled) CA batches in the lookback window. */
+    public List<Long> listParsedSince(Instant since, int limit) {
+        return jdbc.queryForList(
+                """
+                        SELECT b.id FROM broker_corporate_action_batch b
+                        WHERE b.status IN ('parsed', 'applied')
+                          AND b.received_at >= :since
+                          AND NOT EXISTS (
+                              SELECT 1 FROM corporate_action_reconciliation_report r WHERE r.batch_id = b.id
+                          )
+                        ORDER BY b.received_at ASC
+                        LIMIT :lim
+                        """,
+                new MapSqlParameterSource().addValue("since", Timestamp.from(since)).addValue("lim", limit),
+                Long.class);
+    }
+
     public void updateStatus(long id, String status, Integer eventCount, String errorSummary) {
         jdbc.update(
                 UPDATE_STATUS,

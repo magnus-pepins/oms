@@ -1,8 +1,10 @@
 package com.balh.oms.settlement;
 
 import com.balh.oms.config.OmsConfig;
+import com.balh.oms.ledger.LedgerBalanceClient;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -33,7 +35,8 @@ public class CashReconciliationService {
             int mismatchCount,
             int unmatchedCount,
             int missingInBrokerCount,
-            boolean balanceMismatch) {}
+            boolean balanceMismatch,
+            boolean nostroBalanceMismatch) {}
 
     private record PendingDetail(
             String outcome,
@@ -52,6 +55,7 @@ public class CashReconciliationService {
     private final CashReconciliationReportRepository reports;
     private final ReconciliationBreakRepository breaks;
     private final OmsConfig config;
+    private final ObjectProvider<LedgerBalanceClient> ledgerBalance;
 
     public CashReconciliationService(
             BrokerCashStatementBatchRepository batches,
@@ -59,13 +63,15 @@ public class CashReconciliationService {
             CashReconciliationLookupRepository lookup,
             CashReconciliationReportRepository reports,
             ReconciliationBreakRepository breaks,
-            OmsConfig config) {
+            OmsConfig config,
+            ObjectProvider<LedgerBalanceClient> ledgerBalance) {
         this.batches = batches;
         this.movements = movements;
         this.lookup = lookup;
         this.reports = reports;
         this.breaks = breaks;
         this.config = config;
+        this.ledgerBalance = ledgerBalance;
     }
 
     @Transactional
@@ -206,6 +212,54 @@ public class CashReconciliationService {
             }
         }
 
+        boolean nostroBalanceMismatch = false;
+        if (batch.closingBalance() != null && batch.currency() != null && !batch.currency().isBlank()) {
+            LedgerBalanceClient client = ledgerBalance.getIfAvailable();
+            if (client != null) {
+                try {
+                    String indicator = config.getSettlement().nostroIndicatorForCurrency(batch.currency());
+                    BigDecimal ledgerNostro =
+                            client.fetchAvailableBalanceByIndicator(indicator, batch.currency().trim());
+                    nostroBalanceMismatch =
+                            ledgerNostro.subtract(batch.closingBalance()).abs().compareTo(tolerance) > 0;
+                    if (nostroBalanceMismatch) {
+                        ObjectNode root = JSON.createObjectNode();
+                        root.put("outcome", "nostro_balance_mismatch");
+                        root.put("ledgerNostro", ledgerNostro.toPlainString());
+                        root.put("brokerClosingBalance", batch.closingBalance().toPlainString());
+                        root.put("nostroIndicator", indicator);
+                        String diffJson = serialize(root);
+                        long breakId = openBreak(batch, null, diffJson);
+                        detailRows.add(pendingDetail(
+                                "nostro_balance_mismatch",
+                                null,
+                                null,
+                                null,
+                                null,
+                                batch.closingBalance(),
+                                ledgerNostro,
+                                diffJson,
+                                breakId));
+                    }
+                } catch (LedgerBalanceClient.LedgerServiceException e) {
+                    ObjectNode root = JSON.createObjectNode();
+                    root.put("outcome", "nostro_balance_mismatch");
+                    root.put("reason", "ledger_nostro_read_failed");
+                    root.put("detail", e.getMessage());
+                    detailRows.add(pendingDetail(
+                            "nostro_balance_mismatch",
+                            null,
+                            null,
+                            null,
+                            null,
+                            batch.closingBalance(),
+                            null,
+                            serialize(root),
+                            null));
+                }
+            }
+        }
+
         long reportId = reports.insertReport(new CashReconciliationReportRepository.ReportInsert(
                 batchId,
                 batch.brokerId(),
@@ -217,7 +271,8 @@ public class CashReconciliationService {
                 mismatch,
                 unmatched,
                 missingInBroker,
-                balanceMismatch));
+                balanceMismatch,
+                nostroBalanceMismatch));
 
         for (PendingDetail pending : detailRows) {
             reports.insertDetail(new CashReconciliationReportRepository.DetailInsert(
@@ -242,7 +297,8 @@ public class CashReconciliationService {
                 mismatch,
                 unmatched,
                 missingInBroker,
-                balanceMismatch));
+                balanceMismatch,
+                nostroBalanceMismatch));
     }
 
     private long openBreak(

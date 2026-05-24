@@ -155,6 +155,12 @@ public final class CachingLedgerBalanceClient implements LedgerBalanceClient {
         return delegate.fetchBalanceReadModel(balanceId);
     }
 
+    @Override
+    public BigDecimal fetchAvailableBalanceByIndicator(String indicator, String currency)
+            throws LedgerServiceException {
+        return delegate.fetchAvailableBalanceByIndicator(indicator, currency);
+    }
+
     /**
      * Test-only / runbook helper. Returns a {@link CacheStats} snapshot from Caffeine.
      * Production code should rely on the Micrometer counters; this exists so tests can

@@ -28,6 +28,7 @@ public class CashReconciliationReportRepository {
             int unmatchedCount,
             int missingInBrokerCount,
             boolean balanceMismatch,
+            boolean nostroBalanceMismatch,
             Instant createdAt) {}
 
     public record ReportDetailRow(
@@ -48,10 +49,11 @@ public class CashReconciliationReportRepository {
                     INSERT INTO cash_reconciliation_report (
                         batch_id, broker_id, business_date, currency, status,
                         movement_count, matched_count, mismatch_count,
-                        unmatched_count, missing_in_broker_count, balance_mismatch
+                        unmatched_count, missing_in_broker_count, balance_mismatch, nostro_balance_mismatch
                     ) VALUES (
                         :batchId, :brokerId, :businessDate, :currency, :status,
-                        :movementCount, :matched, :mismatch, :unmatched, :missingBroker, :balanceMismatch
+                        :movementCount, :matched, :mismatch, :unmatched, :missingBroker, :balanceMismatch,
+                        :nostroMismatch
                     )
                     """;
 
@@ -70,7 +72,8 @@ public class CashReconciliationReportRepository {
             """
                     SELECT id, batch_id, broker_id, business_date, currency, status,
                            movement_count, matched_count, mismatch_count,
-                           unmatched_count, missing_in_broker_count, balance_mismatch, created_at
+                           unmatched_count, missing_in_broker_count, balance_mismatch,
+                           nostro_balance_mismatch, created_at
                     FROM cash_reconciliation_report
                     ORDER BY created_at DESC, id DESC
                     LIMIT :lim OFFSET :off
@@ -107,7 +110,8 @@ public class CashReconciliationReportRepository {
                         .addValue("mismatch", insert.mismatchCount())
                         .addValue("unmatched", insert.unmatchedCount())
                         .addValue("missingBroker", insert.missingInBrokerCount())
-                        .addValue("balanceMismatch", insert.balanceMismatch()),
+                        .addValue("balanceMismatch", insert.balanceMismatch())
+                        .addValue("nostroMismatch", insert.nostroBalanceMismatch()),
                 kh,
                 new String[] {"id"});
         Number key = kh.getKey();
@@ -151,6 +155,7 @@ public class CashReconciliationReportRepository {
                                 rs.getInt("unmatched_count"),
                                 rs.getInt("missing_in_broker_count"),
                                 rs.getBoolean("balance_mismatch"),
+                                rs.getBoolean("nostro_balance_mismatch"),
                                 rs.getTimestamp("created_at").toInstant()));
     }
 
@@ -184,7 +189,8 @@ public class CashReconciliationReportRepository {
             int mismatchCount,
             int unmatchedCount,
             int missingInBrokerCount,
-            boolean balanceMismatch) {}
+            boolean balanceMismatch,
+            boolean nostroBalanceMismatch) {}
 
     public record DetailInsert(
             long reportId,

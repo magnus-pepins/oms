@@ -336,6 +336,18 @@ const COMMON_ENV = {
   // Reconciler runs on oms-postgres-projector only (see LedgerSettlementOutboxConfiguration
   // @Profile). Keeping this false in COMMON_ENV avoids three JVMs ticking the same rows.
   OMS_LEDGER_SETTLEMENT_OUTBOX_RECONCILER_ENABLED: 'false',
+
+  // Phase 1 Shape A — settlement daily close + ISK metadata sync (off until operator sets paths/flags).
+  OMS_SETTLEMENT_FILE_IMPORT_DROP_FOLDER_ENABLED:
+    process.env.OMS_SETTLEMENT_FILE_IMPORT_DROP_FOLDER_ENABLED || 'false',
+  OMS_SETTLEMENT_FILE_IMPORT_DROP_FOLDER_PATH:
+    process.env.OMS_SETTLEMENT_FILE_IMPORT_DROP_FOLDER_PATH || '',
+  OMS_SETTLEMENT_DAILY_CLOSE_ENABLED: process.env.OMS_SETTLEMENT_DAILY_CLOSE_ENABLED || 'false',
+  OMS_ISK_TAX_QUARTERLY_VALUATION_JOB_ENABLED:
+    process.env.OMS_ISK_TAX_QUARTERLY_VALUATION_JOB_ENABLED || 'false',
+  OMS_ISK_TAX_PENDING_POSITION_COUNT_SYNC_ENABLED:
+    process.env.OMS_ISK_TAX_PENDING_POSITION_COUNT_SYNC_ENABLED || 'false',
+  OMS_LEDGER_METADATA_SYNC_ENABLED: process.env.OMS_LEDGER_METADATA_SYNC_ENABLED || 'false',
 };
 
 const COMMON_PM2 = {

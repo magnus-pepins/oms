@@ -114,6 +114,44 @@ public final class RestLedgerBalanceClient implements LedgerBalanceClient {
         }
     }
 
+    @Override
+    public BigDecimal fetchAvailableBalanceByIndicator(String indicator, String currency)
+            throws LedgerServiceException {
+        if (indicator == null || indicator.isBlank() || currency == null || currency.isBlank()) {
+            throw new LedgerServiceException("indicator and currency required for nostro read");
+        }
+        try {
+            String body =
+                    http.get()
+                            .uri(uriBuilder -> uriBuilder
+                                    .path("/balances/indicator/{indicator}/currency/{currency}")
+                                    .queryParam("with_queued", true)
+                                    .build(indicator.trim(), currency.trim().toUpperCase()))
+                            .header(AUTHORIZATION_HEADER, BEARER_PREFIX + apiKey)
+                            .retrieve()
+                            .body(String.class);
+            if (body == null || body.isBlank()) {
+                throw new LedgerServiceException("empty ledger indicator balance response");
+            }
+            JsonNode tree = objectMapper.readTree(body);
+            JsonNode ab = tree.get("availableBalance");
+            if (ab == null || ab.isNull()) {
+                throw new LedgerServiceException("ledger response missing availableBalance");
+            }
+            return new BigDecimal(ab.asText());
+        } catch (LedgerServiceException e) {
+            throw e;
+        } catch (HttpStatusCodeException e) {
+            if (e.getStatusCode() == HttpStatus.NOT_FOUND) {
+                throw new LedgerServiceException("ledger nostro balance not found");
+            }
+            throw new LedgerServiceException(
+                    "ledger indicator balance GET failed: status=%s".formatted(e.getStatusCode()), e);
+        } catch (Exception e) {
+            throw new LedgerServiceException("failed to read ledger nostro balance: " + e.getMessage(), e);
+        }
+    }
+
     private JsonNode fetchBalanceRoot(String balanceId, boolean withQueued)
             throws LedgerBalanceClient.LedgerServiceException {
         try {

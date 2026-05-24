@@ -174,6 +174,38 @@ class CorporateActionProcessingIntegrationTest extends AbstractPostgresIntegrati
     }
 
     @Test
+    void processor_reverseSplitWithCashInLieu_writesCashImpact() {
+        UUID accountId = UUID.randomUUID();
+        insertPosition(accountId, "ERIC", 10);
+        long eventId =
+                jdbc.queryForObject(
+                        """
+                                INSERT INTO corporate_action_event (
+                                  instrument_symbol, action_type, effective_date, payload_json, record_date, payable_date
+                                ) VALUES (
+                                  'ERIC', 'REVERSE_SPLIT', '2026-06-01',
+                                  CAST('{"newShares":"1","oldShares":"3","cashInLieuPerShare":"12.50","currency":"SEK"}' AS JSONB),
+                                  '2026-05-01', '2026-06-15'
+                                ) RETURNING id
+                                """,
+                        Long.class);
+        snapshotService.captureForEvent(eventId, "ERIC", java.time.LocalDate.of(2026, 5, 1));
+
+        processorJob.processBatch();
+
+        assertThat(jdbc.queryForObject(
+                        "SELECT COUNT(*)::int FROM corporate_action_cash_impact WHERE corporate_action_event_id = ?",
+                        Integer.class,
+                        eventId))
+                .isEqualTo(1);
+        assertThat(jdbc.queryForObject(
+                        "SELECT net_amount FROM corporate_action_cash_impact WHERE corporate_action_event_id = ?",
+                        BigDecimal.class,
+                        eventId))
+                .isEqualByComparingTo("4.17");
+    }
+
+    @Test
     void processor_symbolChange_renamesPosition() {
         UUID accountId = UUID.randomUUID();
         insertPosition(accountId, "VOLV.B", 15);

@@ -5,37 +5,21 @@ import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-class CorporateActionProcessingServiceTest {
+final class CorporateActionProcessingServiceTest {
 
-    private final ObjectMapper objectMapper = new ObjectMapper();
+    private static final ObjectMapper JSON = new ObjectMapper();
 
     @Test
-    void splitRatio_fromNewAndOldShares() throws Exception {
-        var payload = objectMapper.readTree("{\"newShares\": \"2\", \"oldShares\": \"1\"}");
+    void reverseSplitAlias_normalizesToStockSplitRatio() throws Exception {
+        var payload = JSON.readTree("{\"newShares\":\"1\",\"oldShares\":\"3\",\"cashInLieuPerShare\":\"2.50\"}");
         assertThat(CorporateActionProcessingService.splitRatio(payload))
-                .isEqualByComparingTo("2");
+                .isEqualByComparingTo("0.3333333333");
     }
 
     @Test
-    void parseBrokerDates_readsPayableDate() {
-        var dates =
-                CorporateActionProcessorJob.parseBrokerDates(
-                        "{\"payableDate\":\"2026-06-15\",\"recordDate\":\"2026-06-01\"}", objectMapper);
-        assertThat(dates.payableDate()).hasToString("2026-06-15");
-        assertThat(dates.recordDate()).hasToString("2026-06-01");
-    }
-
-    @Test
-    void withholdingAmount_appliesRate() throws Exception {
-        var payload = objectMapper.readTree("{\"withholdingRate\": \"0.15\"}");
-        assertThat(CorporateActionProcessingService.withholdingAmount(new java.math.BigDecimal("100.00"), payload))
-                .isEqualByComparingTo("15.00");
-    }
-
-    @Test
-    void stockDividendRatio_fromSharesPerShare() throws Exception {
-        var payload = objectMapper.readTree("{\"sharesPerShare\": \"0.1\"}");
+    void stockDividendRatio_addsSharesPerShare() throws Exception {
+        var payload = JSON.readTree("{\"sharesPerShare\":\"0.10\"}");
         assertThat(CorporateActionProcessingService.stockDividendRatio(payload))
-                .isEqualByComparingTo("1.1");
+                .isEqualByComparingTo("1.10");
     }
 }

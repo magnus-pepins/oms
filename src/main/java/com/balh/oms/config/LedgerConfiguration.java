@@ -2,6 +2,8 @@ package com.balh.oms.config;
 
 import com.balh.oms.ledger.CachingLedgerBalanceClient;
 import com.balh.oms.ledger.LedgerBalanceClient;
+import com.balh.oms.ledger.LedgerMetadataClient;
+import com.balh.oms.ledger.RestLedgerMetadataClient;
 import com.balh.oms.ledger.LedgerInflightBulkDispatcher;
 import com.balh.oms.ledger.LedgerInflightCoalescer;
 import com.balh.oms.ledger.LedgerInflightReservationClient;
@@ -77,6 +79,17 @@ public class LedgerConfiguration {
                 cacheConfig.getTtlSeconds(),
                 cacheConfig.getMaxSize(),
                 meterRegistry);
+    }
+
+    @Bean
+    @ConditionalOnProperty(prefix = "oms.ledger", name = "metadata-sync-enabled", havingValue = "true")
+    LedgerMetadataClient ledgerMetadataClient(
+            RestClient omsLedgerRestClient, OmsConfig config, ObjectMapper objectMapper) {
+        String key = config.getLedger().getApiKey();
+        if (key == null || key.isBlank()) {
+            throw new IllegalStateException("oms.ledger.api-key is required when oms.ledger.metadata-sync-enabled=true");
+        }
+        return new RestLedgerMetadataClient(omsLedgerRestClient, key, objectMapper);
     }
 
     @Bean

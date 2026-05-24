@@ -240,6 +240,8 @@ public class OmsConfig {
         private String elevatedApiKey = "";
         /** When true with {@link #elevatedApiKey}, wires {@link com.balh.oms.ledger.LedgerIskReadClient}. */
         private boolean iskReadEnabled = false;
+        /** When true, wires {@link com.balh.oms.ledger.LedgerMetadataClient} for ISK metadata sync. */
+        private boolean metadataSyncEnabled = false;
         private long connectTimeoutMs = 2000L;
         private long readTimeoutMs = 5000L;
         /**
@@ -489,6 +491,8 @@ public class OmsConfig {
         public void setElevatedApiKey(String v) { this.elevatedApiKey = v; }
         public boolean isIskReadEnabled() { return iskReadEnabled; }
         public void setIskReadEnabled(boolean v) { this.iskReadEnabled = v; }
+        public boolean isMetadataSyncEnabled() { return metadataSyncEnabled; }
+        public void setMetadataSyncEnabled(boolean v) { this.metadataSyncEnabled = v; }
         public long getConnectTimeoutMs() { return connectTimeoutMs; }
         public void setConnectTimeoutMs(long v) { this.connectTimeoutMs = v; }
         public long getReadTimeoutMs() { return readTimeoutMs; }
@@ -1587,6 +1591,19 @@ public class OmsConfig {
         private String customerNotificationSubjectPrefix = "oms.customer-notifications";
         /** Enqueue {@code CorporateActionDividendPaid} after dividend ledger leg posts. */
         private boolean corporateActionDividendNotificationEnabled = true;
+        /** When true, {@link SettlementDailyCloseJob} runs post-EOD reconcile orchestration. */
+        private boolean dailyCloseEnabled = false;
+        /** Cron for {@link SettlementDailyCloseJob} (Spring {@code @Scheduled}). */
+        private String dailyCloseCron = "0 0 22 * * *";
+        /** Lookback window for parsed batches eligible for daily close. */
+        private long dailyCloseLookbackHours = 48L;
+        /** Max batches per daily-close step per tick. */
+        private int dailyCloseBatchLimit = 20;
+        /**
+         * Ledger nostro indicator template for cash recon; {@code {CCY}} is replaced with batch currency
+         * (default {@code @Nostro-{CCY}-Bank} matches pop seed-fx-nostros).
+         */
+        private String nostroIndicatorTemplate = "@Nostro-{CCY}-Bank";
 
         public String getDefaultCustodyAccountId() {
             return defaultCustodyAccountId;
@@ -1999,6 +2016,55 @@ public class OmsConfig {
 
         public void setCorporateActionDividendNotificationEnabled(boolean corporateActionDividendNotificationEnabled) {
             this.corporateActionDividendNotificationEnabled = corporateActionDividendNotificationEnabled;
+        }
+
+        public boolean isDailyCloseEnabled() {
+            return dailyCloseEnabled;
+        }
+
+        public void setDailyCloseEnabled(boolean dailyCloseEnabled) {
+            this.dailyCloseEnabled = dailyCloseEnabled;
+        }
+
+        public String getDailyCloseCron() {
+            return dailyCloseCron;
+        }
+
+        public void setDailyCloseCron(String dailyCloseCron) {
+            this.dailyCloseCron = dailyCloseCron == null || dailyCloseCron.isBlank()
+                    ? "0 0 22 * * *"
+                    : dailyCloseCron.trim();
+        }
+
+        public long getDailyCloseLookbackHours() {
+            return dailyCloseLookbackHours;
+        }
+
+        public void setDailyCloseLookbackHours(long dailyCloseLookbackHours) {
+            this.dailyCloseLookbackHours = Math.max(1L, dailyCloseLookbackHours);
+        }
+
+        public int getDailyCloseBatchLimit() {
+            return dailyCloseBatchLimit;
+        }
+
+        public void setDailyCloseBatchLimit(int dailyCloseBatchLimit) {
+            this.dailyCloseBatchLimit = Math.min(500, Math.max(1, dailyCloseBatchLimit));
+        }
+
+        public String getNostroIndicatorTemplate() {
+            return nostroIndicatorTemplate;
+        }
+
+        public void setNostroIndicatorTemplate(String nostroIndicatorTemplate) {
+            this.nostroIndicatorTemplate = nostroIndicatorTemplate == null || nostroIndicatorTemplate.isBlank()
+                    ? "@Nostro-{CCY}-Bank"
+                    : nostroIndicatorTemplate.trim();
+        }
+
+        public String nostroIndicatorForCurrency(String currency) {
+            String ccy = currency == null ? "" : currency.trim().toUpperCase(java.util.Locale.ROOT);
+            return getNostroIndicatorTemplate().replace("{CCY}", ccy);
         }
     }
 
@@ -2527,6 +2593,10 @@ public class OmsConfig {
         private BigDecimal defaultFxToSekRate = new BigDecimal("10.00");
         private BigDecimal statslanerantaOverride;
         private java.util.Map<String, BigDecimal> fxToSekRates = new java.util.HashMap<>();
+        private boolean quarterlyValuationJobEnabled = false;
+        private String quarterlyValuationCron = "0 0 6 1 1,4,7,10 *";
+        private boolean pendingPositionCountSyncEnabled = false;
+        private long pendingPositionCountSyncIntervalMs = 300_000L;
 
         public BigDecimal getDefaultFxToSekRate() {
             return defaultFxToSekRate;
@@ -2558,6 +2628,40 @@ public class OmsConfig {
 
         public void setFxToSekRates(java.util.Map<String, BigDecimal> fxToSekRates) {
             this.fxToSekRates = fxToSekRates;
+        }
+
+        public boolean isQuarterlyValuationJobEnabled() {
+            return quarterlyValuationJobEnabled;
+        }
+
+        public void setQuarterlyValuationJobEnabled(boolean quarterlyValuationJobEnabled) {
+            this.quarterlyValuationJobEnabled = quarterlyValuationJobEnabled;
+        }
+
+        public String getQuarterlyValuationCron() {
+            return quarterlyValuationCron;
+        }
+
+        public void setQuarterlyValuationCron(String quarterlyValuationCron) {
+            this.quarterlyValuationCron = quarterlyValuationCron == null || quarterlyValuationCron.isBlank()
+                    ? "0 0 6 1 1,4,7,10 *"
+                    : quarterlyValuationCron.trim();
+        }
+
+        public boolean isPendingPositionCountSyncEnabled() {
+            return pendingPositionCountSyncEnabled;
+        }
+
+        public void setPendingPositionCountSyncEnabled(boolean pendingPositionCountSyncEnabled) {
+            this.pendingPositionCountSyncEnabled = pendingPositionCountSyncEnabled;
+        }
+
+        public long getPendingPositionCountSyncIntervalMs() {
+            return pendingPositionCountSyncIntervalMs;
+        }
+
+        public void setPendingPositionCountSyncIntervalMs(long pendingPositionCountSyncIntervalMs) {
+            this.pendingPositionCountSyncIntervalMs = Math.max(60_000L, pendingPositionCountSyncIntervalMs);
         }
     }
 

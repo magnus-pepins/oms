@@ -576,6 +576,24 @@ public class PositionsRepository {
         return rows.isEmpty() ? BigDecimal.ZERO : rows.getFirst();
     }
 
+    /** Positions with non-zero pending buy or sell settlement quantity (ISK close guard input). */
+    public int countPositionsWithPendingSettlement(UUID accountId) {
+        if (accountId == null) {
+            return 0;
+        }
+        Integer count =
+                jdbc.queryForObject(
+                        """
+                                SELECT COUNT(*)::int FROM positions
+                                WHERE account_id = :accountId
+                                  AND (quantity_pending_buy_settle <> 0
+                                       OR quantity_pending_sell_settle <> 0)
+                                """,
+                        new MapSqlParameterSource("accountId", accountId),
+                        Integer.class);
+        return count == null ? 0 : count;
+    }
+
     private void insertHistory(
             UUID accountId,
             String symbol,

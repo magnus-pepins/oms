@@ -27,12 +27,14 @@ public class OmsAccountTaxWrapperRepository {
                     LIMIT 1
                     """;
 
-    private static final String SELECT_ISK_ACCOUNTS =
+
+    private static final String SELECT_PAGE =
             """
                     SELECT account_id, tax_wrapper, isk_account_id, ledger_balance_id
                     FROM oms_account_tax_wrapper
-                    WHERE tax_wrapper = 'isk'
+                    WHERE (:taxWrapper IS NULL OR tax_wrapper = :taxWrapper)
                     ORDER BY account_id
+                    LIMIT :limit OFFSET :offset
                     """;
 
     private static final String UPSERT =
@@ -83,9 +85,17 @@ public class OmsAccountTaxWrapperRepository {
     }
 
     public List<AccountTaxWrapperRow> listIskAccounts() {
+        return listPage(TAX_WRAPPER_ISK, Integer.MAX_VALUE, 0);
+    }
+
+    /** Paginated list; {@code taxWrapperFilter} null returns all wrapper types. */
+    public List<AccountTaxWrapperRow> listPage(String taxWrapperFilter, int limit, int offset) {
         return jdbc.query(
-                SELECT_ISK_ACCOUNTS,
-                new MapSqlParameterSource(),
+                SELECT_PAGE,
+                new MapSqlParameterSource()
+                        .addValue("taxWrapper", taxWrapperFilter)
+                        .addValue("limit", limit)
+                        .addValue("offset", offset),
                 (rs, rowNum) ->
                         new AccountTaxWrapperRow(
                                 (UUID) rs.getObject("account_id"),

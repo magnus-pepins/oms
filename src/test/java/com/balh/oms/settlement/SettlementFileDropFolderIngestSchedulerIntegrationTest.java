@@ -136,6 +136,34 @@ class SettlementFileDropFolderIngestSchedulerIntegrationTest extends AbstractPos
                 .isEqualTo(1);
     }
 
+    @Test
+    void pollDropFolder_ingestsCashStatementJsonAndArchivesToDone() throws Exception {
+        String json =
+                """
+                        {
+                          "schemaVersion": 1,
+                          "brokerId": "broker_x",
+                          "businessDate": "2026-05-27",
+                          "fileId": "CASH-DF-%s",
+                          "currency": "SEK",
+                          "openingBalance": "1000.00",
+                          "closingBalance": "900.00",
+                          "movements": []
+                        }
+                        """
+                        .formatted(UUID.randomUUID());
+        Path incoming = DROP_ROOT.resolve("eod-cash-drop.json");
+        Files.writeString(incoming, json, StandardCharsets.UTF_8);
+
+        scheduler.pollDropFolder();
+
+        assertThat(Files.exists(incoming)).isFalse();
+        assertThat(jdbc.queryForObject(
+                        "SELECT COUNT(*)::int FROM broker_cash_statement_batch WHERE broker_id = 'broker_x'",
+                        Integer.class))
+                .isEqualTo(1);
+    }
+
     private void seedTradeExecutionWithVenueRef(UUID accountId, String venueExecRef) {
         UUID orderId = UUID.randomUUID();
         jdbc.update(

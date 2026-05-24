@@ -21,6 +21,8 @@ import com.balh.oms.settlement.InstrumentSettlementProfileIngestService;
 import com.balh.oms.settlement.MarkTradeFailedResult;
 import com.balh.oms.settlement.LedgerSettlementOutboxRepository;
 import com.balh.oms.settlement.CashReconciliationReportRepository;
+import com.balh.oms.settlement.CorporateActionReconciliationReportRepository;
+import com.balh.oms.settlement.CorporateActionReconciliationService;
 import com.balh.oms.settlement.CashReconciliationService;
 import com.balh.oms.settlement.PositionReconciliationReportRepository;
 import com.balh.oms.settlement.PositionReconciliationService;
@@ -228,7 +230,20 @@ public class SettlementController {
             int mismatchCount,
             int unmatchedCount,
             int missingInBrokerCount,
-            boolean balanceMismatch) {}
+            boolean balanceMismatch,
+            boolean nostroBalanceMismatch) {}
+
+    public record CorporateActionReconciliationResponse(
+            long reportId,
+            long batchId,
+            String status,
+            int eventCount,
+            int matchedCount,
+            int mismatchCount,
+            int unmatchedCount) {}
+
+    public record CorporateActionReconciliationReportListResponse(
+            List<CorporateActionReconciliationReportRepository.ReportRow> items, int limit, int offset) {}
 
     public record CashReconciliationReportListResponse(
             List<CashReconciliationReportRepository.ReportRow> items, int limit, int offset) {}
@@ -327,6 +342,8 @@ public class SettlementController {
     private final BrokerCorporateActionIngestService brokerCorporateActionIngestService;
     private final BrokerCorporateActionBatchRepository brokerCorporateActionBatches;
     private final BrokerCorporateActionApplyService brokerCorporateActionApplyService;
+    private final CorporateActionReconciliationService corporateActionReconciliationService;
+    private final CorporateActionReconciliationReportRepository corporateActionReconciliationReports;
     private final ReconciliationBreakRepository reconciliationBreaks;
     private final ReconciliationBreakWorkflowService reconciliationBreakWorkflow;
     private final InstrumentSettlementProfileIngestService instrumentSettlementProfileIngestService;
@@ -371,6 +388,8 @@ public class SettlementController {
             BrokerCorporateActionIngestService brokerCorporateActionIngestService,
             BrokerCorporateActionBatchRepository brokerCorporateActionBatches,
             BrokerCorporateActionApplyService brokerCorporateActionApplyService,
+            CorporateActionReconciliationService corporateActionReconciliationService,
+            CorporateActionReconciliationReportRepository corporateActionReconciliationReports,
             ReconciliationBreakRepository reconciliationBreaks,
             ReconciliationBreakWorkflowService reconciliationBreakWorkflow,
             InstrumentSettlementProfileIngestService instrumentSettlementProfileIngestService,
@@ -401,6 +420,8 @@ public class SettlementController {
         this.brokerCorporateActionIngestService = brokerCorporateActionIngestService;
         this.brokerCorporateActionBatches = brokerCorporateActionBatches;
         this.brokerCorporateActionApplyService = brokerCorporateActionApplyService;
+        this.corporateActionReconciliationService = corporateActionReconciliationService;
+        this.corporateActionReconciliationReports = corporateActionReconciliationReports;
         this.reconciliationBreaks = reconciliationBreaks;
         this.reconciliationBreakWorkflow = reconciliationBreakWorkflow;
         this.instrumentSettlementProfileIngestService = instrumentSettlementProfileIngestService;
@@ -892,7 +913,8 @@ public class SettlementController {
                             r.mismatchCount(),
                             r.unmatchedCount(),
                             r.missingInBrokerCount(),
-                            r.balanceMismatch())))
+                            r.balanceMismatch(),
+                            r.nostroBalanceMismatch())))
                     .orElse(ResponseEntity.notFound().build());
         } catch (IllegalStateException e) {
             return ResponseEntity.status(HttpStatus.CONFLICT).build();
@@ -1077,6 +1099,38 @@ public class SettlementController {
         } catch (IllegalStateException e) {
             return ResponseEntity.status(HttpStatus.CONFLICT).build();
         }
+    }
+
+    @PostMapping("/broker-corporate-actions/batches/{batchId}/reconcile")
+    public ResponseEntity<CorporateActionReconciliationResponse> reconcileBrokerCorporateActionBatch(
+            @PathVariable long batchId) {
+        try {
+            return corporateActionReconciliationService
+                    .reconcile(batchId)
+                    .map(r -> ResponseEntity.ok(new CorporateActionReconciliationResponse(
+                            r.reportId(),
+                            r.batchId(),
+                            r.status(),
+                            r.eventCount(),
+                            r.matchedCount(),
+                            r.mismatchCount(),
+                            r.unmatchedCount())))
+                    .orElse(ResponseEntity.notFound().build());
+        } catch (IllegalStateException e) {
+            return ResponseEntity.status(HttpStatus.CONFLICT).build();
+        }
+    }
+
+    @GetMapping("/corporate-action-reconciliation-reports")
+    public ResponseEntity<CorporateActionReconciliationReportListResponse> listCorporateActionReconciliationReports(
+            @RequestParam(required = false) Integer limit, @RequestParam(required = false) Integer offset) {
+        int lim = resolveListLimit(limit);
+        int off = resolveListOffset(offset);
+        if (off < 0) {
+            return ResponseEntity.badRequest().build();
+        }
+        return ResponseEntity.ok(new CorporateActionReconciliationReportListResponse(
+                corporateActionReconciliationReports.listRecent(lim, off), lim, off));
     }
 
     /** Beard Admin reads the break queue here (gap plan §5.13). */
@@ -1338,7 +1392,7 @@ public class SettlementController {
         try {
             SettlementFileIngestRouter.RoutedResult r =
                     settlementFileIngestRouter.ingest(source, file.getOriginalFilename(), bytes);
-            if ("v2-economic".equals(r.format())) {
+            if ("v2-economic".equals(r.format()) || !"v0-fixture".equals(r.format())) {
                 return ResponseEntity.ok(
                         new SettlementFileImportResponse(
                                 r.duplicate(),

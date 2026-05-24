@@ -115,6 +115,23 @@ public class BrokerCashStatementBatchRepository {
                 (rs, rowNum) -> mapRow(rs));
     }
 
+    /** Parsed batches in the lookback window that have not yet been reconciled. */
+    public List<Long> listParsedWithoutReportSince(java.time.Instant since, int limit) {
+        return jdbc.queryForList(
+                """
+                        SELECT b.id FROM broker_cash_statement_batch b
+                        WHERE b.status = 'parsed'
+                          AND b.received_at >= :since
+                          AND NOT EXISTS (
+                              SELECT 1 FROM cash_reconciliation_report r WHERE r.batch_id = b.id
+                          )
+                        ORDER BY b.received_at ASC
+                        LIMIT :lim
+                        """,
+                new MapSqlParameterSource().addValue("since", java.sql.Timestamp.from(since)).addValue("lim", limit),
+                Long.class);
+    }
+
     public void updateStatus(long id, String status, Integer movementCount, String errorSummary) {
         jdbc.update(
                 UPDATE_STATUS,

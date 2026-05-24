@@ -43,6 +43,8 @@ public class ReconciliationBreakRepository {
     public static final String BREAK_POSITION_MISMATCH = "position_mismatch";
     /** Gap plan §5.7 — opened by broker cash statement reconciliation. */
     public static final String BREAK_CASH_MISMATCH = "cash_mismatch";
+    /** Gap plan §5.9 — broker CA row drift vs OMS corporate_action_event. */
+    public static final String BREAK_CORPORATE_ACTION_MISMATCH = "corporate_action_mismatch";
     /** Gap plan §5.8 — broker fail row could not resolve to an OMS execution. */
     public static final String BREAK_SETTLEMENT_FAIL_UNMATCHED = "settlement_fail_unmatched";
     /** Gap plan §5.8 — broker failed quantity exceeds OMS trade quantity. */

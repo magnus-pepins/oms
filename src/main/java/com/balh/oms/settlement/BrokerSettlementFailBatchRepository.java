@@ -106,6 +106,20 @@ public class BrokerSettlementFailBatchRepository {
                 (rs, rowNum) -> mapRow(rs));
     }
 
+    /** Parsed fail batches not yet applied. */
+    public List<Long> listParsedWithoutApplySince(Instant since, int limit) {
+        return jdbc.queryForList(
+                """
+                        SELECT b.id FROM broker_settlement_fail_batch b
+                        WHERE b.status = 'parsed'
+                          AND b.received_at >= :since
+                        ORDER BY b.received_at ASC
+                        LIMIT :lim
+                        """,
+                new MapSqlParameterSource().addValue("since", Timestamp.from(since)).addValue("lim", limit),
+                Long.class);
+    }
+
     public void updateStatus(long id, String status, Integer failCount, String errorSummary) {
         jdbc.update(
                 UPDATE_STATUS,

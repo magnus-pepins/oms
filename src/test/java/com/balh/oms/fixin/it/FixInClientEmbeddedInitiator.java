@@ -9,6 +9,7 @@ import quickfix.Initiator;
 import quickfix.LogFactory;
 import quickfix.MessageStoreFactory;
 import quickfix.ScreenLogFactory;
+import quickfix.Message;
 import quickfix.Session;
 import quickfix.SessionID;
 import quickfix.SessionNotFound;
@@ -18,6 +19,7 @@ import quickfix.field.BeginString;
 import quickfix.field.ClOrdID;
 import quickfix.field.OrdType;
 import quickfix.field.OrderQty;
+import quickfix.field.OrigClOrdID;
 import quickfix.field.Price;
 import quickfix.field.SenderCompID;
 import quickfix.field.Side;
@@ -26,13 +28,18 @@ import quickfix.field.TargetCompID;
 import quickfix.field.TimeInForce;
 import quickfix.field.TransactTime;
 import quickfix.fix44.NewOrderSingle;
+import quickfix.fix44.OrderCancelReplaceRequest;
+import quickfix.fix44.OrderCancelRequest;
 
+import java.io.IOException;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
+import java.util.Comparator;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Stream;
 
 /** Loopback FIX-in client initiator for integration tests (connects to {@code oms-fix-ingress} acceptor). */
 public final class FixInClientEmbeddedInitiator {
@@ -87,6 +94,32 @@ public final class FixInClientEmbeddedInitiator {
         }
     }
 
+    /** Stop, wipe the file store (seq state), and start — simulates counterparty process bounce after operator logout. */
+    public void restartFresh() {
+        stop();
+        wipeStore();
+        start();
+    }
+
+    private void wipeStore() {
+        try {
+            if (Files.exists(fileStorePath)) {
+                try (Stream<Path> walk = Files.walk(fileStorePath)) {
+                    walk.sorted(Comparator.reverseOrder()).forEach(p -> {
+                        try {
+                            Files.deleteIfExists(p);
+                        } catch (IOException e) {
+                            throw new IllegalStateException("failed to wipe FIX-in IT client store " + p, e);
+                        }
+                    });
+                }
+            }
+            Files.createDirectories(fileStorePath);
+        } catch (IOException e) {
+            throw new IllegalStateException("failed to reset FIX-in IT client store at " + fileStorePath, e);
+        }
+    }
+
     public boolean isRunning() {
         return running.get();
     }
@@ -100,11 +133,51 @@ public final class FixInClientEmbeddedInitiator {
         return session != null && session.isLoggedOn();
     }
 
-    public void sendNewOrderSingle(String clOrdId, String symbol, double qty, double price) {
+    public void sendOrderCancelRequest(String origClOrdId, String cancelClOrdId, String symbol) {
+        SessionID sid = requireSession();
+        OrderCancelRequest cancel = new OrderCancelRequest();
+        cancel.set(new OrigClOrdID(origClOrdId));
+        cancel.set(new ClOrdID(cancelClOrdId));
+        cancel.set(new Symbol(symbol));
+        cancel.set(new Side(Side.BUY));
+        cancel.set(new TransactTime(LocalDateTime.now(ZoneOffset.UTC)));
+        sendApp(cancel, sid);
+    }
+
+    public void sendOrderCancelReplaceRequest(
+            String origClOrdId, String replaceClOrdId, String symbol, double qty, double price) {
+        SessionID sid = requireSession();
+        OrderCancelReplaceRequest replace = new OrderCancelReplaceRequest();
+        replace.set(new OrigClOrdID(origClOrdId));
+        replace.set(new ClOrdID(replaceClOrdId));
+        replace.set(new Symbol(symbol));
+        replace.set(new Side(Side.BUY));
+        replace.set(new OrdType(OrdType.LIMIT));
+        replace.set(new OrderQty(qty));
+        replace.set(new Price(price));
+        replace.set(new TimeInForce(TimeInForce.DAY));
+        replace.set(new TransactTime(LocalDateTime.now(ZoneOffset.UTC)));
+        sendApp(replace, sid);
+    }
+
+    private SessionID requireSession() {
         SessionID sid = sessionId;
         if (sid == null) {
             throw new IllegalStateException("session_not_initialized");
         }
+        return sid;
+    }
+
+    private static void sendApp(Message message, SessionID sid) {
+        try {
+            Session.sendToTarget(message, sid);
+        } catch (SessionNotFound e) {
+            throw new IllegalStateException("fix_in_client_session_not_found", e);
+        }
+    }
+
+    public void sendNewOrderSingle(String clOrdId, String symbol, double qty, double price) {
+        SessionID sid = requireSession();
         NewOrderSingle nos = new NewOrderSingle();
         nos.set(new ClOrdID(clOrdId));
         nos.set(new Symbol(symbol));
@@ -114,11 +187,7 @@ public final class FixInClientEmbeddedInitiator {
         nos.set(new Price(price));
         nos.set(new TimeInForce(TimeInForce.DAY));
         nos.set(new TransactTime(LocalDateTime.now(ZoneOffset.UTC)));
-        try {
-            Session.sendToTarget(nos, sid);
-        } catch (SessionNotFound e) {
-            throw new IllegalStateException("fix_in_client_session_not_found", e);
-        }
+        sendApp(nos, sid);
     }
 
     private SessionSettings initiatorSettings() throws ConfigError {
@@ -139,6 +208,7 @@ public final class FixInClientEmbeddedInitiator {
         s.setString(sid, "BeginString", "FIX.4.4");
         s.setString(sid, "SenderCompID", clientCompId);
         s.setString(sid, "TargetCompID", omsCompId);
+        s.setString(sid, "ResetOnLogon", "Y");
         return s;
     }
 }

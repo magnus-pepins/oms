@@ -22,7 +22,9 @@ import quickfix.field.LeavesQty;
 import quickfix.field.MsgType;
 import quickfix.field.OrdStatus;
 import quickfix.field.OrderID;
+import quickfix.field.OrigClOrdID;
 import quickfix.field.OrderQty;
+import quickfix.field.Price;
 import quickfix.field.Side;
 import quickfix.field.Symbol;
 import quickfix.field.TransactTime;
@@ -65,6 +67,10 @@ public final class EgressBrokerFillingAcceptorApplication implements Application
     /** Cumulative {@code NewOrderSingle} count across the test JVM. Reset by {@link #resetItHooks}. */
     public static final AtomicInteger NOS_RECEIVED = new AtomicInteger(0);
 
+    public static final AtomicInteger CANCEL_RECEIVED = new AtomicInteger(0);
+
+    public static final AtomicInteger REPLACE_RECEIVED = new AtomicInteger(0);
+
     /** ClOrdIDs the acceptor has produced ER replies for. Useful for cross-test isolation. */
     public static final List<UUID> CL_ORD_IDS_RECEIVED = new CopyOnWriteArrayList<>();
 
@@ -73,6 +79,8 @@ public final class EgressBrokerFillingAcceptorApplication implements Application
 
     public static void resetItHooks() {
         NOS_RECEIVED.set(0);
+        CANCEL_RECEIVED.set(0);
+        REPLACE_RECEIVED.set(0);
         CL_ORD_IDS_RECEIVED.clear();
         EXEC_ID_SEQ.set(0);
     }
@@ -104,6 +112,14 @@ public final class EgressBrokerFillingAcceptorApplication implements Application
     public void fromApp(Message message, SessionID sessionId)
             throws FieldNotFound, IncorrectTagValue, UnsupportedMessageType {
         String msgType = message.getHeader().getString(MsgType.FIELD);
+        if (MsgType.ORDER_CANCEL_REQUEST.equals(msgType)) {
+            handleCancel(message, sessionId);
+            return;
+        }
+        if (MsgType.ORDER_CANCEL_REPLACE_REQUEST.equals(msgType)) {
+            handleReplace(message, sessionId);
+            return;
+        }
         if (!MsgType.ORDER_SINGLE.equals(msgType)) {
             throw new UnsupportedMessageType();
         }
@@ -121,6 +137,60 @@ public final class EgressBrokerFillingAcceptorApplication implements Application
             Session.sendToTarget(reply, sessionId);
         } catch (FieldNotFound | SessionNotFound e) {
             log.error("egress round-trip IT acceptor failed to send ER reply for clOrdId={}", clOrdId, e);
+        }
+    }
+
+    private static void handleCancel(Message message, SessionID sessionId) throws FieldNotFound {
+        CANCEL_RECEIVED.incrementAndGet();
+        String origClOrdId = message.getString(OrigClOrdID.FIELD);
+        char side = message.getChar(Side.FIELD);
+        String symbol = message.getString(Symbol.FIELD);
+        try {
+            ExecutionReport er = new ExecutionReport(
+                    new OrderID("BR-" + EXEC_ID_SEQ.incrementAndGet()),
+                    new ExecID("EXEC-C-" + EXEC_ID_SEQ.get()),
+                    new ExecType(ExecType.CANCELED),
+                    new OrdStatus(OrdStatus.CANCELED),
+                    new Side(side),
+                    new LeavesQty(0),
+                    new CumQty(0),
+                    new AvgPx(0));
+            er.set(new ClOrdID(origClOrdId));
+            er.set(new Symbol(symbol));
+            er.set(new TransactTime(LocalDateTime.now(ZoneOffset.UTC)));
+            Session.sendToTarget(er, sessionId);
+        } catch (SessionNotFound e) {
+            log.error("egress round-trip IT acceptor failed cancel ER for origClOrdId={}", origClOrdId, e);
+        }
+    }
+
+    private static void handleReplace(Message message, SessionID sessionId) throws FieldNotFound {
+        REPLACE_RECEIVED.incrementAndGet();
+        String origClOrdId = message.getString(OrigClOrdID.FIELD);
+        char side = message.getChar(Side.FIELD);
+        String symbol = message.getString(Symbol.FIELD);
+        BigDecimal orderQty = new BigDecimal(message.getString(OrderQty.FIELD));
+        BigDecimal px = message.isSetField(Price.FIELD)
+                ? new BigDecimal(message.getString(Price.FIELD))
+                : BigDecimal.ONE;
+        try {
+            ExecutionReport er = new ExecutionReport(
+                    new OrderID("BR-" + EXEC_ID_SEQ.incrementAndGet()),
+                    new ExecID("EXEC-R-" + EXEC_ID_SEQ.get()),
+                    new ExecType(ExecType.REPLACED),
+                    new OrdStatus(OrdStatus.NEW),
+                    new Side(side),
+                    new LeavesQty(orderQty.doubleValue()),
+                    new CumQty(0),
+                    new AvgPx(px.doubleValue()));
+            er.set(new ClOrdID(origClOrdId));
+            er.set(new Symbol(symbol));
+            er.setString(OrderQty.FIELD, orderQty.toPlainString());
+            er.setString(Price.FIELD, px.toPlainString());
+            er.set(new TransactTime(LocalDateTime.now(ZoneOffset.UTC)));
+            Session.sendToTarget(er, sessionId);
+        } catch (SessionNotFound e) {
+            log.error("egress round-trip IT acceptor failed replace ER for origClOrdId={}", origClOrdId, e);
         }
     }
 

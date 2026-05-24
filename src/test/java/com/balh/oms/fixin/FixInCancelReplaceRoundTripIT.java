@@ -1,6 +1,5 @@
 package com.balh.oms.fixin;
 
-import com.balh.oms.AbstractPostgresIntegrationTest;
 import com.balh.oms.config.OmsProfiles;
 import com.balh.oms.fix.FixOutboundSessionSend;
 import com.balh.oms.fixegress.EgressBrokerFillingAcceptorApplication;
@@ -10,7 +9,6 @@ import com.balh.oms.fixin.it.FixInClientEmbeddedInitiator;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.parallel.ResourceLock;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Import;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -33,20 +31,22 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 
+import org.junit.jupiter.api.MethodOrderer;
+import org.junit.jupiter.api.Order;
+import org.junit.jupiter.api.TestMethodOrder;
+import org.junit.jupiter.api.parallel.ResourceLock;
+
 /**
- * Full wire round trip (test-only dual profile): FIX-in client {@code 35=D} → cluster admit →
- * {@code oms-fix-egress} {@code NOS} → embedded broker partial fill → cluster ER apply →
- * {@code OmsFixInReturnService} → FIX-in client {@code ExecutionReport}.
- *
- * <p>Production forbids co-locating {@code oms-fix-ingress} and {@code oms-fix-egress}; topology
- * validators are {@code @Profile("!test")} so this IT can exercise both paths in one JVM.
+ * FIX-in {@code 35=F}/{@code 35=G} wire round trip through cluster + egress broker acceptor
+ * (extends {@link FixInFullRoundTripIT} broker/acceptor harness).
  */
 @ResourceLock("oms-fixin-wire-it")
 @ActiveProfiles({"test", OmsProfiles.FIX_INGRESS, OmsProfiles.FIX_EGRESS})
 @Import(FixInFullRoundTripItBeans.class)
 @Sql(scripts = "/db/fix-in-uat-seed.sql")
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
-class FixInFullRoundTripIT extends FixInWireItAcceptorSupport {
+@TestMethodOrder(MethodOrderer.OrderAnnotation.class)
+class FixInCancelReplaceRoundTripIT extends FixInWireItAcceptorSupport {
 
     private static final Duration LOGON_TIMEOUT = Duration.ofSeconds(45);
     private static final Duration FLOW_TIMEOUT = Duration.ofSeconds(60);
@@ -56,14 +56,13 @@ class FixInFullRoundTripIT extends FixInWireItAcceptorSupport {
 
     private static final Path FIX_IN_ACCEPTOR_STORE;
     private static final Path FIX_EGRESS_INITIATOR_STORE;
-
     private static final int FIX_IN_ACCEPT_PORT;
     private static final int BROKER_ACCEPT_PORT;
 
     static {
         try {
-            FIX_IN_ACCEPTOR_STORE = Files.createTempDirectory("oms-fix-in-full-rt-acc-store");
-            FIX_EGRESS_INITIATOR_STORE = Files.createTempDirectory("oms-fix-in-full-rt-egress-ini");
+            FIX_IN_ACCEPTOR_STORE = Files.createTempDirectory("oms-fix-in-cr-rt-acc-store");
+            FIX_EGRESS_INITIATOR_STORE = Files.createTempDirectory("oms-fix-in-cr-rt-egress-ini");
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
@@ -138,18 +137,17 @@ class FixInFullRoundTripIT extends FixInWireItAcceptorSupport {
     }
 
     @Test
-    void fixInClientOrder_partialFillReturnsOnFixInWire() {
-        await().atMost(LOGON_TIMEOUT).pollInterval(Duration.ofMillis(100)).untilAsserted(() -> {
-            assertThat(fixOutboundSessionSend.hasActiveSession()).isTrue();
-            assertThat(fixInClient.isLoggedOn()).isTrue();
-        });
+    @Order(1)
+    void fixInClientCancel_afterPartialFillReturnsCanceledOnFixInWire() {
+        awaitLogonAndEgress();
 
-        String clOrdId = "FIR-" + UUID.randomUUID().toString().substring(0, 8);
-        fixInClient.sendNewOrderSingle(clOrdId, "AAPL", 10, 100.0);
+        String origClOrdId = "FIR-" + UUID.randomUUID().toString().substring(0, 8);
+        String cancelClOrdId = origClOrdId + "-C";
+        fixInClient.sendNewOrderSingle(origClOrdId, "AAPL", 10, 100.0);
 
         await().atMost(FLOW_TIMEOUT).pollInterval(Duration.ofMillis(100)).untilAsserted(() -> {
             assertThat(FixInClientCollectorApplication.RECEIVED)
-                    .anyMatch(er -> clOrdId.equals(er.clOrdId()) && er.execType() == ExecType.NEW);
+                    .anyMatch(er -> origClOrdId.equals(er.clOrdId()) && er.execType() == ExecType.NEW);
         });
 
         await().atMost(FLOW_TIMEOUT).pollInterval(Duration.ofMillis(50)).untilAsserted(() ->
@@ -157,20 +155,64 @@ class FixInFullRoundTripIT extends FixInWireItAcceptorSupport {
 
         await().atMost(FLOW_TIMEOUT).pollInterval(Duration.ofMillis(100)).untilAsserted(() -> {
             assertThat(FixInClientCollectorApplication.RECEIVED)
-                    .anyMatch(er -> clOrdId.equals(er.clOrdId()) && er.execType() == ExecType.PARTIAL_FILL);
+                    .anyMatch(er -> origClOrdId.equals(er.clOrdId()) && er.execType() == ExecType.PARTIAL_FILL);
+        });
+
+        fixInClient.sendOrderCancelRequest(origClOrdId, cancelClOrdId, "AAPL");
+
+        await().atMost(FLOW_TIMEOUT).pollInterval(Duration.ofMillis(100)).untilAsserted(() -> {
+            assertThat(EgressBrokerFillingAcceptorApplication.CANCEL_RECEIVED.get()).isGreaterThanOrEqualTo(1);
+            assertThat(FixInClientCollectorApplication.RECEIVED)
+                    .anyMatch(er -> origClOrdId.equals(er.clOrdId()) && er.execType() == ExecType.CANCELED);
             assertThat(FixInClientCollectorApplication.RECEIVED.stream()
-                            .filter(er -> clOrdId.equals(er.clOrdId()) && er.execType() == ExecType.PARTIAL_FILL)
+                            .filter(er -> origClOrdId.equals(er.clOrdId()) && er.execType() == ExecType.CANCELED)
                             .findFirst()
                             .orElseThrow()
                             .ordStatus())
-                    .isEqualTo(OrdStatus.PARTIALLY_FILLED);
+                    .isEqualTo(OrdStatus.CANCELED);
         });
 
         Long auditCount = jdbc.queryForObject(
-                "SELECT COUNT(*) FROM oms_fix_message_audit WHERE cl_ord_id = ? AND direction = 'OUTBOUND'",
+                "SELECT COUNT(*) FROM oms_fix_message_audit WHERE cl_ord_id = ? AND direction = 'INBOUND'",
                 Long.class,
-                clOrdId);
+                cancelClOrdId);
         assertThat(auditCount).isGreaterThanOrEqualTo(1L);
+    }
+
+    @Test
+    @Order(2)
+    void fixInClientReplace_returnsReplacedOnFixInWire() {
+        awaitLogonAndEgress();
+
+        String origClOrdId = "FIR-" + UUID.randomUUID().toString().substring(0, 8);
+        String replaceClOrdId = origClOrdId + "-R";
+        fixInClient.sendNewOrderSingle(origClOrdId, "MSFT", 10, 50.0);
+
+        await().atMost(FLOW_TIMEOUT).pollInterval(Duration.ofMillis(100)).untilAsserted(() -> {
+            assertThat(FixInClientCollectorApplication.RECEIVED)
+                    .anyMatch(er -> origClOrdId.equals(er.clOrdId()) && er.execType() == ExecType.NEW);
+        });
+
+        fixInClient.sendOrderCancelReplaceRequest(origClOrdId, replaceClOrdId, "MSFT", 8, 99.0);
+
+        await().atMost(FLOW_TIMEOUT).pollInterval(Duration.ofMillis(100)).untilAsserted(() -> {
+            assertThat(EgressBrokerFillingAcceptorApplication.REPLACE_RECEIVED.get()).isGreaterThanOrEqualTo(1);
+            assertThat(FixInClientCollectorApplication.RECEIVED)
+                    .anyMatch(er -> origClOrdId.equals(er.clOrdId()) && er.execType() == ExecType.REPLACED);
+            assertThat(FixInClientCollectorApplication.RECEIVED.stream()
+                            .filter(er -> origClOrdId.equals(er.clOrdId()) && er.execType() == ExecType.REPLACED)
+                            .findFirst()
+                            .orElseThrow()
+                            .ordStatus())
+                    .isEqualTo(OrdStatus.REPLACED);
+        });
+    }
+
+    private void awaitLogonAndEgress() {
+        await().atMost(LOGON_TIMEOUT).pollInterval(Duration.ofMillis(100)).untilAsserted(() -> {
+            assertThat(fixOutboundSessionSend.hasActiveSession()).isTrue();
+            assertThat(fixInClient.isLoggedOn()).isTrue();
+        });
     }
 
     private static int allocatePort() {

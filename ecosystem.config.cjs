@@ -410,6 +410,9 @@ const apps = [
       SPRING_PROFILES_ACTIVE: 'oms-postgres-projector',
       OMS_POSTGRES_PROJECTOR_AERON_DIR: AERON_MEDIA_DRIVER,
       OMS_LEDGER_SETTLEMENT_OUTBOX_RECONCILER_ENABLED: 'true',
+      // Settlement customer notifications (outbox → NATS → customer-frontend BFF).
+      OMS_SETTLEMENT_CUSTOMER_NOTIFICATION_PUBLISHER_ENABLED: 'true',
+      OMS_SETTLEMENT_FAIL_CUSTOMER_NOTIFICATION_ENABLED: 'true',
       // §8.3 — tier MQTT publisher runs on this role ONLY (single instance).
       OMS_FX_CUSTOMER_QUOTE_PUBLISHER_ENABLED: 'true',
       OMS_FX_CUSTOMER_QUOTE_PUBLISHER_TIERS: 'basic,premium,elite,admin,business',

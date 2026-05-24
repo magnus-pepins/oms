@@ -82,6 +82,21 @@ public class SettlementOpsMetricsRepository {
                     ) late_batches
                     """;
 
+    private static final String COUNT_PENDING_CUSTOMER_NOTIFICATIONS =
+            """
+                    SELECT COUNT(*)::int
+                    FROM settlement_customer_notification_outbox
+                    WHERE published_at IS NULL
+                    """;
+
+    private static final String COUNT_STUCK_CUSTOMER_NOTIFICATIONS =
+            """
+                    SELECT COUNT(*)::int
+                    FROM settlement_customer_notification_outbox
+                    WHERE published_at IS NULL
+                      AND attempts >= :minAttempts
+                    """;
+
     private final NamedParameterJdbcTemplate jdbc;
 
     public SettlementOpsMetricsRepository(NamedParameterJdbcTemplate jdbc) {
@@ -139,6 +154,21 @@ public class SettlementOpsMetricsRepository {
     public int countLateBrokerFileBatches() {
         Integer n =
                 jdbc.queryForObject(COUNT_LATE_BROKER_FILE_BATCHES, new MapSqlParameterSource(), Integer.class);
+        return n == null ? 0 : n;
+    }
+
+    public int countPendingCustomerNotifications() {
+        Integer n =
+                jdbc.queryForObject(COUNT_PENDING_CUSTOMER_NOTIFICATIONS, new MapSqlParameterSource(), Integer.class);
+        return n == null ? 0 : n;
+    }
+
+    public int countStuckCustomerNotificationOutboxRows(int minAttempts) {
+        Integer n =
+                jdbc.queryForObject(
+                        COUNT_STUCK_CUSTOMER_NOTIFICATIONS,
+                        new MapSqlParameterSource("minAttempts", Math.max(1, minAttempts)),
+                        Integer.class);
         return n == null ? 0 : n;
     }
 

@@ -1568,6 +1568,15 @@ public class OmsConfig {
         private boolean failCustomerNotificationEnabled = false;
         private long failCustomerNotificationIntervalMs = 3_600_000L;
         private int failCustomerNotificationSlaBusinessDays = 3;
+        /** Drains {@code settlement_customer_notification_outbox} to NATS for the customer BFF. */
+        private boolean customerNotificationPublisherEnabled = false;
+        private long customerNotificationPublisherIntervalMs = 1_000L;
+        private int customerNotificationPublisherBatchSize = 50;
+        private long customerNotificationPublisherAgeMs = 2_000L;
+        private String customerNotificationStreamName = "OMS_CUSTOMER_NOTIFICATIONS";
+        private String customerNotificationSubjectPrefix = "oms.customer-notifications";
+        /** Enqueue {@code CorporateActionDividendPaid} after dividend ledger leg posts. */
+        private boolean corporateActionDividendNotificationEnabled = true;
 
         public String getDefaultCustodyAccountId() {
             return defaultCustodyAccountId;
@@ -1918,6 +1927,68 @@ public class OmsConfig {
 
         public void setFailCustomerNotificationSlaBusinessDays(int failCustomerNotificationSlaBusinessDays) {
             this.failCustomerNotificationSlaBusinessDays = Math.max(1, failCustomerNotificationSlaBusinessDays);
+        }
+
+        public boolean isCustomerNotificationPublisherEnabled() {
+            return customerNotificationPublisherEnabled;
+        }
+
+        public void setCustomerNotificationPublisherEnabled(boolean customerNotificationPublisherEnabled) {
+            this.customerNotificationPublisherEnabled = customerNotificationPublisherEnabled;
+        }
+
+        public long getCustomerNotificationPublisherIntervalMs() {
+            return customerNotificationPublisherIntervalMs;
+        }
+
+        public void setCustomerNotificationPublisherIntervalMs(long customerNotificationPublisherIntervalMs) {
+            this.customerNotificationPublisherIntervalMs = Math.max(100L, customerNotificationPublisherIntervalMs);
+        }
+
+        public int getCustomerNotificationPublisherBatchSize() {
+            return customerNotificationPublisherBatchSize;
+        }
+
+        public void setCustomerNotificationPublisherBatchSize(int customerNotificationPublisherBatchSize) {
+            this.customerNotificationPublisherBatchSize = Math.max(1, customerNotificationPublisherBatchSize);
+        }
+
+        public long getCustomerNotificationPublisherAgeMs() {
+            return customerNotificationPublisherAgeMs;
+        }
+
+        public void setCustomerNotificationPublisherAgeMs(long customerNotificationPublisherAgeMs) {
+            this.customerNotificationPublisherAgeMs = Math.max(0L, customerNotificationPublisherAgeMs);
+        }
+
+        public String getCustomerNotificationStreamName() {
+            return customerNotificationStreamName;
+        }
+
+        public void setCustomerNotificationStreamName(String customerNotificationStreamName) {
+            this.customerNotificationStreamName =
+                    customerNotificationStreamName == null || customerNotificationStreamName.isBlank()
+                            ? "OMS_CUSTOMER_NOTIFICATIONS"
+                            : customerNotificationStreamName.trim();
+        }
+
+        public String getCustomerNotificationSubjectPrefix() {
+            return customerNotificationSubjectPrefix;
+        }
+
+        public void setCustomerNotificationSubjectPrefix(String customerNotificationSubjectPrefix) {
+            this.customerNotificationSubjectPrefix =
+                    customerNotificationSubjectPrefix == null || customerNotificationSubjectPrefix.isBlank()
+                            ? "oms.customer-notifications"
+                            : customerNotificationSubjectPrefix.trim();
+        }
+
+        public boolean isCorporateActionDividendNotificationEnabled() {
+            return corporateActionDividendNotificationEnabled;
+        }
+
+        public void setCorporateActionDividendNotificationEnabled(boolean corporateActionDividendNotificationEnabled) {
+            this.corporateActionDividendNotificationEnabled = corporateActionDividendNotificationEnabled;
         }
     }
 

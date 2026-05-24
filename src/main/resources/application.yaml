@@ -188,6 +188,16 @@ oms:
     ops-metrics-publisher-enabled: ${OMS_SETTLEMENT_OPS_METRICS_PUBLISHER_ENABLED:true}
     ops-metrics-poll-interval-ms: ${OMS_SETTLEMENT_OPS_METRICS_POLL_INTERVAL_MS:30000}
     stuck-outbox-min-attempts: ${OMS_SETTLEMENT_STUCK_OUTBOX_MIN_ATTEMPTS:3}
+    fail-customer-notification-enabled: ${OMS_SETTLEMENT_FAIL_CUSTOMER_NOTIFICATION_ENABLED:false}
+    fail-customer-notification-interval-ms: ${OMS_SETTLEMENT_FAIL_CUSTOMER_NOTIFICATION_INTERVAL_MS:3600000}
+    fail-customer-notification-sla-business-days: ${OMS_SETTLEMENT_FAIL_CUSTOMER_NOTIFICATION_SLA_BUSINESS_DAYS:3}
+    customer-notification-publisher-enabled: ${OMS_SETTLEMENT_CUSTOMER_NOTIFICATION_PUBLISHER_ENABLED:false}
+    customer-notification-publisher-interval-ms: ${OMS_SETTLEMENT_CUSTOMER_NOTIFICATION_PUBLISHER_INTERVAL_MS:1000}
+    customer-notification-publisher-batch-size: ${OMS_SETTLEMENT_CUSTOMER_NOTIFICATION_PUBLISHER_BATCH_SIZE:50}
+    customer-notification-publisher-age-ms: ${OMS_SETTLEMENT_CUSTOMER_NOTIFICATION_PUBLISHER_AGE_MS:2000}
+    customer-notification-stream-name: ${OMS_SETTLEMENT_CUSTOMER_NOTIFICATION_STREAM_NAME:OMS_CUSTOMER_NOTIFICATIONS}
+    customer-notification-subject-prefix: ${OMS_SETTLEMENT_CUSTOMER_NOTIFICATION_SUBJECT_PREFIX:oms.customer-notifications}
+    corporate-action-dividend-notification-enabled: ${OMS_SETTLEMENT_CORPORATE_ACTION_DIVIDEND_NOTIFICATION_ENABLED:true}
     file-import-max-bytes: ${OMS_SETTLEMENT_FILE_IMPORT_MAX_BYTES:10000000}
     file-import-max-rows: ${OMS_SETTLEMENT_FILE_IMPORT_MAX_ROWS:10000}
     file-import-register-slice-size: ${OMS_SETTLEMENT_FILE_IMPORT_REGISTER_SLICE_SIZE:50}

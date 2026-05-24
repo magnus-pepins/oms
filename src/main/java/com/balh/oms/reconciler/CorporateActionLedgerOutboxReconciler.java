@@ -2,6 +2,7 @@ package com.balh.oms.reconciler;
 
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.corporateaction.CorporateActionCashLedgerBookingService;
+import com.balh.oms.corporateaction.CorporateActionCustomerNotificationService;
 import com.balh.oms.ledger.LedgerSettlementLegPoster;
 import com.balh.oms.ledger.LedgerSettlementPostingClient;
 import java.time.Instant;
@@ -46,16 +47,19 @@ public class CorporateActionLedgerOutboxReconciler {
 
     private final NamedParameterJdbcTemplate jdbc;
     private final LedgerSettlementLegPoster poster;
+    private final CorporateActionCustomerNotificationService customerNotifications;
     private final OmsConfig config;
     private final TransactionTemplate transactionTemplate;
 
     public CorporateActionLedgerOutboxReconciler(
             NamedParameterJdbcTemplate jdbc,
             LedgerSettlementLegPoster poster,
+            CorporateActionCustomerNotificationService customerNotifications,
             OmsConfig config,
             org.springframework.transaction.PlatformTransactionManager transactionManager) {
         this.jdbc = jdbc;
         this.poster = poster;
+        this.customerNotifications = customerNotifications;
         this.config = config;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
     }
@@ -83,6 +87,9 @@ public class CorporateActionLedgerOutboxReconciler {
                         try {
                             poster.postCorporateActionOutbox(row.id(), row.legKind(), row.payloadJson());
                             jdbc.update(MARK_POSTED, new MapSqlParameterSource("id", row.id()));
+                            if (CorporateActionCashLedgerBookingService.LEG_DIVIDEND.equals(row.legKind())) {
+                                customerNotifications.enqueueDividendPaidIfEnabled(row.payloadJson());
+                            }
                         } catch (LedgerSettlementPostingClient.LedgerSettlementPostingException e) {
                             jdbc.update(
                                     MARK_FAILED,

@@ -31,6 +31,10 @@ public class SettlementOpsMetricsPublisher {
     public static final String METRIC_CA_PENDING = "oms_corporate_action_events_pending";
     public static final String METRIC_POSITION_BREAKS = "oms_position_reconciliation_breaks_total";
     public static final String METRIC_CASH_BREAKS = "oms_cash_reconciliation_breaks_total";
+    public static final String METRIC_CUSTOMER_NOTIFICATION_PENDING =
+            "oms_settlement_customer_notification_outbox_pending_total";
+    public static final String METRIC_CUSTOMER_NOTIFICATION_STUCK =
+            "oms_settlement_customer_notification_outbox_stuck_total";
     public static final String TAG_BREAK_TYPE = "break_type";
 
     /** Sentinel before the first successful poll. */
@@ -47,6 +51,8 @@ public class SettlementOpsMetricsPublisher {
     private final AtomicLong pendingCorporateActions = new AtomicLong(-1L);
     private final AtomicLong positionBreaksTotal = new AtomicLong(-1L);
     private final AtomicLong cashBreaksTotal = new AtomicLong(-1L);
+    private final AtomicLong customerNotificationPending = new AtomicLong(-1L);
+    private final AtomicLong customerNotificationStuck = new AtomicLong(-1L);
 
     public SettlementOpsMetricsPublisher(
             OmsConfig config, SettlementOpsMetricsRepository metricsRepo, MeterRegistry meterRegistry) {
@@ -89,6 +95,13 @@ public class SettlementOpsMetricsPublisher {
         Gauge.builder("oms_broker_file_late_total", metricsRepo, SettlementOpsMetricsRepository::countLateBrokerFileBatches)
                 .description("Broker EOD file batches past business date not applied.")
                 .register(meterRegistry);
+        Gauge.builder(METRIC_CUSTOMER_NOTIFICATION_PENDING, customerNotificationPending, AtomicLong::doubleValue)
+                .description("Unpublished settlement customer notification outbox rows.")
+                .register(meterRegistry);
+        Gauge.builder(METRIC_CUSTOMER_NOTIFICATION_STUCK, customerNotificationStuck, AtomicLong::doubleValue)
+                .description(
+                        "Unpublished customer notification outbox rows with attempts >= configured stuck threshold.")
+                .register(meterRegistry);
         log.info("Registered settlement ops metrics gauges (§5.18)");
     }
 
@@ -110,6 +123,10 @@ public class SettlementOpsMetricsPublisher {
             pendingCorporateActions.set(metricsRepo.countPendingCorporateActionEvents());
             positionBreaksTotal.set(metricsRepo.countPositionReconciliationBreaks());
             cashBreaksTotal.set(metricsRepo.countCashReconciliationBreaks());
+            customerNotificationPending.set(metricsRepo.countPendingCustomerNotifications());
+            customerNotificationStuck.set(
+                    metricsRepo.countStuckCustomerNotificationOutboxRows(
+                            config.getSettlement().getStuckOutboxMinAttempts()));
         } catch (RuntimeException e) {
             log.warn("Settlement ops metrics poll failed: {}", e.toString());
         }

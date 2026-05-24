@@ -20,13 +20,13 @@ import org.springframework.stereotype.Component;
 public class SettlementFailCustomerNotificationJob {
 
     private static final Logger log = LoggerFactory.getLogger(SettlementFailCustomerNotificationJob.class);
-    public static final String TYPE_SETTLEMENT_DELAYED = "SettlementDelayed";
 
     private static final String LIST_OVERDUE =
             """
-                    SELECT f.id AS fail_row_id, f.execution_id, e.account_id
+                    SELECT f.id AS fail_row_id, f.execution_id, e.account_id, o.instrument_symbol
                     FROM broker_settlement_fail_row f
                     JOIN executions e ON e.id = f.execution_id
+                    JOIN orders o ON o.id = e.order_id
                     WHERE f.applied_at IS NOT NULL
                       AND f.customer_notified_at IS NULL
                       AND f.execution_id IS NOT NULL
@@ -65,17 +65,19 @@ public class SettlementFailCustomerNotificationJob {
                                 new Row(
                                         rs.getLong("fail_row_id"),
                                         rs.getLong("execution_id"),
-                                        UUID.fromString(rs.getString("account_id"))));
+                                        UUID.fromString(rs.getString("account_id")),
+                                        rs.getString("instrument_symbol")));
         for (Row row : rows) {
             try {
                 ObjectNode envelope = objectMapper.createObjectNode();
                 envelope.put("schemaVersion", 1);
-                envelope.put("type", TYPE_SETTLEMENT_DELAYED);
+                envelope.put("type", SettlementCustomerNotificationTypes.SETTLEMENT_DELAYED);
                 envelope.put("failRowId", row.failRowId());
                 envelope.put("executionId", row.executionId());
                 envelope.put("accountId", row.accountId().toString());
+                envelope.put("instrumentSymbol", row.instrumentSymbol() == null ? "" : row.instrumentSymbol());
                 outbox.insertIgnore(
-                        TYPE_SETTLEMENT_DELAYED,
+                        SettlementCustomerNotificationTypes.SETTLEMENT_DELAYED,
                         row.accountId(),
                         row.executionId(),
                         row.failRowId(),
@@ -91,5 +93,5 @@ public class SettlementFailCustomerNotificationJob {
         }
     }
 
-    private record Row(long failRowId, long executionId, UUID accountId) {}
+    private record Row(long failRowId, long executionId, UUID accountId, String instrumentSymbol) {}
 }

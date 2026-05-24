@@ -85,11 +85,10 @@ public class FixInApplication implements Application {
         sessionRegistry.unregister(sessionId);
         Session session = Session.lookupSession(sessionId);
         if (session != null) {
-            // QFJ disables the acceptor Session on logout(); reset after disconnect so
-            // the counterparty initiator can log on again (operator force-logout soak).
-            session.reset();
+            // QFJ 2.3+ leaves acceptor sessions disabled after logout(); logon() re-enables inbound logons.
+            session.logon();
         }
-        log.info("FIX-in logout {} (acceptor reset for re-logon)", sessionId);
+        log.info("FIX-in logout {} (acceptor re-enabled for re-logon)", sessionId);
     }
 
     @Override

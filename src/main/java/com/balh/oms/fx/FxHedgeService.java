@@ -146,6 +146,7 @@ public class FxHedgeService {
         // converges to the same state.
         Long existingId = findByActionKey(req.actionKey);
         if (existingId != null) {
+            linkManualExecution(req.actionKey, existingId);
             Map<String, Object> existing = readById(existingId);
             publishHedgeEvent(existing);
             return existing;
@@ -154,6 +155,7 @@ public class FxHedgeService {
         Long actionId = insertPending(req, pair, side, baseCcy, quoteCcy, baseAmount, quoteAmount,
                 rate, effectiveQuoteId, source, destination);
         submittedCounter.increment();
+        linkManualExecution(req.actionKey, actionId);
 
         // Step 2: best-effort Ledger post. The audit row is canonical; the
         // ledger txn is the actual money movement.
@@ -215,6 +217,18 @@ public class FxHedgeService {
         } catch (DataAccessException e) {
             log.warn("[fx-hedge] findByActionKey failed", e);
             return null;
+        }
+    }
+
+    /** Parity with {@link FxAutoHedger#linkAutoFire} for desk-initiated advisory executes. */
+    private void linkManualExecution(String actionKey, long hedgeActionId) {
+        try {
+            jdbc.update(
+                    "UPDATE fx_hedger_recommendations SET executed_action_id = ? "
+                            + "WHERE action_key = ? AND executed_action_id IS NULL",
+                    hedgeActionId, actionKey);
+        } catch (DataAccessException e) {
+            log.warn("[fx-hedge] link manual execution failed actionKey={}: {}", actionKey, e.getMessage());
         }
     }
 

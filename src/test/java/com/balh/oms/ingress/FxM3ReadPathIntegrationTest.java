@@ -53,6 +53,8 @@ class FxM3ReadPathIntegrationTest extends AbstractPostgresIntegrationTest {
         registry.add("oms.fx.nostro-balance-ids-csv", () -> "bal_nostro_it");
         registry.add("oms.fx.multi-leg-atomicity-stub-enabled", () -> "true");
         registry.add("oms.fx.hedge-hooks-enabled", () -> "true");
+        registry.add("oms.fx.suspense.currencies-csv", () -> "USD,EUR");
+        registry.add("oms.fx.suspense.max-abs-csv", () -> "USD=500,EUR=600");
     }
 
     @AfterAll
@@ -145,6 +147,47 @@ class FxM3ReadPathIntegrationTest extends AbstractPostgresIntegrationTest {
         assertThat(res.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(res.getBody()).isNotNull();
         assertThat(res.getBody().get("paused")).isEqualTo(Boolean.FALSE);
+    }
+
+    @Test
+    void suspenseSnapshotMarksOverLimitAndPassesThroughLedgerErrors() {
+        // USD over the configured 500 limit, EUR is a ledger lookup failure (404).
+        // RestClient encodes '@' as %40 in path segments.
+        ledgerWireMock.stubFor(get(urlPathEqualTo("/balances/indicator/%40FX-Suspense-USD/currency/USD"))
+                .withQueryParam("with_queued", equalTo("true"))
+                .withHeader("Authorization", equalTo("Bearer fx-m3-ledger-key"))
+                .willReturn(aResponse()
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\"availableBalance\":\"-800.00\"}")));
+        ledgerWireMock.stubFor(get(urlPathEqualTo("/balances/indicator/%40FX-Suspense-EUR/currency/EUR"))
+                .withQueryParam("with_queued", equalTo("true"))
+                .willReturn(aResponse()
+                        .withStatus(404)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\"error\":\"BALANCE_NOT_FOUND\"}")));
+
+        ResponseEntity<Map> res = http.exchange(
+                fxUrl("/internal/v1/fx/suspense/snapshot"),
+                HttpMethod.GET,
+                internalKeyEntity(),
+                Map.class);
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(res.getBody()).isNotNull();
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> balances = (List<Map<String, Object>>) res.getBody().get("balances");
+        assertThat(balances).hasSize(2);
+
+        Map<String, Object> usd = balances.stream()
+                .filter(b -> "USD".equals(b.get("currency"))).findFirst().orElseThrow();
+        assertThat(usd.get("availableBalance")).isEqualTo("-800.00");
+        assertThat(usd.get("absAvailable")).isEqualTo("800.00");
+        assertThat(usd.get("maxAbsLimit")).isEqualTo("500");
+        assertThat(usd.get("overLimit")).isEqualTo(Boolean.TRUE);
+
+        Map<String, Object> eur = balances.stream()
+                .filter(b -> "EUR".equals(b.get("currency"))).findFirst().orElseThrow();
+        assertThat(eur.get("error")).isNotNull();
+        assertThat(eur.get("overLimit")).isEqualTo(Boolean.FALSE);
     }
 
     @Test

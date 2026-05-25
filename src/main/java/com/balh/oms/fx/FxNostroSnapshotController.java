@@ -15,12 +15,15 @@ public class FxNostroSnapshotController {
 
     private final FxNostroSnapshotService fxNostroSnapshotService;
     private final FxNostroCorrespondentService correspondentService;
+    private final FxSuspenseSnapshotService fxSuspenseSnapshotService;
 
     public FxNostroSnapshotController(
             FxNostroSnapshotService fxNostroSnapshotService,
-            FxNostroCorrespondentService correspondentService) {
+            FxNostroCorrespondentService correspondentService,
+            FxSuspenseSnapshotService fxSuspenseSnapshotService) {
         this.fxNostroSnapshotService = fxNostroSnapshotService;
         this.correspondentService = correspondentService;
+        this.fxSuspenseSnapshotService = fxSuspenseSnapshotService;
     }
 
     @GetMapping("/scale/status")
@@ -38,6 +41,23 @@ public class FxNostroSnapshotController {
                 return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", code));
             }
             if ("ledger_client_unavailable".equals(code) || "fx_nostro_balance_ids_empty".equals(code)) {
+                return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(Map.of("error", code));
+            }
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("error", code));
+        }
+    }
+
+    @GetMapping("/suspense/snapshot")
+    public ResponseEntity<Map<String, Object>> suspenseSnapshot() {
+        try {
+            return ResponseEntity.ok(fxSuspenseSnapshotService.buildSnapshot());
+        } catch (IllegalStateException e) {
+            String code = e.getMessage();
+            if ("fx_suspense_read_disabled".equals(code)) {
+                return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", code));
+            }
+            if ("ledger_client_unavailable".equals(code)
+                    || "fx_suspense_currencies_empty".equals(code)) {
                 return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(Map.of("error", code));
             }
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("error", code));

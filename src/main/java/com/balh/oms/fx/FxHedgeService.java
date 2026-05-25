@@ -20,6 +20,7 @@ import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.Clock;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -264,8 +265,9 @@ public class FxHedgeService {
     }
 
     /**
-     * Posts the hedge as two same-currency Ledger transactions through
-     * {@code @FX-Suspense-<CCY>} balances:
+     * Posts the hedge atomically as two same-currency Ledger transactions
+     * through {@code @FX-Suspense-<CCY>} balances, using
+     * {@code POST /transactions/bulk?atomic=true}:
      *
      * <pre>
      *   leg 1 (base)  : @FX-Suspense-&lt;BASE&gt;   -&gt; baseNostro       (+baseAmount BASE)
@@ -278,18 +280,31 @@ public class FxHedgeService {
      *             nostro, debit quote suspense).
      * </pre>
      *
-     * Why split: the Ledger refuses {@code rate != 1} multi-currency posts
-     * with HTTP 501 (see Ledger J-7 ticket). Both legs above use rate=1,
-     * single-currency, so they go through the standard path. The two
-     * suspense balances together represent the open FX exposure pending PB
-     * settlement — net-zero per currency after all hedges close. Suspense
-     * sources allow overdraft so the first hedge in a fresh demo doesn't
-     * have to be pre-funded.
+     * <p>Why split: the Ledger refuses {@code rate != 1} multi-currency posts
+     * with HTTP 501 (J-7 deferred). Both legs above are rate=1 single-currency
+     * so they take the standard apply path. The two suspense balances net-zero
+     * per currency once all hedges close against the PB settlement.
      *
-     * @return concatenated transactionIds (leg1 + "," + leg2) so the audit
-     *         row captures both. If either leg fails, we abort and let the
-     *         caller mark the action as failed; partial-leg state is
-     *         visible in Ledger and can be reconciled by hand for the demo.
+     * <p>Atomicity guarantee: with {@code atomic=true} the ledger's
+     * {@code BulkController} stops on first leg failure and issues a
+     * compensating {@link com.balh.ledger.cluster.wire.RecordPostedTransactionCommand}
+     * with source/destination swapped on every already-applied leg
+     * ({@code BulkController.runAtomic} + {@code reverseAppliedLegs}). This
+     * closes the previous gap where leg 1 could commit and leg 2 fail,
+     * leaving orphaned cash visible only by hand-reconciling the ledger.
+     * The atomicity is compensating-reversal, not Raft-native — same
+     * caveat the TS Ledger has carried since cutover. Tracked: a future
+     * {@code RecordBulkTransactionsCommand} would give true log-level
+     * atomicity (see {@code BulkController} class doc).
+     *
+     * <p>Each leg carries {@code allowOverdraft=true} per row because
+     * suspense and nostro balances may both legitimately swing negative
+     * pending PB settlement; the soft limit lives in
+     * {@code oms.fx.suspense.max-abs-csv} + {@link FxSuspenseLimitMonitor}.
+     *
+     * @return the ledger {@code batch_id} (one per atomic hedge); leg
+     *         transaction ids are recoverable via the read-side projector
+     *         by joining on {@code metaData.batch_id}.
      */
     private String postLedgerTransaction(HedgeRequest req, String pair, String side, String baseCcy,
                                          String quoteCcy, BigDecimal baseAmount, BigDecimal rate,
@@ -314,44 +329,75 @@ public class FxHedgeService {
 
         String baseLegSource, baseLegDest, quoteLegSource, quoteLegDest;
         if ("BUY".equals(side)) {
-            // Acquire BASE, give up QUOTE.
             baseLegSource = baseSuspense;
             baseLegDest = req.baseNostroId.trim();
             quoteLegSource = req.quoteNostroId.trim();
             quoteLegDest = quoteSuspense;
         } else {
-            // SELL: give up BASE, acquire QUOTE.
             baseLegSource = req.baseNostroId.trim();
             baseLegDest = baseSuspense;
             quoteLegSource = quoteSuspense;
             quoteLegDest = req.quoteNostroId.trim();
         }
 
-        String leg1Id = postLeg(http, apiKey, req, pair, side, "BASE",
-                baseLegSource, baseLegDest, baseAmount, baseCcy, rate);
-        String leg2Id = postLeg(http, apiKey, req, pair, side, "QUOTE",
-                quoteLegSource, quoteLegDest, quoteAmount, quoteCcy, rate);
-        return leg1Id + "," + leg2Id;
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("inflight", false);
+        body.put("atomic", true);
+        List<Map<String, Object>> txns = new ArrayList<>(2);
+        txns.add(buildLegRow(req, pair, side, "BASE",
+                baseLegSource, baseLegDest, baseAmount, baseCcy, rate));
+        txns.add(buildLegRow(req, pair, side, "QUOTE",
+                quoteLegSource, quoteLegDest, quoteAmount, quoteCcy, rate));
+        body.put("transactions", txns);
+
+        try {
+            String resp = http.post()
+                    .uri("/transactions/bulk")
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .header("Authorization", "Bearer " + apiKey)
+                    .body(body)
+                    .retrieve()
+                    .body(String.class);
+            JsonNode root = objectMapper.readTree(resp == null ? "{}" : resp);
+            String status = root.path("status").asText("");
+            String batchId = root.path("batch_id").asText(null);
+            JsonNode errors = root.path("errors");
+            // BulkController returns 201 with status=applied on full success;
+            // status=partial cannot happen under atomic=true (atomic clears
+            // applied[] on any failure). Treat anything other than applied
+            // as a failure with the ledger-provided error string.
+            if (!"applied".equals(status)) {
+                throw new IllegalStateException(
+                        "ledger bulk hedge non-applied: status=" + status
+                                + " errors=" + truncate(errors.toString()));
+            }
+            if (batchId == null || batchId.isBlank()) {
+                throw new IllegalStateException("ledger bulk hedge missing batch_id; body=" + resp);
+            }
+            return batchId;
+        } catch (RestClientResponseException e) {
+            // 400 "all failed" branch carries an errors[] we want surfaced.
+            String b = e.getResponseBodyAsString();
+            throw new IllegalStateException(
+                    "ledger bulk hedge HTTP " + e.getStatusCode().value() + ": "
+                            + truncate(b));
+        }
     }
 
-    private String postLeg(RestClient http, String apiKey, HedgeRequest req, String pair, String side,
-                           String legLabel, String src, String dst, BigDecimal amount, String ccy,
-                           BigDecimal rate) throws Exception {
-        Map<String, Object> body = new LinkedHashMap<>();
-        body.put("source", src);
-        body.put("destination", dst);
-        body.put("amount", amount.doubleValue());
-        body.put("currency", ccy);
-        body.put("reference", "fx-hedge-" + req.actionKey + "-" + legLabel);
-        body.put("description",
+    private Map<String, Object> buildLegRow(HedgeRequest req, String pair, String side, String legLabel,
+                                            String src, String dst, BigDecimal amount, String ccy,
+                                            BigDecimal rate) {
+        Map<String, Object> row = new LinkedHashMap<>();
+        row.put("source", src);
+        row.put("destination", dst);
+        row.put("amount", amount.doubleValue());
+        row.put("currency", ccy);
+        row.put("reference", "fx-hedge-" + req.actionKey + "-" + legLabel);
+        row.put("description",
                 "FX hedge " + side + " " + pair + " leg=" + legLabel + " " + amount.toPlainString() + " " + ccy);
-        body.put("sync", true);
-        // Suspense balances need to be allowed to go negative until the PB
-        // settlement closes the loop. Same for the per-leg deduction from
-        // a nostro that may not have been pre-funded in dev. Production
-        // will gate this behind suspense balances configured with their own
-        // overdraft limit.
-        body.put("allowOverdraft", true);
+        // Per-row, J-4h.5 enabled. Suspense + nostro may both legitimately
+        // swing negative; the soft cap lives in FxSuspenseLimitMonitor.
+        row.put("allowOverdraft", true);
         Map<String, Object> meta = new LinkedHashMap<>();
         meta.put("kind", "fx_hedge_leg");
         meta.put("pair", pair);
@@ -362,30 +408,13 @@ public class FxHedgeService {
         meta.put("rate", rate.toPlainString());
         meta.put("submittedBy", req.submittedBy);
         meta.put("actionKey", req.actionKey);
-        body.put("metaData", meta);
+        row.put("metaData", meta);
+        return row;
+    }
 
-        try {
-            String resp = http.post()
-                    .uri("/transactions")
-                    .contentType(MediaType.APPLICATION_JSON)
-                    .header("Authorization", "Bearer " + apiKey)
-                    .body(body)
-                    .retrieve()
-                    .body(String.class);
-            JsonNode root = objectMapper.readTree(resp == null ? "{}" : resp);
-            String txnId = root.has("transactionId") ? root.get("transactionId").asText() :
-                    root.has("transaction_id") ? root.get("transaction_id").asText() :
-                            root.has("id") ? root.get("id").asText() : null;
-            if (txnId == null || txnId.isBlank()) {
-                throw new IllegalStateException("ledger leg " + legLabel + " missing transactionId; body=" + resp);
-            }
-            return txnId;
-        } catch (RestClientResponseException e) {
-            String b = e.getResponseBodyAsString();
-            throw new IllegalStateException(
-                    "ledger leg " + legLabel + " HTTP " + e.getStatusCode().value() + ": "
-                            + b.substring(0, Math.min(300, b.length())));
-        }
+    private static String truncate(String s) {
+        if (s == null) return "";
+        return s.length() <= 300 ? s : s.substring(0, 300) + "…";
     }
 
     private void markPosted(Long id, String ledgerTxnId) {

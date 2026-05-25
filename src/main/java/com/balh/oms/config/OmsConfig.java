@@ -6,8 +6,10 @@ import org.springframework.context.annotation.Configuration;
 import java.math.BigDecimal;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
@@ -2198,6 +2200,7 @@ public class OmsConfig {
         private final MarkupOverrides markupOverrides = new MarkupOverrides();
         private final TierKills tierKills = new TierKills();
         private final AutoHedger autoHedger = new AutoHedger();
+        private final Suspense suspense = new Suspense();
 
         public MarkupOverrides getMarkupOverrides() {
             return markupOverrides;
@@ -2209,6 +2212,10 @@ public class OmsConfig {
 
         public AutoHedger getAutoHedger() {
             return autoHedger;
+        }
+
+        public Suspense getSuspense() {
+            return suspense;
         }
 
         /**
@@ -2464,6 +2471,104 @@ public class OmsConfig {
 
         public void setStubMidsAllowed(boolean stubMidsAllowed) {
             this.stubMidsAllowed = stubMidsAllowed;
+        }
+    }
+
+    /**
+     * FX suspense exposure visibility + limit monitoring (§11.5 tail). Suspense
+     * balances ({@code @FX-Suspense-<CCY>}) hold open FX position pending
+     * prime-broker settlement; they're the indicator side of cross-currency
+     * customer cash legs and FX hedge legs. Operators need them surfaced
+     * because hedge submissions fail at the suspense leg when cumulative
+     * customer flow has pushed it past the ledger's overdraft tolerance.
+     *
+     * <p>Read by {@link com.balh.oms.fx.FxSuspenseSnapshotService} (panel) and
+     * {@link com.balh.oms.fx.FxSuspenseLimitMonitor} (gauge + alert source).
+     */
+    public static class Suspense {
+        /**
+         * CSV of currencies whose {@code @FX-Suspense-<CCY>} balance is
+         * monitored (env {@code OMS_FX_SUSPENSE_CURRENCIES_CSV}). Empty
+         * → snapshot is 503 and monitor stays idle.
+         */
+        private String currenciesCsv = "";
+
+        /**
+         * Optional per-currency absolute-value soft limit
+         * (env {@code OMS_FX_SUSPENSE_MAX_ABS_CSV}, e.g.
+         * {@code USD=1000000,EUR=1000000,GBP=500000}). Triggers
+         * {@code overLimit=true} in the snapshot and increments
+         * {@code oms_fx_suspense_over_limit_total{currency}} when crossed.
+         * A currency without a limit is reported but never marked over.
+         */
+        private String maxAbsCsv = "";
+
+        /**
+         * When {@code true} the {@code @Scheduled} monitor polls suspense
+         * balances and publishes gauges + over-limit counters. Off by default
+         * so a stack without {@code currenciesCsv} configured stays quiet.
+         */
+        private boolean limitMonitorEnabled = false;
+
+        /** Monitor poll cadence; clamped to ≥10s. */
+        private long limitMonitorPollIntervalMs = 30_000L;
+
+        public String getCurrenciesCsv() { return currenciesCsv; }
+
+        public void setCurrenciesCsv(String csv) {
+            this.currenciesCsv = csv == null ? "" : csv;
+        }
+
+        public String getMaxAbsCsv() { return maxAbsCsv; }
+
+        public void setMaxAbsCsv(String csv) {
+            this.maxAbsCsv = csv == null ? "" : csv;
+        }
+
+        public boolean isLimitMonitorEnabled() { return limitMonitorEnabled; }
+
+        public void setLimitMonitorEnabled(boolean v) { this.limitMonitorEnabled = v; }
+
+        public long getLimitMonitorPollIntervalMs() { return limitMonitorPollIntervalMs; }
+
+        public void setLimitMonitorPollIntervalMs(long v) {
+            this.limitMonitorPollIntervalMs = Math.max(10_000L, v);
+        }
+
+        public List<String> currencies() {
+            if (currenciesCsv == null || currenciesCsv.isBlank()) {
+                return List.of();
+            }
+            return Arrays.stream(currenciesCsv.split(","))
+                    .map(String::trim)
+                    .filter(s -> !s.isEmpty())
+                    .map(String::toUpperCase)
+                    .toList();
+        }
+
+        /**
+         * Parse {@link #maxAbsCsv} into a {@code currency → absolute-limit} map.
+         * Malformed entries (no {@code =}, blank key/value, unparseable number)
+         * are skipped silently so a single bad pair can't kill the snapshot.
+         */
+        public Map<String, BigDecimal> maxAbsByCurrency() {
+            if (maxAbsCsv == null || maxAbsCsv.isBlank()) {
+                return Map.of();
+            }
+            Map<String, BigDecimal> out = new LinkedHashMap<>();
+            for (String pair : maxAbsCsv.split(",")) {
+                int eq = pair.indexOf('=');
+                if (eq <= 0 || eq == pair.length() - 1) continue;
+                String key = pair.substring(0, eq).trim().toUpperCase();
+                String value = pair.substring(eq + 1).trim();
+                if (key.isEmpty() || value.isEmpty()) continue;
+                try {
+                    out.put(key, new BigDecimal(value));
+                } catch (NumberFormatException ignore) {
+                    // skip malformed
+                }
+            }
+            return out;
         }
     }
 

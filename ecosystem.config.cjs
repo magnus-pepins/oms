@@ -284,6 +284,22 @@ const COMMON_ENV = {
     'balance_e3a2aa4a-ed30-48b6-8480-c4e5e0f1456f,' +
     'balance_885efbde-3b17-41f3-b8ec-b6f9db33afe4',
 
+  // FX-Suspense visibility (mirror of OMS_FX_NOSTRO_BALANCE_IDS_CSV but
+  // resolved by Ledger indicator @FX-Suspense-<CCY> so we don't need to
+  // pin balance ids that the seed script regenerates between rebuilds).
+  // The trading-desk Treasury panel reads these via /api/desk/fx/suspense/snapshot
+  // on whichever role serves /internal/v1/fx (typically ingress).
+  OMS_FX_SUSPENSE_CURRENCIES_CSV: 'USD,EUR,GBP',
+  // Per-currency soft limit; trips overLimit=true in the snapshot,
+  // the OmsFxSuspenseOverLimit Prometheus alert (oms_fx_suspense_alerts),
+  // and increments oms_fx_suspense_over_limit_total{currency}. Bench
+  // sizes — production stacks will tighten these once the PB settlement
+  // loop closes more reliably.
+  OMS_FX_SUSPENSE_MAX_ABS_CSV: 'USD=1000000,EUR=1000000,GBP=500000',
+  // OMS_FX_SUSPENSE_LIMIT_MONITOR_ENABLED is set only on oms-postgres-projector
+  // below — same pattern as OMS_FX_AUTO_HEDGER_ENGINE_ENABLED so the gauges
+  // are published from a single source and don't double-tick.
+
   // Phase 1.5 FX mid subscriber. When 'true', OmsFxMidSubscriber connects to
   // EMQX on EMQX_MQTT_BROKER_URL (defaults to tcp://127.0.0.1:1883) and
   // subscribes to fx/+/+/quote, replacing FxQuoteService.STUB_MIDS with live
@@ -447,6 +463,12 @@ const apps = [
       // Do NOT set on oms-ingress — duplicate ENGINE_ENABLED=true on two JVMs
       // can double-insert recommendations. auto-fire stays off (plan B1.3).
       OMS_FX_AUTO_HEDGER_ENGINE_ENABLED: 'true',
+      // FX-Suspense limit monitor (FxSuspenseLimitMonitor): polls
+      // @FX-Suspense-<CCY> via Ledger and publishes oms_fx_suspense_*
+      // gauges + over-limit counter. Single-source-of-truth pattern —
+      // pinned to this JVM only so we don't double-publish.
+      OMS_FX_SUSPENSE_LIMIT_MONITOR_ENABLED: 'true',
+      OMS_FX_SUSPENSE_LIMIT_MONITOR_POLL_INTERVAL_MS: '30000',
       // Corporate-action processors + record-date snapshot job (Slice 17 / §5.9).
       OMS_CORPORATE_ACTION_PROCESSOR_ENABLED: 'true',
       OMS_CORPORATE_ACTION_RECORD_DATE_SNAPSHOT_JOB_ENABLED: 'true',

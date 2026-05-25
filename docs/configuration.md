@@ -130,6 +130,8 @@ Transport choice vs MQTT: [marketdata-ingestion-path.md](marketdata-ingestion-pa
 | `OMS_CORPORATE_ACTION_INGEST_PAYLOAD_JSON_MAX_CHARS` | `16000` | Max serialized **`payloadJson`** characters on ingest. |
 | `OMS_CORPORATE_ACTION_LIST_MAX_LIMIT` | `200` | Max **`limit`** on **`GET /internal/v1/corporate-action-events`**. |
 | `OMS_CORPORATE_ACTION_LIST_DEFAULT_LIMIT` | `50` | Default page size when **`limit`** is omitted on list. |
+| `OMS_CORPORATE_ACTION_RECORD_DATE_SNAPSHOT_JOB_ENABLED` | `false` | When **`true`**, daily job captures record-date position snapshots for pending voluntary CAs. |
+| `OMS_FX_NETTING_WINDOW_MS` | `300000` | Customer FX flow netting window (§11.5.5); minimum **60000** ms in config clamp. |
 
 ## Desk snapshot (internal — trading desk BFF)
 

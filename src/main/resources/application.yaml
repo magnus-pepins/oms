@@ -292,6 +292,7 @@ oms:
       pricing-tier: ${OMS_FX_AUTO_HEDGER_PRICING_TIER:desk}
       auto-fire-submitter: ${OMS_FX_AUTO_HEDGER_AUTO_FIRE_SUBMITTER:fx-auto-hedger}
       policy-refresh-ms: ${OMS_FX_AUTO_HEDGER_POLICY_REFRESH_MS:60000}
+    netting-window-ms: ${OMS_FX_NETTING_WINDOW_MS:300000}
   corporate-action:
     processor-enabled: ${OMS_CORPORATE_ACTION_PROCESSOR_ENABLED:false}
     processor-interval-ms: ${OMS_CORPORATE_ACTION_PROCESSOR_INTERVAL_MS:60000}

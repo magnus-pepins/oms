@@ -447,6 +447,9 @@ const apps = [
       // Do NOT set on oms-ingress — duplicate ENGINE_ENABLED=true on two JVMs
       // can double-insert recommendations. auto-fire stays off (plan B1.3).
       OMS_FX_AUTO_HEDGER_ENGINE_ENABLED: 'true',
+      // Corporate-action processors + record-date snapshot job (Slice 17 / §5.9).
+      OMS_CORPORATE_ACTION_PROCESSOR_ENABLED: 'true',
+      OMS_CORPORATE_ACTION_RECORD_DATE_SNAPSHOT_JOB_ENABLED: 'true',
     },
     ...COMMON_PM2,
   },

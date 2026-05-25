@@ -4,8 +4,8 @@ import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.stereotype.Repository;
 
-import java.time.LocalDate;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.util.List;
 import java.util.Optional;
 
@@ -13,11 +13,17 @@ import java.util.Optional;
 @Repository
 public class CorporateActionEventRepository {
 
-    private static final String INSERT_SQL = """
-            INSERT INTO corporate_action_event (instrument_symbol, action_type, effective_date, payload_json)
-            VALUES (:instrument_symbol, :action_type, CAST(:effective_date AS DATE), CAST(:payload_json AS JSONB))
-            RETURNING id
-            """;
+    private static final String INSERT_WITH_DATES_SQL =
+            """
+                    INSERT INTO corporate_action_event (
+                        instrument_symbol, action_type, effective_date, record_date, payable_date, payload_json
+                    ) VALUES (
+                        :instrument_symbol, :action_type, CAST(:effective_date AS DATE),
+                        CAST(:record_date AS DATE), CAST(:payable_date AS DATE),
+                        CAST(:payload_json AS JSONB)
+                    )
+                    RETURNING id
+                    """;
 
     private static final String INSERT_FROM_BROKER_IF_NEW =
             """
@@ -51,36 +57,37 @@ public class CorporateActionEventRepository {
                     WHERE id = :id AND processed_at IS NULL
                     """;
 
-    /**
-     * {@code FOR UPDATE SKIP LOCKED} — callers must run inside a Spring transaction that spans this fetch and
-     * {@link #markProcessedIfPending(long)} (see {@link CorporateActionProcessorJob}).
-     */
-    private static final String SELECT_UNPROCESSED_SQL = """
-            SELECT id, instrument_symbol, action_type, effective_date::text AS effective_date
-            FROM corporate_action_event
-            WHERE processed_at IS NULL
-            ORDER BY id ASC
-            LIMIT :limit
-            FOR UPDATE SKIP LOCKED
-            """;
+    private static final String SELECT_UNPROCESSED_SQL =
+            """
+                    SELECT id, instrument_symbol, action_type, effective_date::text AS effective_date
+                    FROM corporate_action_event
+                    WHERE processed_at IS NULL
+                    ORDER BY id ASC
+                    LIMIT :limit
+                    FOR UPDATE SKIP LOCKED
+                    """;
 
-    private static final String MARK_PROCESSED_SQL = """
-            UPDATE corporate_action_event SET processed_at = NOW() WHERE id = :id AND processed_at IS NULL
-            """;
+    private static final String MARK_PROCESSED_SQL =
+            """
+                    UPDATE corporate_action_event SET processed_at = NOW() WHERE id = :id AND processed_at IS NULL
+                    """;
 
-    private static final String SELECT_PAGE_SQL = """
-            SELECT id, instrument_symbol, action_type, effective_date::text AS effective_date,
-                   created_at, processed_at
-            FROM corporate_action_event
-            ORDER BY id DESC
-            LIMIT :limit OFFSET :offset
-            """;
+    private static final String SELECT_PAGE_SQL =
+            """
+                    SELECT id, instrument_symbol, action_type, effective_date::text AS effective_date,
+                           created_at, processed_at
+                    FROM corporate_action_event
+                    ORDER BY id DESC
+                    LIMIT :limit OFFSET :offset
+                    """;
 
-    private static final String SELECT_BY_ID_SQL = """
-            SELECT id, instrument_symbol, action_type, effective_date::text AS effective_date,
-                   payload_json::text AS payload_json, created_at, processed_at
-            FROM corporate_action_event WHERE id = :id
-            """;
+    private static final String SELECT_BY_ID_SQL =
+            """
+                    SELECT id, instrument_symbol, action_type, effective_date::text AS effective_date,
+                           payload_json::text AS payload_json, record_date, payable_date,
+                           created_at, processed_at
+                    FROM corporate_action_event WHERE id = :id
+                    """;
 
     private final NamedParameterJdbcTemplate jdbc;
 
@@ -89,13 +96,29 @@ public class CorporateActionEventRepository {
     }
 
     public long insert(String instrumentSymbol, String actionType, LocalDate effectiveDate, String payloadJson) {
+        return insert(instrumentSymbol, actionType, effectiveDate, null, null, payloadJson);
+    }
+
+    public long insert(
+            String instrumentSymbol,
+            String actionType,
+            LocalDate effectiveDate,
+            LocalDate recordDate,
+            LocalDate payableDate,
+            String payloadJson) {
         List<Long> ids =
                 jdbc.query(
-                        INSERT_SQL,
+                        INSERT_WITH_DATES_SQL,
                         new MapSqlParameterSource()
                                 .addValue("instrument_symbol", instrumentSymbol)
                                 .addValue("action_type", actionType)
                                 .addValue("effective_date", effectiveDate.toString())
+                                .addValue(
+                                        "record_date",
+                                        recordDate == null ? null : recordDate.toString())
+                                .addValue(
+                                        "payable_date",
+                                        payableDate == null ? null : payableDate.toString())
                                 .addValue("payload_json", payloadJson),
                         (rs, rowNum) -> rs.getLong("id"));
         if (ids.isEmpty()) {
@@ -104,7 +127,6 @@ public class CorporateActionEventRepository {
         return ids.getFirst();
     }
 
-    /** Idempotent broker-file apply (gap plan §5.9). Returns empty when broker event already ingested. */
     public Optional<Long> insertFromBrokerIfNew(
             String brokerId,
             String brokerEventId,
@@ -132,7 +154,6 @@ public class CorporateActionEventRepository {
         return ids.isEmpty() ? Optional.empty() : Optional.of(ids.getFirst());
     }
 
-    /** Backwards-compatible broker insert without record/payable dates. */
     public Optional<Long> insertFromBrokerIfNew(
             String brokerId,
             String brokerEventId,
@@ -182,9 +203,6 @@ public class CorporateActionEventRepository {
         jdbc.update(MARK_PROCESSING_ERROR, new MapSqlParameterSource("id", id).addValue("error", err));
     }
 
-    /**
-     * @return 1 if the row was newly marked processed, 0 if already processed or missing.
-     */
     public int markProcessedIfPending(long id) {
         return jdbc.update(MARK_PROCESSED_SQL, new MapSqlParameterSource("id", id));
     }
@@ -203,6 +221,8 @@ public class CorporateActionEventRepository {
             String actionType,
             String effectiveDate,
             String payloadJson,
+            LocalDate recordDate,
+            LocalDate payableDate,
             Instant createdAt,
             Instant processedAt) {}
 
@@ -229,12 +249,16 @@ public class CorporateActionEventRepository {
                         new MapSqlParameterSource("id", id),
                         (rs, rowNum) -> {
                             var proc = rs.getTimestamp("processed_at");
+                            java.sql.Date recordDate = rs.getDate("record_date");
+                            java.sql.Date payableDate = rs.getDate("payable_date");
                             return new DetailRow(
                                     rs.getLong("id"),
                                     rs.getString("instrument_symbol"),
                                     rs.getString("action_type"),
                                     rs.getString("effective_date"),
                                     rs.getString("payload_json"),
+                                    recordDate == null ? null : recordDate.toLocalDate(),
+                                    payableDate == null ? null : payableDate.toLocalDate(),
                                     rs.getTimestamp("created_at").toInstant(),
                                     proc == null ? null : proc.toInstant());
                         });

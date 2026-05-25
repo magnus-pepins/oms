@@ -14,9 +14,18 @@ import java.util.Map;
 public class FxNostroSnapshotController {
 
     private final FxNostroSnapshotService fxNostroSnapshotService;
+    private final FxNostroCorrespondentService correspondentService;
 
-    public FxNostroSnapshotController(FxNostroSnapshotService fxNostroSnapshotService) {
+    public FxNostroSnapshotController(
+            FxNostroSnapshotService fxNostroSnapshotService,
+            FxNostroCorrespondentService correspondentService) {
         this.fxNostroSnapshotService = fxNostroSnapshotService;
+        this.correspondentService = correspondentService;
+    }
+
+    @GetMapping("/scale/status")
+    public ResponseEntity<Map<String, Object>> scaleStatus() {
+        return ResponseEntity.ok(correspondentService.status());
     }
 
     @GetMapping("/nostro/snapshot")

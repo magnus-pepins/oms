@@ -36,7 +36,13 @@ public class CorporateActionEventsController {
         this.objectMapper = objectMapper;
     }
 
-    public record IngestRequest(String instrumentSymbol, String actionType, String effectiveDate, Map<String, Object> payloadJson) {}
+    public record IngestRequest(
+            String instrumentSymbol,
+            String actionType,
+            String effectiveDate,
+            String recordDate,
+            String payableDate,
+            Map<String, Object> payloadJson) {}
 
     public record IngestResponse(long id) {}
 
@@ -81,6 +87,18 @@ public class CorporateActionEventsController {
         } catch (Exception e) {
             return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(Map.of("error", "invalid_effective_date"));
         }
+        LocalDate recordDate = null;
+        LocalDate payableDate = null;
+        try {
+            if (body.recordDate() != null && !body.recordDate().isBlank()) {
+                recordDate = LocalDate.parse(body.recordDate());
+            }
+            if (body.payableDate() != null && !body.payableDate().isBlank()) {
+                payableDate = LocalDate.parse(body.payableDate());
+            }
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(Map.of("error", "invalid_record_or_payable_date"));
+        }
         JsonNode payload =
                 body.payloadJson() == null
                         ? objectMapper.createObjectNode()
@@ -94,7 +112,14 @@ public class CorporateActionEventsController {
         if (payloadText.length() > ca.getIngestPayloadJsonMaxChars()) {
             return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(Map.of("error", "payload_json_too_large"));
         }
-        long id = repository.insert(body.instrumentSymbol().trim(), body.actionType().trim(), effective, payloadText);
+        long id =
+                repository.insert(
+                        body.instrumentSymbol().trim(),
+                        body.actionType().trim(),
+                        effective,
+                        recordDate,
+                        payableDate,
+                        payloadText);
         return ResponseEntity.status(HttpStatus.CREATED).body(new IngestResponse(id));
     }
 }

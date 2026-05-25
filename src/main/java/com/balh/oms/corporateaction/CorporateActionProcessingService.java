@@ -40,6 +40,7 @@ public class CorporateActionProcessingService {
     private final CorporateActionRecordDateSnapshotService recordDateSnapshots;
     private final CorporateActionElectionService elections;
     private final CorporateActionElectionRepository electionRepository;
+    private final CorporateActionWithholdingResolver withholdingResolver;
     private final ObjectMapper objectMapper;
     private final OmsConfig config;
 
@@ -49,6 +50,7 @@ public class CorporateActionProcessingService {
             CorporateActionRecordDateSnapshotService recordDateSnapshots,
             CorporateActionElectionService elections,
             CorporateActionElectionRepository electionRepository,
+            CorporateActionWithholdingResolver withholdingResolver,
             ObjectMapper objectMapper,
             OmsConfig config) {
         this.impacts = impacts;
@@ -56,6 +58,7 @@ public class CorporateActionProcessingService {
         this.recordDateSnapshots = recordDateSnapshots;
         this.elections = elections;
         this.electionRepository = electionRepository;
+        this.withholdingResolver = withholdingResolver;
         this.objectMapper = objectMapper;
         this.config = config;
     }
@@ -98,7 +101,7 @@ public class CorporateActionProcessingService {
         for (CorporateActionRecordDateSnapshotService.ResolvedHolder holder : holders) {
             BigDecimal gross =
                     holder.quantitySettled().multiply(dividendPerShare).setScale(MONEY_SCALE, RoundingMode.HALF_UP);
-            BigDecimal withholding = withholdingAmount(gross, payload);
+            BigDecimal withholding = withholdingResolver.resolve(gross, payload, holder.accountId());
             BigDecimal net = gross.subtract(withholding).setScale(MONEY_SCALE, RoundingMode.HALF_UP);
             impacts.insertEntitlement(
                     row.id(),
@@ -296,10 +299,30 @@ public class CorporateActionProcessingService {
             BigDecimal before = holder.quantitySettled();
             BigDecimal after =
                     before.multiply(exchangeRatio).setScale(10, RoundingMode.HALF_UP);
+            BigDecimal parentCost = investedAmount(holder.accountId(), oldSymbol, before);
+            var costSplit =
+                    CorporateActionCostBasisAllocator.merger(parentCost, before, after, payload);
             positions.applyCorporateActionZeroOut(holder.accountId(), oldSymbol, custody);
             positions.applyCorporateActionCreditPosition(holder.accountId(), survivorSymbol, custody, after);
             impacts.insertEntitlement(row.id(), holder.accountId(), oldSymbol, before, after, null, null);
-            impacts.insertPositionImpact(row.id(), holder.accountId(), survivorSymbol, BigDecimal.ZERO, after);
+            impacts.insertPositionImpactWithCostBasis(
+                    row.id(),
+                    holder.accountId(),
+                    oldSymbol,
+                    before,
+                    BigDecimal.ZERO,
+                    parentCost,
+                    costSplit.parentCostAfter(),
+                    costSplit.method());
+            impacts.insertPositionImpactWithCostBasis(
+                    row.id(),
+                    holder.accountId(),
+                    survivorSymbol,
+                    BigDecimal.ZERO,
+                    after,
+                    null,
+                    costSplit.childCostAfter(),
+                    costSplit.method());
         }
         log.info(
                 "corporate_action MERGER processed id={} {} -> {} holders={}",
@@ -337,11 +360,31 @@ public class CorporateActionProcessingService {
                     parentBefore.multiply(parentRetention).setScale(10, RoundingMode.HALF_UP);
             BigDecimal spunQty =
                     parentBefore.multiply(spinOffRatio).setScale(10, RoundingMode.HALF_UP);
+            BigDecimal parentCost = investedAmount(holder.accountId(), parentSymbol, parentBefore);
+            var costSplit =
+                    CorporateActionCostBasisAllocator.spinOff(
+                            parentCost, parentRetention, spinOffRatio, payload);
             positions.applyCorporateActionSetSettledQuantity(holder.accountId(), parentSymbol, custody, parentAfter);
             positions.applyCorporateActionCreditPosition(holder.accountId(), spunOffSymbol, custody, spunQty);
             impacts.insertEntitlement(row.id(), holder.accountId(), parentSymbol, parentBefore, parentAfter, null, null);
-            impacts.insertPositionImpact(row.id(), holder.accountId(), parentSymbol, parentBefore, parentAfter);
-            impacts.insertPositionImpact(row.id(), holder.accountId(), spunOffSymbol, BigDecimal.ZERO, spunQty);
+            impacts.insertPositionImpactWithCostBasis(
+                    row.id(),
+                    holder.accountId(),
+                    parentSymbol,
+                    parentBefore,
+                    parentAfter,
+                    parentCost,
+                    costSplit.parentCostAfter(),
+                    costSplit.method());
+            impacts.insertPositionImpactWithCostBasis(
+                    row.id(),
+                    holder.accountId(),
+                    spunOffSymbol,
+                    BigDecimal.ZERO,
+                    spunQty,
+                    null,
+                    costSplit.childCostAfter(),
+                    costSplit.method());
         }
         log.info(
                 "corporate_action SPIN_OFF processed id={} parent={} child={} holders={}",
@@ -370,7 +413,7 @@ public class CorporateActionProcessingService {
             if (recoveryPerShare != null && recoveryPerShare.signum() > 0 && before.signum() > 0) {
                 BigDecimal gross =
                         before.multiply(recoveryPerShare).setScale(MONEY_SCALE, RoundingMode.HALF_UP);
-                BigDecimal withholding = withholdingAmount(gross, payload);
+                BigDecimal withholding = withholdingResolver.resolve(gross, payload, holder.accountId());
                 BigDecimal net = gross.subtract(withholding).setScale(MONEY_SCALE, RoundingMode.HALF_UP);
                 impacts.insertCashImpactWithWithholding(
                         row.id(), holder.accountId(), gross, net, withholding, currency, row.payableDate());
@@ -440,6 +483,13 @@ public class CorporateActionProcessingService {
             return ratio;
         }
         return BigDecimal.ONE;
+    }
+
+    private BigDecimal investedAmount(UUID accountId, String symbol, BigDecimal quantity) {
+        return positions
+                .findAverageBuyFillPrice(accountId, symbol)
+                .map(avg -> quantity.multiply(avg).setScale(MONEY_SCALE, RoundingMode.HALF_UP))
+                .orElse(null);
     }
 
     private JsonNode parsePayload(String json) {

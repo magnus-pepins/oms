@@ -586,6 +586,34 @@ public class PositionsRepository {
                                 rs.getBigDecimal("invested_amount")));
     }
 
+    private static final String SELECT_AVG_BUY_FILL_PRICE =
+            """
+            SELECT CASE
+                       WHEN SUM(e.last_quantity) IS NULL OR SUM(e.last_quantity) = 0 THEN NULL
+                       ELSE SUM(e.last_quantity * e.last_price) / SUM(e.last_quantity)
+                   END AS avg_buy_fill_price
+            FROM executions e
+            JOIN orders o ON o.id = e.order_id
+            WHERE o.account_id = :account_id
+              AND o.instrument_symbol = :symbol
+              AND o.side = 'BUY'
+              AND e.exec_type = 'TRADE'
+              AND e.last_price IS NOT NULL
+              AND e.settlement_status NOT IN ('failed')
+            """;
+
+    /** Lifetime volume-weighted average BUY price for corporate-action cost-basis allocation. */
+    public java.util.Optional<BigDecimal> findAverageBuyFillPrice(UUID accountId, String symbol) {
+        BigDecimal avg =
+                jdbc.queryForObject(
+                        SELECT_AVG_BUY_FILL_PRICE,
+                        new MapSqlParameterSource()
+                                .addValue("account_id", accountId)
+                                .addValue("symbol", symbol.trim().toUpperCase(java.util.Locale.ROOT)),
+                        BigDecimal.class);
+        return java.util.Optional.ofNullable(avg);
+    }
+
     /** Read-side row for {@link #findByAccountId(UUID)}. */
     public record PositionRow(
             String instrumentSymbol,

@@ -21,17 +21,6 @@ public class CorporateActionImpactRepository {
                     ON CONFLICT (corporate_action_event_id, account_id) DO NOTHING
                     """;
 
-    private static final String INSERT_POSITION_IMPACT =
-            """
-                    INSERT INTO corporate_action_position_impact (
-                        corporate_action_event_id, account_id, instrument_symbol,
-                        quantity_before, quantity_after
-                    ) VALUES (
-                        :eventId, :accountId, :symbol, :qtyBefore, :qtyAfter
-                    )
-                    ON CONFLICT (corporate_action_event_id, account_id) DO NOTHING
-                    """;
-
     private static final String INSERT_CASH_IMPACT =
             """
                     INSERT INTO corporate_action_cash_impact (
@@ -75,14 +64,40 @@ public class CorporateActionImpactRepository {
             String symbol,
             BigDecimal qtyBefore,
             BigDecimal qtyAfter) {
+        return insertPositionImpactWithCostBasis(
+                eventId, accountId, symbol, qtyBefore, qtyAfter, null, null, null);
+    }
+
+    public int insertPositionImpactWithCostBasis(
+            long eventId,
+            java.util.UUID accountId,
+            String symbol,
+            BigDecimal qtyBefore,
+            BigDecimal qtyAfter,
+            BigDecimal costBasisBefore,
+            BigDecimal costBasisAfter,
+            String costBasisMethod) {
         return jdbc.update(
-                INSERT_POSITION_IMPACT,
+                """
+                        INSERT INTO corporate_action_position_impact (
+                            corporate_action_event_id, account_id, instrument_symbol,
+                            quantity_before, quantity_after,
+                            cost_basis_before, cost_basis_after, cost_basis_method
+                        ) VALUES (
+                            :eventId, :accountId, :symbol, :qtyBefore, :qtyAfter,
+                            :costBefore, :costAfter, :method
+                        )
+                        ON CONFLICT (corporate_action_event_id, account_id, instrument_symbol) DO NOTHING
+                        """,
                 new MapSqlParameterSource()
                         .addValue("eventId", eventId)
                         .addValue("accountId", accountId)
                         .addValue("symbol", symbol)
                         .addValue("qtyBefore", qtyBefore)
-                        .addValue("qtyAfter", qtyAfter));
+                        .addValue("qtyAfter", qtyAfter)
+                        .addValue("costBefore", costBasisBefore)
+                        .addValue("costAfter", costBasisAfter)
+                        .addValue("method", costBasisMethod));
     }
 
     public int insertCashImpact(

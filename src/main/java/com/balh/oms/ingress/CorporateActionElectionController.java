@@ -4,6 +4,8 @@ import com.balh.oms.corporateaction.CorporateActionBrokerElectionExportService;
 import com.balh.oms.corporateaction.CorporateActionElectionRepository;
 import com.balh.oms.corporateaction.CorporateActionElectionService;
 import com.balh.oms.corporateaction.CorporateActionEventRepository;
+import com.balh.oms.corporateaction.CorporateActionRecordDateSnapshotService;
+import java.time.LocalDate;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -32,16 +34,38 @@ public class CorporateActionElectionController {
     private final CorporateActionElectionService electionService;
     private final CorporateActionElectionRepository elections;
     private final CorporateActionBrokerElectionExportService brokerExport;
+    private final CorporateActionRecordDateSnapshotService recordDateSnapshots;
 
     public CorporateActionElectionController(
             CorporateActionEventRepository events,
             CorporateActionElectionService electionService,
             CorporateActionElectionRepository elections,
-            CorporateActionBrokerElectionExportService brokerExport) {
+            CorporateActionBrokerElectionExportService brokerExport,
+            CorporateActionRecordDateSnapshotService recordDateSnapshots) {
         this.events = events;
         this.electionService = electionService;
         this.elections = elections;
         this.brokerExport = brokerExport;
+        this.recordDateSnapshots = recordDateSnapshots;
+    }
+
+    public record CaptureSnapshotResponse(long eventId, int holdersCaptured, String recordDate) {}
+
+    @PostMapping("/{eventId}/record-date-snapshot/capture")
+    public ResponseEntity<CaptureSnapshotResponse> captureRecordDateSnapshot(@PathVariable long eventId) {
+        return events.findById(eventId)
+                .map(
+                        row -> {
+                            LocalDate recordDate =
+                                    row.recordDate() != null ? row.recordDate() : LocalDate.now();
+                            int captured =
+                                    recordDateSnapshots.captureForEvent(
+                                            eventId, row.instrumentSymbol(), recordDate);
+                            return ResponseEntity.ok(
+                                    new CaptureSnapshotResponse(
+                                            eventId, captured, recordDate.toString()));
+                        })
+                .orElseGet(() -> ResponseEntity.notFound().build());
     }
 
     @GetMapping("/{eventId}/elections/export")

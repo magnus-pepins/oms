@@ -70,6 +70,7 @@ public class FxAutoHedger {
     private final OmsConfig omsConfig;
     private final FxAutoHedgerPolicyService policyService;
     private final FxNostroSnapshotService nostroSnapshot;
+    private final FxCustomerFlowNettingService customerFlowNetting;
     private final FxQuoteService quoteService;
     private final ObjectProvider<FxHedgeService> hedgeService;
     private final ObjectMapper objectMapper;
@@ -117,6 +118,7 @@ public class FxAutoHedger {
             OmsConfig omsConfig,
             FxAutoHedgerPolicyService policyService,
             FxNostroSnapshotService nostroSnapshot,
+            FxCustomerFlowNettingService customerFlowNetting,
             FxQuoteService quoteService,
             ObjectProvider<FxHedgeService> hedgeService,
             ObjectMapper objectMapper,
@@ -126,6 +128,7 @@ public class FxAutoHedger {
         this.omsConfig = omsConfig;
         this.policyService = policyService;
         this.nostroSnapshot = nostroSnapshot;
+        this.customerFlowNetting = customerFlowNetting;
         this.quoteService = quoteService;
         this.hedgeService = hedgeService;
         this.objectMapper = objectMapper;
@@ -213,24 +216,34 @@ public class FxAutoHedger {
             OmsConfig.Fx.AutoHedger cfg) {
         BigDecimal current = balances.getOrDefault(r.currency(), BigDecimal.ZERO);
         BigDecimal drift = current.subtract(r.targetBalance()).setScale(AMOUNT_SCALE, RoundingMode.HALF_UP);
-        BigDecimal absDrift = drift.abs();
+        BigDecimal customerFlowNet =
+                customerFlowNetting.signedNetForCurrency(r.currency()).setScale(AMOUNT_SCALE, RoundingMode.HALF_UP);
+        BigDecimal driftAdjusted = drift.subtract(customerFlowNet).setScale(AMOUNT_SCALE, RoundingMode.HALF_UP);
+        BigDecimal absDrift = driftAdjusted.abs();
         updateGauges(r.currency(), current, r.targetBalance());
 
         BigDecimal threshold = effectiveThreshold(r);
         if (absDrift.compareTo(threshold) < 0) {
             belowThresholdCounter.increment();
-            return new TickResult(r.currency(), "below_threshold", drift, null, null);
+            String detail =
+                    customerFlowNet.signum() == 0
+                            ? null
+                            : "rawDrift="
+                                    + drift.toPlainString()
+                                    + " customerFlowNet="
+                                    + customerFlowNet.toPlainString();
+            return new TickResult(r.currency(), "below_threshold", driftAdjusted, null, detail);
         }
         if ("off".equals(r.mode())) {
             // Engine is on, policy is off: just keep emitting drift telemetry.
-            return new TickResult(r.currency(), "policy_off", drift, null, null);
+            return new TickResult(r.currency(), "policy_off", driftAdjusted, null, nettingDetail(drift, customerFlowNet));
         }
 
         Instant now = clock.instant();
         Long last = lastFireMs.get(r.currency());
         if (last != null && now.toEpochMilli() - last < (long) r.cooldownS() * 1000L) {
             cooldownSkipCounter.increment();
-            return new TickResult(r.currency(), "cooldown", drift, null, null);
+            return new TickResult(r.currency(), "cooldown", driftAdjusted, null, nettingDetail(drift, customerFlowNet));
         }
 
         // Side derived from currency position in the pair_route.
@@ -241,7 +254,7 @@ public class FxAutoHedger {
         BigDecimal baseAmount;
         if (r.currency().equals(baseCcy)) {
             // currency is the base — excess base means SELL pair (give up base for quote).
-            side = drift.signum() > 0 ? "SELL" : "BUY";
+            side = driftAdjusted.signum() > 0 ? "SELL" : "BUY";
             baseAmount = absDrift;
         } else if (r.currency().equals(quoteCcy)) {
             // currency is the quote — excess quote means BUY pair (give up quote for base).
@@ -249,13 +262,13 @@ public class FxAutoHedger {
             BigDecimal mid = midRateOrNull(pair);
             if (mid == null || mid.signum() <= 0) {
                 quoteFailuresCounter.increment();
-                return new TickResult(r.currency(), "no_mid_for_quote_side", drift, null,
+                return new TickResult(r.currency(), "no_mid_for_quote_side", driftAdjusted, null,
                         "cannot size base_amount without mid rate for " + pair);
             }
-            side = drift.signum() > 0 ? "BUY" : "SELL";
+            side = driftAdjusted.signum() > 0 ? "BUY" : "SELL";
             baseAmount = absDrift.divide(mid, AMOUNT_SCALE, RoundingMode.HALF_UP);
         } else {
-            return new TickResult(r.currency(), "currency_not_in_pair", drift, null,
+            return new TickResult(r.currency(), "currency_not_in_pair", driftAdjusted, null,
                     r.currency() + " not in pair_route " + pair);
         }
 
@@ -283,7 +296,7 @@ public class FxAutoHedger {
             quote = quoteService.quote(pair, cfg.getPricingTier());
         } catch (RuntimeException e) {
             quoteFailuresCounter.increment();
-            return new TickResult(r.currency(), "quote_failed", drift, null, e.getMessage());
+            return new TickResult(r.currency(), "quote_failed", driftAdjusted, null, e.getMessage());
         }
         BigDecimal rate = new BigDecimal((String) quote.get("BUY".equals(side) ? "ask" : "bid"));
         String quoteId = (String) quote.get("quoteId");
@@ -292,14 +305,14 @@ public class FxAutoHedger {
         // Same currency within one tick second cannot create two rows;
         // the unique index in V52 backstops it.
         String actionKey = "fx-auto-" + r.currency() + "-" + now.getEpochSecond() + "-"
-                + (drift.signum() > 0 ? "excess" : "shortfall");
+                + (driftAdjusted.signum() > 0 ? "excess" : "shortfall");
         long ttlMs = (long) r.cooldownS() * 2L * 1000L;
         Instant expiresAt = now.plus(Math.max(ttlMs, 1_000L), ChronoUnit.MILLIS);
         boolean recCreated = insertRecommendation(
                 actionKey, r.currency(), pair, side, baseAmount, rate, quoteId,
-                drift, r.targetBalance(), current, r.mode(), now, expiresAt);
+                driftAdjusted, r.targetBalance(), current, r.mode(), now, expiresAt);
         if (!recCreated) {
-            return new TickResult(r.currency(), "duplicate_action_key", drift, actionKey, null);
+            return new TickResult(r.currency(), "duplicate_action_key", driftAdjusted, actionKey, null);
         }
         recommendationsCounter.increment();
         lastFireMs.put(r.currency(), now.toEpochMilli());
@@ -311,7 +324,7 @@ public class FxAutoHedger {
                 autoFireFailuresCounter.increment();
                 log.warn("[fx-auto-hedger] auto-mode but FxHedgeService unavailable; recommendation stays unfired actionKey={}",
                         actionKey);
-                return new TickResult(r.currency(), "auto_unavailable", drift, actionKey, "hedge_service_unavailable");
+                return new TickResult(r.currency(), "auto_unavailable", driftAdjusted, actionKey, "hedge_service_unavailable");
             }
             try {
                 FxHedgeService.HedgeRequest req = new FxHedgeService.HedgeRequest(
@@ -324,23 +337,30 @@ public class FxAutoHedger {
                         baseAmount,
                         r.baseNostroId(),
                         r.quoteNostroId(),
-                        "auto-hedge drift=" + drift.toPlainString() + " " + r.currency());
+                        "auto-hedge drift=" + driftAdjusted.toPlainString() + " " + r.currency());
                 Map<String, Object> hedgeRow = svc.submit(req);
                 Object hedgeIdObj = hedgeRow.get("id");
                 if (hedgeIdObj instanceof Number n) {
                     linkAutoFire(actionKey, n.longValue());
                 }
                 autoFiresCounter.increment();
-                return new TickResult(r.currency(), "auto_fired", drift, actionKey, null);
+                return new TickResult(r.currency(), "auto_fired", driftAdjusted, actionKey, null);
             } catch (RuntimeException e) {
                 autoFireFailuresCounter.increment();
                 log.warn("[fx-auto-hedger] auto-fire failed actionKey={} reason={}", actionKey, e.getMessage(), e);
-                return new TickResult(r.currency(), "auto_fire_failed", drift, actionKey, e.getMessage());
+                return new TickResult(r.currency(), "auto_fire_failed", driftAdjusted, actionKey, e.getMessage());
             }
         }
         return new TickResult(r.currency(),
                 "auto".equals(r.mode()) ? "auto_inhibited_by_kill_switch" : "advisory_emitted",
-                drift, actionKey, null);
+                driftAdjusted, actionKey, nettingDetail(drift, customerFlowNet));
+    }
+
+    private static String nettingDetail(BigDecimal rawDrift, BigDecimal customerFlowNet) {
+        if (customerFlowNet == null || customerFlowNet.signum() == 0) {
+            return null;
+        }
+        return "rawDrift=" + rawDrift.toPlainString() + " customerFlowNet=" + customerFlowNet.toPlainString();
     }
 
     private BigDecimal effectiveThreshold(FxAutoHedgerPolicyService.PolicyRow r) {

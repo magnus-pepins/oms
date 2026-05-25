@@ -74,6 +74,17 @@ public class FxCustomerFlowNettingService {
         return buckets.closeExpiredWindows(clock.instant());
     }
 
+    /** Open-window signed net flow for a currency (used by auto-hedger drift adjustment). */
+    public BigDecimal signedNetForCurrency(String currency) {
+        if (!omsConfig.getFx().isCustomerFlowNettingEnabled()) {
+            return BigDecimal.ZERO.setScale(AMOUNT_SCALE, RoundingMode.HALF_UP);
+        }
+        if (currency == null || currency.isBlank()) {
+            return BigDecimal.ZERO.setScale(AMOUNT_SCALE, RoundingMode.HALF_UP);
+        }
+        return buckets.sumSignedNetForCurrency(currency.trim().toUpperCase(Locale.ROOT));
+    }
+
     Instant windowStart(Instant now) {
         long windowMs = omsConfig.getFx().getNettingWindowMs();
         long epochMs = now.toEpochMilli();

@@ -97,4 +97,21 @@ public class FxCustomerFlowNettingRepository {
                         """,
                 new MapSqlParameterSource("now", Timestamp.from(now)));
     }
+
+    /** Signed net customer flow for a currency across open buckets (§11.5.5). */
+    public BigDecimal sumSignedNetForCurrency(String currency) {
+        BigDecimal sum =
+                jdbc.queryForObject(
+                        """
+                                SELECT COALESCE(SUM(
+                                    CASE WHEN base_currency = :ccy THEN net_base_amount ELSE 0 END
+                                  + CASE WHEN quote_currency = :ccy THEN net_quote_amount ELSE 0 END
+                                ), 0)
+                                FROM fx_customer_flow_netting_bucket
+                                WHERE status = 'open'
+                                """,
+                        new MapSqlParameterSource("ccy", currency.trim().toUpperCase()),
+                        BigDecimal.class);
+        return sum == null ? BigDecimal.ZERO : sum;
+    }
 }

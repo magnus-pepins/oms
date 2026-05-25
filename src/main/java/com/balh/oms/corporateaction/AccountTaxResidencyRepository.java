@@ -29,4 +29,18 @@ public class AccountTaxResidencyRepository {
                         (rs, rowNum) -> rs.getString("tax_country"));
         return rows.stream().findFirst();
     }
+
+    public int upsert(UUID accountId, String taxCountry, String source) {
+        return jdbc.update(
+                """
+                        INSERT INTO oms_account_tax_residency (account_id, tax_country, updated_at)
+                        VALUES (:accountId, :taxCountry, NOW())
+                        ON CONFLICT (account_id) DO UPDATE SET
+                            tax_country = EXCLUDED.tax_country,
+                            updated_at = NOW()
+                        """,
+                new MapSqlParameterSource()
+                        .addValue("accountId", accountId)
+                        .addValue("taxCountry", taxCountry.trim().toUpperCase()));
+    }
 }

@@ -64,6 +64,8 @@ class FxAutoHedgerTest {
 
         policy = mock(FxAutoHedgerPolicyService.class);
         nostro = mock(FxNostroSnapshotService.class);
+        FxCustomerFlowNettingService netting = mock(FxCustomerFlowNettingService.class);
+        when(netting.signedNetForCurrency(anyString())).thenReturn(BigDecimal.ZERO);
         quoteService = mock(FxQuoteService.class);
         hedgeService = mock(FxHedgeService.class);
         @SuppressWarnings("unchecked")
@@ -78,6 +80,7 @@ class FxAutoHedgerTest {
                 omsConfig,
                 policy,
                 nostro,
+                netting,
                 quoteService,
                 hedgeProvider,
                 new ObjectMapper(),

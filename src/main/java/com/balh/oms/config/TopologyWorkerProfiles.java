@@ -22,6 +22,10 @@ public final class TopologyWorkerProfiles {
         rejectPair(environment, OmsProfiles.FIX_INGRESS, OmsProfiles.INGRESS_REPLICA);
         rejectPair(environment, OmsProfiles.FIX_INGRESS, OmsProfiles.POSTGRES_PROJECTOR);
         rejectPair(environment, OmsProfiles.FIX_INGRESS, OmsProfiles.FIX_EGRESS);
+        rejectPair(environment, OmsProfiles.VENUE_EGRESS, OmsProfiles.INGRESS_REPLICA);
+        rejectPair(environment, OmsProfiles.VENUE_EGRESS, OmsProfiles.POSTGRES_PROJECTOR);
+        rejectPair(environment, OmsProfiles.VENUE_EGRESS, OmsProfiles.FIX_EGRESS);
+        rejectPair(environment, OmsProfiles.VENUE_EGRESS, OmsProfiles.FIX_INGRESS);
     }
 
     private static void rejectPair(Environment environment, String profileA, String profileB) {

@@ -1,0 +1,85 @@
+syntax = "proto3";
+
+package balh.venue.v1;
+
+option java_multiple_files = true;
+option java_package = "com.balh.venue.grpc.v1";
+option java_outer_classname = "VenueServiceProto";
+
+service VenueOrderService {
+  rpc RouteOrder(RouteOrderRequest) returns (RouteOrderResponse);
+  rpc RouteCancel(RouteCancelRequest) returns (RouteCancelResponse);
+  rpc RouteReplace(RouteReplaceRequest) returns (RouteReplaceResponse);
+  rpc StreamExecutionReports(StreamExecutionReportsRequest) returns (stream ExecutionReport);
+  rpc StreamQuotes(StreamQuotesRequest) returns (stream QuoteUpdate);
+}
+
+message RouteOrderRequest {
+  string oms_order_id = 1;
+  string instrument_symbol = 2;
+  int64 quantity_scaled = 3;
+  int64 limit_price_scaled = 4;
+  int32 side = 5;
+}
+
+message RouteOrderResponse {
+  bool accepted = 1;
+  string reject_reason = 2;
+  ExecutionReport execution_report = 3;
+}
+
+message RouteCancelRequest {
+  string oms_order_id = 1;
+  string instrument_symbol = 2;
+}
+
+message RouteCancelResponse {
+  bool accepted = 1;
+  string reject_reason = 2;
+  ExecutionReport execution_report = 3;
+}
+
+message RouteReplaceRequest {
+  string oms_order_id = 1;
+  string instrument_symbol = 2;
+  int64 new_quantity_scaled = 3;
+  int64 new_limit_price_scaled = 4;
+  int32 side = 5;
+}
+
+message RouteReplaceResponse {
+  bool accepted = 1;
+  string reject_reason = 2;
+  ExecutionReport execution_report = 3;
+}
+
+message StreamExecutionReportsRequest {
+  string consumer_id = 1;
+}
+
+message StreamQuotesRequest {
+  string symbol = 1;
+}
+
+message ExecutionReport {
+  string oms_order_id = 1;
+  string venue_exec_ref = 2;
+  int64 last_qty_scaled = 3;
+  int64 last_px_scaled = 4;
+  int64 venue_ts_nanos = 5;
+  ExecType exec_type = 6;
+}
+
+enum ExecType {
+  EXEC_TYPE_UNSPECIFIED = 0;
+  EXEC_TYPE_TRADE = 1;
+  EXEC_TYPE_CANCEL = 2;
+  EXEC_TYPE_REPLACE = 3;
+}
+
+message QuoteUpdate {
+  string symbol = 1;
+  int64 bid_scaled = 2;
+  int64 ask_scaled = 3;
+  int64 published_at_nanos = 4;
+}

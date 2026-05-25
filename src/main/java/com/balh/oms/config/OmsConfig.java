@@ -37,6 +37,7 @@ public class OmsConfig {
     private final Routing routing = new Routing();
     private final Fix fix = new Fix();
     private final FixIn fixIn = new FixIn();
+    private final Venue venue = new Venue();
     private final Settlement settlement = new Settlement();
     private final Marketdata marketdata = new Marketdata();
     private final CorporateAction corporateAction = new CorporateAction();
@@ -59,6 +60,7 @@ public class OmsConfig {
     public Routing getRouting() { return routing; }
     public Fix getFix() { return fix; }
     public FixIn getFixIn() { return fixIn; }
+    public Venue getVenue() { return venue; }
     public Settlement getSettlement() { return settlement; }
     public Marketdata getMarketdata() { return marketdata; }
     public CorporateAction getCorporateAction() { return corporateAction; }
@@ -974,6 +976,28 @@ public class OmsConfig {
 
         public void setNbboStubAskPrice(BigDecimal nbboStubAskPrice) {
             this.nbboStubAskPrice = nbboStubAskPrice == null ? BigDecimal.ZERO : nbboStubAskPrice;
+        }
+    }
+
+    /** gRPC client settings for {@code oms.routing.backend=internal-venue}. */
+    public static class Venue {
+        private String grpcHost = "127.0.0.1";
+        private int grpcPort = 50051;
+        private String venueId = "balh-internal-venue";
+
+        public String getGrpcHost() { return grpcHost; }
+        public void setGrpcHost(String grpcHost) {
+            this.grpcHost = grpcHost == null || grpcHost.isBlank() ? "127.0.0.1" : grpcHost.trim();
+        }
+
+        public int getGrpcPort() { return grpcPort; }
+        public void setGrpcPort(int grpcPort) {
+            this.grpcPort = grpcPort <= 0 ? 50051 : grpcPort;
+        }
+
+        public String getVenueId() { return venueId; }
+        public void setVenueId(String venueId) {
+            this.venueId = venueId == null || venueId.isBlank() ? "balh-internal-venue" : venueId.trim();
         }
     }
 
@@ -2922,10 +2946,12 @@ public class OmsConfig {
         private final Client client = new Client();
         private final Projector projector = new Projector();
         private final FixEgress fixEgress = new FixEgress();
+        private final VenueEgress venueEgress = new VenueEgress();
 
         public Client getClient() { return client; }
         public Projector getProjector() { return projector; }
         public FixEgress getFixEgress() { return fixEgress; }
+        public VenueEgress getVenueEgress() { return venueEgress; }
 
         /**
          * Phase 3 of the Aeron Cluster substrate plan: configuration for the
@@ -3045,6 +3071,93 @@ public class OmsConfig {
             public long getSessionNotReadyParkNanos() { return sessionNotReadyParkNanos; }
             public void setSessionNotReadyParkNanos(long sessionNotReadyParkNanos) {
                 this.sessionNotReadyParkNanos = Math.max(1_000L, sessionNotReadyParkNanos);
+            }
+
+            public int getCursorFlushEvery() { return cursorFlushEvery; }
+            public void setCursorFlushEvery(int cursorFlushEvery) {
+                this.cursorFlushEvery = Math.max(1, cursorFlushEvery);
+            }
+        }
+
+        /**
+         * Phase 0 of the internal-venue plan: configuration for the {@code oms-venue-egress} JVM.
+         * Same replay shape as {@link FixEgress}; distinct replay stream id so FIX and venue egress
+         * can co-exist on one host during bench.
+         */
+        public static class VenueEgress {
+
+            private static final long DEFAULT_POLL_PARK_NANOS = 1_000_000L;
+            private static final int DEFAULT_FRAGMENT_LIMIT = 64;
+            private static final long DEFAULT_RECORDING_LOOKUP_PARK_MS = 100L;
+            private static final int DEFAULT_REPLAY_STREAM_ID = 4324;
+            private static final int DEFAULT_CURSOR_FLUSH_EVERY = 1;
+
+            private boolean enabled = false;
+            private String aeronDirectory = "";
+            private String archiveControlRequestChannel = "aeron:ipc?term-length=64k";
+            private String archiveControlResponseChannel = "aeron:ipc?term-length=64k";
+            private String replayChannel = "aeron:ipc?term-length=64k";
+            private int replayStreamId = DEFAULT_REPLAY_STREAM_ID;
+            private long pollParkNanos = DEFAULT_POLL_PARK_NANOS;
+            private int fragmentLimit = DEFAULT_FRAGMENT_LIMIT;
+            private long recordingLookupParkMs = DEFAULT_RECORDING_LOOKUP_PARK_MS;
+            private int cursorFlushEvery = DEFAULT_CURSOR_FLUSH_EVERY;
+
+            public boolean isEnabled() { return enabled; }
+            public void setEnabled(boolean enabled) { this.enabled = enabled; }
+
+            public String getAeronDirectory() { return aeronDirectory; }
+            public void setAeronDirectory(String aeronDirectory) {
+                this.aeronDirectory = aeronDirectory == null ? "" : aeronDirectory.trim();
+            }
+
+            public String getArchiveControlRequestChannel() { return archiveControlRequestChannel; }
+            public void setArchiveControlRequestChannel(String archiveControlRequestChannel) {
+                this.archiveControlRequestChannel =
+                        archiveControlRequestChannel == null || archiveControlRequestChannel.isBlank()
+                                ? "aeron:ipc?term-length=64k"
+                                : archiveControlRequestChannel.trim();
+            }
+
+            public String getArchiveControlResponseChannel() { return archiveControlResponseChannel; }
+            public void setArchiveControlResponseChannel(String archiveControlResponseChannel) {
+                this.archiveControlResponseChannel =
+                        archiveControlResponseChannel == null || archiveControlResponseChannel.isBlank()
+                                ? "aeron:ipc?term-length=64k"
+                                : archiveControlResponseChannel.trim();
+            }
+
+            public String getReplayChannel() { return replayChannel; }
+            public void setReplayChannel(String replayChannel) {
+                this.replayChannel =
+                        replayChannel == null || replayChannel.isBlank()
+                                ? "aeron:ipc?term-length=64k"
+                                : replayChannel.trim();
+            }
+
+            public int getReplayStreamId() { return replayStreamId; }
+            public void setReplayStreamId(int replayStreamId) {
+                if (replayStreamId == com.balh.oms.cluster.OmsClusterWireFormat.EVENTS_STREAM_ID) {
+                    throw new IllegalArgumentException(
+                            "oms.cluster.venue-egress.replay-stream-id must differ from EVENTS_STREAM_ID="
+                                    + com.balh.oms.cluster.OmsClusterWireFormat.EVENTS_STREAM_ID);
+                }
+                this.replayStreamId = replayStreamId;
+            }
+
+            public long getPollParkNanos() { return pollParkNanos; }
+            public void setPollParkNanos(long pollParkNanos) {
+                this.pollParkNanos = Math.max(1_000L, pollParkNanos);
+            }
+
+            public int getFragmentLimit() { return fragmentLimit; }
+            public void setFragmentLimit(int fragmentLimit) {
+                this.fragmentLimit = Math.max(1, fragmentLimit);
+            }
+
+            public long getRecordingLookupParkMs() { return recordingLookupParkMs; }
+            public void setRecordingLookupParkMs(long recordingLookupParkMs) {
+                this.recordingLookupParkMs = Math.max(10L, recordingLookupParkMs);
             }
 
             public int getCursorFlushEvery() { return cursorFlushEvery; }

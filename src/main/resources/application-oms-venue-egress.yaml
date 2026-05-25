@@ -1,0 +1,15 @@
+oms:
+  grpc:
+    enabled: false
+  routing:
+    backend: internal-venue
+  venue:
+    grpc-target: ${OMS_VENUE_GRPC_TARGET:localhost:50051}
+  cluster:
+    client:
+      enabled: ${OMS_VENUE_EGRESS_CLUSTER_CLIENT_ENABLED:true}
+    venue-egress:
+      enabled: ${OMS_VENUE_EGRESS_ENABLED:true}
+      replay-stream-id: ${OMS_VENUE_EGRESS_REPLAY_STREAM_ID:4324}
+server:
+  port: ${OMS_VENUE_EGRESS_HTTP_PORT:8095}

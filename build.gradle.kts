@@ -164,6 +164,7 @@ dependencies {
     testImplementation("org.testcontainers:junit-jupiter:1.20.3")
     testImplementation("org.assertj:assertj-core:3.26.3")
     testImplementation("org.awaitility:awaitility:4.2.2")
+    testImplementation("com.balh:balh-venue:0.1.0-SNAPSHOT")
 
     testImplementation("com.google.protobuf:protobuf-java:$protobufJavaVersion")
     // WireMock 3 core does not ship an HTTP server; Jetty 12 extension is required on the test classpath.
@@ -371,6 +372,32 @@ tasks.register<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJarF
 }
 
 tasks.named<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJarFixEgress").configure {
+    shouldRunAfter(tasks.named("bootJar"))
+    duplicatesStrategy = org.gradle.api.file.DuplicatesStrategy.EXCLUDE
+}
+
+/** Phase 0 internal-venue: oms-venue-egress JVM (`application-oms-venue-egress.yaml`). */
+tasks.register<org.springframework.boot.gradle.tasks.run.BootRun>("bootRunVenueEgress") {
+    group = "application"
+    description =
+        "Run OMS with oms-venue-egress profile (cluster→venue gRPC egress; application-oms-venue-egress.yaml)."
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.balh.oms.OmsVenueEgressBootstrap")
+    jvmArgs(lowLatencyJvmModuleOpens)
+}
+
+tasks.register<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJarVenueEgress") {
+    group = "build"
+    description =
+        "Executable JAR for venue-egress entry (Start-Class OmsVenueEgressBootstrap; classifier venue-egress)."
+    mainClass.set("com.balh.oms.OmsVenueEgressBootstrap")
+    archiveClassifier.set("venue-egress")
+    archiveBaseName.set("oms")
+    targetJavaVersion.set(JavaVersion.VERSION_21)
+    classpath = sourceSets["main"].runtimeClasspath
+}
+
+tasks.named<org.springframework.boot.gradle.tasks.bundling.BootJar>("bootJarVenueEgress").configure {
     shouldRunAfter(tasks.named("bootJar"))
     duplicatesStrategy = org.gradle.api.file.DuplicatesStrategy.EXCLUDE
 }

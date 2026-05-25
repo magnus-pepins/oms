@@ -26,13 +26,14 @@ public final class OmsProfiles {
      * {@value #POSTGRES_PROJECTOR}, {@value #FIX_EGRESS}, or {@value #FIX_INGRESS}).
      */
     public static final String ORDER_ACCEPT_PROFILE =
-            "!oms-postgres-projector & !oms-fix-egress & !oms-fix-ingress";
+            "!oms-postgres-projector & !oms-fix-egress & !oms-fix-ingress & !oms-venue-egress";
 
     /**
      * Spring {@code @Profile} expression: JVMs that submit commands through {@code OmsClusterIngressClient}.
      * Superset of {@link #ORDER_ACCEPT_PROFILE}: ingress JVMs offer {@code AcceptOrderCommand} on the HTTP /
-     * gRPC accept paths, and {@value #FIX_EGRESS} offers {@code ApplyExecutionReportCommand} on inbound FIX
-     * execution reports. Excludes pure cluster-internal roles ({@value #POSTGRES_PROJECTOR}) that read state
+     * gRPC accept paths, {@value #FIX_EGRESS} offers {@code ApplyExecutionReportCommand} on inbound FIX
+     * execution reports, and {@value #VENUE_EGRESS} offers the same on inbound venue gRPC fills.
+     * Excludes pure cluster-internal roles ({@value #POSTGRES_PROJECTOR}) that read state
      * from the cluster events recording but never offer commands back.
      */
     public static final String CLUSTER_CLIENT_PROFILE =
@@ -74,4 +75,12 @@ public final class OmsProfiles {
      * constraint).
      */
     public static final String FIX_EGRESS = "oms-fix-egress";
+
+    /**
+     * Venue egress — subscribes to cluster events recording and routes admitted orders to the
+     * in-house venue via gRPC ({@code oms.routing.backend=internal-venue}). Inbound venue fills are
+     * translated to {@code ApplyExecutionReportCommand} exactly like {@code oms-fix-egress} does
+     * for FIX {@code ExecutionReport}.
+     */
+    public static final String VENUE_EGRESS = "oms-venue-egress";
 }

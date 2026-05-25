@@ -123,6 +123,9 @@ public class ReconciliationBreakRepository {
                     WHERE status = :status
                       AND (CAST(:breakType AS TEXT) IS NULL OR break_type = CAST(:breakType AS TEXT))
                       AND (CAST(:severity AS TEXT) IS NULL OR severity = CAST(:severity AS TEXT))
+                      AND (CAST(:accountId AS UUID) IS NULL OR account_id = CAST(:accountId AS UUID))
+                      AND (CAST(:ageGtSeconds AS BIGINT) IS NULL
+                           OR EXTRACT(EPOCH FROM (NOW() - opened_at)) > CAST(:ageGtSeconds AS BIGINT))
                     ORDER BY opened_at DESC, id DESC
                     LIMIT :lim OFFSET :off
                     """;
@@ -208,6 +211,17 @@ public class ReconciliationBreakRepository {
     }
 
     public List<BreakRow> listFiltered(String status, String breakType, String severity, int limit, int offset) {
+        return listFiltered(status, breakType, severity, null, null, limit, offset);
+    }
+
+    public List<BreakRow> listFiltered(
+            String status,
+            String breakType,
+            String severity,
+            UUID accountId,
+            Long ageGtSeconds,
+            int limit,
+            int offset) {
         validateStatus(status);
         validateOptionalBreakType(breakType);
         validateOptionalSeverity(severity);
@@ -219,6 +233,8 @@ public class ReconciliationBreakRepository {
                         .addValue("status", status)
                         .addValue("breakType", normalizedBreakType)
                         .addValue("severity", normalizedSeverity)
+                        .addValue("accountId", accountId)
+                        .addValue("ageGtSeconds", ageGtSeconds)
                         .addValue("lim", limit)
                         .addValue("off", offset),
                 ROW_MAPPER);

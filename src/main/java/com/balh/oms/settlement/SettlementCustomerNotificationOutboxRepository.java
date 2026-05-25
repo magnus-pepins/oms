@@ -68,6 +68,33 @@ public class SettlementCustomerNotificationOutboxRepository {
 
     public record OutboxRow(long id, String notificationType, UUID accountId, String envelopeJson, int attempts) {}
 
+    public record ExecutionNotificationRow(
+            long id, String notificationType, UUID accountId, int attempts, Instant publishedAt) {}
+
+    private static final String LIST_BY_EXECUTION =
+            """
+                    SELECT id, notification_type, account_id, attempts, published_at
+                    FROM settlement_customer_notification_outbox
+                    WHERE execution_id = :executionId
+                    ORDER BY id
+                    LIMIT :lim
+                    """;
+
+    public List<ExecutionNotificationRow> listByExecutionId(long executionId) {
+        return jdbc.query(
+                LIST_BY_EXECUTION,
+                new MapSqlParameterSource().addValue("executionId", executionId).addValue("lim", 20),
+                (rs, rowNum) -> {
+                    Timestamp published = rs.getTimestamp("published_at");
+                    return new ExecutionNotificationRow(
+                            rs.getLong("id"),
+                            rs.getString("notification_type"),
+                            UUID.fromString(rs.getString("account_id")),
+                            rs.getInt("attempts"),
+                            published == null ? null : published.toInstant());
+                });
+    }
+
     public int insertIgnore(
             String notificationType,
             UUID accountId,

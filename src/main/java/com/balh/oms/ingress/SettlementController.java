@@ -31,6 +31,8 @@ import com.balh.oms.settlement.ReconciliationBreakEventRepository;
 import com.balh.oms.settlement.ReconciliationBreakRepository;
 import com.balh.oms.settlement.ReconciliationBreakWorkflowService;
 import com.balh.oms.settlement.SettlementEvidencePackService;
+import com.balh.oms.settlement.SettlementCorrelateExecutionService;
+import com.balh.oms.settlement.SettlementBreakNarrativeService;
 import com.balh.oms.settlement.SettlementCalendarIngestService;
 import com.balh.oms.settlement.SettlementConfirmProcessor;
 import com.balh.oms.settlement.SettlementFileImportBatchRepository;
@@ -324,6 +326,8 @@ public class SettlementController {
     private final SettlementFileImportBatchRepository settlementFileImportBatchRepository;
     private final SettlementTimelineService timelineService;
     private final SettlementEvidencePackService evidencePackService;
+    private final SettlementCorrelateExecutionService correlateExecutionService;
+    private final SettlementBreakNarrativeService breakNarrativeService;
     private final BrokerTradeConfirmIngestService brokerTradeConfirmIngestService;
     private final BrokerTradeConfirmMatcher brokerTradeConfirmMatcher;
     private final BrokerTradeConfirmBatchLifecycleService brokerTradeConfirmBatchLifecycle;
@@ -369,6 +373,8 @@ public class SettlementController {
             SettlementFileImportBatchRepository settlementFileImportBatchRepository,
             SettlementTimelineService timelineService,
             SettlementEvidencePackService evidencePackService,
+            SettlementCorrelateExecutionService correlateExecutionService,
+            SettlementBreakNarrativeService breakNarrativeService,
             LedgerSettlementOutboxRepository ledgerSettlementOutbox,
             BrokerTradeConfirmIngestService brokerTradeConfirmIngestService,
             BrokerTradeConfirmMatcher brokerTradeConfirmMatcher,
@@ -401,6 +407,8 @@ public class SettlementController {
         this.settlementFileImportBatchRepository = settlementFileImportBatchRepository;
         this.timelineService = timelineService;
         this.evidencePackService = evidencePackService;
+        this.correlateExecutionService = correlateExecutionService;
+        this.breakNarrativeService = breakNarrativeService;
         this.ledgerSettlementOutbox = ledgerSettlementOutbox;
         this.brokerTradeConfirmIngestService = brokerTradeConfirmIngestService;
         this.brokerTradeConfirmMatcher = brokerTradeConfirmMatcher;
@@ -543,6 +551,25 @@ public class SettlementController {
     public ResponseEntity<SettlementEvidencePackResponse> getEvidencePack(@PathVariable long executionId) {
         return evidencePackService
                 .load(executionId)
+                .map(ResponseEntity::ok)
+                .orElse(ResponseEntity.notFound().build());
+    }
+
+    /** Cross-system correlation for MCP §10.A. */
+    @GetMapping("/executions/{executionId}/correlate")
+    public ResponseEntity<SettlementCorrelateExecutionResponse> correlateExecution(
+            @PathVariable long executionId) {
+        return correlateExecutionService
+                .correlate(executionId)
+                .map(ResponseEntity::ok)
+                .orElse(ResponseEntity.notFound().build());
+    }
+
+    /** Structured break narrative for MCP §10.A. */
+    @GetMapping("/reconciliation-breaks/{id}/narrative")
+    public ResponseEntity<SettlementBreakNarrativeResponse> getBreakNarrative(@PathVariable long id) {
+        return breakNarrativeService
+                .narrate(id)
                 .map(ResponseEntity::ok)
                 .orElse(ResponseEntity.notFound().build());
     }
@@ -1139,6 +1166,8 @@ public class SettlementController {
             @RequestParam(required = false) String status,
             @RequestParam(required = false) String breakType,
             @RequestParam(required = false) String severity,
+            @RequestParam(required = false) UUID accountId,
+            @RequestParam(required = false) Long ageGtSeconds,
             @RequestParam(required = false) Integer limit,
             @RequestParam(required = false) Integer offset) {
         String st = (status == null || status.isBlank()) ? "open" : status;
@@ -1149,7 +1178,7 @@ public class SettlementController {
         }
         List<ReconciliationBreakRepository.BreakRow> rows;
         try {
-            rows = reconciliationBreaks.listFiltered(st, breakType, severity, lim, off);
+            rows = reconciliationBreaks.listFiltered(st, breakType, severity, accountId, ageGtSeconds, lim, off);
         } catch (IllegalArgumentException e) {
             return ResponseEntity.badRequest().build();
         }

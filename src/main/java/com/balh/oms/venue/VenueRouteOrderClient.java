@@ -52,6 +52,7 @@ public class VenueRouteOrderClient {
                         .setQuantityScaled(ev.quantityScaled())
                         .setLimitPriceScaled(ev.limitPriceScaledOrZero())
                         .setSide(ev.side())
+                        .setCounterpartyId(ev.accountId())
                         .build();
         RouteOrderResponse response = blockingStub.routeOrder(request);
         if (!response.getAccepted()) {

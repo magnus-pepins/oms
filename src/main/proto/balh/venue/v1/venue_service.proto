@@ -20,6 +20,7 @@ message RouteOrderRequest {
   int64 quantity_scaled = 3;
   int64 limit_price_scaled = 4;
   int32 side = 5;
+  string counterparty_id = 6;
 }
 
 message RouteOrderResponse {

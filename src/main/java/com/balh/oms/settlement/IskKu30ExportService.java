@@ -1,12 +1,19 @@
 package com.balh.oms.settlement;
 
+import com.balh.oms.ledger.LedgerIskReadClient;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.LocalDate;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.stereotype.Repository;
@@ -16,6 +23,7 @@ import org.springframework.stereotype.Service;
 @Service
 public class IskKu30ExportService {
 
+    private static final Logger log = LoggerFactory.getLogger(IskKu30ExportService.class);
     private static final int MONEY_SCALE = 2;
 
     private final IskValuationSnapshotRepository snapshots;
@@ -23,6 +31,7 @@ public class IskKu30ExportService {
     private final IskTaxYearExportRepository exports;
     private final IskSchablonTaxService schablonTax;
     private final IskKapitalunderlagDepositService kapitalunderlagDeposits;
+    private final ObjectProvider<LedgerIskReadClient> ledgerIskRead;
     private final ObjectMapper objectMapper;
 
     public IskKu30ExportService(
@@ -31,12 +40,14 @@ public class IskKu30ExportService {
             IskTaxYearExportRepository exports,
             IskSchablonTaxService schablonTax,
             IskKapitalunderlagDepositService kapitalunderlagDeposits,
+            ObjectProvider<LedgerIskReadClient> ledgerIskRead,
             ObjectMapper objectMapper) {
         this.snapshots = snapshots;
         this.taxWrappers = taxWrappers;
         this.exports = exports;
         this.schablonTax = schablonTax;
         this.kapitalunderlagDeposits = kapitalunderlagDeposits;
+        this.ledgerIskRead = ledgerIskRead;
         this.objectMapper = objectMapper;
     }
 
@@ -48,6 +59,7 @@ public class IskKu30ExportService {
     }
 
     public ExportResult buildDraft(int taxYear) {
+        Map<UUID, String> publicAccountNumbers = loadPublicAccountNumbers();
         BigDecimal aggregateKapital = BigDecimal.ZERO;
         BigDecimal aggregateSchablon = BigDecimal.ZERO;
         ArrayNode quarterValues = objectMapper.createArrayNode();
@@ -70,11 +82,13 @@ public class IskKu30ExportService {
         aggregateKu30.set("quarterTotals", quarterValues);
 
         for (OmsAccountTaxWrapperRepository.AccountTaxWrapperRow acct : taxWrappers.listIskAccounts()) {
-            java.util.UUID iskId = acct.iskAccountId() != null ? acct.iskAccountId() : acct.accountId();
+            UUID iskId = acct.iskAccountId() != null ? acct.iskAccountId() : acct.accountId();
             BigDecimal kapital = kapitalunderlagForAccount(iskId, taxYear);
             BigDecimal schablon = schablonTax.schablonintakt(kapital, taxYear);
             aggregateKapital = aggregateKapital.add(kapital);
             aggregateSchablon = aggregateSchablon.add(schablon);
+
+            String publicAccountNumber = publicAccountNumbers.get(iskId);
 
             ObjectNode perAccount = objectMapper.createObjectNode();
             perAccount.put("schemaVersion", 2);
@@ -83,8 +97,11 @@ public class IskKu30ExportService {
             perAccount.put("status", "draft");
             perAccount.put("iskAccountId", iskId.toString());
             perAccount.put("accountId", acct.accountId().toString());
+            if (publicAccountNumber != null && !publicAccountNumber.isBlank()) {
+                perAccount.put("publicAccountNumber", publicAccountNumber);
+            }
             if (acct.ledgerBalanceId() != null) {
-                perAccount.put("publicAccountNumber", acct.ledgerBalanceId());
+                perAccount.put("ledgerBalanceId", acct.ledgerBalanceId());
             }
             perAccount.put("kapitalunderlagSek", kapital.toPlainString());
             perAccount.put("schablonintaktSek", schablon.toPlainString());
@@ -100,7 +117,7 @@ public class IskKu30ExportService {
             exports.upsertDraft(
                     taxYear,
                     iskId,
-                    acct.ledgerBalanceId(),
+                    publicAccountNumber,
                     kapital,
                     schablon,
                     perAccount.toString());
@@ -127,6 +144,47 @@ public class IskKu30ExportService {
                     .orElse(ApproveResult.NOT_FOUND);
         }
         return ApproveResult.APPROVED;
+    }
+
+    /**
+     * Pulls ledger {@code isk_accounts} → {@code (iskAccountId, public_account_number)} into a
+     * map keyed by {@link UUID}. KU30 ruta 817 reads from this map; if the ledger is unreachable
+     * or a row is missing the public number, the per-account JSON simply omits the field rather
+     * than falling back to the internal {@code ledger_balance_id} (which is not a SKV-eligible
+     * identifier).
+     */
+    private Map<UUID, String> loadPublicAccountNumbers() {
+        LedgerIskReadClient client = ledgerIskRead.getIfAvailable();
+        if (client == null) {
+            log.warn("KU30 draft: ledger ISK read client unavailable; public_account_number will be omitted");
+            return Map.of();
+        }
+        try {
+            List<LedgerIskReadClient.IskAccountRow> rows = client.listAccounts();
+            Map<UUID, String> map = new HashMap<>(rows.size() * 2);
+            for (LedgerIskReadClient.IskAccountRow row : rows) {
+                if (row.iskAccountId() == null || row.iskAccountId().isBlank()) {
+                    continue;
+                }
+                if (row.publicAccountNumber() == null || row.publicAccountNumber().isBlank()) {
+                    continue;
+                }
+                try {
+                    map.put(UUID.fromString(row.iskAccountId().trim()), row.publicAccountNumber().trim());
+                } catch (IllegalArgumentException malformed) {
+                    log.warn(
+                            "KU30 draft: skipping malformed ledger iskAccountId '{}': {}",
+                            row.iskAccountId(),
+                            malformed.getMessage());
+                }
+            }
+            return map;
+        } catch (LedgerIskReadClient.LedgerIskReadException e) {
+            log.warn(
+                    "KU30 draft: ledger ISK accounts read failed; public_account_number will be omitted: {}",
+                    e.getMessage());
+            return Map.of();
+        }
     }
 
     private BigDecimal kapitalunderlagForAccount(java.util.UUID iskAccountId, int taxYear) {

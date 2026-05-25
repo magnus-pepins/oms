@@ -81,4 +81,48 @@ public final class RestLedgerIskReadClient implements LedgerIskReadClient {
             throw new LedgerIskReadException("failed to parse ledger ISK deposits: " + e.getMessage(), e);
         }
     }
+
+    @Override
+    public List<IskAccountRow> listAccounts() throws LedgerIskReadException {
+        try {
+            String body =
+                    http.get()
+                            .uri("/internal/v1/isk/accounts")
+                            .header("Authorization", "Bearer " + elevatedBearerToken)
+                            .retrieve()
+                            .body(String.class);
+            return parseAccounts(body);
+        } catch (RestClientResponseException e) {
+            HttpStatusCode status = e.getStatusCode();
+            if (status.value() == 404) {
+                return List.of();
+            }
+            throw new LedgerIskReadException(
+                    "ledger ISK accounts HTTP " + status.value() + ": " + e.getMessage(), e);
+        } catch (Exception e) {
+            throw new LedgerIskReadException("ledger ISK accounts read failed: " + e.getMessage(), e);
+        }
+    }
+
+    private List<IskAccountRow> parseAccounts(String body) throws LedgerIskReadException {
+        try {
+            JsonNode root = objectMapper.readTree(body == null ? "{}" : body);
+            JsonNode accounts = root.get("accounts");
+            if (accounts == null || !accounts.isArray()) {
+                return List.of();
+            }
+            List<IskAccountRow> rows = new ArrayList<>();
+            for (JsonNode node : accounts) {
+                String iskAccountId = node.path("iskAccountId").asText("");
+                if (iskAccountId.isBlank()) {
+                    continue;
+                }
+                String publicAccountNumber = node.path("publicAccountNumber").asText(null);
+                rows.add(new IskAccountRow(iskAccountId, publicAccountNumber));
+            }
+            return rows;
+        } catch (Exception e) {
+            throw new LedgerIskReadException("failed to parse ledger ISK accounts: " + e.getMessage(), e);
+        }
+    }
 }

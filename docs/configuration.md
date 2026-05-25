@@ -152,6 +152,13 @@ Transport choice vs MQTT: [marketdata-ingestion-path.md](marketdata-ingestion-pa
 | `OMS_FX_HEDGE_HOOKS_ENABLED` | `false` | When **`true`**, **`GET /internal/v1/fx/hedge/hooks-status`** returns stub pause/kill-switch JSON and increments **`oms.fx.hedge_hook.probe`**. |
 | `OMS_FX_EOD_FLATTEN_ENABLED` | `false` | When **`true`** with module on, schedules **`FxEodFlattenScheduler`** ticks at `OMS_FX_EOD_FLATTEN_INTERVAL_MS` (finance-gated log only). |
 | `OMS_FX_EOD_FLATTEN_INTERVAL_MS` | `86400000` | Minimum **60000** ms in config clamp; delay between EOD flatten **stub** scheduler invocations. |
+| `OMS_FX_CUSTOMER_QUOTE_PUBLISHER_ENABLED` | `false` | When **`true`**, **`OmsFxCustomerQuotePublisher`** runs on **this JVM only** (typically `oms-postgres-projector`). Ingress returns `enabled: false` on `/internal/v1/fx/customer-quote/*`. |
+| `OMS_FX_AUTO_HEDGER_ENGINE_ENABLED` | `false` | Master switch for the **`FxAutoHedger`** scheduled tick. Enable on **one** JVM (same role as the customer-quote publisher). When **`false`**, ticks still update drift gauges but emit no recommendations. |
+| `OMS_FX_AUTO_HEDGER_AUTO_FIRE_ENABLED` | `false` | Global kill-switch for **`mode=auto`** policies. When **`false`**, auto-mode rows write recommendations only (`auto_inhibited_by_kill_switch`). Flip only after advisory-mode evidence (plan B1.3). |
+| `OMS_FX_AUTO_HEDGER_EVAL_INTERVAL_MS` | `15000` | Drift evaluation cadence (minimum **1000** ms in config clamp). |
+| `OMS_FX_AUTO_HEDGER_PRICING_TIER` | `desk` | Tier passed to **`FxQuoteService.quote`** for engine recommendations (V53 seeds `desk` markups). |
+| `OMS_FX_AUTO_HEDGER_AUTO_FIRE_SUBMITTER` | `fx-auto-hedger` | `submittedBy` on auto-fired **`fx_hedge_actions`** rows. |
+| `OMS_FX_AUTO_HEDGER_POLICY_REFRESH_MS` | `60000` | In-memory cache refresh for **`fx_hedger_policy`** (minimum **5000** ms in config clamp). |
 
 ## FIX (slice 4+)
 

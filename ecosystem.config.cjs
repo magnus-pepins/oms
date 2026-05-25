@@ -443,6 +443,10 @@ const apps = [
       // §8.3 — tier MQTT publisher runs on this role ONLY (single instance).
       OMS_FX_CUSTOMER_QUOTE_PUBLISHER_ENABLED: 'true',
       OMS_FX_CUSTOMER_QUOTE_PUBLISHER_TIERS: 'basic,premium,elite,admin,business',
+      // Auto-hedger engine (plan B1): advisory drift + recommendations only.
+      // Do NOT set on oms-ingress — duplicate ENGINE_ENABLED=true on two JVMs
+      // can double-insert recommendations. auto-fire stays off (plan B1.3).
+      OMS_FX_AUTO_HEDGER_ENGINE_ENABLED: 'true',
     },
     ...COMMON_PM2,
   },

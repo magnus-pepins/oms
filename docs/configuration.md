@@ -132,6 +132,8 @@ Transport choice vs MQTT: [marketdata-ingestion-path.md](marketdata-ingestion-pa
 | `OMS_CORPORATE_ACTION_LIST_DEFAULT_LIMIT` | `50` | Default page size when **`limit`** is omitted on list. |
 | `OMS_CORPORATE_ACTION_RECORD_DATE_SNAPSHOT_JOB_ENABLED` | `false` | When **`true`**, daily job captures record-date position snapshots for pending voluntary CAs. |
 | `OMS_FX_NETTING_WINDOW_MS` | `300000` | Customer FX flow netting window (§11.5.5); minimum **60000** ms in config clamp. |
+| `OMS_FX_CUSTOMER_FLOW_NETTING_ENABLED` | `true` | When **`true`**, cross-currency BUY accepts with a locked quote aggregate into `fx_customer_flow_netting_bucket`. |
+| `OMS_FX_CUSTOMER_FLOW_NETTING_CLOSE_INTERVAL_MS` | `60000` | Scheduler interval for closing expired open netting buckets. |
 
 ## Desk snapshot (internal — trading desk BFF)
 

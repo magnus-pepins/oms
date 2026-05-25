@@ -2154,6 +2154,8 @@ public class OmsConfig {
         private long eodFlattenIntervalMs = 86_400_000L;
         /** Customer FX netting window before nostro hedge aggregation (§11.5.5). Default 5 min. */
         private long nettingWindowMs = 300_000L;
+        /** When true, cross-currency order accepts aggregate into {@code fx_customer_flow_netting_bucket}. */
+        private boolean customerFlowNettingEnabled = true;
         /**
          * §8.4 quote-lock at order accept. When {@code true}, the ingress
          * pipeline recalls {@code CreateOrderRequest.fxQuoteId} via
@@ -2426,6 +2428,14 @@ public class OmsConfig {
 
         public void setNettingWindowMs(long nettingWindowMs) {
             this.nettingWindowMs = Math.max(60_000L, nettingWindowMs);
+        }
+
+        public boolean isCustomerFlowNettingEnabled() {
+            return customerFlowNettingEnabled;
+        }
+
+        public void setCustomerFlowNettingEnabled(boolean customerFlowNettingEnabled) {
+            this.customerFlowNettingEnabled = customerFlowNettingEnabled;
         }
 
         public boolean isAcceptUseQuoterEnabled() {

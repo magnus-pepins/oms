@@ -9,6 +9,7 @@ import com.balh.oms.cluster.OrderRejectedEvent;
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.domain.Order;
 import com.balh.oms.domain.Side;
+import com.balh.oms.fx.FxCustomerFlowNettingService;
 import com.balh.oms.fx.FxQuoteService;
 import com.balh.oms.ledger.LedgerBalanceClient;
 import com.balh.oms.ledger.LedgerInflightCoalescer;
@@ -87,6 +88,9 @@ class OrderIngressServiceClusterGateTest {
         ObjectProvider<FxQuoteService> fxQuoteService =
                 (ObjectProvider<FxQuoteService>) mock(ObjectProvider.class);
         when(fxQuoteService.getIfAvailable()).thenReturn(null);
+        ObjectProvider<FxCustomerFlowNettingService> customerFlowNetting =
+                (ObjectProvider<FxCustomerFlowNettingService>) mock(ObjectProvider.class);
+        when(customerFlowNetting.getIfAvailable()).thenReturn(null);
 
         // Phase 4 Tier 2.5 phase D-9: OrderIngressService no longer depends on
         // LedgerInflightOutboxRepository or ObjectMapper — the BUY-async ledger_inflight_outbox
@@ -106,6 +110,7 @@ class OrderIngressServiceClusterGateTest {
                 ledgerInflightCoalescer,
                 ledgerBalance,
                 fxQuoteService,
+                customerFlowNetting,
                 new SimpleMeterRegistry(),
                 orderControlAdmission,
                 router);

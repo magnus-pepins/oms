@@ -293,6 +293,9 @@ oms:
       auto-fire-submitter: ${OMS_FX_AUTO_HEDGER_AUTO_FIRE_SUBMITTER:fx-auto-hedger}
       policy-refresh-ms: ${OMS_FX_AUTO_HEDGER_POLICY_REFRESH_MS:60000}
     netting-window-ms: ${OMS_FX_NETTING_WINDOW_MS:300000}
+    customer-flow-netting-enabled: ${OMS_FX_CUSTOMER_FLOW_NETTING_ENABLED:true}
+    customer-flow-netting:
+      close-interval-ms: ${OMS_FX_CUSTOMER_FLOW_NETTING_CLOSE_INTERVAL_MS:60000}
   corporate-action:
     processor-enabled: ${OMS_CORPORATE_ACTION_PROCESSOR_ENABLED:false}
     processor-interval-ms: ${OMS_CORPORATE_ACTION_PROCESSOR_INTERVAL_MS:60000}

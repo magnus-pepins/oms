@@ -81,4 +81,31 @@ public class FxNostroCorrespondentRepository {
                                 rs.getInt("priority"),
                                 rs.getString("status")));
     }
+
+    public int upsert(
+            String currency,
+            String correspondentCode,
+            String ledgerBalanceId,
+            int priority,
+            String status) {
+        return jdbc.update(
+                """
+                        INSERT INTO fx_nostro_correspondent (
+                            currency, correspondent_code, ledger_balance_id, priority, status, updated_at
+                        ) VALUES (
+                            :currency, :code, :balanceId, :priority, :status, NOW()
+                        )
+                        ON CONFLICT (currency, correspondent_code) DO UPDATE SET
+                            ledger_balance_id = EXCLUDED.ledger_balance_id,
+                            priority = EXCLUDED.priority,
+                            status = EXCLUDED.status,
+                            updated_at = NOW()
+                        """,
+                new MapSqlParameterSource()
+                        .addValue("currency", currency.trim().toUpperCase())
+                        .addValue("code", correspondentCode.trim())
+                        .addValue("balanceId", ledgerBalanceId.trim())
+                        .addValue("priority", priority)
+                        .addValue("status", status.trim().toLowerCase()));
+    }
 }

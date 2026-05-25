@@ -10,6 +10,7 @@ import com.balh.oms.domain.Order;
 import com.balh.oms.domain.OrderStatus;
 import com.balh.oms.domain.RejectCode;
 import com.balh.oms.domain.ShardKey;
+import com.balh.oms.fx.FxCustomerFlowNettingService;
 import com.balh.oms.fx.FxQuoteService;
 import com.balh.oms.observability.PiiHash;
 import com.balh.oms.observability.metrics.OmsPipelineMetrics;
@@ -32,6 +33,7 @@ import org.springframework.stereotype.Service;
 import java.math.BigDecimal;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -111,6 +113,7 @@ public class OrderIngressService {
      * stacks) still construct cleanly.
      */
     private final ObjectProvider<FxQuoteService> fxQuoteService;
+    private final ObjectProvider<FxCustomerFlowNettingService> customerFlowNetting;
     private final MeterRegistry meterRegistry;
     private final OrderControlAdmission orderControlAdmission;
     /**
@@ -130,6 +133,7 @@ public class OrderIngressService {
             ObjectProvider<LedgerInflightCoalescer> ledgerInflightCoalescer,
             ObjectProvider<LedgerBalanceClient> ledgerBalanceClient,
             ObjectProvider<FxQuoteService> fxQuoteService,
+            ObjectProvider<FxCustomerFlowNettingService> customerFlowNetting,
             MeterRegistry meterRegistry,
             OrderControlAdmission orderControlAdmission,
             OmsClusterShardRouter clusterShardRouter) {
@@ -140,6 +144,7 @@ public class OrderIngressService {
         this.ledgerInflightCoalescer = ledgerInflightCoalescer;
         this.ledgerBalanceClient = ledgerBalanceClient;
         this.fxQuoteService = fxQuoteService;
+        this.customerFlowNetting = customerFlowNetting;
         this.meterRegistry = meterRegistry;
         this.orderControlAdmission = orderControlAdmission;
         this.clusterShardRouter = clusterShardRouter;
@@ -226,7 +231,7 @@ public class OrderIngressService {
             //   3. Aeron cluster admit (CompletableFuture wait; pulled out of tx in D-1).
             // All can fail and short-circuit before any Postgres conn is acquired.
             maybeVerifyLedgerBalanceBinding(req);
-            maybeRecallFxQuoteOrReject(req);
+            Optional<FxQuoteService.CachedQuote> lockedQuote = maybeRecallFxQuoteOrReject(req);
 
             UUID id = UUID.randomUUID();
             Instant now = Instant.now();
@@ -266,6 +271,7 @@ public class OrderIngressService {
             // from the cluster's authoritative OrderAdmittedEvent. No Postgres I/O on the
             // hot path for the BUY-async branch.
             maybePlaceBuyLedgerInflightHold(order, req);
+            lockedQuote.ifPresent(cached -> maybeRecordCustomerFxFlow(req, cached));
 
             OmsPipelineMetrics.finishIngressAccept(meterRegistry, ingressSample, "created");
             return new IngressResult(order, true);
@@ -458,12 +464,12 @@ public class OrderIngressService {
      * (= single-currency order), this method is a no-op so the legacy path
      * stays byte-identical.
      */
-    private void maybeRecallFxQuoteOrReject(CreateOrderRequest req) {
+    private Optional<FxQuoteService.CachedQuote> maybeRecallFxQuoteOrReject(CreateOrderRequest req) {
         if (!config.getFx().isAcceptUseQuoterEnabled()) {
-            return;
+            return Optional.empty();
         }
         if (req.fxQuoteId() == null) {
-            return;
+            return Optional.empty();
         }
         FxQuoteService svc = fxQuoteService.getIfAvailable();
         if (svc == null) {
@@ -530,6 +536,30 @@ public class OrderIngressService {
                                 + " drifts from locked rate (expected " + expected.toPlainString()
                                 + " ± " + tolerance.toPlainString() + " at " + bps + " bps)");
             }
+        }
+        return Optional.of(cached);
+    }
+
+    private void maybeRecordCustomerFxFlow(CreateOrderRequest req, FxQuoteService.CachedQuote cached) {
+        if (req.side() != Side.BUY || req.cashHoldAmount() == null) {
+            return;
+        }
+        FxCustomerFlowNettingService netting = customerFlowNetting.getIfAvailable();
+        if (netting == null) {
+            return;
+        }
+        if (req.quantity() == null || req.limitPrice() == null) {
+            return;
+        }
+        try {
+            BigDecimal quoteTradeNotional = req.quantity().multiply(req.limitPrice());
+            netting.recordOrderAcceptFlow(cached.pair(), req.cashHoldAmount(), quoteTradeNotional);
+        } catch (RuntimeException e) {
+            log.warn(
+                    "[fx-netting] record skipped idempotencyKey={} pair={} reason={}",
+                    req.clientIdempotencyKey(),
+                    cached.pair(),
+                    e.getMessage());
         }
     }
 

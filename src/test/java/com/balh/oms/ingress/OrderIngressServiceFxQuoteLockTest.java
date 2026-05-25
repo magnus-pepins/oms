@@ -8,6 +8,7 @@ import com.balh.oms.cluster.OrderAcceptedEvent;
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.domain.RejectCode;
 import com.balh.oms.domain.Side;
+import com.balh.oms.fx.FxCustomerFlowNettingService;
 import com.balh.oms.fx.FxQuoteService;
 import com.balh.oms.ledger.LedgerBalanceClient;
 import com.balh.oms.ledger.LedgerInflightCoalescer;
@@ -102,11 +103,14 @@ class OrderIngressServiceFxQuoteLockTest {
         ObjectProvider<FxQuoteService> fxProvider =
                 (ObjectProvider<FxQuoteService>) mock(ObjectProvider.class);
         when(fxProvider.getIfAvailable()).thenReturn(fxSvc);
+        ObjectProvider<FxCustomerFlowNettingService> nettingProvider =
+                (ObjectProvider<FxCustomerFlowNettingService>) mock(ObjectProvider.class);
+        when(nettingProvider.getIfAvailable()).thenReturn(null);
 
         OmsClusterShardRouter router = new OmsClusterShardRouter(1, Map.of(0, cluster));
         service = new OrderIngressService(
                 orders, config, piiHash,
-                ledgerInflight, ledgerInflightCoalescer, ledgerBalance, fxProvider,
+                ledgerInflight, ledgerInflightCoalescer, ledgerBalance, fxProvider, nettingProvider,
                 new SimpleMeterRegistry(), orderControlAdmission, router);
     }
 
@@ -250,6 +254,10 @@ class OrderIngressServiceFxQuoteLockTest {
         @SuppressWarnings("unchecked")
         ObjectProvider<FxQuoteService> noFx = (ObjectProvider<FxQuoteService>) mock(ObjectProvider.class);
         when(noFx.getIfAvailable()).thenReturn(null);
+        @SuppressWarnings("unchecked")
+        ObjectProvider<FxCustomerFlowNettingService> nettingProvider =
+                (ObjectProvider<FxCustomerFlowNettingService>) mock(ObjectProvider.class);
+        when(nettingProvider.getIfAvailable()).thenReturn(null);
 
         @SuppressWarnings("unchecked")
         ObjectProvider<LedgerInflightReservationClient> ledgerInflight =
@@ -266,7 +274,7 @@ class OrderIngressServiceFxQuoteLockTest {
 
         OmsClusterShardRouter router = new OmsClusterShardRouter(1, Map.of(0, cluster));
         OrderIngressService noFxService = new OrderIngressService(
-                orders, config, piiHash, ledgerInflight, coal, bal, noFx,
+                orders, config, piiHash, ledgerInflight, coal, bal, noFx, nettingProvider,
                 new SimpleMeterRegistry(), orderControlAdmission, router);
 
         CreateOrderRequest req = buildRequest("q_test", new BigDecimal("100.00"));

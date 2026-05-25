@@ -237,6 +237,98 @@ class CorporateActionProcessingIntegrationTest extends AbstractPostgresIntegrati
                 .isEqualTo("VOLV");
     }
 
+    @Test
+    void processor_merger_movesQuantityToSurvivor() {
+        UUID accountId = UUID.randomUUID();
+        insertPosition(accountId, "OLD", 40);
+        long eventId =
+                jdbc.queryForObject(
+                        """
+                                INSERT INTO corporate_action_event (
+                                  instrument_symbol, action_type, effective_date, payload_json, record_date
+                                ) VALUES (
+                                  'OLD', 'MERGER', '2026-06-01',
+                                  CAST('{"survivorSymbol":"NEW","exchangeRatio":"0.5"}' AS JSONB),
+                                  '2026-05-01'
+                                ) RETURNING id
+                                """,
+                        Long.class);
+        snapshotService.captureForEvent(eventId, "OLD", java.time.LocalDate.of(2026, 5, 1));
+
+        processorJob.processBatch();
+
+        assertThat(jdbc.queryForObject(
+                        "SELECT quantity_settled FROM positions WHERE account_id = ? AND instrument_symbol = 'NEW'",
+                        BigDecimal.class,
+                        accountId))
+                .isEqualByComparingTo("20");
+        assertThat(jdbc.queryForObject(
+                        "SELECT COALESCE(quantity_settled, 0) FROM positions WHERE account_id = ? AND instrument_symbol = 'OLD'",
+                        BigDecimal.class,
+                        accountId))
+                .isEqualByComparingTo("0");
+    }
+
+    @Test
+    void processor_spinOff_creditsChildSymbol() {
+        UUID accountId = UUID.randomUUID();
+        insertPosition(accountId, "PARENT", 100);
+        long eventId =
+                jdbc.queryForObject(
+                        """
+                                INSERT INTO corporate_action_event (
+                                  instrument_symbol, action_type, effective_date, payload_json, record_date
+                                ) VALUES (
+                                  'PARENT', 'SPIN_OFF', '2026-06-01',
+                                  CAST('{"spunOffSymbol":"CHILD","spinOffRatio":"0.2"}' AS JSONB),
+                                  '2026-05-01'
+                                ) RETURNING id
+                                """,
+                        Long.class);
+        snapshotService.captureForEvent(eventId, "PARENT", java.time.LocalDate.of(2026, 5, 1));
+
+        processorJob.processBatch();
+
+        assertThat(jdbc.queryForObject(
+                        "SELECT quantity_settled FROM positions WHERE account_id = ? AND instrument_symbol = 'CHILD'",
+                        BigDecimal.class,
+                        accountId))
+                .isEqualByComparingTo("20");
+    }
+
+    @Test
+    void processor_bankruptcyDelisting_zerosPositionAndBooksRecovery() {
+        UUID accountId = UUID.randomUUID();
+        insertPosition(accountId, "BUST", 10);
+        long eventId =
+                jdbc.queryForObject(
+                        """
+                                INSERT INTO corporate_action_event (
+                                  instrument_symbol, action_type, effective_date, payload_json,
+                                  record_date, payable_date
+                                ) VALUES (
+                                  'BUST', 'BANKRUPTCY_DELISTING', '2026-06-01',
+                                  CAST('{"recoveryPerShare":"1.50","currency":"USD"}' AS JSONB),
+                                  '2026-05-01', '2026-06-15'
+                                ) RETURNING id
+                                """,
+                        Long.class);
+        snapshotService.captureForEvent(eventId, "BUST", java.time.LocalDate.of(2026, 5, 1));
+
+        processorJob.processBatch();
+
+        assertThat(jdbc.queryForObject(
+                        "SELECT COALESCE(quantity_settled, 0) FROM positions WHERE account_id = ? AND instrument_symbol = 'BUST'",
+                        BigDecimal.class,
+                        accountId))
+                .isEqualByComparingTo("0");
+        assertThat(jdbc.queryForObject(
+                        "SELECT net_amount FROM corporate_action_cash_impact WHERE corporate_action_event_id = ?",
+                        BigDecimal.class,
+                        eventId))
+                .isEqualByComparingTo("15.00");
+    }
+
     private void insertPosition(UUID accountId, String symbol, int qty) {
         jdbc.update(
                 """

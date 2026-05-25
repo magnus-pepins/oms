@@ -37,7 +37,9 @@ Templates: `MERGER` (requires `survivorSymbol`), `SPIN_OFF` (requires `spunOffSy
 
 **Four-eyes:** approver must differ from `createdBy`.
 
-After approve, run the normal CA processor (`CorporateActionProcessorJob`) or wait for the scheduler to process the new `corporate_action_event`.
+Broker election handoff: `GET /internal/v1/corporate-action-events/{id}/elections/export` returns approved customer/ops elections as JSON for broker file/API submission (Phase 2, 2026-05-25).
+
+After approve, run the normal CA processor (`CorporateActionProcessorJob`) or wait for the scheduler to process the new `corporate_action_event`. Processors for `MERGER`, `SPIN_OFF`, and `BANKRUPTCY_DELISTING` landed in Slice 17 (2026-05-25).
 
 ## When to use manual vs broker file
 

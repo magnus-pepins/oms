@@ -369,6 +369,86 @@ public class PositionsRepository {
         }
     }
 
+    /**
+     * Credits settled quantity on a symbol, creating the row when absent (merger survivor / spin-off child).
+     */
+    public void applyCorporateActionCreditPosition(
+            UUID accountId, String instrumentSymbol, UUID custodyAccountId, BigDecimal settledQty) {
+        String sym = instrumentSymbol == null ? "" : instrumentSymbol.trim().toUpperCase(Locale.ROOT);
+        if (settledQty == null || settledQty.signum() <= 0) {
+            return;
+        }
+        jdbc.update(
+                """
+                        INSERT INTO positions (
+                            account_id, instrument_symbol, custody_account_id,
+                            quantity_total, quantity_settled, updated_at
+                        ) VALUES (
+                            :accountId, :symbol, :custody, :qty, :qty, NOW()
+                        )
+                        ON CONFLICT (account_id, instrument_symbol, custody_account_id) DO UPDATE SET
+                            quantity_total = positions.quantity_total + EXCLUDED.quantity_total,
+                            quantity_settled = positions.quantity_settled + EXCLUDED.quantity_settled,
+                            updated_at = NOW()
+                        """,
+                new MapSqlParameterSource()
+                        .addValue("accountId", accountId)
+                        .addValue("symbol", sym)
+                        .addValue("custody", custodyAccountId)
+                        .addValue("qty", settledQty));
+    }
+
+    /** Zeros all quantity columns for a symbol (bankruptcy / merger source leg). */
+    public void applyCorporateActionZeroOut(
+            UUID accountId, String instrumentSymbol, UUID custodyAccountId) {
+        String sym = instrumentSymbol == null ? "" : instrumentSymbol.trim().toUpperCase(Locale.ROOT);
+        jdbc.update(
+                """
+                        UPDATE positions
+                        SET quantity_total = 0,
+                            quantity_settled = 0,
+                            quantity_pending_buy_settle = 0,
+                            quantity_pending_sell_settle = 0,
+                            updated_at = NOW()
+                        WHERE account_id = :accountId
+                          AND instrument_symbol = :symbol
+                          AND custody_account_id = :custody
+                        """,
+                new MapSqlParameterSource()
+                        .addValue("accountId", accountId)
+                        .addValue("symbol", sym)
+                        .addValue("custody", custodyAccountId));
+    }
+
+    /** Sets settled + total to an explicit post-action quantity (spin-off parent retention). */
+    public void applyCorporateActionSetSettledQuantity(
+            UUID accountId, String instrumentSymbol, UUID custodyAccountId, BigDecimal settledQty) {
+        String sym = instrumentSymbol == null ? "" : instrumentSymbol.trim().toUpperCase(Locale.ROOT);
+        BigDecimal qty = settledQty == null ? BigDecimal.ZERO : settledQty;
+        int updated =
+                jdbc.update(
+                        """
+                                UPDATE positions
+                                SET quantity_total = :qty,
+                                    quantity_settled = :qty,
+                                    quantity_pending_buy_settle = 0,
+                                    quantity_pending_sell_settle = 0,
+                                    updated_at = NOW()
+                                WHERE account_id = :accountId
+                                  AND instrument_symbol = :symbol
+                                  AND custody_account_id = :custody
+                                """,
+                        new MapSqlParameterSource()
+                                .addValue("qty", qty)
+                                .addValue("accountId", accountId)
+                                .addValue("symbol", sym)
+                                .addValue("custody", custodyAccountId));
+        if (updated != 1) {
+            throw new IllegalStateException(
+                    "corporate action set quantity expected 1 position row, got " + updated);
+        }
+    }
+
     /** Renames {@code instrument_symbol} for all settled quantity (gap plan §5.9 mandatory symbol change). */
     public void applyCorporateActionSymbolRename(
             UUID accountId, String oldSymbol, String newSymbol, UUID custodyAccountId) {

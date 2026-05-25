@@ -29,6 +29,9 @@ public class CorporateActionProcessingService {
     public static final String ACTION_STOCK_DIVIDEND = "STOCK_DIVIDEND";
     public static final String ACTION_SYMBOL_CHANGE = "SYMBOL_CHANGE";
     public static final String ACTION_ISIN_CHANGE = "ISIN_CHANGE";
+    public static final String ACTION_MERGER = "MERGER";
+    public static final String ACTION_SPIN_OFF = "SPIN_OFF";
+    public static final String ACTION_BANKRUPTCY_DELISTING = "BANKRUPTCY_DELISTING";
 
     private static final int MONEY_SCALE = 2;
 
@@ -72,6 +75,9 @@ public class CorporateActionProcessingService {
             case ACTION_RIGHTS_ISSUE -> processRightsIssue(row, holders, payload);
             case ACTION_STOCK_DIVIDEND -> processStockDividend(row, custody, holders, payload);
             case ACTION_SYMBOL_CHANGE, ACTION_ISIN_CHANGE -> processSymbolChange(row, custody, holders, payload);
+            case ACTION_MERGER -> processMerger(row, custody, holders, payload);
+            case ACTION_SPIN_OFF -> processSpinOff(row, custody, holders, payload);
+            case ACTION_BANKRUPTCY_DELISTING -> processBankruptcyDelisting(row, custody, holders, payload);
             default -> throw new UnsupportedCorporateActionException("unsupported actionType: " + action);
         }
     }
@@ -271,6 +277,109 @@ public class CorporateActionProcessingService {
                 row.id(), oldSymbol, newSymbol, holders.size());
     }
 
+    private void processMerger(
+            CorporateActionEventRepository.ProcessingRow row,
+            UUID custody,
+            java.util.List<CorporateActionRecordDateSnapshotService.ResolvedHolder> holders,
+            JsonNode payload) {
+        String oldSymbol = row.instrumentSymbol().trim().toUpperCase(Locale.ROOT);
+        String survivorSymbol = textField(payload, "survivorSymbol");
+        if (survivorSymbol == null || survivorSymbol.isBlank()) {
+            throw new UnsupportedCorporateActionException("MERGER missing survivorSymbol");
+        }
+        survivorSymbol = survivorSymbol.trim().toUpperCase(Locale.ROOT);
+        BigDecimal exchangeRatio = exchangeRatio(payload);
+        if (exchangeRatio == null || exchangeRatio.signum() <= 0) {
+            throw new UnsupportedCorporateActionException("MERGER missing exchangeRatio");
+        }
+        for (CorporateActionRecordDateSnapshotService.ResolvedHolder holder : holders) {
+            BigDecimal before = holder.quantitySettled();
+            BigDecimal after =
+                    before.multiply(exchangeRatio).setScale(10, RoundingMode.HALF_UP);
+            positions.applyCorporateActionZeroOut(holder.accountId(), oldSymbol, custody);
+            positions.applyCorporateActionCreditPosition(holder.accountId(), survivorSymbol, custody, after);
+            impacts.insertEntitlement(row.id(), holder.accountId(), oldSymbol, before, after, null, null);
+            impacts.insertPositionImpact(row.id(), holder.accountId(), survivorSymbol, BigDecimal.ZERO, after);
+        }
+        log.info(
+                "corporate_action MERGER processed id={} {} -> {} holders={}",
+                row.id(),
+                oldSymbol,
+                survivorSymbol,
+                holders.size());
+    }
+
+    private void processSpinOff(
+            CorporateActionEventRepository.ProcessingRow row,
+            UUID custody,
+            java.util.List<CorporateActionRecordDateSnapshotService.ResolvedHolder> holders,
+            JsonNode payload) {
+        String parentSymbol = row.instrumentSymbol().trim().toUpperCase(Locale.ROOT);
+        String spunOffSymbol = textField(payload, "spunOffSymbol");
+        if (spunOffSymbol == null || spunOffSymbol.isBlank()) {
+            throw new UnsupportedCorporateActionException("SPIN_OFF missing spunOffSymbol");
+        }
+        spunOffSymbol = spunOffSymbol.trim().toUpperCase(Locale.ROOT);
+        BigDecimal spinOffRatio = decimalField(payload, "spinOffRatio");
+        if (spinOffRatio == null || spinOffRatio.signum() <= 0) {
+            spinOffRatio = decimalField(payload, "sharesPerShare");
+        }
+        if (spinOffRatio == null || spinOffRatio.signum() <= 0) {
+            throw new UnsupportedCorporateActionException("SPIN_OFF missing spinOffRatio");
+        }
+        BigDecimal parentRetention = decimalField(payload, "parentRetentionRatio");
+        if (parentRetention == null) {
+            parentRetention = BigDecimal.ONE;
+        }
+        for (CorporateActionRecordDateSnapshotService.ResolvedHolder holder : holders) {
+            BigDecimal parentBefore = holder.quantitySettled();
+            BigDecimal parentAfter =
+                    parentBefore.multiply(parentRetention).setScale(10, RoundingMode.HALF_UP);
+            BigDecimal spunQty =
+                    parentBefore.multiply(spinOffRatio).setScale(10, RoundingMode.HALF_UP);
+            positions.applyCorporateActionSetSettledQuantity(holder.accountId(), parentSymbol, custody, parentAfter);
+            positions.applyCorporateActionCreditPosition(holder.accountId(), spunOffSymbol, custody, spunQty);
+            impacts.insertEntitlement(row.id(), holder.accountId(), parentSymbol, parentBefore, parentAfter, null, null);
+            impacts.insertPositionImpact(row.id(), holder.accountId(), parentSymbol, parentBefore, parentAfter);
+            impacts.insertPositionImpact(row.id(), holder.accountId(), spunOffSymbol, BigDecimal.ZERO, spunQty);
+        }
+        log.info(
+                "corporate_action SPIN_OFF processed id={} parent={} child={} holders={}",
+                row.id(),
+                parentSymbol,
+                spunOffSymbol,
+                holders.size());
+    }
+
+    private void processBankruptcyDelisting(
+            CorporateActionEventRepository.ProcessingRow row,
+            UUID custody,
+            java.util.List<CorporateActionRecordDateSnapshotService.ResolvedHolder> holders,
+            JsonNode payload) {
+        String symbol = row.instrumentSymbol().trim().toUpperCase(Locale.ROOT);
+        String currency = textField(payload, "currency");
+        if (currency == null || currency.isBlank()) {
+            currency = "USD";
+        }
+        BigDecimal recoveryPerShare = decimalField(payload, "recoveryPerShare");
+        for (CorporateActionRecordDateSnapshotService.ResolvedHolder holder : holders) {
+            BigDecimal before = holder.quantitySettled();
+            positions.applyCorporateActionZeroOut(holder.accountId(), symbol, custody);
+            impacts.insertEntitlement(row.id(), holder.accountId(), symbol, before, BigDecimal.ZERO, null, null);
+            impacts.insertPositionImpact(row.id(), holder.accountId(), symbol, before, BigDecimal.ZERO);
+            if (recoveryPerShare != null && recoveryPerShare.signum() > 0 && before.signum() > 0) {
+                BigDecimal gross =
+                        before.multiply(recoveryPerShare).setScale(MONEY_SCALE, RoundingMode.HALF_UP);
+                BigDecimal withholding = withholdingAmount(gross, payload);
+                BigDecimal net = gross.subtract(withholding).setScale(MONEY_SCALE, RoundingMode.HALF_UP);
+                impacts.insertCashImpactWithWithholding(
+                        row.id(), holder.accountId(), gross, net, withholding, currency, row.payableDate());
+            }
+        }
+        log.info("corporate_action BANKRUPTCY_DELISTING processed id={} symbol={} holders={}",
+                row.id(), symbol, holders.size());
+    }
+
     private void applyCashInLieu(
             CorporateActionEventRepository.ProcessingRow row,
             CorporateActionRecordDateSnapshotService.ResolvedHolder holder,
@@ -318,6 +427,19 @@ public class CorporateActionProcessingService {
             return BigDecimal.ZERO.setScale(MONEY_SCALE);
         }
         return gross.multiply(rate).setScale(MONEY_SCALE, RoundingMode.HALF_UP);
+    }
+
+    /** Survivor shares per source share (merger). Defaults to 1 when omitted. */
+    static BigDecimal exchangeRatio(JsonNode payload) {
+        BigDecimal ratio = decimalField(payload, "exchangeRatio");
+        if (ratio != null && ratio.signum() > 0) {
+            return ratio;
+        }
+        ratio = decimalField(payload, "survivorSharesPerShare");
+        if (ratio != null && ratio.signum() > 0) {
+            return ratio;
+        }
+        return BigDecimal.ONE;
     }
 
     private JsonNode parsePayload(String json) {

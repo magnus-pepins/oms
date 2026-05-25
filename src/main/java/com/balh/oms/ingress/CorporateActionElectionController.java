@@ -1,5 +1,6 @@
 package com.balh.oms.ingress;
 
+import com.balh.oms.corporateaction.CorporateActionBrokerElectionExportService;
 import com.balh.oms.corporateaction.CorporateActionElectionRepository;
 import com.balh.oms.corporateaction.CorporateActionElectionService;
 import com.balh.oms.corporateaction.CorporateActionEventRepository;
@@ -30,14 +31,25 @@ public class CorporateActionElectionController {
     private final CorporateActionEventRepository events;
     private final CorporateActionElectionService electionService;
     private final CorporateActionElectionRepository elections;
+    private final CorporateActionBrokerElectionExportService brokerExport;
 
     public CorporateActionElectionController(
             CorporateActionEventRepository events,
             CorporateActionElectionService electionService,
-            CorporateActionElectionRepository elections) {
+            CorporateActionElectionRepository elections,
+            CorporateActionBrokerElectionExportService brokerExport) {
         this.events = events;
         this.electionService = electionService;
         this.elections = elections;
+        this.brokerExport = brokerExport;
+    }
+
+    @GetMapping("/{eventId}/elections/export")
+    public ResponseEntity<?> exportBrokerElections(@PathVariable long eventId) {
+        return brokerExport
+                .exportForEvent(eventId)
+                .<ResponseEntity<?>>map(ResponseEntity::ok)
+                .orElseGet(() -> ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "not_found")));
     }
 
     @GetMapping("/{eventId}/elections")

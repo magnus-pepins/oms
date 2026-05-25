@@ -54,6 +54,42 @@ public class CustomerInvestReadRepository {
             LIMIT :lim
             """;
 
+    private static final String LIST_PENDING_VOLUNTARY_CA =
+            """
+            SELECT e.id AS event_id,
+                   e.instrument_symbol,
+                   e.action_type,
+                   e.effective_date,
+                   s.quantity_settled,
+                   el.election_choice,
+                   CASE
+                     WHEN el.approved_at IS NOT NULL THEN 'approved'
+                     WHEN el.id IS NOT NULL THEN 'pending_approval'
+                     ELSE 'none'
+                   END AS election_status
+            FROM corporate_action_record_date_snapshot s
+            JOIN corporate_action_event e ON e.id = s.corporate_action_event_id
+            LEFT JOIN corporate_action_election el
+              ON el.corporate_action_event_id = e.id AND el.account_id = s.account_id
+            WHERE s.account_id = :account_id
+              AND e.processed_at IS NULL
+              AND e.action_type IN ('TENDER_OFFER', 'RIGHTS_ISSUE')
+            ORDER BY e.effective_date ASC NULLS LAST, e.id ASC
+            """;
+
+    private static final String EXISTS_PENDING_VOLUNTARY_CA =
+            """
+            SELECT EXISTS (
+              SELECT 1
+              FROM corporate_action_record_date_snapshot s
+              JOIN corporate_action_event e ON e.id = s.corporate_action_event_id
+              WHERE s.account_id = :account_id
+                AND e.id = :event_id
+                AND e.processed_at IS NULL
+                AND e.action_type IN ('TENDER_OFFER', 'RIGHTS_ISSUE')
+            )
+            """;
+
     private final NamedParameterJdbcTemplate jdbc;
 
     public CustomerInvestReadRepository(NamedParameterJdbcTemplate jdbc) {
@@ -73,6 +109,15 @@ public class CustomerInvestReadRepository {
             LocalDate tradeDate,
             LocalDate expectedSettlementDate,
             Instant venueTs) {}
+
+    public record PendingVoluntaryCorporateActionRow(
+            long eventId,
+            String instrumentSymbol,
+            String actionType,
+            LocalDate effectiveDate,
+            BigDecimal quantitySettled,
+            String electionChoice,
+            String electionStatus) {}
 
     public OpenTradeSettlementAmounts sumOpenTradeSettlementAmounts(UUID accountId) {
         return jdbc.queryForObject(
@@ -104,5 +149,33 @@ public class CustomerInvestReadRepository {
                             esd == null ? null : esd.toLocalDate(),
                             venueTs == null ? null : venueTs.toInstant());
                 });
+    }
+
+    public List<PendingVoluntaryCorporateActionRow> listPendingVoluntaryCorporateActions(UUID accountId) {
+        return jdbc.query(
+                LIST_PENDING_VOLUNTARY_CA,
+                new MapSqlParameterSource("account_id", accountId),
+                (rs, rowNum) -> {
+                    java.sql.Date ed = rs.getDate("effective_date");
+                    return new PendingVoluntaryCorporateActionRow(
+                            rs.getLong("event_id"),
+                            rs.getString("instrument_symbol"),
+                            rs.getString("action_type"),
+                            ed == null ? null : ed.toLocalDate(),
+                            rs.getBigDecimal("quantity_settled"),
+                            rs.getString("election_choice"),
+                            rs.getString("election_status"));
+                });
+    }
+
+    public boolean accountHasPendingVoluntaryCorporateAction(UUID accountId, long eventId) {
+        Boolean exists =
+                jdbc.queryForObject(
+                        EXISTS_PENDING_VOLUNTARY_CA,
+                        new MapSqlParameterSource()
+                                .addValue("account_id", accountId)
+                                .addValue("event_id", eventId),
+                        Boolean.class);
+        return Boolean.TRUE.equals(exists);
     }
 }

@@ -35,6 +35,16 @@ public class VenueContractResolutionRepository {
                     WHERE contract_symbol = :symbol AND evidence_hash = :hash
                     """;
 
+    private static final String SET_POSTING_PAUSED =
+            """
+                    UPDATE venue_contract_resolution
+                    SET posting_paused = :paused
+                    WHERE id = :id
+                    """;
+
+    private static final String EXISTS_BY_ID =
+            "SELECT EXISTS(SELECT 1 FROM venue_contract_resolution WHERE id = :id)";
+
     private final NamedParameterJdbcTemplate jdbc;
 
     public VenueContractResolutionRepository(NamedParameterJdbcTemplate jdbc) {
@@ -78,5 +88,21 @@ public class VenueContractResolutionRepository {
                                 .addValue("hash", evidenceHash),
                         (rs, rowNum) -> rs.getLong("id"));
         return ids.isEmpty() ? Optional.empty() : Optional.of(ids.getFirst());
+    }
+
+    public boolean existsById(long resolutionId) {
+        Boolean exists =
+                jdbc.queryForObject(
+                        EXISTS_BY_ID,
+                        new MapSqlParameterSource("id", resolutionId),
+                        Boolean.class);
+        return Boolean.TRUE.equals(exists);
+    }
+
+    public boolean setPostingPaused(long resolutionId, boolean paused) {
+        return jdbc.update(
+                        SET_POSTING_PAUSED,
+                        new MapSqlParameterSource().addValue("id", resolutionId).addValue("paused", paused))
+                > 0;
     }
 }

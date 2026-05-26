@@ -1,10 +1,12 @@
 package com.balh.oms;
 
 import com.balh.oms.cluster.AcceptOrderCommand;
+import com.balh.oms.cluster.ExecutionAppliedEvent;
 import com.balh.oms.cluster.OmsClusterWireFormat;
 import com.balh.oms.cluster.OrderAdmittedEvent;
 import com.balh.oms.cluster.VenueResolutionAppliedEvent;
 import com.balh.oms.config.OmsConfig;
+import com.balh.oms.persistence.ExecutionsRepository;
 import com.balh.oms.persistence.PositionsRepository;
 import com.balh.oms.settlement.PredictionMarketLedgerOutboxRepository;
 import com.balh.oms.settlement.PredictionMarketResolutionService;
@@ -581,12 +583,16 @@ public abstract class AbstractPostgresIntegrationTest {
             domainEventObjectMapper.registerModule(new JavaTimeModule());
             DomainEventEnvelopeCodec domainEventCodec = new DomainEventEnvelopeCodec(domainEventObjectMapper);
             LedgerInflightOutboxRepository ledgerInflightOutbox = new LedgerInflightOutboxRepository(jdbc);
+            ExecutionsRepository executionsRepository = new ExecutionsRepository(jdbc);
             PositionsRepository positionsRepository = new PositionsRepository(jdbc);
             VenueContractResolutionRepository venueContractResolutionRepository =
                     new VenueContractResolutionRepository(jdbc);
             PredictionMarketLedgerOutboxRepository predictionMarketLedgerOutboxRepository =
                     new PredictionMarketLedgerOutboxRepository(jdbc);
             OmsConfig omsConfig = new OmsConfig();
+            TestPostgresProjectorTradeApplier tradeApplier =
+                    new TestPostgresProjectorTradeApplier(
+                            omsConfig, orders, executionsRepository, positionsRepository);
             ObjectMapper resolutionObjectMapper = new ObjectMapper();
             resolutionObjectMapper.registerModule(new JavaTimeModule());
             PredictionMarketResolutionService predictionMarketResolutionService =
@@ -625,6 +631,7 @@ public abstract class AbstractPostgresIntegrationTest {
                             domainEventCodec,
                             ledgerInflightOutbox,
                             predictionMarketResolutionService,
+                            tradeApplier,
                             inflightObjectMapper,
                             running),
                     "oms-test-projector-daemon");
@@ -694,6 +701,7 @@ public abstract class AbstractPostgresIntegrationTest {
                 DomainEventEnvelopeCodec domainEventCodec,
                 LedgerInflightOutboxRepository ledgerInflightOutbox,
                 PredictionMarketResolutionService predictionMarketResolutionService,
+                TestPostgresProjectorTradeApplier tradeApplier,
                 ObjectMapper inflightObjectMapper,
                 AtomicBoolean running) {
             FragmentHandler handler = (buffer, offset, length, header) -> {
@@ -709,6 +717,9 @@ public abstract class AbstractPostgresIntegrationTest {
                                 domainEventCodec,
                                 ledgerInflightOutbox,
                                 inflightObjectMapper);
+                    } else if (typeId == OmsClusterWireFormat.TYPE_ID_EXECUTION_APPLIED) {
+                        ExecutionAppliedEvent ev = ExecutionAppliedEvent.decode(buffer, offset, length);
+                        tradeApplier.applyExecutionAppliedEvent(ev);
                     } else if (typeId == OmsClusterWireFormat.TYPE_ID_VENUE_RESOLUTION_APPLIED) {
                         VenueResolutionAppliedEvent ev = VenueResolutionAppliedEvent.decode(buffer, offset, length);
                         predictionMarketResolutionService.apply(ev);

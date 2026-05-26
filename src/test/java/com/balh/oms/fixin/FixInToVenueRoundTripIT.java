@@ -1,6 +1,5 @@
 package com.balh.oms.fixin;
 
-import com.balh.oms.config.OmsConfig;
 import com.balh.oms.config.OmsProfiles;
 import com.balh.oms.fixin.it.FixInClientCollectorApplication;
 import com.balh.oms.fixin.it.FixInClientEmbeddedInitiator;
@@ -24,6 +23,7 @@ import org.springframework.test.context.jdbc.Sql;
 import quickfix.field.ExecType;
 import quickfix.field.OrdStatus;
 
+import java.math.BigDecimal;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.net.ServerSocket;
@@ -101,13 +101,13 @@ class FixInToVenueRoundTripIT extends FixInWireItAcceptorSupport {
         registry.add("oms.routing.backend", () -> "internal-venue");
         registry.add("oms.venue.grpc-host", () -> "127.0.0.1");
         registry.add("oms.venue.grpc-port", () -> String.valueOf(embeddedVenue.grpcPort()));
+        registry.add("oms.venue.resolution-dispute-window-ms", () -> "0");
     }
 
     @Autowired OmsVenueEgressService egress;
     @Autowired OmsVenueResolverService venueResolver;
     @Autowired FixInClientEmbeddedInitiator fixInClient;
     @Autowired JdbcTemplate jdbc;
-    @Autowired OmsConfig omsConfig;
 
     @BeforeEach
     void startClientAndResetHooks() throws InterruptedException {
@@ -199,21 +199,17 @@ class FixInToVenueRoundTripIT extends FixInWireItAcceptorSupport {
                         .isTrue());
 
         UUID accountId = UUID.fromString("a0000001-0000-4000-8000-000000000002");
-        UUID custodyId = UUID.fromString(omsConfig.getSettlement().getDefaultCustodyAccountId());
-        jdbc.update(
-                """
-                        INSERT INTO positions (
-                            account_id, instrument_symbol, custody_account_id,
-                            quantity_total, quantity_pending_buy_settle, updated_at
-                        ) VALUES (?, ?, ?, 10, 10, NOW())
-                        ON CONFLICT (account_id, instrument_symbol, custody_account_id) DO UPDATE SET
-                            quantity_total = 10,
-                            quantity_pending_buy_settle = 10,
-                            updated_at = NOW()
-                        """,
-                accountId,
-                PREDMKT_SYMBOL,
-                custodyId);
+        await().atMost(FLOW_TIMEOUT).pollInterval(Duration.ofMillis(100)).untilAsserted(() -> {
+            BigDecimal qty = jdbc.queryForObject(
+                    """
+                            SELECT quantity_total FROM positions
+                            WHERE account_id = ? AND instrument_symbol = ?
+                            """,
+                    java.math.BigDecimal.class,
+                    accountId,
+                    PREDMKT_SYMBOL);
+            assertThat(qty).isEqualByComparingTo("10");
+        });
 
         String evidenceHash = "it-hash-" + UUID.randomUUID();
         embeddedVenue.resolveContractYes(PREDMKT_SYMBOL, evidenceHash);

@@ -3,7 +3,9 @@ package com.balh.oms.config;
 import com.balh.oms.ledger.LedgerSettlementLegPoster;
 import com.balh.oms.ledger.LedgerSettlementPostingClient;
 import com.balh.oms.reconciler.LedgerSettlementOutboxReconciler;
+import com.balh.oms.reconciler.PredictionMarketLedgerOutboxReconciler;
 import com.balh.oms.settlement.LedgerSettlementOutboxRepository;
+import com.balh.oms.settlement.PredictionMarketLedgerOutboxRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -51,5 +53,18 @@ public class LedgerSettlementOutboxConfiguration {
             MeterRegistry meterRegistry) {
         return new LedgerSettlementOutboxReconciler(
                 outbox, postingClient, config, transactionManager, meterRegistry);
+    }
+
+    @Bean
+    PredictionMarketLedgerOutboxReconciler predictionMarketLedgerOutboxReconciler(
+            PredictionMarketLedgerOutboxRepository outbox,
+            LedgerSettlementPostingClient postingClient,
+            OmsConfig config,
+            PlatformTransactionManager transactionManager) {
+        if (!(postingClient instanceof LedgerSettlementLegPoster poster)) {
+            throw new IllegalStateException(
+                    "prediction-market reconciler requires LedgerSettlementLegPoster implementation");
+        }
+        return new PredictionMarketLedgerOutboxReconciler(outbox, poster, config, transactionManager);
     }
 }

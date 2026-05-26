@@ -8,14 +8,10 @@ import java.time.Instant;
 import java.util.List;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.scheduling.annotation.Scheduled;
-import org.springframework.stereotype.Component;
 import org.springframework.transaction.support.TransactionTemplate;
 
 /** Drains {@code prediction_market_ledger_outbox} after the resolution dispute window (Phase B). */
-@Component
-@ConditionalOnBean(LedgerSettlementLegPoster.class)
 public class PredictionMarketLedgerOutboxReconciler {
 
     private static final Logger log = LoggerFactory.getLogger(PredictionMarketLedgerOutboxReconciler.class);

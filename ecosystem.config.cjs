@@ -105,6 +105,8 @@ const JAVA = process.env.OMS_JAVA || 'java';
 
 // Same low-latency module-opens as ledger-cluster — Aeron/Agrona need these on
 // JDK 21 to access jdk.internal.misc.* / sun.nio.ch.* / sun.misc.Unsafe.
+const OMS_JAVA_TMPDIR =
+  process.env.OMS_JAVA_TMPDIR || path.join(projectRoot, 'tmp', 'java');
 const LOW_LATENCY_JVM_FLAGS = [
   '--add-exports=java.base/jdk.internal.ref=ALL-UNNAMED',
   '--add-exports=java.base/sun.nio.ch=ALL-UNNAMED',
@@ -113,6 +115,7 @@ const LOW_LATENCY_JVM_FLAGS = [
   '--add-opens=java.base/java.lang.reflect=ALL-UNNAMED',
   '--add-opens=java.base/java.util=ALL-UNNAMED',
   '--add-opens=java.base/jdk.internal.misc=ALL-UNNAMED',
+  `-Djava.io.tmpdir=${OMS_JAVA_TMPDIR}`,
 ];
 
 // Shared Aeron media-driver IPC root for cluster-node / projector / fix-egress
@@ -374,6 +377,15 @@ const COMMON_ENV = {
   OMS_ISK_TAX_PENDING_POSITION_COUNT_SYNC_ENABLED:
     BENCH_ENV.OMS_ISK_TAX_PENDING_POSITION_COUNT_SYNC_ENABLED
     || process.env.OMS_ISK_TAX_PENDING_POSITION_COUNT_SYNC_ENABLED
+    || 'false',
+  // ISK Slice ISK-B / Phase E 12a — flip on pop after BFF binds ISK ledgerBalanceId.
+  OMS_RISK_ISK_FUNDING_CHECK_ENABLED:
+    BENCH_ENV.OMS_RISK_ISK_FUNDING_CHECK_ENABLED
+    || process.env.OMS_RISK_ISK_FUNDING_CHECK_ENABLED
+    || 'false',
+  OMS_RISK_ISK_INSTRUMENT_ELIGIBILITY_CHECK_ENABLED:
+    BENCH_ENV.OMS_RISK_ISK_INSTRUMENT_ELIGIBILITY_CHECK_ENABLED
+    || process.env.OMS_RISK_ISK_INSTRUMENT_ELIGIBILITY_CHECK_ENABLED
     || 'false',
   OMS_LEDGER_METADATA_SYNC_ENABLED:
     BENCH_ENV.OMS_LEDGER_METADATA_SYNC_ENABLED

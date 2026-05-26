@@ -560,6 +560,39 @@ public class OmsClusterIngressClient {
         }
     }
 
+    /** Phase B: fire-and-forget offer for {@link ApplyVenueResolutionCommand}. */
+    public void submitApplyVenueResolution(ApplyVenueResolutionCommand cmd, Duration timeout)
+            throws TimeoutException, InterruptedException {
+        Objects.requireNonNull(cmd, "cmd");
+        Objects.requireNonNull(timeout, "timeout");
+
+        ExpandableArrayBuffer buffer = new ExpandableArrayBuffer(OmsClusterWireFormat.MAX_COMMAND_BYTES);
+        int written = cmd.encode(buffer, 0);
+        long deadlineNanos = System.nanoTime() + timeout.toNanos();
+
+        clientLock.lockInterruptibly();
+        try {
+            AeronCluster active = client;
+            if (active == null) {
+                throw new IllegalStateException("OMS cluster client is not connected");
+            }
+            long offerResult;
+            do {
+                offerResult = active.offer(buffer, 0, written);
+                if (offerResult < 0L) {
+                    if (System.nanoTime() > deadlineNanos) {
+                        throw new TimeoutException(
+                                "cluster offer back-pressure timeout for ApplyVenueResolutionCommand symbol="
+                                        + cmd.instrumentSymbol());
+                    }
+                    parkOrThrow(config.getOfferBackpressureParkNanos());
+                }
+            } while (offerResult < 0L);
+        } finally {
+            clientLock.unlock();
+        }
+    }
+
     /**
      * Submits a {@link CancelOrderCommand} to the cluster as a fire-and-forget offer, mirroring
      * {@link #submitApplyExecutionReport}. Used by {@code LedgerInflightHoldFailureCompensator}

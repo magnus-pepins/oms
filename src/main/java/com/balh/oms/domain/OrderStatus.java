@@ -8,9 +8,15 @@ public enum OrderStatus {
     FILLED,
     CANCELLED,
     REJECTED,
-    EXPIRED;
+    EXPIRED,
+    /** Phase B: binary contract resolved; no further trading on this symbol. */
+    RESOLVED;
 
     public boolean isTerminal() {
-        return this == FILLED || this == CANCELLED || this == REJECTED || this == EXPIRED;
+        return this == FILLED
+                || this == CANCELLED
+                || this == REJECTED
+                || this == EXPIRED
+                || this == RESOLVED;
     }
 }

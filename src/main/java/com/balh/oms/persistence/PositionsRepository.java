@@ -649,6 +649,36 @@ public class PositionsRepository {
                            OR quantity_pending_sell_settle <> 0)
                     """;
 
+    private static final String SELECT_NONZERO_BY_SYMBOL =
+            """
+                    SELECT account_id, instrument_symbol, custody_account_id,
+                           quantity_total, quantity_settled,
+                           quantity_pending_buy_settle, quantity_pending_sell_settle
+                    FROM positions
+                    WHERE instrument_symbol = :symbol
+                      AND quantity_total <> 0
+                    """;
+
+    /** Phase B: holders with non-zero quantity on a contract at resolution time. */
+    public List<AccountPositionKeyRow> findNonZeroPositionsForSymbol(String instrumentSymbol) {
+        String sym = instrumentSymbol == null ? "" : instrumentSymbol.trim();
+        if (sym.isEmpty()) {
+            return List.of();
+        }
+        return jdbc.query(
+                SELECT_NONZERO_BY_SYMBOL,
+                new MapSqlParameterSource("symbol", sym),
+                (rs, rowNum) ->
+                        new AccountPositionKeyRow(
+                                (UUID) rs.getObject("account_id"),
+                                rs.getString("instrument_symbol"),
+                                (UUID) rs.getObject("custody_account_id"),
+                                rs.getBigDecimal("quantity_total"),
+                                rs.getBigDecimal("quantity_settled"),
+                                rs.getBigDecimal("quantity_pending_buy_settle"),
+                                rs.getBigDecimal("quantity_pending_sell_settle")));
+    }
+
     /** Non-zero positions for accounts included in a broker snapshot reconcile pass. */
     public List<AccountPositionKeyRow> findNonZeroPositionsForAccounts(java.util.Collection<UUID> accountIds) {
         if (accountIds == null || accountIds.isEmpty()) {

@@ -1,6 +1,12 @@
 package com.balh.oms.fixin;
 
+import com.balh.oms.cluster.ApplyVenueResolutionCommand;
+import com.balh.oms.cluster.OmsClusterIngressClient;
+import com.balh.oms.cluster.OmsClusterWireFormat;
+import com.balh.oms.cluster.VenueResolutionAppliedEvent;
+import com.balh.oms.config.OmsConfig;
 import com.balh.oms.config.OmsProfiles;
+import com.balh.oms.settlement.PredictionMarketResolutionService;
 import com.balh.oms.fixin.it.FixInClientCollectorApplication;
 import com.balh.oms.fixin.it.FixInClientEmbeddedInitiator;
 import com.balh.oms.venue.EmbeddedVenueStack;
@@ -100,6 +106,9 @@ class FixInToVenueRoundTripIT extends FixInWireItAcceptorSupport {
     @Autowired OmsVenueEgressService egress;
     @Autowired FixInClientEmbeddedInitiator fixInClient;
     @Autowired JdbcTemplate jdbc;
+    @Autowired OmsClusterIngressClient clusterIngressClient;
+    @Autowired OmsConfig omsConfig;
+    @Autowired PredictionMarketResolutionService predictionMarketResolutionService;
 
     @BeforeEach
     void startClientAndResetHooks() throws InterruptedException {
@@ -174,6 +183,95 @@ class FixInToVenueRoundTripIT extends FixInWireItAcceptorSupport {
                 Long.class,
                 clOrdId);
         assertThat(auditCount).isGreaterThanOrEqualTo(2L);
+    }
+
+    @Test
+    void fixInFillThenYesResolution_enqueuesPredictionMarketLedgerOutbox() throws Exception {
+        embeddedVenue.seedRestingSell(PREDMKT_SYMBOL, 10, 0.65);
+        await().atMost(LOGON_TIMEOUT).pollInterval(Duration.ofMillis(100)).untilAsserted(() ->
+                assertThat(fixInClient.isLoggedOn()).isTrue());
+
+        String clOrdId = "FVRES-" + UUID.randomUUID().toString().substring(0, 8);
+        fixInClient.sendNewOrderSingle(clOrdId, PREDMKT_SYMBOL, 10, 0.65);
+
+        await().atMost(FLOW_TIMEOUT).pollInterval(Duration.ofMillis(100)).untilAsserted(() ->
+                assertThat(FixInClientCollectorApplication.RECEIVED.stream()
+                                .anyMatch(er -> clOrdId.equals(er.clOrdId()) && er.execType() == ExecType.FILL))
+                        .isTrue());
+
+        String evidenceHash = "it-hash-" + UUID.randomUUID();
+        embeddedVenue.resolveContractYes(PREDMKT_SYMBOL, evidenceHash);
+
+        ApplyVenueResolutionCommand resolution =
+                new ApplyVenueResolutionCommand(
+                        System.nanoTime(),
+                        PREDMKT_SYMBOL,
+                        OmsClusterWireFormat.OUTCOME_YES,
+                        "it-oracle",
+                        System.currentTimeMillis(),
+                        evidenceHash,
+                        omsConfig.getVenue().getVenueId());
+        clusterIngressClient.submitApplyVenueResolution(resolution, Duration.ofSeconds(10));
+
+        UUID accountId = UUID.fromString("a0000001-0000-4000-8000-000000000002");
+        UUID custodyId = UUID.fromString(omsConfig.getSettlement().getDefaultCustodyAccountId());
+        jdbc.update(
+                """
+                        INSERT INTO positions (
+                            account_id, instrument_symbol, custody_account_id,
+                            quantity_total, quantity_pending_buy_settle, updated_at
+                        ) VALUES (?, ?, ?, 10, 10, NOW())
+                        ON CONFLICT (account_id, instrument_symbol, custody_account_id) DO UPDATE SET
+                            quantity_total = 10,
+                            quantity_pending_buy_settle = 10,
+                            updated_at = NOW()
+                        """,
+                accountId,
+                PREDMKT_SYMBOL,
+                custodyId);
+
+        predictionMarketResolutionService.apply(
+                new VenueResolutionAppliedEvent(
+                        PREDMKT_SYMBOL,
+                        OmsClusterWireFormat.OUTCOME_YES,
+                        resolution.resolutionSource(),
+                        resolution.resolutionTimestampMillis(),
+                        evidenceHash,
+                        resolution.venueId(),
+                        System.currentTimeMillis(),
+                        1));
+
+        await().atMost(FLOW_TIMEOUT).pollInterval(Duration.ofMillis(100)).untilAsserted(() -> {
+            Integer resolutionRows =
+                    jdbc.queryForObject(
+                            "SELECT COUNT(*) FROM venue_contract_resolution WHERE contract_symbol = ? AND evidence_hash = ?",
+                            Integer.class,
+                            PREDMKT_SYMBOL,
+                            evidenceHash);
+            assertThat(resolutionRows).isEqualTo(1);
+            Integer outboxRows =
+                    jdbc.queryForObject(
+                            "SELECT COUNT(*) FROM prediction_market_ledger_outbox o "
+                                    + "JOIN venue_contract_resolution r ON r.id = o.resolution_id "
+                                    + "WHERE r.evidence_hash = ?",
+                            Integer.class,
+                            evidenceHash);
+            assertThat(outboxRows).isGreaterThanOrEqualTo(1);
+        });
+
+        String payout =
+                jdbc.queryForObject(
+                        """
+                                SELECT o.payload_json::text
+                                FROM prediction_market_ledger_outbox o
+                                JOIN venue_contract_resolution r ON r.id = o.resolution_id
+                                WHERE r.evidence_hash = ?
+                                LIMIT 1
+                                """,
+                        String.class,
+                        evidenceHash);
+        assertThat(payout).contains("prediction_market_binary_resolution");
+        assertThat(payout).contains("payoutAmount").contains("10.00");
     }
 
     private static int allocatePort() {

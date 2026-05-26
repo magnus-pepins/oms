@@ -10,6 +10,7 @@ import com.balh.oms.cluster.OmsClusterEventsRecordingSupport.BootstrapPick;
 import com.balh.oms.cluster.OmsClusterWireFormat;
 import com.balh.oms.cluster.OrderAdmittedEvent;
 import com.balh.oms.cluster.OrderCancelAppliedEvent;
+import com.balh.oms.cluster.VenueResolutionAppliedEvent;
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.config.OmsProfiles;
 import com.balh.oms.domain.Order;
@@ -30,6 +31,7 @@ import com.balh.oms.persistence.SellFillPositionSplit;
 import com.balh.oms.risk.BuyFundsRequirement;
 import com.balh.oms.returnpath.ExecutionTradeCommand;
 import com.balh.oms.returnpath.MarketContextVenueEvidence;
+import com.balh.oms.settlement.PredictionMarketResolutionService;
 import com.balh.oms.settlement.SettlementDateCalculator;
 import com.balh.oms.tailer.OrderControlAdmission;
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -181,6 +183,7 @@ public class OmsPostgresProjector {
      * profile-driven.
      */
     private final SettlementDateCalculator settlementDateCalculator;
+    private final PredictionMarketResolutionService predictionMarketResolutionService;
     /**
      * Phase 4 Tier 2.5 phase E-2 — pre-registered counter for the defensive shard guard in
      * {@link #applyAdmittedEvent}. See {@link #METRIC_SHARD_MISMATCH_DROPPED} for the contract.
@@ -224,7 +227,8 @@ public class OmsPostgresProjector {
             MeterRegistry meterRegistry,
             ObjectMapper objectMapper,
             PlatformTransactionManager transactionManager,
-            SettlementDateCalculator settlementDateCalculator) {
+            SettlementDateCalculator settlementDateCalculator,
+            PredictionMarketResolutionService predictionMarketResolutionService) {
         this(
                 config,
                 cursorRepository,
@@ -241,7 +245,8 @@ public class OmsPostgresProjector {
                 objectMapper,
                 transactionManager,
                 Clock.systemUTC(),
-                settlementDateCalculator);
+                settlementDateCalculator,
+                predictionMarketResolutionService);
     }
 
     /**
@@ -265,7 +270,8 @@ public class OmsPostgresProjector {
             ObjectMapper objectMapper,
             PlatformTransactionManager transactionManager,
             Clock wallClock,
-            SettlementDateCalculator settlementDateCalculator) {
+            SettlementDateCalculator settlementDateCalculator,
+            PredictionMarketResolutionService predictionMarketResolutionService) {
         this.config = config;
         this.cursorRepository = cursorRepository;
         this.ordersRepository = ordersRepository;
@@ -281,6 +287,7 @@ public class OmsPostgresProjector {
         this.objectMapper = objectMapper;
         this.wallClock = wallClock;
         this.settlementDateCalculator = settlementDateCalculator;
+        this.predictionMarketResolutionService = predictionMarketResolutionService;
         this.shardMismatchCounter = Counter.builder(METRIC_SHARD_MISMATCH_DROPPED)
                 .description(
                         "Cluster events whose shard id did not match this projector's "
@@ -925,6 +932,12 @@ public class OmsPostgresProjector {
                     transactionTemplate.executeWithoutResult(status -> applyOrderCancelAppliedEvent(ev, newPosition));
                     lastAppliedPosition.set(newPosition);
                 }
+                case OmsClusterWireFormat.TYPE_ID_VENUE_RESOLUTION_APPLIED -> {
+                    VenueResolutionAppliedEvent ev = VenueResolutionAppliedEvent.decode(buffer, offset, length);
+                    transactionTemplate.executeWithoutResult(
+                            status -> applyVenueResolutionAppliedEvent(ev, newPosition));
+                    lastAppliedPosition.set(newPosition);
+                }
                 default -> {
                     // Unknown event types must still advance the cursor so the projector does not stall
                     // on a recording from a future schema. The cluster's snapshot bump procedure already
@@ -1386,6 +1399,15 @@ public class OmsPostgresProjector {
             throw new IllegalStateException(
                     "domain event serialisation failed for OMS-cancel of order " + refreshed.id(), e);
         }
+        cursorRepository.advanceWithRecording(
+                PROJECTOR_ID,
+                OmsClusterWireFormat.EVENTS_STREAM_ID,
+                requireCurrentRecordingId(),
+                newPosition);
+    }
+
+    void applyVenueResolutionAppliedEvent(VenueResolutionAppliedEvent ev, long newPosition) {
+        predictionMarketResolutionService.apply(ev);
         cursorRepository.advanceWithRecording(
                 PROJECTOR_ID,
                 OmsClusterWireFormat.EVENTS_STREAM_ID,

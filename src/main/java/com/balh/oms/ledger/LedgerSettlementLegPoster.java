@@ -2,6 +2,7 @@ package com.balh.oms.ledger;
 
 import com.balh.oms.corporateaction.CorporateActionCashLedgerBookingService;
 import com.balh.oms.settlement.LedgerSettlementOutboxRepository;
+import com.balh.oms.settlement.PredictionMarketLedgerOutboxRepository;
 import com.balh.oms.settlement.SettlementFailPenaltyBookingService;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -95,8 +96,50 @@ public final class LedgerSettlementLegPoster implements LedgerSettlementPostingC
             case LedgerSettlementOutboxRepository.LEG_CASH_QUOTE -> postCashCrossCurrency(outboxId, p, false);
             case LedgerSettlementOutboxRepository.LEG_FEE -> postFee(outboxId, p);
             case LedgerSettlementOutboxRepository.LEG_PENALTY -> postPenalty(outboxId, p);
+            case PredictionMarketLedgerOutboxRepository.LEG_PREDICTION_PAYOUT ->
+                    postPredictionMarketPayout(outboxId, p);
             default -> throw new LedgerSettlementPostingException("unknown legKind: " + legKind);
         }
+    }
+
+    /** Prediction-market resolution payout legs ({@code prediction_market_ledger_outbox}). */
+    public void postPredictionMarketOutbox(long outboxId, String legKind, String payloadJson)
+            throws LedgerSettlementPostingException {
+        JsonNode p;
+        try {
+            p = objectMapper.readTree(payloadJson == null || payloadJson.isBlank() ? "{}" : payloadJson);
+        } catch (JsonProcessingException e) {
+            throw new LedgerSettlementPostingException("invalid prediction-market outbox payload_json", e);
+        }
+        if (PredictionMarketLedgerOutboxRepository.LEG_PREDICTION_PAYOUT.equals(legKind)) {
+            postPredictionMarketPayout(outboxId, p);
+        } else {
+            throw new LedgerSettlementPostingException("unknown prediction-market legKind: " + legKind);
+        }
+    }
+
+    private void postPredictionMarketPayout(long outboxId, JsonNode p) throws LedgerSettlementPostingException {
+        String accountId = required(p, "accountId");
+        String currency = required(p, "currency");
+        BigDecimal payout = bigDecimal(p, "payoutAmount");
+        if (payout.signum() <= 0) {
+            log.debug("prediction payout skipped (amount<=0) outboxId={}", outboxId);
+            return;
+        }
+        String collateral =
+                textOrDefault(p, "collateralIndicator", "@Prediction-Market-Collateral-" + currency);
+        String customerBalance = resolveCustomerBalanceId(p, accountId, currency);
+        Map<String, Object> body =
+                legBody(
+                        collateral,
+                        customerBalance,
+                        payout,
+                        currency,
+                        "prediction-payout-" + outboxId,
+                        "Prediction market resolution payout symbol="
+                                + textOrDefault(p, "instrumentSymbol", ""));
+        addLegMetaData(body, p, "prediction-payout");
+        postLeg(body, outboxId, "prediction-payout");
     }
 
     /** Corporate-action payable-date legs ({@code corporate_action_ledger_outbox}). */

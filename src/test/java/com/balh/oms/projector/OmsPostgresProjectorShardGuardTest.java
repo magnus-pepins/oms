@@ -93,7 +93,8 @@ class OmsPostgresProjectorShardGuardTest {
                 txManager,
                 pinned,
                 new com.balh.oms.settlement.SettlementDateCalculator(
-                        com.balh.oms.settlement.SettlementDateCalculator.DEFAULT_CYCLE_FALLBACK));
+                        com.balh.oms.settlement.SettlementDateCalculator.DEFAULT_CYCLE_FALLBACK),
+                org.mockito.Mockito.mock(com.balh.oms.settlement.PredictionMarketResolutionService.class));
         // Production seeding (init() → bootstrap → replay loop) is bypassed in unit tests that
         // drive applyAdmittedEvent / applyOrderCancelAppliedEvent directly. Seed the recording
         // id so the apply path's cursor write does not fail loud on -1.

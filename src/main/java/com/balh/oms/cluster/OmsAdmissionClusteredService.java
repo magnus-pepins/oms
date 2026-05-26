@@ -23,6 +23,7 @@ import org.agrona.MutableDirectBuffer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
@@ -108,7 +109,7 @@ public class OmsAdmissionClusteredService implements ClusteredService {
      * member <em>before</em> starting the E-3b binary; the cluster will rebuild state from the
      * recorded log.
      */
-    static final int SNAPSHOT_SCHEMA_VERSION = 4;
+    static final int SNAPSHOT_SCHEMA_VERSION = 5;
 
     /** Phase 2.1 readiness counter — see {@code plans/oms-cluster-recovery-and-hardening.md}. */
     public static final int READINESS_COUNTER_TYPE_ID = 2_000_002;
@@ -201,6 +202,9 @@ public class OmsAdmissionClusteredService implements ClusteredService {
      * the snapshot is a follow-up if we ever see customer-frontend doubles in production logs.
      */
     private final Map<UUID, Set<String>> requestedKeysIndex = new HashMap<>(INITIAL_INDEX_CAPACITY);
+
+    /** Phase B: idempotency for {@link ApplyVenueResolutionCommand} keyed by symbol|evidenceHash. */
+    private final Set<String> resolvedContractKeys = new HashSet<>();
 
     private final ExpandableArrayBuffer egressBuffer = new ExpandableArrayBuffer(INITIAL_BUFFER_CAPACITY);
 
@@ -562,6 +566,8 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                     applyRequestCancelOrder(timestamp, buffer, offset, length);
             case OmsClusterWireFormat.TYPE_ID_REQUEST_REPLACE_ORDER ->
                     applyRequestReplaceOrder(timestamp, buffer, offset, length);
+            case OmsClusterWireFormat.TYPE_ID_APPLY_VENUE_RESOLUTION ->
+                    applyVenueResolution(timestamp, buffer, offset, length);
             default -> {
                 // Unknown command — silently ignored. A real reject would require an event;
                 // adding an UnknownCommandRejected event is a Phase 2 concern.
@@ -720,6 +726,14 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                 buffer.putInt(p, seq);
                 p += Integer.BYTES;
             }
+        }
+        buffer.putInt(p, resolvedContractKeys.size());
+        p += Integer.BYTES;
+        for (String key : resolvedContractKeys) {
+            byte[] bytes = key.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            buffer.putInt(p, bytes.length);
+            buffer.putBytes(p + Integer.BYTES, bytes);
+            p += Integer.BYTES + bytes.length;
         }
         // Phase 7 self-healing — encode/decode round-trip self-test BEFORE we publish. Decodes the
         // bytes we just encoded into a throwaway target and asserts:
@@ -1169,6 +1183,72 @@ public class OmsAdmissionClusteredService implements ClusteredService {
         emitExecutionApplied(cmd, mutated, clusterTimestampMillis);
     }
 
+    private void applyVenueResolution(long clusterTimestampMillis, DirectBuffer buffer, int offset, int length) {
+        ApplyVenueResolutionCommand cmd = ApplyVenueResolutionCommand.decode(buffer, offset, length);
+        if (resolvedContractKeys.contains(cmd.idempotencyKey())) {
+            return;
+        }
+        String symbolNorm = cmd.instrumentSymbol().trim().toUpperCase(java.util.Locale.ROOT);
+        int resolvedCount = 0;
+        for (Map.Entry<UUID, AdmittedOrder> entry : new ArrayList<>(orderIndex.entrySet())) {
+            AdmittedOrder order = entry.getValue();
+            if (order.instrumentSymbol() == null
+                    || !symbolNorm.equals(order.instrumentSymbol().trim().toUpperCase(java.util.Locale.ROOT))) {
+                continue;
+            }
+            if (isTerminal(order.statusCode())) {
+                continue;
+            }
+            AdmittedOrder mutated =
+                    new AdmittedOrder(
+                            order.orderId(),
+                            order.accountId(),
+                            order.clientIdempotencyKey(),
+                            order.accountIdHash(),
+                            order.instrumentSymbol(),
+                            order.side(),
+                            order.quantityScaled(),
+                            order.limitPriceScaledOrZero(),
+                            order.timeInForceCode(),
+                            order.ledgerBalanceIdOrNull(),
+                            order.version() + 1,
+                            order.acceptedAtMillis(),
+                            STATUS_RESOLVED,
+                            order.cumQtyScaled(),
+                            order.shardId());
+            orderIndex.put(order.orderId(), mutated);
+            idempotencyIndex.put(new IdempotencyKey(mutated.accountId(), mutated.clientIdempotencyKey()), mutated);
+            resolvedCount++;
+        }
+        resolvedContractKeys.add(cmd.idempotencyKey());
+        emitVenueResolutionApplied(cmd, clusterTimestampMillis, resolvedCount);
+    }
+
+    private void emitVenueResolutionApplied(
+            ApplyVenueResolutionCommand cmd, long appliedAtMillis, int ordersResolvedCount) {
+        if (eventsPublication == null) {
+            return;
+        }
+        VenueResolutionAppliedEvent ev =
+                new VenueResolutionAppliedEvent(
+                        cmd.instrumentSymbol(),
+                        cmd.outcomeCode(),
+                        cmd.resolutionSource(),
+                        cmd.resolutionTimestampMillis(),
+                        cmd.evidenceHash(),
+                        cmd.venueId(),
+                        appliedAtMillis,
+                        ordersResolvedCount);
+        int len = ev.encode(eventsBuffer, 0);
+        long pos;
+        while ((pos = eventsPublication.offer(eventsBuffer, 0, len)) < 0L) {
+            if (pos == io.aeron.Publication.CLOSED || pos == io.aeron.Publication.MAX_POSITION_EXCEEDED) {
+                throw new IllegalStateException("eventsPublication offer closed; pos=" + pos);
+            }
+            Thread.yield();
+        }
+    }
+
     /**
      * Slice 4p — apply path for OMS-initiated {@link CancelOrderCommand}s. Mirrors the discipline
      * of {@link #applyExecutionReport}: idempotent on unknown / terminal orders, single state
@@ -1616,6 +1696,12 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                 }
                 verifySenderSeqs.put(sender, seqs);
             }
+            int resolvedCount = buffer.getInt(p);
+            p += Integer.BYTES;
+            for (int i = 0; i < resolvedCount; i++) {
+                int keyLen = buffer.getInt(p);
+                p += Integer.BYTES + keyLen;
+            }
             this.finalCursor = p - offset;
             if (this.finalCursor > length) {
                 throw new IllegalStateException(
@@ -1695,6 +1781,15 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                 }
                 senderSeqIndex.put(sender, seqs);
             }
+            int resolvedCount = buffer.getInt(p);
+            p += Integer.BYTES;
+            for (int i = 0; i < resolvedCount; i++) {
+                int keyLen = buffer.getInt(p);
+                byte[] keyBytes = new byte[keyLen];
+                buffer.getBytes(p + Integer.BYTES, keyBytes);
+                resolvedContractKeys.add(new String(keyBytes, java.nio.charset.StandardCharsets.UTF_8));
+                p += Integer.BYTES + keyLen;
+            }
         }
     }
 
@@ -1723,10 +1818,14 @@ public class OmsAdmissionClusteredService implements ClusteredService {
     /** Equivalent to {@code OrderStatus.REJECTED.ordinal()}. */
     static final byte STATUS_REJECTED = 6;
 
+    /** Equivalent to {@code OrderStatus.RESOLVED.ordinal()}. Phase B prediction-market resolution. */
+    static final byte STATUS_RESOLVED = 8;
+
     private static boolean isTerminal(byte statusCode) {
         return statusCode == STATUS_FILLED
                 || statusCode == STATUS_CANCELLED
-                || statusCode == STATUS_REJECTED;
+                || statusCode == STATUS_REJECTED
+                || statusCode == STATUS_RESOLVED;
     }
 
     /**

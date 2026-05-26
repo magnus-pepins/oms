@@ -91,6 +91,21 @@ public final class EmbeddedVenueStack implements AutoCloseable {
         return service.tradeCountForTest();
     }
 
+    /** Phase B: resolve a binary contract on the embedded venue cluster (operator role). */
+    public void resolveContractYes(String symbol, String evidenceHash)
+            throws TimeoutException, InterruptedException {
+        com.balh.venue.cluster.ResolveContractCommand cmd =
+                new com.balh.venue.cluster.ResolveContractCommand(
+                        System.nanoTime(),
+                        symbol,
+                        com.balh.venue.cluster.VenueClusterWireFormat.OUTCOME_YES,
+                        "it-oracle",
+                        System.currentTimeMillis(),
+                        evidenceHash,
+                        com.balh.venue.matching.VenueOperatorRole.OPERATOR);
+        clusterIngressClient.submitResolveContract(cmd, Duration.ofSeconds(10));
+    }
+
     public void resetMatchingState() {
         service.matchingEngineForTest().clearForTest();
     }

@@ -998,9 +998,13 @@ public class OmsConfig {
 
     /** gRPC client settings for {@code oms.routing.backend=internal-venue}. */
     public static class Venue {
+        private static final long DEFAULT_RESOLUTION_DISPUTE_WINDOW_MS = 7_200_000L;
+
         private String grpcHost = "127.0.0.1";
         private int grpcPort = 50051;
         private String venueId = "balh-internal-venue";
+        /** Phase B: hold Ledger posting until this window elapses (default 2h). */
+        private long resolutionDisputeWindowMs = DEFAULT_RESOLUTION_DISPUTE_WINDOW_MS;
 
         public String getGrpcHost() { return grpcHost; }
         public void setGrpcHost(String grpcHost) {
@@ -1015,6 +1019,17 @@ public class OmsConfig {
         public String getVenueId() { return venueId; }
         public void setVenueId(String venueId) {
             this.venueId = venueId == null || venueId.isBlank() ? "balh-internal-venue" : venueId.trim();
+        }
+
+        public long getResolutionDisputeWindowMs() {
+            return resolutionDisputeWindowMs;
+        }
+
+        public void setResolutionDisputeWindowMs(long resolutionDisputeWindowMs) {
+            this.resolutionDisputeWindowMs =
+                    resolutionDisputeWindowMs > 0
+                            ? resolutionDisputeWindowMs
+                            : DEFAULT_RESOLUTION_DISPUTE_WINDOW_MS;
         }
     }
 

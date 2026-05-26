@@ -125,6 +125,12 @@ public final class OmsClusterWireFormat {
      */
     public static final int TYPE_ID_REQUEST_REPLACE_ORDER = 6;
 
+    /**
+     * {@link ApplyVenueResolutionCommand}. Phase B prediction-market resolution: transitions open
+     * orders on a contract to {@code RESOLVED} and emits {@link VenueResolutionAppliedEvent}.
+     */
+    public static final int TYPE_ID_APPLY_VENUE_RESOLUTION = 7;
+
     // ---- Event type IDs (1000..1999) ----
 
     /** {@link OrderAcceptedEvent}. */
@@ -175,6 +181,16 @@ public final class OmsClusterWireFormat {
      * to {@code domain_event_outbox}.
      */
     public static final int TYPE_ID_ORDER_REPLACE_REQUESTED = 1006;
+
+    /**
+     * {@link VenueResolutionAppliedEvent}. Phase B projection event after
+     * {@link ApplyVenueResolutionCommand} applies on the cluster.
+     */
+    public static final int TYPE_ID_VENUE_RESOLUTION_APPLIED = 1007;
+
+    /** Binary contract outcome wire codes (mirrors balh-venue {@code VenueClusterWireFormat}). */
+    public static final byte OUTCOME_YES = 1;
+    public static final byte OUTCOME_NO = 2;
 
     // ---- Cluster→projector event stream (Phase 2) ----
 

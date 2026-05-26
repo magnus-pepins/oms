@@ -93,7 +93,8 @@ class OmsPostgresProjectorInitLoudFailTest {
                 txManager,
                 Clock.systemUTC(),
                 new com.balh.oms.settlement.SettlementDateCalculator(
-                        com.balh.oms.settlement.SettlementDateCalculator.DEFAULT_CYCLE_FALLBACK));
+                        com.balh.oms.settlement.SettlementDateCalculator.DEFAULT_CYCLE_FALLBACK),
+                org.mockito.Mockito.mock(com.balh.oms.settlement.PredictionMarketResolutionService.class));
     }
 
     @Test

@@ -109,7 +109,8 @@ class OmsPostgresProjectorD3OrderAcceptedTest {
                 txManager,
                 pinned,
                 new com.balh.oms.settlement.SettlementDateCalculator(
-                        com.balh.oms.settlement.SettlementDateCalculator.DEFAULT_CYCLE_FALLBACK));
+                        com.balh.oms.settlement.SettlementDateCalculator.DEFAULT_CYCLE_FALLBACK),
+                org.mockito.Mockito.mock(com.balh.oms.settlement.PredictionMarketResolutionService.class));
     }
 
     @Test
@@ -166,7 +167,8 @@ class OmsPostgresProjectorD3OrderAcceptedTest {
                 txManager,
                 pinned,
                 new com.balh.oms.settlement.SettlementDateCalculator(
-                        com.balh.oms.settlement.SettlementDateCalculator.DEFAULT_CYCLE_FALLBACK));
+                        com.balh.oms.settlement.SettlementDateCalculator.DEFAULT_CYCLE_FALLBACK),
+                org.mockito.Mockito.mock(com.balh.oms.settlement.PredictionMarketResolutionService.class));
 
         OrderAdmittedEvent ev = new OrderAdmittedEvent(
                 UUID.fromString("00000000-0000-4000-8000-0000000000d3"),
@@ -229,7 +231,8 @@ class OmsPostgresProjectorD3OrderAcceptedTest {
                 txManager,
                 pinned,
                 new com.balh.oms.settlement.SettlementDateCalculator(
-                        com.balh.oms.settlement.SettlementDateCalculator.DEFAULT_CYCLE_FALLBACK));
+                        com.balh.oms.settlement.SettlementDateCalculator.DEFAULT_CYCLE_FALLBACK),
+                org.mockito.Mockito.mock(com.balh.oms.settlement.PredictionMarketResolutionService.class));
 
         OrderAdmittedEvent ev = new OrderAdmittedEvent(
                 UUID.randomUUID(),

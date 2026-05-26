@@ -107,6 +107,11 @@ const JAVA = process.env.OMS_JAVA || 'java';
 // JDK 21 to access jdk.internal.misc.* / sun.nio.ch.* / sun.misc.Unsafe.
 const OMS_JAVA_TMPDIR =
   process.env.OMS_JAVA_TMPDIR || path.join(projectRoot, 'tmp', 'java');
+try {
+  fs.mkdirSync(OMS_JAVA_TMPDIR, { recursive: true });
+} catch (_) {
+  // may already exist
+}
 const LOW_LATENCY_JVM_FLAGS = [
   '--add-exports=java.base/jdk.internal.ref=ALL-UNNAMED',
   '--add-exports=java.base/sun.nio.ch=ALL-UNNAMED',

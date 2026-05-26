@@ -1,16 +1,12 @@
 package com.balh.oms.fixin;
 
-import com.balh.oms.cluster.ApplyVenueResolutionCommand;
-import com.balh.oms.cluster.OmsClusterIngressClient;
-import com.balh.oms.cluster.OmsClusterWireFormat;
-import com.balh.oms.cluster.VenueResolutionAppliedEvent;
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.config.OmsProfiles;
-import com.balh.oms.settlement.PredictionMarketResolutionService;
 import com.balh.oms.fixin.it.FixInClientCollectorApplication;
 import com.balh.oms.fixin.it.FixInClientEmbeddedInitiator;
 import com.balh.oms.venue.EmbeddedVenueStack;
 import com.balh.oms.venueegress.OmsVenueEgressService;
+import com.balh.oms.venueresolver.OmsVenueResolverService;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
@@ -50,7 +46,8 @@ import static org.awaitility.Awaitility.await;
         scripts = "/db/fix-in-uat-seed.sql",
         statements = {
             "DELETE FROM oms_venue_egress_cursor WHERE egress_id = 'oms-venue-egress-default'",
-            "DELETE FROM oms_fix_in_return_cursor WHERE egress_id = 'oms-fix-in-return-default'"
+            "DELETE FROM oms_fix_in_return_cursor WHERE egress_id = 'oms-fix-in-return-default'",
+            "DELETE FROM oms_venue_resolver_cursor WHERE resolver_id = 'oms-venue-resolver-default'"
         },
         executionPhase = Sql.ExecutionPhase.BEFORE_TEST_METHOD)
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
@@ -98,17 +95,19 @@ class FixInToVenueRoundTripIT extends FixInWireItAcceptorSupport {
 
         registry.add("oms.cluster.venue-egress.enabled", () -> "true");
         registry.add("oms.cluster.venue-egress.aeron-directory", () -> aeronDir);
+        registry.add("oms.cluster.venue-resolver.enabled", () -> "true");
+        registry.add("oms.cluster.venue-resolver.venue-aeron-directory", embeddedVenue::aeronDirectory);
+        registry.add("oms.cluster.venue-resolver.replay-stream-id", () -> "4326");
         registry.add("oms.routing.backend", () -> "internal-venue");
         registry.add("oms.venue.grpc-host", () -> "127.0.0.1");
         registry.add("oms.venue.grpc-port", () -> String.valueOf(embeddedVenue.grpcPort()));
     }
 
     @Autowired OmsVenueEgressService egress;
+    @Autowired OmsVenueResolverService venueResolver;
     @Autowired FixInClientEmbeddedInitiator fixInClient;
     @Autowired JdbcTemplate jdbc;
-    @Autowired OmsClusterIngressClient clusterIngressClient;
     @Autowired OmsConfig omsConfig;
-    @Autowired PredictionMarketResolutionService predictionMarketResolutionService;
 
     @BeforeEach
     void startClientAndResetHooks() throws InterruptedException {
@@ -199,20 +198,6 @@ class FixInToVenueRoundTripIT extends FixInWireItAcceptorSupport {
                                 .anyMatch(er -> clOrdId.equals(er.clOrdId()) && er.execType() == ExecType.FILL))
                         .isTrue());
 
-        String evidenceHash = "it-hash-" + UUID.randomUUID();
-        embeddedVenue.resolveContractYes(PREDMKT_SYMBOL, evidenceHash);
-
-        ApplyVenueResolutionCommand resolution =
-                new ApplyVenueResolutionCommand(
-                        System.nanoTime(),
-                        PREDMKT_SYMBOL,
-                        OmsClusterWireFormat.OUTCOME_YES,
-                        "it-oracle",
-                        System.currentTimeMillis(),
-                        evidenceHash,
-                        omsConfig.getVenue().getVenueId());
-        clusterIngressClient.submitApplyVenueResolution(resolution, Duration.ofSeconds(10));
-
         UUID accountId = UUID.fromString("a0000001-0000-4000-8000-000000000002");
         UUID custodyId = UUID.fromString(omsConfig.getSettlement().getDefaultCustodyAccountId());
         jdbc.update(
@@ -230,17 +215,11 @@ class FixInToVenueRoundTripIT extends FixInWireItAcceptorSupport {
                 PREDMKT_SYMBOL,
                 custodyId);
 
-        predictionMarketResolutionService.apply(
-                new VenueResolutionAppliedEvent(
-                        PREDMKT_SYMBOL,
-                        OmsClusterWireFormat.OUTCOME_YES,
-                        resolution.resolutionSource(),
-                        resolution.resolutionTimestampMillis(),
-                        evidenceHash,
-                        resolution.venueId(),
-                        System.currentTimeMillis(),
-                        1));
+        String evidenceHash = "it-hash-" + UUID.randomUUID();
+        embeddedVenue.resolveContractYes(PREDMKT_SYMBOL, evidenceHash);
 
+        await().atMost(FLOW_TIMEOUT).pollInterval(Duration.ofMillis(100)).untilAsserted(() ->
+                assertThat(venueResolver.lastAppliedPosition()).isGreaterThan(0L));
         await().atMost(FLOW_TIMEOUT).pollInterval(Duration.ofMillis(100)).untilAsserted(() -> {
             Integer resolutionRows =
                     jdbc.queryForObject(

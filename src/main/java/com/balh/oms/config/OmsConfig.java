@@ -2979,11 +2979,13 @@ public class OmsConfig {
         private final Projector projector = new Projector();
         private final FixEgress fixEgress = new FixEgress();
         private final VenueEgress venueEgress = new VenueEgress();
+        private final VenueResolver venueResolver = new VenueResolver();
 
         public Client getClient() { return client; }
         public Projector getProjector() { return projector; }
         public FixEgress getFixEgress() { return fixEgress; }
         public VenueEgress getVenueEgress() { return venueEgress; }
+        public VenueResolver getVenueResolver() { return venueResolver; }
 
         /**
          * Phase 3 of the Aeron Cluster substrate plan: configuration for the
@@ -3195,6 +3197,84 @@ public class OmsConfig {
             public int getCursorFlushEvery() { return cursorFlushEvery; }
             public void setCursorFlushEvery(int cursorFlushEvery) {
                 this.cursorFlushEvery = Math.max(1, cursorFlushEvery);
+            }
+        }
+
+        /**
+         * Phase B: tails balh-venue cluster {@code VenueResolutionEvent} fragments and submits
+         * {@link com.balh.oms.cluster.ApplyVenueResolutionCommand} to the OMS cluster.
+         */
+        public static class VenueResolver {
+
+            private static final long DEFAULT_POLL_PARK_NANOS = 1_000_000L;
+            private static final int DEFAULT_FRAGMENT_LIMIT = 64;
+            private static final long DEFAULT_RECORDING_LOOKUP_PARK_MS = 100L;
+            private static final int DEFAULT_REPLAY_STREAM_ID = 4326;
+            private static final long DEFAULT_OFFER_TIMEOUT_MS = 30_000L;
+
+            private boolean enabled = false;
+            /** Aeron directory of the balh-venue MediaDriver (not the OMS cluster driver). */
+            private String venueAeronDirectory = "";
+            private String archiveControlRequestChannel = "aeron:ipc?term-length=64k";
+            private String archiveControlResponseChannel = "aeron:ipc?term-length=64k";
+            private String replayChannel = "aeron:ipc?term-length=64k";
+            private int replayStreamId = DEFAULT_REPLAY_STREAM_ID;
+            private long pollParkNanos = DEFAULT_POLL_PARK_NANOS;
+            private int fragmentLimit = DEFAULT_FRAGMENT_LIMIT;
+            private long recordingLookupParkMs = DEFAULT_RECORDING_LOOKUP_PARK_MS;
+            private long offerTimeoutMs = DEFAULT_OFFER_TIMEOUT_MS;
+
+            public boolean isEnabled() { return enabled; }
+            public void setEnabled(boolean enabled) { this.enabled = enabled; }
+
+            public String getVenueAeronDirectory() { return venueAeronDirectory; }
+            public void setVenueAeronDirectory(String venueAeronDirectory) {
+                this.venueAeronDirectory = venueAeronDirectory == null ? "" : venueAeronDirectory.trim();
+            }
+
+            public String getArchiveControlRequestChannel() { return archiveControlRequestChannel; }
+            public void setArchiveControlRequestChannel(String channel) {
+                this.archiveControlRequestChannel =
+                        channel == null || channel.isBlank() ? "aeron:ipc?term-length=64k" : channel.trim();
+            }
+
+            public String getArchiveControlResponseChannel() { return archiveControlResponseChannel; }
+            public void setArchiveControlResponseChannel(String channel) {
+                this.archiveControlResponseChannel =
+                        channel == null || channel.isBlank() ? "aeron:ipc?term-length=64k" : channel.trim();
+            }
+
+            public String getReplayChannel() { return replayChannel; }
+            public void setReplayChannel(String replayChannel) {
+                this.replayChannel =
+                        replayChannel == null || replayChannel.isBlank()
+                                ? "aeron:ipc?term-length=64k"
+                                : replayChannel.trim();
+            }
+
+            public int getReplayStreamId() { return replayStreamId; }
+            public void setReplayStreamId(int replayStreamId) {
+                this.replayStreamId = replayStreamId;
+            }
+
+            public long getPollParkNanos() { return pollParkNanos; }
+            public void setPollParkNanos(long pollParkNanos) {
+                this.pollParkNanos = Math.max(1_000L, pollParkNanos);
+            }
+
+            public int getFragmentLimit() { return fragmentLimit; }
+            public void setFragmentLimit(int fragmentLimit) {
+                this.fragmentLimit = Math.max(1, fragmentLimit);
+            }
+
+            public long getRecordingLookupParkMs() { return recordingLookupParkMs; }
+            public void setRecordingLookupParkMs(long recordingLookupParkMs) {
+                this.recordingLookupParkMs = Math.max(10L, recordingLookupParkMs);
+            }
+
+            public long getOfferTimeoutMs() { return offerTimeoutMs; }
+            public void setOfferTimeoutMs(long offerTimeoutMs) {
+                this.offerTimeoutMs = Math.max(1_000L, offerTimeoutMs);
             }
         }
 

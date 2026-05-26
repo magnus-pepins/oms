@@ -166,6 +166,9 @@ dependencies {
     testImplementation("org.awaitility:awaitility:4.2.2")
     testImplementation("com.balh:balh-venue:0.1.0-SNAPSHOT")
 
+    // Phase B: decode VenueResolutionEvent in OmsVenueResolverService.
+    implementation("com.balh:balh-venue:0.1.0-SNAPSHOT")
+
     testImplementation("com.google.protobuf:protobuf-java:$protobufJavaVersion")
     // WireMock 3 core does not ship an HTTP server; Jetty 12 extension is required on the test classpath.
     testImplementation("org.wiremock:wiremock-jetty12:3.9.1")

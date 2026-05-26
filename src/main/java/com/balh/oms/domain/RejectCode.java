@@ -40,6 +40,17 @@ public enum RejectCode {
      * {@code isk_eligible=false} (gap plan §5.10 / Phase E Slice 12a).
      */
     RISK_ISK_INSTRUMENT_NOT_ELIGIBLE,
+    /**
+     * ISK tax-wrapper account BUY whose {@code order.ledgerBalanceId} does not match the
+     * ISK's own ledger balance in {@code oms_account_tax_wrapper.ledger_balance_id}
+     * (gap plan §5.10 / I3). Without this gate, a BFF mis-pick can silently route
+     * settlement cash for an ISK BUY through a non-ISK wrapper, which (a) breaks the
+     * schablon kapitalunderlag computation because no {@code isk_deposit_event} fires
+     * on the right balance, and (b) makes the SKV KU30 ruta 817 chain inconsistent
+     * with where the cash actually moved. Fail-loud is preferable to silent
+     * cross-wrapper leakage.
+     */
+    RISK_ISK_FUNDING_MISMATCH,
     /** Reserved for session / calendar gates (slice 5 catalogue). */
     RISK_MARKET_SESSION_CLOSED,
     /** Sanctions / PEP cache stale or screening failed when execution-time re-check is enabled (slice 8). */

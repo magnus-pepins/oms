@@ -41,6 +41,7 @@ public class ControlRiskEvaluator {
     private final PositionsRepository positionsRepository;
     private final FixRouteStateRepository fixRouteStateRepository;
     private final IskInstrumentEligibilityGate iskInstrumentEligibilityGate;
+    private final IskFundingGate iskFundingGate;
 
     private final AtomicReference<Set<String>> cachedTradable = new AtomicReference<>(Set.of());
     private final AtomicReference<String> cachedTradableSource = new AtomicReference<>("");
@@ -53,7 +54,8 @@ public class ControlRiskEvaluator {
             SanctionsExecutionGate sanctionsExecutionGate,
             PositionsRepository positionsRepository,
             FixRouteStateRepository fixRouteStateRepository,
-            IskInstrumentEligibilityGate iskInstrumentEligibilityGate) {
+            IskInstrumentEligibilityGate iskInstrumentEligibilityGate,
+            IskFundingGate iskFundingGate) {
         this.omsConfig = omsConfig;
         this.runtimeFlags = runtimeFlags;
         this.marketdataInstrumentsCache = marketdataInstrumentsCache;
@@ -61,6 +63,7 @@ public class ControlRiskEvaluator {
         this.positionsRepository = positionsRepository;
         this.fixRouteStateRepository = fixRouteStateRepository;
         this.iskInstrumentEligibilityGate = iskInstrumentEligibilityGate;
+        this.iskFundingGate = iskFundingGate;
     }
 
     /**
@@ -136,6 +139,10 @@ public class ControlRiskEvaluator {
         Optional<RejectCode> iskEligibility = iskInstrumentEligibilityGate.evaluate(order);
         if (iskEligibility.isPresent()) {
             return iskEligibility;
+        }
+        Optional<RejectCode> iskFunding = iskFundingGate.evaluate(order);
+        if (iskFunding.isPresent()) {
+            return iskFunding;
         }
         BigDecimal maxLimitPx = risk.getFatFingerMaxLimitPrice();
         if (maxLimitPx.compareTo(BigDecimal.ZERO) > 0

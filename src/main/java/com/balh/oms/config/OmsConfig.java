@@ -731,6 +731,15 @@ public class OmsConfig {
          * ({@link com.balh.oms.domain.RejectCode#RISK_ISK_INSTRUMENT_NOT_ELIGIBLE}).
          */
         private boolean iskInstrumentEligibilityCheckEnabled = false;
+        /**
+         * When {@code true}, an ISK tax-wrapper account BUY whose {@code order.ledgerBalanceId}
+         * does not match the ISK's own ledger balance recorded in
+         * {@code oms_account_tax_wrapper.ledger_balance_id} is rejected with
+         * {@link com.balh.oms.domain.RejectCode#RISK_ISK_FUNDING_MISMATCH}. Gap plan §5.10 / I3.
+         * Default off until the BFF picker is verified to always emit the ISK SEK cash balance
+         * on ISK BUYs; flipping on prematurely would reject legitimate orders from older clients.
+         */
+        private boolean iskFundingCheckEnabled = false;
 
         public boolean isInstrumentAllowlistEnabled() { return instrumentAllowlistEnabled; }
         public void setInstrumentAllowlistEnabled(boolean v) { this.instrumentAllowlistEnabled = v; }
@@ -915,6 +924,14 @@ public class OmsConfig {
 
         public void setIskInstrumentEligibilityCheckEnabled(boolean iskInstrumentEligibilityCheckEnabled) {
             this.iskInstrumentEligibilityCheckEnabled = iskInstrumentEligibilityCheckEnabled;
+        }
+
+        public boolean isIskFundingCheckEnabled() {
+            return iskFundingCheckEnabled;
+        }
+
+        public void setIskFundingCheckEnabled(boolean iskFundingCheckEnabled) {
+            this.iskFundingCheckEnabled = iskFundingCheckEnabled;
         }
 
         /** Uppercased symbols from {@link #allowedInstrumentSymbols}, comma-separated. */

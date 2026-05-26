@@ -45,7 +45,8 @@ class ControlRiskEvaluatorSellPositionTest {
                         new SanctionsExecutionGate(cfg),
                         positions,
                         fixRoutes,
-                        disabledIskGate(cfg));
+                        disabledIskGate(cfg),
+                        disabledIskFundingGate(cfg));
 
         Instant now = Instant.now();
         Order sell =
@@ -78,5 +79,10 @@ class ControlRiskEvaluatorSellPositionTest {
                 cfg,
                 mock(com.balh.oms.settlement.OmsAccountTaxWrapperRepository.class),
                 mock(com.balh.oms.settlement.InstrumentSettlementProfileRepository.class));
+    }
+
+    private static IskFundingGate disabledIskFundingGate(OmsConfig cfg) {
+        return new IskFundingGate(
+                cfg, mock(com.balh.oms.settlement.OmsAccountTaxWrapperRepository.class));
     }
 }

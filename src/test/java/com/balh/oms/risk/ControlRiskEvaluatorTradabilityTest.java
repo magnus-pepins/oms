@@ -86,7 +86,14 @@ class ControlRiskEvaluatorTradabilityTest {
         FixRouteStateRepository fixRoutes = mock(FixRouteStateRepository.class);
         when(fixRoutes.findByRouteKey(anyString())).thenReturn(Optional.empty());
         return new ControlRiskEvaluator(
-                cfg, flags, cache, new SanctionsExecutionGate(cfg), positions, fixRoutes, disabledIskGate(cfg));
+                cfg,
+                flags,
+                cache,
+                new SanctionsExecutionGate(cfg),
+                positions,
+                fixRoutes,
+                disabledIskGate(cfg),
+                mock(com.balh.oms.risk.IskFundingGate.class));
     }
 
     private static IskInstrumentEligibilityGate disabledIskGate(OmsConfig cfg) {

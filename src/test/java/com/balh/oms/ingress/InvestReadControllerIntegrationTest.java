@@ -80,6 +80,46 @@ class InvestReadControllerIntegrationTest extends AbstractPostgresIntegrationTes
     }
 
     @Test
+    void executions_returnsTradeFillHistory() {
+        UUID accountId = UUID.randomUUID();
+        seedOpenBuyExecution(accountId, "10", "5.00");
+        seedOpenSellExecution(accountId, "2", "100.00");
+
+        HttpHeaders h = new HttpHeaders();
+        h.set(ApiKeyFilter.HEADER, "test-key");
+        ResponseEntity<InvestReadController.ExecutionsListResponse> res = http.exchange(
+                base() + "/executions?accountId=" + accountId + "&limit=100",
+                HttpMethod.GET,
+                new HttpEntity<>(h),
+                new ParameterizedTypeReference<>() {});
+
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(res.getBody()).isNotNull();
+        assertThat(res.getBody().items()).hasSize(2);
+        assertThat(res.getBody().items())
+                .allSatisfy(item -> assertThat(item.instrumentSymbol()).isEqualTo("AAPL"));
+    }
+
+    @Test
+    void executions_honoursFromToWindow() {
+        UUID accountId = UUID.randomUUID();
+        seedOpenBuyExecution(accountId, "10", "5.00");
+
+        HttpHeaders h = new HttpHeaders();
+        h.set(ApiKeyFilter.HEADER, "test-key");
+        // A future-only window excludes the NOW()-stamped fill above.
+        ResponseEntity<InvestReadController.ExecutionsListResponse> res = http.exchange(
+                base() + "/executions?accountId=" + accountId + "&from=2999-01-01T00:00:00Z",
+                HttpMethod.GET,
+                new HttpEntity<>(h),
+                new ParameterizedTypeReference<>() {});
+
+        assertThat(res.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(res.getBody()).isNotNull();
+        assertThat(res.getBody().items()).isEmpty();
+    }
+
+    @Test
     void investPositions_exposesPendingQuantityColumns() {
         UUID accountId = UUID.randomUUID();
         UUID custodyId = UUID.fromString("a0000001-0000-4000-8000-000000000001");

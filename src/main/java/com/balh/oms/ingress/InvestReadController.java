@@ -21,6 +21,8 @@ public class InvestReadController {
 
     private static final int DEFAULT_SETTLEMENT_EVENTS_LIMIT = 20;
     private static final int MAX_SETTLEMENT_EVENTS_LIMIT = 100;
+    private static final int DEFAULT_EXECUTIONS_LIMIT = 500;
+    private static final int MAX_EXECUTIONS_LIMIT = 5000;
 
     private final CustomerInvestReadRepository investRead;
     private final PositionsRepository positions;
@@ -52,6 +54,8 @@ public class InvestReadController {
             String venueTs) {}
 
     public record SettlementEventsListResponse(List<SettlementEventResponse> items) {}
+
+    public record ExecutionsListResponse(List<SettlementEventResponse> items) {}
 
     public record InvestPositionResponse(
             String instrumentSymbol,
@@ -117,6 +121,55 @@ public class InvestReadController {
                                                 r.venueTs() == null ? null : r.venueTs().toString()))
                         .toList();
         return ResponseEntity.ok(new SettlementEventsListResponse(items));
+    }
+
+    /**
+     * Full TRADE fill history for an account in an optional {@code [from, to]}
+     * window (ISO-8601 instants on {@code venue_ts}), ascending. Backs the BFF
+     * portfolio-history (equity replay) and statements engines. Larger row cap
+     * than {@code /settlement-events}, which is a recent-activity feed.
+     */
+    @GetMapping("/executions")
+    public ResponseEntity<ExecutionsListResponse> executions(
+            @RequestParam("accountId") UUID accountId,
+            @RequestParam(name = "from", required = false) String from,
+            @RequestParam(name = "to", required = false) String to,
+            @RequestParam(name = "limit", required = false) Integer limit) {
+        int lim = limit == null ? DEFAULT_EXECUTIONS_LIMIT : limit;
+        lim = Math.min(Math.max(lim, 1), MAX_EXECUTIONS_LIMIT);
+        java.time.Instant fromTs = parseInstantOrNull(from);
+        java.time.Instant toTs = parseInstantOrNull(to);
+        var rows = investRead.listExecutions(accountId, fromTs, toTs, lim);
+        var items =
+                rows.stream()
+                        .map(
+                                r ->
+                                        new SettlementEventResponse(
+                                                r.executionId(),
+                                                r.orderId() == null ? null : r.orderId().toString(),
+                                                r.instrumentSymbol(),
+                                                r.side(),
+                                                plain(r.quantity()),
+                                                plain(r.price()),
+                                                r.settlementStatus(),
+                                                r.tradeDate() == null ? null : r.tradeDate().toString(),
+                                                r.expectedSettlementDate() == null
+                                                        ? null
+                                                        : r.expectedSettlementDate().toString(),
+                                                r.venueTs() == null ? null : r.venueTs().toString()))
+                        .toList();
+        return ResponseEntity.ok(new ExecutionsListResponse(items));
+    }
+
+    private static java.time.Instant parseInstantOrNull(String value) {
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        try {
+            return java.time.Instant.parse(value.trim());
+        } catch (java.time.format.DateTimeParseException ex) {
+            return null;
+        }
     }
 
     /**

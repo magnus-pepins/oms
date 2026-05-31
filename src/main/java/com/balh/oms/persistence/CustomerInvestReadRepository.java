@@ -54,6 +54,35 @@ public class CustomerInvestReadRepository {
             LIMIT :lim
             """;
 
+    /**
+     * Full TRADE execution (fill) history for one account, optionally bounded by
+     * {@code venue_ts} window. Ordered ascending so the BFF can replay fills to
+     * reconstruct positions/equity over time (portfolio history + statements).
+     * Unlike {@code LIST_SETTLEMENT_EVENTS} this supports a date range and a
+     * larger row cap.
+     */
+    private static final String LIST_EXECUTIONS =
+            """
+            SELECT e.id AS execution_id,
+                   e.order_id,
+                   o.instrument_symbol,
+                   o.side::text AS side,
+                   e.last_quantity,
+                   e.last_price,
+                   e.settlement_status::text AS settlement_status,
+                   e.trade_date,
+                   e.expected_settlement_date,
+                   e.venue_ts
+            FROM executions e
+            JOIN orders o ON o.id = e.order_id
+            WHERE e.account_id = :account_id
+              AND e.exec_type = CAST('TRADE' AS execution_exec_type)
+              AND (CAST(:from_ts AS timestamptz) IS NULL OR e.venue_ts >= CAST(:from_ts AS timestamptz))
+              AND (CAST(:to_ts AS timestamptz) IS NULL OR e.venue_ts <= CAST(:to_ts AS timestamptz))
+            ORDER BY e.venue_ts ASC NULLS LAST, e.id ASC
+            LIMIT :lim
+            """;
+
     private static final String LIST_PENDING_VOLUNTARY_CA =
             """
             SELECT e.id AS event_id,
@@ -133,23 +162,41 @@ public class CustomerInvestReadRepository {
         return jdbc.query(
                 LIST_SETTLEMENT_EVENTS,
                 new MapSqlParameterSource("account_id", accountId).addValue("lim", limit),
-                (rs, rowNum) -> {
-                    java.sql.Date td = rs.getDate("trade_date");
-                    java.sql.Date esd = rs.getDate("expected_settlement_date");
-                    var venueTs = rs.getTimestamp("venue_ts");
-                    return new SettlementEventRow(
-                            rs.getLong("execution_id"),
-                            rs.getObject("order_id", UUID.class),
-                            rs.getString("instrument_symbol"),
-                            rs.getString("side"),
-                            rs.getBigDecimal("last_quantity"),
-                            rs.getBigDecimal("last_price"),
-                            rs.getString("settlement_status"),
-                            td == null ? null : td.toLocalDate(),
-                            esd == null ? null : esd.toLocalDate(),
-                            venueTs == null ? null : venueTs.toInstant());
-                });
+                SETTLEMENT_EVENT_ROW_MAPPER);
     }
+
+    /**
+     * TRADE fills for one account in optional {@code [from, to]} {@code venue_ts}
+     * window, ascending. {@code from}/{@code to} may be {@code null} for an
+     * open-ended bound. Used by the BFF portfolio-history and statements engines.
+     */
+    public List<SettlementEventRow> listExecutions(UUID accountId, Instant from, Instant to, int limit) {
+        return jdbc.query(
+                LIST_EXECUTIONS,
+                new MapSqlParameterSource("account_id", accountId)
+                        .addValue("from_ts", from == null ? null : from.toString())
+                        .addValue("to_ts", to == null ? null : to.toString())
+                        .addValue("lim", limit),
+                SETTLEMENT_EVENT_ROW_MAPPER);
+    }
+
+    private static final org.springframework.jdbc.core.RowMapper<SettlementEventRow> SETTLEMENT_EVENT_ROW_MAPPER =
+            (rs, rowNum) -> {
+                java.sql.Date td = rs.getDate("trade_date");
+                java.sql.Date esd = rs.getDate("expected_settlement_date");
+                var venueTs = rs.getTimestamp("venue_ts");
+                return new SettlementEventRow(
+                        rs.getLong("execution_id"),
+                        rs.getObject("order_id", UUID.class),
+                        rs.getString("instrument_symbol"),
+                        rs.getString("side"),
+                        rs.getBigDecimal("last_quantity"),
+                        rs.getBigDecimal("last_price"),
+                        rs.getString("settlement_status"),
+                        td == null ? null : td.toLocalDate(),
+                        esd == null ? null : esd.toLocalDate(),
+                        venueTs == null ? null : venueTs.toInstant());
+            };
 
     public List<PendingVoluntaryCorporateActionRow> listPendingVoluntaryCorporateActions(UUID accountId) {
         return jdbc.query(

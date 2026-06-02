@@ -90,6 +90,7 @@ public class FxAutoHedgerController {
                             body.mode(),
                             body.baseNostroId(),
                             body.quoteNostroId(),
+                            body.exposureSource(),
                             body.updatedBy(),
                             body.autoApprovedBy()));
             Map<String, Object> out = new LinkedHashMap<>();
@@ -196,6 +197,7 @@ public class FxAutoHedgerController {
         m.put("mode", r.mode());
         m.put("baseNostroId", r.baseNostroId());
         m.put("quoteNostroId", r.quoteNostroId());
+        m.put("exposureSource", r.exposureSource());
         m.put("createdBy", r.createdBy());
         m.put("createdAt", r.createdAt().toString());
         m.put("updatedBy", r.updatedBy());
@@ -216,6 +218,7 @@ public class FxAutoHedgerController {
             String mode,
             String baseNostroId,
             String quoteNostroId,
+            String exposureSource,
             String updatedBy,
             String autoApprovedBy
     ) {}

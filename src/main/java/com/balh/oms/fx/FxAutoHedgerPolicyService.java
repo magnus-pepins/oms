@@ -98,7 +98,7 @@ public class FxAutoHedgerPolicyService {
     public void refreshNow() {
         String sql = "SELECT currency, target_balance, threshold_abs, threshold_pct, "
                 + "       pair_route, max_per_action, cooldown_s, mode, "
-                + "       base_nostro_id, quote_nostro_id, "
+                + "       base_nostro_id, quote_nostro_id, exposure_source, "
                 + "       created_by, created_at, updated_by, updated_at, "
                 + "       auto_approved_by, auto_approved_at "
                 + "FROM fx_hedger_policy";
@@ -146,6 +146,7 @@ public class FxAutoHedgerPolicyService {
         validate(req);
         String currency = req.currency().toUpperCase();
         String mode = req.mode().toLowerCase();
+        String exposureSource = normalizeExposureSource(req.exposureSource());
         String updatedBy = req.updatedBy().trim();
         Instant now = clock.instant();
 
@@ -187,13 +188,13 @@ public class FxAutoHedgerPolicyService {
             sql = "INSERT INTO fx_hedger_policy ("
                     + "currency, target_balance, threshold_abs, threshold_pct, "
                     + "pair_route, max_per_action, cooldown_s, mode, "
-                    + "base_nostro_id, quote_nostro_id, created_by, created_at, "
+                    + "base_nostro_id, quote_nostro_id, exposure_source, created_by, created_at, "
                     + "auto_approved_by, auto_approved_at) "
-                    + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                    + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
             args = new Object[]{
                     currency, req.targetBalance(), req.thresholdAbs(), req.thresholdPct(),
                     req.pairRoute().toUpperCase(), req.maxPerAction(), req.cooldownS(), mode,
-                    req.baseNostroId().trim(), req.quoteNostroId().trim(),
+                    req.baseNostroId().trim(), req.quoteNostroId().trim(), exposureSource,
                     updatedBy, Timestamp.from(now),
                     "auto".equals(mode) ? req.autoApprovedBy().trim() : null,
                     "auto".equals(mode) ? Timestamp.from(now) : null};
@@ -201,7 +202,7 @@ public class FxAutoHedgerPolicyService {
             sql = "UPDATE fx_hedger_policy SET "
                     + "target_balance = ?, threshold_abs = ?, threshold_pct = ?, "
                     + "pair_route = ?, max_per_action = ?, cooldown_s = ?, mode = ?, "
-                    + "base_nostro_id = ?, quote_nostro_id = ?, "
+                    + "base_nostro_id = ?, quote_nostro_id = ?, exposure_source = ?, "
                     + "updated_by = ?, updated_at = ?, "
                     + "auto_approved_by = ?, auto_approved_at = ? "
                     + "WHERE currency = ?";
@@ -220,7 +221,7 @@ public class FxAutoHedgerPolicyService {
             args = new Object[]{
                     req.targetBalance(), req.thresholdAbs(), req.thresholdPct(),
                     req.pairRoute().toUpperCase(), req.maxPerAction(), req.cooldownS(), mode,
-                    req.baseNostroId().trim(), req.quoteNostroId().trim(),
+                    req.baseNostroId().trim(), req.quoteNostroId().trim(), exposureSource,
                     updatedBy, Timestamp.from(now),
                     approver, approvedAt == null ? null : Timestamp.from(approvedAt),
                     currency};
@@ -295,11 +296,14 @@ public class FxAutoHedgerPolicyService {
         if (req.updatedBy() == null || req.updatedBy().trim().isEmpty()) {
             throw new IllegalArgumentException("updatedBy required");
         }
+        // Throws when exposureSource is neither suspense nor retail.
+        normalizeExposureSource(req.exposureSource());
     }
 
     private PolicyRow mapRow(ResultSet rs, int rowNum) throws SQLException {
         Timestamp updatedAt = rs.getTimestamp("updated_at");
         Timestamp approvedAt = rs.getTimestamp("auto_approved_at");
+        String exposureSource = rs.getString("exposure_source");
         return new PolicyRow(
                 rs.getString("currency"),
                 rs.getBigDecimal("target_balance"),
@@ -311,6 +315,7 @@ public class FxAutoHedgerPolicyService {
                 rs.getString("mode"),
                 rs.getString("base_nostro_id"),
                 rs.getString("quote_nostro_id"),
+                normalizeExposureSource(exposureSource),
                 rs.getString("created_by"),
                 rs.getTimestamp("created_at").toInstant(),
                 rs.getString("updated_by"),
@@ -331,12 +336,30 @@ public class FxAutoHedgerPolicyService {
             String mode,
             String baseNostroId,
             String quoteNostroId,
+            String exposureSource,
             String updatedBy,
             String autoApprovedBy
     ) {}
 
     /** Outcome of {@link #upsert(UpsertRequest)}. */
     public record UpsertResult(String currency, String mode, boolean promotedToAuto, boolean demotedFromAuto) {}
+
+    /**
+     * Canonicalise the {@code exposure_source} token. Null/blank → the
+     * pre-V87 default {@code 'suspense'}; {@code 'retail'} is passed through;
+     * anything else is rejected so a typo can't silently route money to the
+     * wrong book.
+     */
+    static String normalizeExposureSource(String exposureSource) {
+        if (exposureSource == null || exposureSource.isBlank()) {
+            return "suspense";
+        }
+        String v = exposureSource.trim().toLowerCase();
+        if ("suspense".equals(v) || "retail".equals(v)) {
+            return v;
+        }
+        throw new IllegalArgumentException("exposure_source must be suspense or retail");
+    }
 
     /** Cached row used by the engine + by the API view. */
     public record PolicyRow(
@@ -350,6 +373,7 @@ public class FxAutoHedgerPolicyService {
             String mode,
             String baseNostroId,
             String quoteNostroId,
+            String exposureSource,
             String createdBy,
             Instant createdAt,
             String updatedBy,

@@ -70,7 +70,8 @@ public class FxHedgeHooksController {
             BigDecimal baseAmount,
             String baseNostroId,
             String quoteNostroId,
-            String description
+            String description,
+            String exposure
     ) {}
 
     @PostMapping("/hedge/submit")
@@ -96,7 +97,8 @@ public class FxHedgeHooksController {
                     body.baseAmount(),
                     body.baseNostroId(),
                     body.quoteNostroId(),
-                    body.description()));
+                    body.description(),
+                    body.exposure()));
             return ResponseEntity.status(HttpStatus.CREATED).body(result);
         } catch (IllegalArgumentException e) {
             Map<String, Object> err = new LinkedHashMap<>();

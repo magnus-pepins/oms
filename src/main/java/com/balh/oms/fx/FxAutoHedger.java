@@ -70,6 +70,7 @@ public class FxAutoHedger {
     private final OmsConfig omsConfig;
     private final FxAutoHedgerPolicyService policyService;
     private final FxNostroSnapshotService nostroSnapshot;
+    private final FxRetailNostroSnapshotService retailNostroSnapshot;
     private final FxCustomerFlowNettingService customerFlowNetting;
     private final FxQuoteService quoteService;
     private final ObjectProvider<FxHedgeService> hedgeService;
@@ -118,6 +119,7 @@ public class FxAutoHedger {
             OmsConfig omsConfig,
             FxAutoHedgerPolicyService policyService,
             FxNostroSnapshotService nostroSnapshot,
+            FxRetailNostroSnapshotService retailNostroSnapshot,
             FxCustomerFlowNettingService customerFlowNetting,
             FxQuoteService quoteService,
             ObjectProvider<FxHedgeService> hedgeService,
@@ -128,6 +130,7 @@ public class FxAutoHedger {
         this.omsConfig = omsConfig;
         this.policyService = policyService;
         this.nostroSnapshot = nostroSnapshot;
+        this.retailNostroSnapshot = retailNostroSnapshot;
         this.customerFlowNetting = customerFlowNetting;
         this.quoteService = quoteService;
         this.hedgeService = hedgeService;
@@ -186,8 +189,9 @@ public class FxAutoHedger {
             // even when the engine is "off" so the eventual flip to
             // advisory isn't a leap of faith.
             Map<String, BigDecimal> balances = readBalances();
+            Map<String, BigDecimal> retailBalances = readRetailBalances();
             for (FxAutoHedgerPolicyService.PolicyRow r : policyService.listAll()) {
-                BigDecimal bal = balances.getOrDefault(r.currency(), BigDecimal.ZERO);
+                BigDecimal bal = currentForPolicy(r, balances, retailBalances);
                 updateGauges(r.currency(), bal, r.targetBalance());
             }
             TickStatus s = new TickStatus(clock.instant(), false, "engine_disabled", List.of());
@@ -196,10 +200,11 @@ public class FxAutoHedger {
         }
 
         Map<String, BigDecimal> balances = readBalances();
+        Map<String, BigDecimal> retailBalances = readRetailBalances();
         List<TickResult> results = new ArrayList<>();
         for (FxAutoHedgerPolicyService.PolicyRow r : policyService.listAll()) {
             try {
-                results.add(evaluateOne(r, balances, cfg));
+                results.add(evaluateOne(r, balances, retailBalances, cfg));
             } catch (RuntimeException e) {
                 log.warn("[fx-auto-hedger] policy currency={} eval failed: {}", r.currency(), e.getMessage(), e);
                 results.add(new TickResult(r.currency(), "error", null, null, e.getMessage()));
@@ -213,11 +218,18 @@ public class FxAutoHedger {
     private TickResult evaluateOne(
             FxAutoHedgerPolicyService.PolicyRow r,
             Map<String, BigDecimal> balances,
+            Map<String, BigDecimal> retailBalances,
             OmsConfig.Fx.AutoHedger cfg) {
-        BigDecimal current = balances.getOrDefault(r.currency(), BigDecimal.ZERO);
+        boolean retail = "retail".equals(r.exposureSource());
+        BigDecimal current = currentForPolicy(r, balances, retailBalances);
         BigDecimal drift = current.subtract(r.targetBalance()).setScale(AMOUNT_SCALE, RoundingMode.HALF_UP);
-        BigDecimal customerFlowNet =
-                customerFlowNetting.signedNetForCurrency(r.currency()).setScale(AMOUNT_SCALE, RoundingMode.HALF_UP);
+        // Customer-flow netting tracks OMS *invest* order flow, which lands
+        // in the bank-nostro book. It must not be applied to a retail policy
+        // whose drift already IS the live @Nostro-<CCY> conversion-pool
+        // balance — double-counting there would chase a phantom position.
+        BigDecimal customerFlowNet = retail
+                ? BigDecimal.ZERO.setScale(AMOUNT_SCALE, RoundingMode.HALF_UP)
+                : customerFlowNetting.signedNetForCurrency(r.currency()).setScale(AMOUNT_SCALE, RoundingMode.HALF_UP);
         BigDecimal driftAdjusted = drift.subtract(customerFlowNet).setScale(AMOUNT_SCALE, RoundingMode.HALF_UP);
         BigDecimal absDrift = driftAdjusted.abs();
         updateGauges(r.currency(), current, r.targetBalance());
@@ -337,7 +349,9 @@ public class FxAutoHedger {
                         baseAmount,
                         r.baseNostroId(),
                         r.quoteNostroId(),
-                        "auto-hedge drift=" + driftAdjusted.toPlainString() + " " + r.currency());
+                        "auto-hedge drift=" + driftAdjusted.toPlainString() + " " + r.currency()
+                                + " exposure=" + r.exposureSource(),
+                        r.exposureSource());
                 Map<String, Object> hedgeRow = svc.submit(req);
                 Object hedgeIdObj = hedgeRow.get("id");
                 if (hedgeIdObj instanceof Number n) {
@@ -378,9 +392,25 @@ public class FxAutoHedger {
     }
 
     private Map<String, BigDecimal> readBalances() {
+        return readSnapshotBalances(nostroSnapshot::buildSnapshot, "nostro");
+    }
+
+    /**
+     * Per-currency signed balance of the retail {@code @Nostro-<CCY>}
+     * conversion pools — the drift source for {@code exposure_source='retail'}
+     * policies. Empty (so retail policies report drift=current-target=−target,
+     * harmlessly below-threshold at the default target 0) when the retail
+     * snapshot is disabled/unconfigured.
+     */
+    private Map<String, BigDecimal> readRetailBalances() {
+        return readSnapshotBalances(retailNostroSnapshot::buildSnapshot, "retail-nostro");
+    }
+
+    private Map<String, BigDecimal> readSnapshotBalances(
+            java.util.function.Supplier<Map<String, Object>> snapshot, String label) {
         Map<String, BigDecimal> out = new HashMap<>();
         try {
-            Object payload = nostroSnapshot.buildSnapshot();
+            Object payload = snapshot.get();
             if (!(payload instanceof Map<?, ?> m)) return out;
             Object rows = m.get("balances");
             if (!(rows instanceof List<?> list)) return out;
@@ -398,9 +428,22 @@ public class FxAutoHedger {
                 out.merge(ccy.toString().toUpperCase(), v, BigDecimal::add);
             }
         } catch (RuntimeException e) {
-            log.warn("[fx-auto-hedger] nostro snapshot failed: {}", e.getMessage());
+            log.warn("[fx-auto-hedger] {} snapshot failed: {}", label, e.getMessage());
         }
         return out;
+    }
+
+    /**
+     * The "current balance" a policy is measured against: the retail pool
+     * balance for {@code exposure_source='retail'} rows, otherwise the
+     * bank-nostro book (pre-V87 behaviour).
+     */
+    private BigDecimal currentForPolicy(
+            FxAutoHedgerPolicyService.PolicyRow r,
+            Map<String, BigDecimal> bankBalances,
+            Map<String, BigDecimal> retailBalances) {
+        Map<String, BigDecimal> src = "retail".equals(r.exposureSource()) ? retailBalances : bankBalances;
+        return src.getOrDefault(r.currency(), BigDecimal.ZERO);
     }
 
     private BigDecimal midRateOrNull(String pair) {

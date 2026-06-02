@@ -100,7 +100,8 @@ class FxHedgeServiceAtomicIntegrationTest extends AbstractPostgresIntegrationTes
                 new BigDecimal("100.00"),
                 "balance_base_eur",
                 "balance_quote_usd",
-                "atomic IT happy path"));
+                "atomic IT happy path",
+                "suspense"));
 
         assertThat(result.get("status")).isEqualTo("posted");
         assertThat(result.get("ledgerTransactionId")).isEqualTo("b-atomic-ok-1");
@@ -134,7 +135,8 @@ class FxHedgeServiceAtomicIntegrationTest extends AbstractPostgresIntegrationTes
                 new BigDecimal("100.00"),
                 "balance_base_eur",
                 "balance_quote_usd",
-                "atomic IT failure path"));
+                "atomic IT failure path",
+                "suspense"));
 
         assertThat(result.get("status")).isEqualTo("failed");
         assertThat(result.get("ledgerTransactionId")).isNull();

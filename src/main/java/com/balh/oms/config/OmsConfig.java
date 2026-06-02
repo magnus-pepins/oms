@@ -2257,6 +2257,7 @@ public class OmsConfig {
         private final TierKills tierKills = new TierKills();
         private final AutoHedger autoHedger = new AutoHedger();
         private final Suspense suspense = new Suspense();
+        private final RetailNostro retailNostro = new RetailNostro();
 
         public MarkupOverrides getMarkupOverrides() {
             return markupOverrides;
@@ -2272,6 +2273,10 @@ public class OmsConfig {
 
         public Suspense getSuspense() {
             return suspense;
+        }
+
+        public RetailNostro getRetailNostro() {
+            return retailNostro;
         }
 
         /**
@@ -2606,6 +2611,114 @@ public class OmsConfig {
          * Parse {@link #maxAbsCsv} into a {@code currency → absolute-limit} map.
          * Malformed entries (no {@code =}, blank key/value, unparseable number)
          * are skipped silently so a single bad pair can't kill the snapshot.
+         */
+        public Map<String, BigDecimal> maxAbsByCurrency() {
+            if (maxAbsCsv == null || maxAbsCsv.isBlank()) {
+                return Map.of();
+            }
+            Map<String, BigDecimal> out = new LinkedHashMap<>();
+            for (String pair : maxAbsCsv.split(",")) {
+                int eq = pair.indexOf('=');
+                if (eq <= 0 || eq == pair.length() - 1) continue;
+                String key = pair.substring(0, eq).trim().toUpperCase();
+                String value = pair.substring(eq + 1).trim();
+                if (key.isEmpty() || value.isEmpty()) continue;
+                try {
+                    out.put(key, new BigDecimal(value));
+                } catch (NumberFormatException ignore) {
+                    // skip malformed
+                }
+            }
+            return out;
+        }
+    }
+
+    /**
+     * Retail FX conversion pool visibility + limit monitoring. The plain
+     * {@code @Nostro-<CCY>} balances (no {@code -Bank} suffix) are the pool
+     * the customer-app "move money" cross-currency path debits/credits:
+     * a EUR→GBP transfer credits {@code @Nostro-EUR} and debits
+     * {@code @Nostro-GBP}, so the signed pool balance per currency is the
+     * <em>retail</em> open FX position — distinct from the OMS-routed
+     * {@code @FX-Suspense-<CCY>} book ({@link Suspense}) and the
+     * correspondent-cash {@code @Nostro-<CCY>-Bank} inventory
+     * ({@code nostroBalanceIdsCsv}).
+     *
+     * <p>Before this block landed nothing read these balances, so retail
+     * conversion exposure was unsupervised and un-hedgeable. Surfaced via
+     * {@link com.balh.oms.fx.FxRetailNostroSnapshotService} (panel +
+     * auto-hedger drift source for {@code exposure_source='retail'}
+     * policies) and {@link com.balh.oms.fx.FxRetailNostroLimitMonitor}
+     * (gauge + alert source).
+     *
+     * <p>Configured via {@code oms.fx.retail-nostro.currencies-csv} (env
+     * {@code OMS_FX_RETAIL_NOSTRO_CURRENCIES_CSV}, e.g. {@code USD,EUR,GBP,SEK}).
+     * Same parse + soft-limit semantics as {@link Suspense}.
+     */
+    public static class RetailNostro {
+        /**
+         * CSV of currencies whose retail {@code @Nostro-<CCY>} pool balance
+         * is monitored (env {@code OMS_FX_RETAIL_NOSTRO_CURRENCIES_CSV}).
+         * Empty → snapshot is 503 and monitor stays idle.
+         */
+        private String currenciesCsv = "";
+
+        /**
+         * Optional per-currency absolute-value soft limit
+         * (env {@code OMS_FX_RETAIL_NOSTRO_MAX_ABS_CSV}, e.g.
+         * {@code USD=1000000,EUR=1000000,GBP=500000}). Triggers
+         * {@code overLimit=true} in the snapshot and increments
+         * {@code oms_fx_retail_nostro_over_limit_total{currency}} when crossed.
+         */
+        private String maxAbsCsv = "";
+
+        /**
+         * When {@code true} the {@code @Scheduled} monitor polls retail pool
+         * balances and publishes gauges + over-limit counters. Off by default
+         * so a stack without {@code currenciesCsv} configured stays quiet.
+         */
+        private boolean limitMonitorEnabled = false;
+
+        /** Monitor poll cadence; clamped to ≥10s. */
+        private long limitMonitorPollIntervalMs = 30_000L;
+
+        public String getCurrenciesCsv() { return currenciesCsv; }
+
+        public void setCurrenciesCsv(String csv) {
+            this.currenciesCsv = csv == null ? "" : csv;
+        }
+
+        public String getMaxAbsCsv() { return maxAbsCsv; }
+
+        public void setMaxAbsCsv(String csv) {
+            this.maxAbsCsv = csv == null ? "" : csv;
+        }
+
+        public boolean isLimitMonitorEnabled() { return limitMonitorEnabled; }
+
+        public void setLimitMonitorEnabled(boolean v) { this.limitMonitorEnabled = v; }
+
+        public long getLimitMonitorPollIntervalMs() { return limitMonitorPollIntervalMs; }
+
+        public void setLimitMonitorPollIntervalMs(long v) {
+            this.limitMonitorPollIntervalMs = Math.max(10_000L, v);
+        }
+
+        public List<String> currencies() {
+            if (currenciesCsv == null || currenciesCsv.isBlank()) {
+                return List.of();
+            }
+            return Arrays.stream(currenciesCsv.split(","))
+                    .map(String::trim)
+                    .filter(s -> !s.isEmpty())
+                    .map(String::toUpperCase)
+                    .toList();
+        }
+
+        /**
+         * Parse {@link #maxAbsCsv} into a {@code currency → absolute-limit} map.
+         * Malformed entries are skipped silently so a single bad pair can't
+         * kill the snapshot.
          */
         public Map<String, BigDecimal> maxAbsByCurrency() {
             if (maxAbsCsv == null || maxAbsCsv.isBlank()) {

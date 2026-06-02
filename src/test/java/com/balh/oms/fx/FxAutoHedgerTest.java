@@ -45,6 +45,7 @@ class FxAutoHedgerTest {
     private OmsConfig omsConfig;
     private FxAutoHedgerPolicyService policy;
     private FxNostroSnapshotService nostro;
+    private FxRetailNostroSnapshotService retailNostro;
     private FxQuoteService quoteService;
     private ObjectProvider<FxHedgeService> hedgeProvider;
     private FxHedgeService hedgeService;
@@ -64,6 +65,7 @@ class FxAutoHedgerTest {
 
         policy = mock(FxAutoHedgerPolicyService.class);
         nostro = mock(FxNostroSnapshotService.class);
+        retailNostro = mock(FxRetailNostroSnapshotService.class);
         FxCustomerFlowNettingService netting = mock(FxCustomerFlowNettingService.class);
         when(netting.signedNetForCurrency(anyString())).thenReturn(BigDecimal.ZERO);
         quoteService = mock(FxQuoteService.class);
@@ -80,6 +82,7 @@ class FxAutoHedgerTest {
                 omsConfig,
                 policy,
                 nostro,
+                retailNostro,
                 netting,
                 quoteService,
                 hedgeProvider,
@@ -97,6 +100,7 @@ class FxAutoHedgerTest {
                 300,                                    // cooldown_s
                 mode,
                 "nostro-base", "nostro-quote",
+                "suspense",
                 "trader-a", T.minusSeconds(3600),
                 "trader-a", T.minusSeconds(3600),
                 "auto".equals(mode) ? "approver-x" : null,
@@ -108,6 +112,33 @@ class FxAutoHedgerTest {
                 "asOf", T.toString(),
                 "balances", List.of(Map.of(
                         "balanceId", currency + "-nostro",
+                        "currency", currency,
+                        "availableBalance", amount))));
+    }
+
+    private FxAutoHedgerPolicyService.PolicyRow retailPolicyRow(
+            String currency, String mode, String pairRoute, BigDecimal target) {
+        return new FxAutoHedgerPolicyService.PolicyRow(
+                currency, target,
+                new BigDecimal("50000"),
+                null,
+                pairRoute,
+                new BigDecimal("100000"),
+                300,
+                mode,
+                "nostro-base", "nostro-quote",
+                "retail",
+                "trader-a", T.minusSeconds(3600),
+                "trader-a", T.minusSeconds(3600),
+                "auto".equals(mode) ? "approver-x" : null,
+                "auto".equals(mode) ? T.minusSeconds(60) : null);
+    }
+
+    private void primeRetailBalance(String currency, String amount) {
+        when(retailNostro.buildSnapshot()).thenReturn(Map.of(
+                "asOf", T.toString(),
+                "balances", List.of(Map.of(
+                        "indicator", "@Nostro-" + currency,
                         "currency", currency,
                         "availableBalance", amount))));
     }
@@ -248,6 +279,48 @@ class FxAutoHedgerTest {
         engine.tickInternal();
         assertThat(meterRegistry.find("oms_fx_auto_hedger_engine_enabled").gauge().value()).isEqualTo(0.0);
         assertThat(meterRegistry.find("oms_fx_auto_hedger_auto_fire_enabled").gauge().value()).isEqualTo(0.0);
+    }
+
+    @Test
+    void retailPolicy_readsRetailPoolBalanceAndIgnoresBankNostro() {
+        // GBP retail pool sits at -1_200_000 (short GBP from EUR→GBP conversions).
+        // Bank nostro snapshot is flat at target — proving the retail policy
+        // does NOT read the bank book. Drift = -1.2M vs target 0 → above 50k
+        // threshold → recommendation written. Currency is the QUOTE of EURGBP,
+        // so a short (negative drift) means SELL EUR / acquire GBP.
+        when(policy.listAll()).thenReturn(List.of(retailPolicyRow(
+                "GBP", "advisory", "EURGBP", new BigDecimal("0"))));
+        primeBalance("GBP", "0");
+        primeRetailBalance("GBP", "-1200000");
+        primeQuote("EURGBP", "0.8400", "0.8410", "0.8405");
+        doReturn(1).when(jdbc).update(anyString(), any(Object[].class));
+
+        FxAutoHedger.TickStatus s = engine.tickInternal();
+
+        assertThat(s.results()).hasSize(1);
+        FxAutoHedger.TickResult r = s.results().get(0);
+        assertThat(r.outcome()).isEqualTo("advisory_emitted");
+        assertThat(r.drift()).isEqualByComparingTo("-1200000");
+    }
+
+    @Test
+    void retailPolicyAutoFire_routesHedgeWithRetailExposure() {
+        omsConfig.getFx().getAutoHedger().setAutoFireEnabled(true);
+        when(policy.listAll()).thenReturn(List.of(retailPolicyRow(
+                "GBP", "auto", "EURGBP", new BigDecimal("0"))));
+        primeBalance("GBP", "0");
+        primeRetailBalance("GBP", "-1200000");
+        primeQuote("EURGBP", "0.8400", "0.8410", "0.8405");
+        doReturn(1).when(jdbc).update(anyString(), any(Object[].class));
+        when(hedgeService.submit(any())).thenReturn(Map.of("id", 99L, "status", "posted"));
+
+        FxAutoHedger.TickStatus s = engine.tickInternal();
+
+        assertThat(s.results().get(0).outcome()).isEqualTo("auto_fired");
+        org.mockito.ArgumentCaptor<FxHedgeService.HedgeRequest> captor =
+                org.mockito.ArgumentCaptor.forClass(FxHedgeService.HedgeRequest.class);
+        verify(hedgeService, times(1)).submit(captor.capture());
+        assertThat(captor.getValue().exposureSource()).isEqualTo("retail");
     }
 
     @Test

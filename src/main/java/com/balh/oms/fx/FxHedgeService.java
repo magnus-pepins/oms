@@ -98,6 +98,18 @@ public class FxHedgeService {
                 .register(registry);
     }
 
+    /**
+     * Exposure books a hedge can flatten. {@code suspense} crosses the
+     * OMS-routed {@code @FX-Suspense-<CCY>} balances (the pre-V87 default);
+     * {@code retail} crosses the customer-app conversion pools
+     * {@code @Nostro-<CCY>}. The inventory legs (the configured nostro ids)
+     * are identical for both — only the indicator the position is parked
+     * against differs.
+     */
+    static final String EXPOSURE_SUSPENSE = "suspense";
+    static final String EXPOSURE_RETAIL = "retail";
+    private static final String SUSPENSE_INDICATOR_PREFIX = "@FX-Suspense-";
+
     public record HedgeRequest(
             String actionKey,
             String submittedBy,
@@ -108,11 +120,35 @@ public class FxHedgeService {
             BigDecimal baseAmount,
             String baseNostroId,
             String quoteNostroId,
-            String description
+            String description,
+            String exposureSource
     ) {}
+
+    /** Normalise the request's exposure book to a canonical lower-case token. */
+    static String normalizeExposure(String exposureSource) {
+        if (exposureSource == null || exposureSource.isBlank()) {
+            return EXPOSURE_SUSPENSE;
+        }
+        String v = exposureSource.trim().toLowerCase();
+        if (EXPOSURE_RETAIL.equals(v)) {
+            return EXPOSURE_RETAIL;
+        }
+        if (EXPOSURE_SUSPENSE.equals(v)) {
+            return EXPOSURE_SUSPENSE;
+        }
+        throw new IllegalArgumentException("exposure_must_be_suspense_or_retail");
+    }
+
+    /** Ledger indicator prefix the open-position legs cross for an exposure book. */
+    static String exposureIndicatorPrefix(String normalizedExposure) {
+        return EXPOSURE_RETAIL.equals(normalizedExposure)
+                ? FxRetailNostroSnapshotService.RETAIL_NOSTRO_INDICATOR_PREFIX
+                : SUSPENSE_INDICATOR_PREFIX;
+    }
 
     public Map<String, Object> submit(HedgeRequest req) {
         validate(req);
+        String exposure = normalizeExposure(req.exposureSource);
         String pair = req.pair.toUpperCase();
         String side = req.side.toUpperCase();
         String tier = (req.tier == null || req.tier.isBlank()) ? "default" : req.tier.toLowerCase();
@@ -154,7 +190,7 @@ public class FxHedgeService {
         }
 
         Long actionId = insertPending(req, pair, side, baseCcy, quoteCcy, baseAmount, quoteAmount,
-                rate, effectiveQuoteId, source, destination);
+                rate, effectiveQuoteId, source, destination, exposure);
         submittedCounter.increment();
         linkManualExecution(req.actionKey, actionId);
 
@@ -162,7 +198,7 @@ public class FxHedgeService {
         // ledger txn is the actual money movement.
         try {
             String ledgerTxnId = postLedgerTransaction(req, pair, side, baseCcy, quoteCcy,
-                    baseAmount, rate, source, destination);
+                    baseAmount, rate, source, destination, exposure);
             markPosted(actionId, ledgerTxnId);
             postedCounter.increment();
         } catch (Exception e) {
@@ -207,6 +243,8 @@ public class FxHedgeService {
             throw new IllegalArgumentException("quote_nostro_required");
         if (req.baseNostroId.equals(req.quoteNostroId))
             throw new IllegalArgumentException("nostros_must_differ");
+        // Throws when the exposure book is neither suspense nor retail.
+        normalizeExposure(req.exposureSource);
     }
 
     private Long findByActionKey(String actionKey) {
@@ -235,29 +273,30 @@ public class FxHedgeService {
 
     private Long insertPending(HedgeRequest req, String pair, String side, String baseCcy, String quoteCcy,
                                BigDecimal baseAmount, BigDecimal quoteAmount, BigDecimal rate,
-                               String quoteId, String source, String destination) {
+                               String quoteId, String source, String destination, String exposure) {
         // Single-shot insert + RETURNING id.
         return jdbc.queryForObject(
                 "INSERT INTO fx_hedge_actions ("
                         + "action_key, submitted_by, pair, side, base_currency, quote_currency, "
                         + "base_amount, quote_amount, quoted_rate, quote_id, "
-                        + "base_nostro_id, quote_nostro_id, status, payload_json"
-                        + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?::jsonb) "
+                        + "base_nostro_id, quote_nostro_id, exposure, status, payload_json"
+                        + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?::jsonb) "
                         + "RETURNING id",
                 Long.class,
                 req.actionKey, req.submittedBy, pair, side, baseCcy, quoteCcy,
                 baseAmount, quoteAmount, rate, quoteId,
-                req.baseNostroId.trim(), req.quoteNostroId.trim(),
-                buildPayloadJson(req, source, destination));
+                req.baseNostroId.trim(), req.quoteNostroId.trim(), exposure,
+                buildPayloadJson(req, source, destination, exposure));
     }
 
-    private String buildPayloadJson(HedgeRequest req, String source, String destination) {
+    private String buildPayloadJson(HedgeRequest req, String source, String destination, String exposure) {
         try {
             Map<String, Object> m = new LinkedHashMap<>();
             m.put("description", req.description == null ? "" : req.description);
             m.put("source", source);
             m.put("destination", destination);
             m.put("tier", req.tier);
+            m.put("exposure", exposure);
             return objectMapper.writeValueAsString(m);
         } catch (Exception e) {
             return "{}";
@@ -308,7 +347,8 @@ public class FxHedgeService {
      */
     private String postLedgerTransaction(HedgeRequest req, String pair, String side, String baseCcy,
                                          String quoteCcy, BigDecimal baseAmount, BigDecimal rate,
-                                         String unusedSource, String unusedDestination) throws Exception {
+                                         String unusedSource, String unusedDestination,
+                                         String exposure) throws Exception {
         var ledger = omsConfig.getLedger();
         if (!ledger.isEnabled()) {
             throw new IllegalStateException("oms.ledger.enabled=false; cannot post hedge");
@@ -324,19 +364,24 @@ public class FxHedgeService {
 
         BigDecimal quoteAmount = baseAmount.multiply(rate)
                 .setScale(LEDGER_AMOUNT_SCALE, RoundingMode.HALF_UP);
-        String baseSuspense = "@FX-Suspense-" + baseCcy;
-        String quoteSuspense = "@FX-Suspense-" + quoteCcy;
+        // The open-position indicator differs per exposure book: suspense
+        // hedges park against @FX-Suspense-<CCY>, retail hedges flatten the
+        // @Nostro-<CCY> conversion pool. Inventory legs (the nostro ids) are
+        // identical either way.
+        String prefix = exposureIndicatorPrefix(exposure);
+        String baseExposure = prefix + baseCcy;
+        String quoteExposure = prefix + quoteCcy;
 
         String baseLegSource, baseLegDest, quoteLegSource, quoteLegDest;
         if ("BUY".equals(side)) {
-            baseLegSource = baseSuspense;
+            baseLegSource = baseExposure;
             baseLegDest = req.baseNostroId.trim();
             quoteLegSource = req.quoteNostroId.trim();
-            quoteLegDest = quoteSuspense;
+            quoteLegDest = quoteExposure;
         } else {
             baseLegSource = req.baseNostroId.trim();
-            baseLegDest = baseSuspense;
-            quoteLegSource = quoteSuspense;
+            baseLegDest = baseExposure;
+            quoteLegSource = quoteExposure;
             quoteLegDest = req.quoteNostroId.trim();
         }
 
@@ -345,9 +390,9 @@ public class FxHedgeService {
         body.put("atomic", true);
         List<Map<String, Object>> txns = new ArrayList<>(2);
         txns.add(buildLegRow(req, pair, side, "BASE",
-                baseLegSource, baseLegDest, baseAmount, baseCcy, rate));
+                baseLegSource, baseLegDest, baseAmount, baseCcy, rate, exposure));
         txns.add(buildLegRow(req, pair, side, "QUOTE",
-                quoteLegSource, quoteLegDest, quoteAmount, quoteCcy, rate));
+                quoteLegSource, quoteLegDest, quoteAmount, quoteCcy, rate, exposure));
         body.put("transactions", txns);
 
         try {
@@ -386,7 +431,7 @@ public class FxHedgeService {
 
     private Map<String, Object> buildLegRow(HedgeRequest req, String pair, String side, String legLabel,
                                             String src, String dst, BigDecimal amount, String ccy,
-                                            BigDecimal rate) {
+                                            BigDecimal rate, String exposure) {
         Map<String, Object> row = new LinkedHashMap<>();
         row.put("source", src);
         row.put("destination", dst);
@@ -406,6 +451,7 @@ public class FxHedgeService {
         meta.put("amount", amount.toPlainString());
         meta.put("currency", ccy);
         meta.put("rate", rate.toPlainString());
+        meta.put("exposure", exposure);
         meta.put("submittedBy", req.submittedBy);
         meta.put("actionKey", req.actionKey);
         row.put("metaData", meta);
@@ -440,7 +486,7 @@ public class FxHedgeService {
         return jdbc.queryForObject(
                 "SELECT id, action_key, submitted_by, pair, side, base_currency, quote_currency, "
                         + "base_amount, quote_amount, quoted_rate, quote_id, base_nostro_id, quote_nostro_id, "
-                        + "ledger_transaction_id, status, failure_reason, submitted_at, posted_at "
+                        + "exposure, ledger_transaction_id, status, failure_reason, submitted_at, posted_at "
                         + "FROM fx_hedge_actions WHERE id = ?",
                 (rs, n) -> {
                     Map<String, Object> m = new LinkedHashMap<>();
@@ -457,6 +503,7 @@ public class FxHedgeService {
                     m.put("quoteId", rs.getString("quote_id"));
                     m.put("baseNostroId", rs.getString("base_nostro_id"));
                     m.put("quoteNostroId", rs.getString("quote_nostro_id"));
+                    m.put("exposure", rs.getString("exposure"));
                     m.put("ledgerTransactionId", rs.getString("ledger_transaction_id"));
                     m.put("status", rs.getString("status"));
                     m.put("failureReason", rs.getString("failure_reason"));
@@ -473,7 +520,7 @@ public class FxHedgeService {
         return jdbc.query(
                 "SELECT id, action_key, submitted_by, pair, side, base_currency, quote_currency, "
                         + "base_amount, quote_amount, quoted_rate, quote_id, base_nostro_id, quote_nostro_id, "
-                        + "ledger_transaction_id, status, failure_reason, submitted_at, posted_at "
+                        + "exposure, ledger_transaction_id, status, failure_reason, submitted_at, posted_at "
                         + "FROM fx_hedge_actions ORDER BY submitted_at DESC LIMIT ?",
                 (rs, n) -> {
                     Map<String, Object> m = new LinkedHashMap<>();
@@ -490,6 +537,7 @@ public class FxHedgeService {
                     m.put("quoteId", rs.getString("quote_id"));
                     m.put("baseNostroId", rs.getString("base_nostro_id"));
                     m.put("quoteNostroId", rs.getString("quote_nostro_id"));
+                    m.put("exposure", rs.getString("exposure"));
                     m.put("ledgerTransactionId", rs.getString("ledger_transaction_id"));
                     m.put("status", rs.getString("status"));
                     m.put("failureReason", rs.getString("failure_reason"));

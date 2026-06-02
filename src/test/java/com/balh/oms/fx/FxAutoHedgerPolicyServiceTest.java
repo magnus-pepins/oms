@@ -49,6 +49,7 @@ class FxAutoHedgerPolicyServiceTest {
                 300,
                 mode,
                 "nostro-base", "nostro-quote",
+                "suspense",
                 createdBy, T.minusSeconds(3600),
                 createdBy, T.minusSeconds(3600),
                 "auto".equals(mode) ? "approver-x" : null,
@@ -67,6 +68,7 @@ class FxAutoHedgerPolicyServiceTest {
                 300,
                 mode,
                 "nostro-base", "nostro-quote",
+                "suspense",
                 updatedBy,
                 autoApprovedBy);
     }
@@ -76,7 +78,7 @@ class FxAutoHedgerPolicyServiceTest {
         FxAutoHedgerPolicyService svc = newService(mock(JdbcTemplate.class));
         FxAutoHedgerPolicyService.UpsertRequest bad = new FxAutoHedgerPolicyService.UpsertRequest(
                 "EUR1", BigDecimal.ONE, BigDecimal.ONE, null, "EURSEK", BigDecimal.ONE, 1, "off",
-                "a", "b", "u", null);
+                "a", "b", "suspense", "u", null);
         assertThatThrownBy(() -> svc.upsert(bad))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("currency");
@@ -87,7 +89,7 @@ class FxAutoHedgerPolicyServiceTest {
         FxAutoHedgerPolicyService svc = newService(mock(JdbcTemplate.class));
         FxAutoHedgerPolicyService.UpsertRequest bad = new FxAutoHedgerPolicyService.UpsertRequest(
                 "EUR", BigDecimal.ONE, null, null, "EURSEK", BigDecimal.ONE, 1, "off",
-                "a", "b", "u", null);
+                "a", "b", "suspense", "u", null);
         assertThatThrownBy(() -> svc.upsert(bad))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("threshold");

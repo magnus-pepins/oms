@@ -244,6 +244,16 @@ oms:
       max-abs-csv: ${OMS_FX_SUSPENSE_MAX_ABS_CSV:}
       limit-monitor-enabled: ${OMS_FX_SUSPENSE_LIMIT_MONITOR_ENABLED:false}
       limit-monitor-poll-interval-ms: ${OMS_FX_SUSPENSE_LIMIT_MONITOR_POLL_INTERVAL_MS:30000}
+    retail-nostro:
+      # CSV of currencies whose retail conversion pool @Nostro-<CCY> (the plain
+      # indicator, no -Bank suffix) is supervised + hedgeable (e.g. "USD,EUR,GBP,SEK").
+      # When empty /internal/v1/fx/retail/snapshot returns 503 and the monitor stays idle.
+      currencies-csv: ${OMS_FX_RETAIL_NOSTRO_CURRENCIES_CSV:}
+      # Optional per-currency soft limit, e.g. "USD=1000000,EUR=1000000,GBP=500000".
+      # |available| > limit → overLimit=true + counter increment.
+      max-abs-csv: ${OMS_FX_RETAIL_NOSTRO_MAX_ABS_CSV:}
+      limit-monitor-enabled: ${OMS_FX_RETAIL_NOSTRO_LIMIT_MONITOR_ENABLED:false}
+      limit-monitor-poll-interval-ms: ${OMS_FX_RETAIL_NOSTRO_LIMIT_MONITOR_POLL_INTERVAL_MS:30000}
     multi-leg-atomicity-stub-enabled: ${OMS_FX_MULTI_LEG_ATOMICITY_STUB_ENABLED:false}
     hedge-hooks-enabled: ${OMS_FX_HEDGE_HOOKS_ENABLED:false}
     eod-flatten-enabled: ${OMS_FX_EOD_FLATTEN_ENABLED:false}

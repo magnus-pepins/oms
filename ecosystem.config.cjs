@@ -304,6 +304,9 @@ const COMMON_ENV = {
   // sizes — production stacks will tighten these once the PB settlement
   // loop closes more reliably.
   OMS_FX_SUSPENSE_MAX_ABS_CSV: 'USD=1000000,EUR=1000000,GBP=500000',
+  // Retail FX conversion pools (@Nostro-<CCY>) for customer move-money.
+  OMS_FX_RETAIL_NOSTRO_CURRENCIES_CSV: 'USD,EUR,GBP,SEK',
+  OMS_FX_RETAIL_NOSTRO_MAX_ABS_CSV: 'USD=1000000,EUR=1000000,GBP=500000,SEK=5000000',
   // OMS_FX_SUSPENSE_LIMIT_MONITOR_ENABLED is set only on oms-postgres-projector
   // below — same pattern as OMS_FX_AUTO_HEDGER_ENGINE_ENABLED so the gauges
   // are published from a single source and don't double-tick.
@@ -485,6 +488,8 @@ const apps = [
       // gauges + over-limit counter. Single-source-of-truth pattern —
       // pinned to this JVM only so we don't double-publish.
       OMS_FX_SUSPENSE_LIMIT_MONITOR_ENABLED: 'true',
+      OMS_FX_RETAIL_NOSTRO_LIMIT_MONITOR_ENABLED: 'true',
+      OMS_FX_RETAIL_NOSTRO_LIMIT_MONITOR_POLL_INTERVAL_MS: '30000',
       OMS_FX_SUSPENSE_LIMIT_MONITOR_POLL_INTERVAL_MS: '30000',
       // Corporate-action processors + record-date snapshot job (Slice 17 / §5.9).
       OMS_CORPORATE_ACTION_PROCESSOR_ENABLED: 'true',

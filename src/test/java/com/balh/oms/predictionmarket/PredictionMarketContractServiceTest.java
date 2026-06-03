@@ -1,8 +1,12 @@
 package com.balh.oms.predictionmarket;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.math.BigDecimal;
+import java.util.List;
 import org.junit.jupiter.api.Test;
 
 class PredictionMarketContractServiceTest {
@@ -18,5 +22,71 @@ class PredictionMarketContractServiceTest {
         assertThrows(
                 IllegalArgumentException.class,
                 () -> PredictionMarketContractService.normalizeCurrency("USDD"));
+    }
+
+    @Test
+    void requiresVenueRegistrySync_falseWhenOnlyRetailCopyChanges() {
+        var before = sampleRow("OPEN", "0.01", "old", "old criteria");
+        var after =
+                new PredictionMarketContractRepository.ContractRow(
+                        before.id(),
+                        before.slug(),
+                        before.title(),
+                        before.yesSymbol(),
+                        before.noSymbol(),
+                        "new description",
+                        "new criteria",
+                        List.of(new PredictionMarketReferenceLinks.Link("Src", "https://example.com")),
+                        before.resolutionSource(),
+                        before.status(),
+                        before.settlementCurrency(),
+                        before.tickSize(),
+                        before.payoutPerContract(),
+                        before.closesAt(),
+                        before.resolvesAt());
+        assertFalse(PredictionMarketContractService.requiresVenueRegistrySync(before, after));
+    }
+
+    @Test
+    void requiresVenueRegistrySync_trueWhenStatusChanges() {
+        var before = sampleRow("OPEN", "0.01", null, null);
+        var after =
+                new PredictionMarketContractRepository.ContractRow(
+                        before.id(),
+                        before.slug(),
+                        before.title(),
+                        before.yesSymbol(),
+                        before.noSymbol(),
+                        before.description(),
+                        before.resolutionCriteria(),
+                        before.referenceLinks(),
+                        before.resolutionSource(),
+                        "HALTED",
+                        before.settlementCurrency(),
+                        before.tickSize(),
+                        before.payoutPerContract(),
+                        before.closesAt(),
+                        before.resolvesAt());
+        assertTrue(PredictionMarketContractService.requiresVenueRegistrySync(before, after));
+    }
+
+    private static PredictionMarketContractRepository.ContractRow sampleRow(
+            String status, String tick, String description, String criteria) {
+        return new PredictionMarketContractRepository.ContractRow(
+                1L,
+                "test-1",
+                "Title",
+                "PREDMKT-TEST-1",
+                "PREDMKT-TEST-1-NO",
+                description,
+                criteria,
+                List.of(),
+                "it-oracle",
+                status,
+                "USD",
+                new BigDecimal(tick),
+                new BigDecimal("1.00"),
+                null,
+                null);
     }
 }

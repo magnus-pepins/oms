@@ -5,13 +5,18 @@ import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.List;
 import java.util.Locale;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 /** Operator catalog CRUD + validation for {@link PredictionMarketContractRepository}. */
 @Service
 public class PredictionMarketContractService {
+
+    private static final Logger log = LoggerFactory.getLogger(PredictionMarketContractService.class);
 
     private static final Set<String> ALLOWED_STATUS = Set.of("OPEN", "HALTED", "CLOSED", "RESOLVED");
     private static final String SYMBOL_PREFIX = "PREDMKT-";
@@ -152,9 +157,37 @@ public class PredictionMarketContractService {
                                             payout,
                                             closesAt,
                                             resolvesAt);
-                            venueRegistry.syncContract(updated);
+                            syncVenueRegistryAfterUpdate(existing, updated);
                             return updated;
                         });
+    }
+
+    /**
+     * Venue registry only cares about tick + lifecycle status (not retail copy fields). Skip gRPC when
+     * operators edit description/criteria/links so a flaky venue cannot block catalog saves.
+     */
+    static boolean requiresVenueRegistrySync(
+            PredictionMarketContractRepository.ContractRow before,
+            PredictionMarketContractRepository.ContractRow after) {
+        return before.tickSize().compareTo(after.tickSize()) != 0
+                || !Objects.equals(before.status(), after.status());
+    }
+
+    private void syncVenueRegistryAfterUpdate(
+            PredictionMarketContractRepository.ContractRow before,
+            PredictionMarketContractRepository.ContractRow after) {
+        if (!requiresVenueRegistrySync(before, after)) {
+            return;
+        }
+        try {
+            venueRegistry.syncContract(after);
+        } catch (RuntimeException e) {
+            log.warn(
+                    "venue registry sync failed after catalog update slug={} (row saved in Postgres);"
+                            + " use admin Sync venue to retry",
+                    after.slug(),
+                    e);
+        }
     }
 
     public static String normalizeCurrency(String raw) {

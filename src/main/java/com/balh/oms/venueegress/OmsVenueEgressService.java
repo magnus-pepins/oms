@@ -1046,12 +1046,17 @@ public class OmsVenueEgressService {
                 erOpt = routeVenueOrderOnce(ev);
             } catch (VenueRouteTransportException e) {
                 venueRouteResultByOrderId.remove(ev.orderId());
-                log.error(
-                        "oms-venue-egress: venue RouteOrder transport failed (will retry fragment): orderId={} symbol={}",
+                // Do not wedge the entire OMS journal behind one admit when the venue gateway was
+                // down (cluster restart, gRPC UNKNOWN). Cancels/replaces already advance best-effort
+                // on transport failure; admits must do the same so later orders and live tail keep
+                // flowing. The admit may remain WORKING in Postgres without a venue rest — operator
+                // reconciliation or a customer cancel is required (see prediction-market-quotes smoke).
+                log.warn(
+                        "oms-venue-egress: venue RouteOrder transport failed; advancing cursor (best-effort): orderId={} symbol={}",
                         ev.orderId(),
                         ev.instrumentSymbol(),
                         e);
-                return false;
+                return advanceCursor(newPosition);
             }
             if (erOpt.isEmpty()) {
                 venueRouteResultByOrderId.remove(ev.orderId());

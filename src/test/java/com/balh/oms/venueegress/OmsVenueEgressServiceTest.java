@@ -175,7 +175,7 @@ class OmsVenueEgressServiceTest {
     }
 
     @Test
-    void applyAdmittedEvent_venueTransportFailure_doesNotAdvanceCursor() throws Exception {
+    void applyAdmittedEvent_venueTransportFailure_advancesCursorBestEffort() throws Exception {
         OrderAdmittedEvent ev =
                 new OrderAdmittedEvent(
                         UUID.randomUUID(),
@@ -197,9 +197,9 @@ class OmsVenueEgressServiceTest {
         when(routeClient.routeAdmittedOrder(ev))
                 .thenThrow(new VenueRouteTransportException("down", new RuntimeException("refused")));
 
-        assertThat(service.applyAdmittedEvent(ev, 100L)).isFalse();
+        assertThat(service.applyAdmittedEvent(ev, 100L)).isTrue();
 
-        verify(cursorRepository, times(0)).advanceWithRecording(any(), anyInt(), anyLong(), anyLong());
+        verify(cursorRepository, times(1)).advanceWithRecording(any(), anyInt(), anyLong(), eq(100L));
         verify(clusterIngressClient, times(0)).submitApplyExecutionReport(any(), any());
     }
 }

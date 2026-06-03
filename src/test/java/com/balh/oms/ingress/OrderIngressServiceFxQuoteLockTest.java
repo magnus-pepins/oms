@@ -64,6 +64,7 @@ class OrderIngressServiceFxQuoteLockTest {
     private OmsConfig config;
     private OrderIngressService service;
     private VenueAdmissionGate venueAdmissionGate;
+    private PredictionMarketTickGate predictionMarketTickGate;
 
     @BeforeEach
     @SuppressWarnings("unchecked")
@@ -115,10 +116,15 @@ class OrderIngressServiceFxQuoteLockTest {
                 mock(com.balh.oms.projector.AeronProjectorCursorRepository.class),
                 mock(com.balh.oms.venueegress.OmsVenueEgressCursorRepository.class),
                 new SimpleMeterRegistry());
+        predictionMarketTickGate = new PredictionMarketTickGate(
+                config,
+                mock(com.balh.oms.predictionmarket.PredictionMarketContractRepository.class),
+                new SimpleMeterRegistry());
         service = new OrderIngressService(
                 orders, config, piiHash,
                 ledgerInflight, ledgerInflightCoalescer, ledgerBalance, fxProvider, nettingProvider,
-                new SimpleMeterRegistry(), orderControlAdmission, router, venueAdmissionGate);
+                new SimpleMeterRegistry(), orderControlAdmission, router, venueAdmissionGate,
+                predictionMarketTickGate);
     }
 
     @Test
@@ -282,7 +288,8 @@ class OrderIngressServiceFxQuoteLockTest {
         OmsClusterShardRouter router = new OmsClusterShardRouter(1, Map.of(0, cluster));
         OrderIngressService noFxService = new OrderIngressService(
                 orders, config, piiHash, ledgerInflight, coal, bal, noFx, nettingProvider,
-                new SimpleMeterRegistry(), orderControlAdmission, router, venueAdmissionGate);
+                new SimpleMeterRegistry(), orderControlAdmission, router, venueAdmissionGate,
+                predictionMarketTickGate);
 
         CreateOrderRequest req = buildRequest("q_test", new BigDecimal("100.00"));
 

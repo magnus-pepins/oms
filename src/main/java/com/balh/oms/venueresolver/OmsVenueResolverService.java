@@ -1,9 +1,11 @@
 package com.balh.oms.venueresolver;
 
+import com.balh.oms.cluster.ApplyExecutionReportCommand;
 import com.balh.oms.cluster.ApplyVenueResolutionCommand;
 import com.balh.oms.cluster.OmsClusterIngressClient;
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.config.OmsProfiles;
+import com.balh.venue.cluster.TradeMatchedEvent;
 import com.balh.venue.cluster.VenueClusterWireFormat;
 import com.balh.venue.cluster.VenueResolutionEvent;
 import io.aeron.Aeron;
@@ -29,8 +31,19 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
 
 /**
- * Phase B: tails balh-venue cluster events recording for {@link VenueResolutionEvent} and submits
- * {@link ApplyVenueResolutionCommand} to the OMS cluster (idempotent on symbol + evidence hash).
+ * Tails the balh-venue cluster events recording and bridges venue→OMS state into the OMS cluster:
+ *
+ * <ul>
+ *   <li><b>{@link VenueResolutionEvent}</b> → {@link ApplyVenueResolutionCommand} (Phase B; idempotent
+ *       on symbol + evidence hash).</li>
+ *   <li><b>{@link TradeMatchedEvent}</b> → maker-side {@link ApplyExecutionReportCommand} (Phase G
+ *       slice 2; idempotent on {@code (orderId, venueExecRef)}). The synchronous {@code routeOrder} ack
+ *       only carries the taker's fill, so this is the only path by which a resting (maker) order learns
+ *       it filled.</li>
+ * </ul>
+ *
+ * <p>Single instance per venue stream (the cursor is single-writer). The cursor only advances past
+ * fragments this service handled, so an unhandled event type is never skipped silently.
  */
 @Component
 @Profile(OmsProfiles.VENUE_EGRESS)
@@ -136,18 +149,24 @@ public class OmsVenueResolverService {
 
             FragmentHandler handler = (buffer, offset, length, header) -> {
                 int typeId = buffer.getInt(offset + VenueClusterWireFormat.HEADER_TYPE_ID_OFFSET);
-                if (typeId != VenueClusterWireFormat.TYPE_ID_VENUE_RESOLUTION) {
-                    return;
-                }
                 try {
-                    VenueResolutionEvent event = VenueResolutionEvent.decode(buffer, offset, length);
-                    submitResolution(event);
+                    switch (typeId) {
+                        case VenueClusterWireFormat.TYPE_ID_VENUE_RESOLUTION ->
+                                submitResolution(VenueResolutionEvent.decode(buffer, offset, length));
+                        case VenueClusterWireFormat.TYPE_ID_TRADE_MATCHED ->
+                                submitMakerFill(TradeMatchedEvent.decode(buffer, offset, length));
+                        default -> {
+                            // Other venue events (quotes, rested, etc.) are not consumed here; leave the
+                            // cursor where it is so we never record progress past an unhandled fragment.
+                            return;
+                        }
+                    }
                     long position = header.position();
                     lastAppliedPosition.set(position);
                     cursorRepository.advance(
                             RESOLVER_ID, VenueClusterWireFormat.EVENTS_STREAM_ID, recordingId, position);
                 } catch (Exception e) {
-                    log.error("oms-venue-resolver failed to apply venue resolution fragment", e);
+                    log.error("oms-venue-resolver failed to apply venue fragment typeId={}", typeId, e);
                 }
             };
 
@@ -209,6 +228,46 @@ public class OmsVenueResolverService {
             LockSupport.parkNanos(cfg.getRecordingLookupParkMs() * 1_000_000L);
         }
         return -1L;
+    }
+
+    /**
+     * Deliver the <b>maker</b> side of a venue trade to the OMS cluster. The synchronous
+     * {@code routeOrder} ack only reports the taker's fill, so without this a resting order that fills
+     * never learns it filled (latent today with thin two-book flow; load-bearing for the Phase G
+     * one-book model where most fills are maker fills). Idempotent: the cluster dedupes on
+     * {@code (orderId, venueExecRef)} ({@link com.balh.oms.cluster.OmsAdmissionClusteredService}), so
+     * replays after a restart re-submit harmlessly. Legacy events (pre-maker-field) decode to
+     * {@link TradeMatchedEvent#NO_MAKER} and are skipped.
+     */
+    void submitMakerFill(TradeMatchedEvent event)
+            throws InterruptedException, java.util.concurrent.TimeoutException {
+        java.util.UUID makerOrderId = event.makerOrderId();
+        if (makerOrderId == null || makerOrderId.equals(TradeMatchedEvent.NO_MAKER)) {
+            return;
+        }
+        String venueId = config.getVenue().getVenueId();
+        ApplyExecutionReportCommand cmd =
+                new ApplyExecutionReportCommand(
+                        0L,
+                        makerOrderId,
+                        event.lastQtyScaled(),
+                        event.makerPxScaled(),
+                        event.venueTsNanos(),
+                        0,
+                        ApplyExecutionReportCommand.EXEC_TYPE_TRADE,
+                        (byte) 0,
+                        venueId,
+                        event.venueExecRef(),
+                        "",
+                        "{\"source\":\"balh-venue-maker-fill\"}");
+        clusterIngressClient.submitApplyExecutionReport(
+                cmd, Duration.ofMillis(config.getCluster().getVenueResolver().getOfferTimeoutMs()));
+        log.debug(
+                "oms-venue-resolver applied maker fill makerOrderId={} qty={} makerPx={} execRef={}",
+                makerOrderId,
+                event.lastQtyScaled(),
+                event.makerPxScaled(),
+                event.venueExecRef());
     }
 
     private void submitResolution(VenueResolutionEvent event) throws InterruptedException, java.util.concurrent.TimeoutException {

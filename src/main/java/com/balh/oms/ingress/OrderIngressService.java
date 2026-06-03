@@ -129,6 +129,13 @@ public class OrderIngressService {
      * when {@code oms-venue-egress} is behind so the OMS never admits an order the venue cannot see.
      */
     private final VenueAdmissionGate venueAdmissionGate;
+    /**
+     * Pre-admission per-contract tick + price-bounds gate for venue-routed orders (Phase G slice 1b).
+     * Rejects off-tick / out-of-band limit prices at accept (HTTP 422) so an off-tick PREDMKT order is
+     * never admitted-then-venue-rejected. Mirrors the venue's authoritative reject; cached so the accept
+     * path stays off Postgres for non-venue flow.
+     */
+    private final PredictionMarketTickGate predictionMarketTickGate;
 
     public OrderIngressService(
             OrdersRepository orders,
@@ -142,7 +149,8 @@ public class OrderIngressService {
             MeterRegistry meterRegistry,
             OrderControlAdmission orderControlAdmission,
             OmsClusterShardRouter clusterShardRouter,
-            VenueAdmissionGate venueAdmissionGate) {
+            VenueAdmissionGate venueAdmissionGate,
+            PredictionMarketTickGate predictionMarketTickGate) {
         this.orders = orders;
         this.config = config;
         this.piiHash = piiHash;
@@ -155,6 +163,7 @@ public class OrderIngressService {
         this.orderControlAdmission = orderControlAdmission;
         this.clusterShardRouter = clusterShardRouter;
         this.venueAdmissionGate = venueAdmissionGate;
+        this.predictionMarketTickGate = predictionMarketTickGate;
     }
 
     /**
@@ -240,6 +249,9 @@ public class OrderIngressService {
             // Venue-health circuit breaker first: refuse venue-routed orders the egress cannot
             // currently deliver to balh-venue, before we admit anything into the OMS cluster.
             venueAdmissionGate.assertVenueAdmissible(req.instrumentSymbol());
+            // Per-contract tick/bounds reject at accept (mirrors the venue's authoritative reject) so an
+            // off-tick venue-routed order is never admitted-then-venue-rejected.
+            predictionMarketTickGate.assertOnTick(req.instrumentSymbol(), req.limitPrice());
             maybeVerifyLedgerBalanceBinding(req);
             Optional<FxQuoteService.CachedQuote> lockedQuote = maybeRecallFxQuoteOrReject(req);
 

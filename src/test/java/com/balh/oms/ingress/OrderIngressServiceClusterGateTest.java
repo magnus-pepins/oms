@@ -111,6 +111,11 @@ class OrderIngressServiceClusterGateTest {
                 mock(AeronProjectorCursorRepository.class),
                 mock(OmsVenueEgressCursorRepository.class),
                 new SimpleMeterRegistry());
+        // AAPL is not a PREDMKT/* venue symbol, so the tick gate short-circuits before the repo.
+        PredictionMarketTickGate predictionMarketTickGate = new PredictionMarketTickGate(
+                config,
+                mock(com.balh.oms.predictionmarket.PredictionMarketContractRepository.class),
+                new SimpleMeterRegistry());
         service = new OrderIngressService(
                 orders,
                 config,
@@ -123,7 +128,8 @@ class OrderIngressServiceClusterGateTest {
                 new SimpleMeterRegistry(),
                 orderControlAdmission,
                 router,
-                venueAdmissionGate);
+                venueAdmissionGate,
+                predictionMarketTickGate);
     }
 
     @Test

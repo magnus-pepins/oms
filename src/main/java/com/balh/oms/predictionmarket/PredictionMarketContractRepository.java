@@ -73,6 +73,14 @@ public class PredictionMarketContractRepository {
                     """
                     .formatted(SELECT_COLUMNS);
 
+    private static final String FIND_TICK_BY_SYMBOL =
+            """
+                    SELECT tick_size
+                    FROM prediction_market_contract
+                    WHERE yes_symbol = :symbol OR no_symbol = :symbol
+                    LIMIT 1
+                    """;
+
     private final NamedParameterJdbcTemplate jdbc;
 
     public PredictionMarketContractRepository(NamedParameterJdbcTemplate jdbc) {
@@ -106,6 +114,23 @@ public class PredictionMarketContractRepository {
                         new MapSqlParameterSource("yesSymbol", yesSymbol.trim()),
                         this::mapRow);
         return rows.isEmpty() ? Optional.empty() : Optional.of(rows.getFirst());
+    }
+
+    /**
+     * Tick size for whichever leg (YES or NO) of a contract carries {@code symbol}. Single indexed
+     * point-select used by the ingress tick gate ({@code PredictionMarketTickGate}); cached there so the
+     * accept path does not re-query per order. Empty when no contract owns the symbol.
+     */
+    public Optional<BigDecimal> findTickSizeBySymbol(String symbol) {
+        if (symbol == null || symbol.isBlank()) {
+            return Optional.empty();
+        }
+        List<BigDecimal> ticks =
+                jdbc.query(
+                        FIND_TICK_BY_SYMBOL,
+                        new MapSqlParameterSource("symbol", symbol.trim()),
+                        (rs, rowNum) -> rs.getBigDecimal("tick_size"));
+        return ticks.isEmpty() ? Optional.empty() : Optional.ofNullable(ticks.getFirst());
     }
 
     public ContractRow insert(

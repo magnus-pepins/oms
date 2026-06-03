@@ -430,41 +430,107 @@ public class OmsVenueEgressService {
                     "oms-venue-egress replay loop skipped: oms.cluster.venue-egress.aeron-directory is empty");
             return;
         }
-        Aeron aeron = null;
-        AeronArchive archive = null;
-        try {
-            aeron = Aeron.connect(new Aeron.Context().aeronDirectoryName(cfg.getAeronDirectory()));
-            archive = AeronArchive.connect(new AeronArchive.Context()
-                    .aeron(aeron)
-                    .ownsAeronClient(false)
-                    .controlRequestChannel(cfg.getArchiveControlRequestChannel())
-                    .controlResponseChannel(cfg.getArchiveControlResponseChannel()));
+        // Outer reconnect loop. A transient OMS cluster MediaDriver bounce (e.g. cluster-node
+        // restart) makes Aeron Archive calls throw io.aeron.exceptions.TimeoutException /
+        // DriverTimeoutException, and the Aeron client conductor raises AgentTerminationException.
+        // Before 2026-06-03 these propagated to a terminal catch and PERMANENTLY stopped the
+        // replay thread, silently severing the OMS->venue bridge until an operator restarted the
+        // process (observed on pop: loop died 17:25 on a cluster bounce, never recovered). Such
+        // infra timeouts are recoverable: close the dead Aeron/Archive, park, and reconnect from
+        // the persisted cursor. Genuine cursor/recording-state corruption (IllegalStateException
+        // from requireRecordingPresent / requirePositionWithinRecording) stays fatal — reconnecting
+        // would re-throw immediately and silently resetting risks data loss, so an operator decides.
+        while (running.get()) {
+            Aeron aeron = null;
+            AeronArchive archive = null;
+            boolean reconnectAfterTransientError = false;
+            try {
+                aeron = Aeron.connect(new Aeron.Context().aeronDirectoryName(cfg.getAeronDirectory()));
+                archive = AeronArchive.connect(new AeronArchive.Context()
+                        .aeron(aeron)
+                        .ownsAeronClient(false)
+                        .controlRequestChannel(cfg.getArchiveControlRequestChannel())
+                        .controlResponseChannel(cfg.getArchiveControlResponseChannel()));
 
-            // Bootstrap: if no saved cursor at startup, wait for the first recording to appear,
-            // then persist (oldestId, 0) so subsequent restarts have a recording id to anchor on.
-            if (startupCursor.get() == null) {
-                if (!bootstrapFromOldestRecording(archive, cfg.getRecordingLookupParkMs())) {
-                    return; // shutdown requested during bootstrap
+                // Bootstrap: if no saved cursor at startup, wait for the first recording to appear,
+                // then persist (oldestId, 0) so subsequent restarts have a recording id to anchor on.
+                if (startupCursor.get() == null) {
+                    if (!bootstrapFromOldestRecording(archive, cfg.getRecordingLookupParkMs())) {
+                        return; // shutdown requested during bootstrap
+                    }
                 }
+
+                runReplayLoopWithRecordingWalk(archive, cfg);
+                // Normal return only happens when running == false (shutdown). The while-guard exits.
+            } catch (IllegalStateException e) {
+                // Genuine, unrecoverable cursor/recording-state corruption (saved recording id
+                // missing from Archive, saved position past recording end). Loud-stop: the
+                // exception message carries the operator remediation. Reconnecting cannot help.
+                log.error("oms-venue-egress replay loop terminating (unrecoverable cursor/recording state)", e);
+                return;
+            } catch (RuntimeException e) {
+                if (!running.get()) {
+                    return; // interrupted during shutdown — not an error worth reconnecting for
+                }
+                if (isRecoverableClusterInfraError(e)) {
+                    reconnectAfterTransientError = true;
+                    log.warn(
+                            "oms-venue-egress lost the OMS cluster archive (transient infra error);"
+                                    + " reconnecting in {}ms and resuming from the persisted cursor",
+                            cfg.getRecordingLookupParkMs(), e);
+                } else {
+                    log.error("oms-venue-egress replay loop terminating (unexpected error)", e);
+                    return;
+                }
+            } finally {
+                // Slice 4l H2: flush any pending batched cursor advance before tearing down. The
+                // replay thread is the only writer of eventsSinceCursorFlush / pendingCursorPosition,
+                // so reading them here (still on the replay thread) is race-free. With
+                // cursorFlushEvery=1 (default) this is always a no-op.
+                flushPendingCursorAdvance("replay loop teardown");
+                CloseHelper.quietClose(archive);
+                CloseHelper.quietClose(aeron);
             }
 
-            runReplayLoopWithRecordingWalk(archive, cfg);
-        } catch (RuntimeException e) {
-            // Loud failures from the recording-walk loop (saved recording id missing from
-            // Archive, saved position past recording end, etc.) land here and stop the egress.
-            // Operators see the stack trace and the diagnostic context in the exception message;
-            // restarting without fixing the underlying state would re-throw immediately.
-            log.error("oms-venue-egress replay loop terminating", e);
-        } finally {
-            // Slice 4l H2: flush any pending batched cursor advance before tearing down. The
-            // replay thread is the only writer of eventsSinceCursorFlush / pendingCursorPosition,
-            // so reading them here (still on the replay thread) is race-free. With
-            // cursorFlushEvery=1 (default) this is always a no-op.
-            flushPendingCursorAdvance("replay loop shutdown");
-            CloseHelper.quietClose(archive);
-            CloseHelper.quietClose(aeron);
-            log.info("oms-venue-egress replay loop stopped");
+            if (!reconnectAfterTransientError) {
+                break; // clean shutdown
+            }
+            try {
+                Thread.sleep(cfg.getRecordingLookupParkMs());
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                break;
+            }
         }
+        log.info("oms-venue-egress replay loop stopped");
+    }
+
+    /**
+     * Classifies a {@link RuntimeException} caught by the replay loop as a <em>recoverable</em>
+     * OMS-cluster infrastructure error (the Aeron MediaDriver / Archive became unreachable, e.g.
+     * because {@code oms-cluster-node} restarted) versus a fatal state error.
+     *
+     * <p>Recoverable: any {@link io.aeron.exceptions.TimeoutException} (covers
+     * {@link io.aeron.exceptions.DriverTimeoutException}),
+     * {@link io.aeron.exceptions.RegistrationException}, or
+     * {@link org.agrona.concurrent.AgentTerminationException} anywhere in the cause chain — these
+     * are transport/driver-level and clear once the cluster is reachable again. Cursor/recording
+     * state corruption is signalled separately via {@link IllegalStateException} (see
+     * {@link #requireRecordingPresent} / {@link #requirePositionWithinRecording}) and is handled
+     * as fatal by the caller, so it is intentionally NOT matched here.
+     *
+     * <p>Package-private + static so it can be unit-tested without standing up a real Aeron
+     * Archive.
+     */
+    static boolean isRecoverableClusterInfraError(Throwable error) {
+        for (Throwable t = error; t != null; t = t.getCause()) {
+            if (t instanceof io.aeron.exceptions.TimeoutException
+                    || t instanceof io.aeron.exceptions.RegistrationException
+                    || t instanceof org.agrona.concurrent.AgentTerminationException) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

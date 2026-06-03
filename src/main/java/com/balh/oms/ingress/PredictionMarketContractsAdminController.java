@@ -2,6 +2,7 @@ package com.balh.oms.ingress;
 
 import com.balh.oms.predictionmarket.PredictionMarketContractRepository;
 import com.balh.oms.predictionmarket.PredictionMarketContractService;
+import com.balh.oms.predictionmarket.PredictionMarketReferenceLinks;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.List;
@@ -30,20 +31,28 @@ public class PredictionMarketContractsAdminController {
             String title,
             String yesSymbol,
             String noSymbol,
+            String description,
+            String resolutionCriteria,
+            List<PredictionMarketReferenceLinks.Link> referenceLinks,
             String resolutionSource,
             String settlementCurrency,
             String tickSize,
             String payoutPerContract,
             Instant closesAt,
+            Instant resolvesAt,
             String status) {}
 
     public record UpdateBody(
             String title,
+            String description,
+            String resolutionCriteria,
+            List<PredictionMarketReferenceLinks.Link> referenceLinks,
             String resolutionSource,
             String settlementCurrency,
             String tickSize,
             String payoutPerContract,
             Instant closesAt,
+            Instant resolvesAt,
             String status) {}
 
     private final PredictionMarketContractRepository repository;
@@ -87,11 +96,15 @@ public class PredictionMarketContractsAdminController {
                                     body.title(),
                                     body.yesSymbol(),
                                     body.noSymbol(),
+                                    body.description(),
+                                    body.resolutionCriteria(),
+                                    body.referenceLinks(),
                                     body.resolutionSource(),
                                     body.settlementCurrency(),
                                     parseDecimal(body.tickSize()),
                                     parseDecimal(body.payoutPerContract()),
                                     body.closesAt(),
+                                    body.resolvesAt(),
                                     body.status()));
             return ResponseEntity.status(HttpStatus.CREATED).body(PredictionMarketContractDto.toResponse(row));
         } catch (IllegalArgumentException e) {
@@ -119,11 +132,15 @@ public class PredictionMarketContractsAdminController {
                             id,
                             new PredictionMarketContractService.UpdateRequest(
                                     body.title(),
+                                    body.description(),
+                                    body.resolutionCriteria(),
+                                    body.referenceLinks(),
                                     body.resolutionSource(),
                                     body.settlementCurrency(),
                                     parseDecimal(body.tickSize()),
                                     parseDecimal(body.payoutPerContract()),
                                     body.closesAt(),
+                                    body.resolvesAt(),
                                     body.status()))
                     .map(row -> ResponseEntity.ok(PredictionMarketContractDto.toResponse(row)))
                     .orElse(ResponseEntity.notFound().build());

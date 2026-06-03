@@ -3,6 +3,7 @@ package com.balh.oms.predictionmarket;
 import com.balh.oms.venue.VenueContractRegistryClient;
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
 import java.util.Set;
@@ -29,20 +30,28 @@ public class PredictionMarketContractService {
             String title,
             String yesSymbol,
             String noSymbol,
+            String description,
+            String resolutionCriteria,
+            List<PredictionMarketReferenceLinks.Link> referenceLinks,
             String resolutionSource,
             String settlementCurrency,
             BigDecimal tickSize,
             BigDecimal payoutPerContract,
             Instant closesAt,
+            Instant resolvesAt,
             String status) {}
 
     public record UpdateRequest(
             String title,
+            String description,
+            String resolutionCriteria,
+            List<PredictionMarketReferenceLinks.Link> referenceLinks,
             String resolutionSource,
             String settlementCurrency,
             BigDecimal tickSize,
             BigDecimal payoutPerContract,
             Instant closesAt,
+            Instant resolvesAt,
             String status) {}
 
     public PredictionMarketContractRepository.ContractRow create(CreateRequest req) {
@@ -58,18 +67,27 @@ public class PredictionMarketContractService {
         if (tickSize.signum() <= 0 || payout.signum() <= 0) {
             throw new IllegalArgumentException("tickSize and payoutPerContract must be positive");
         }
+        String description = PredictionMarketReferenceLinks.normalizeDescription(req.description());
+        String resolutionCriteria =
+                PredictionMarketReferenceLinks.normalizeResolutionCriteria(req.resolutionCriteria());
+        List<PredictionMarketReferenceLinks.Link> referenceLinks =
+                PredictionMarketReferenceLinks.normalize(req.referenceLinks());
         PredictionMarketContractRepository.ContractRow row =
                 repository.insert(
                         slug,
                         title,
                         yesSymbol,
                         noSymbol,
+                        description,
+                        resolutionCriteria,
+                        referenceLinks,
                         trimToNull(req.resolutionSource()),
                         status,
                         settlementCurrency,
                         tickSize,
                         payout,
-                        req.closesAt());
+                        req.closesAt(),
+                        req.resolvesAt());
         venueRegistry.syncContract(row);
         return row;
     }
@@ -81,6 +99,19 @@ public class PredictionMarketContractService {
                         existing -> {
                             String title =
                                     req.title() != null ? requireNonBlank(req.title(), "title") : existing.title();
+                            String description =
+                                    req.description() != null
+                                            ? PredictionMarketReferenceLinks.normalizeDescription(req.description())
+                                            : existing.description();
+                            String resolutionCriteria =
+                                    req.resolutionCriteria() != null
+                                            ? PredictionMarketReferenceLinks.normalizeResolutionCriteria(
+                                                    req.resolutionCriteria())
+                                            : existing.resolutionCriteria();
+                            List<PredictionMarketReferenceLinks.Link> referenceLinks =
+                                    req.referenceLinks() != null
+                                            ? PredictionMarketReferenceLinks.normalize(req.referenceLinks())
+                                            : existing.referenceLinks();
                             String resolutionSource =
                                     req.resolutionSource() != null
                                             ? trimToNull(req.resolutionSource())
@@ -105,16 +136,22 @@ public class PredictionMarketContractService {
                             }
                             Instant closesAt =
                                     req.closesAt() != null ? req.closesAt() : existing.closesAt();
+                            Instant resolvesAt =
+                                    req.resolvesAt() != null ? req.resolvesAt() : existing.resolvesAt();
                             PredictionMarketContractRepository.ContractRow updated =
                                     repository.update(
                                             id,
                                             title,
+                                            description,
+                                            resolutionCriteria,
+                                            referenceLinks,
                                             resolutionSource,
                                             status,
                                             settlementCurrency,
                                             tickSize,
                                             payout,
-                                            closesAt);
+                                            closesAt,
+                                            resolvesAt);
                             venueRegistry.syncContract(updated);
                             return updated;
                         });

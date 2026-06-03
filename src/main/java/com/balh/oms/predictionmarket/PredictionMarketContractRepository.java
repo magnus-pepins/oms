@@ -18,17 +18,22 @@ public class PredictionMarketContractRepository {
             String title,
             String yesSymbol,
             String noSymbol,
+            String description,
+            String resolutionCriteria,
+            List<PredictionMarketReferenceLinks.Link> referenceLinks,
             String resolutionSource,
             String status,
             String settlementCurrency,
             BigDecimal tickSize,
             BigDecimal payoutPerContract,
-            Instant closesAt) {}
+            Instant closesAt,
+            Instant resolvesAt) {}
 
     private static final String SELECT_COLUMNS =
             """
-                    id, slug, title, yes_symbol, no_symbol, resolution_source, status,
-                    settlement_currency, tick_size, payout_per_contract, closes_at
+                    id, slug, title, yes_symbol, no_symbol, description, resolution_criteria,
+                    reference_links, resolution_source, status, settlement_currency, tick_size,
+                    payout_per_contract, closes_at, resolves_at
                     """;
 
     private static final String LIST_OPEN =
@@ -158,21 +163,27 @@ public class PredictionMarketContractRepository {
             String title,
             String yesSymbol,
             String noSymbol,
+            String description,
+            String resolutionCriteria,
+            List<PredictionMarketReferenceLinks.Link> referenceLinks,
             String resolutionSource,
             String status,
             String settlementCurrency,
             BigDecimal tickSize,
             BigDecimal payoutPerContract,
-            Instant closesAt) {
+            Instant closesAt,
+            Instant resolvesAt) {
         Long id =
                 jdbc.queryForObject(
                         """
                                 INSERT INTO prediction_market_contract (
-                                    slug, title, yes_symbol, no_symbol, resolution_source, status,
-                                    settlement_currency, tick_size, payout_per_contract, closes_at
+                                    slug, title, yes_symbol, no_symbol, description, resolution_criteria,
+                                    reference_links, resolution_source, status, settlement_currency,
+                                    tick_size, payout_per_contract, closes_at, resolves_at
                                 ) VALUES (
-                                    :slug, :title, :yesSymbol, :noSymbol, :resolutionSource, :status,
-                                    :settlementCurrency, :tickSize, :payoutPerContract, :closesAt
+                                    :slug, :title, :yesSymbol, :noSymbol, :description, :resolutionCriteria,
+                                    CAST(:referenceLinks AS JSONB), :resolutionSource, :status,
+                                    :settlementCurrency, :tickSize, :payoutPerContract, :closesAt, :resolvesAt
                                 )
                                 RETURNING id
                                 """,
@@ -181,12 +192,16 @@ public class PredictionMarketContractRepository {
                                 title,
                                 yesSymbol,
                                 noSymbol,
+                                description,
+                                resolutionCriteria,
+                                referenceLinks,
                                 resolutionSource,
                                 status,
                                 settlementCurrency,
                                 tickSize,
                                 payoutPerContract,
-                                closesAt),
+                                closesAt,
+                                resolvesAt),
                         Long.class);
         return findById(id).orElseThrow();
     }
@@ -194,25 +209,47 @@ public class PredictionMarketContractRepository {
     public ContractRow update(
             long id,
             String title,
+            String description,
+            String resolutionCriteria,
+            List<PredictionMarketReferenceLinks.Link> referenceLinks,
             String resolutionSource,
             String status,
             String settlementCurrency,
             BigDecimal tickSize,
             BigDecimal payoutPerContract,
-            Instant closesAt) {
+            Instant closesAt,
+            Instant resolvesAt) {
         jdbc.update(
                 """
                         UPDATE prediction_market_contract
                         SET title = :title,
+                            description = :description,
+                            resolution_criteria = :resolutionCriteria,
+                            reference_links = CAST(:referenceLinks AS JSONB),
                             resolution_source = :resolutionSource,
                             status = :status,
                             settlement_currency = :settlementCurrency,
                             tick_size = :tickSize,
                             payout_per_contract = :payoutPerContract,
-                            closes_at = :closesAt
+                            closes_at = :closesAt,
+                            resolves_at = :resolvesAt
                         WHERE id = :id
                         """,
-                bindWrite(null, title, null, null, resolutionSource, status, settlementCurrency, tickSize, payoutPerContract, closesAt)
+                bindWrite(
+                                null,
+                                title,
+                                null,
+                                null,
+                                description,
+                                resolutionCriteria,
+                                referenceLinks,
+                                resolutionSource,
+                                status,
+                                settlementCurrency,
+                                tickSize,
+                                payoutPerContract,
+                                closesAt,
+                                resolvesAt)
                         .addValue("id", id));
         return findById(id).orElseThrow();
     }
@@ -222,12 +259,16 @@ public class PredictionMarketContractRepository {
             String title,
             String yesSymbol,
             String noSymbol,
+            String description,
+            String resolutionCriteria,
+            List<PredictionMarketReferenceLinks.Link> referenceLinks,
             String resolutionSource,
             String status,
             String settlementCurrency,
             BigDecimal tickSize,
             BigDecimal payoutPerContract,
-            Instant closesAt) {
+            Instant closesAt,
+            Instant resolvesAt) {
         MapSqlParameterSource params = new MapSqlParameterSource();
         if (slug != null) {
             params.addValue("slug", slug);
@@ -239,28 +280,42 @@ public class PredictionMarketContractRepository {
         if (noSymbol != null) {
             params.addValue("noSymbol", noSymbol);
         }
+        params.addValue("description", description);
+        params.addValue("resolutionCriteria", resolutionCriteria);
+        params.addValue(
+                "referenceLinks",
+                PredictionMarketReferenceLinks.toJson(
+                        referenceLinks == null
+                                ? PredictionMarketReferenceLinks.empty()
+                                : referenceLinks));
         params.addValue("resolutionSource", resolutionSource);
         params.addValue("status", status);
         params.addValue("settlementCurrency", settlementCurrency);
         params.addValue("tickSize", tickSize);
         params.addValue("payoutPerContract", payoutPerContract);
         params.addValue("closesAt", closesAt == null ? null : Timestamp.from(closesAt));
+        params.addValue("resolvesAt", resolvesAt == null ? null : Timestamp.from(resolvesAt));
         return params;
     }
 
     private ContractRow mapRow(java.sql.ResultSet rs, int rowNum) throws java.sql.SQLException {
         Timestamp closes = rs.getTimestamp("closes_at");
+        Timestamp resolves = rs.getTimestamp("resolves_at");
         return new ContractRow(
                 rs.getLong("id"),
                 rs.getString("slug"),
                 rs.getString("title"),
                 rs.getString("yes_symbol"),
                 rs.getString("no_symbol"),
+                rs.getString("description"),
+                rs.getString("resolution_criteria"),
+                PredictionMarketReferenceLinks.fromJson(rs.getString("reference_links")),
                 rs.getString("resolution_source"),
                 rs.getString("status"),
                 rs.getString("settlement_currency"),
                 rs.getBigDecimal("tick_size"),
                 rs.getBigDecimal("payout_per_contract"),
-                closes == null ? null : closes.toInstant());
+                closes == null ? null : closes.toInstant(),
+                resolves == null ? null : resolves.toInstant());
     }
 }

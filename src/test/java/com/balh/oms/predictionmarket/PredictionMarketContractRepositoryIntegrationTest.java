@@ -4,6 +4,7 @@ import com.balh.oms.IntegrationTestPostgresSupport;
 import com.zaxxer.hikari.HikariDataSource;
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.util.List;
 import java.util.UUID;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -44,12 +45,16 @@ class PredictionMarketContractRepositoryIntegrationTest {
                 "Halted contract",
                 "PREDMKT-HALT-" + suffix,
                 "PREDMKT-HALT-" + suffix + "-NO",
+                null,
+                null,
+                List.of(),
                 "it",
                 "HALTED",
                 "USD",
                 new BigDecimal("0.01"),
                 new BigDecimal("1.00"),
-                Instant.parse("2030-01-01T00:00:00Z"));
+                Instant.parse("2030-01-01T00:00:00Z"),
+                null);
 
         var rows = repository.listAll(null);
 
@@ -67,12 +72,16 @@ class PredictionMarketContractRepositoryIntegrationTest {
                 "Closed contract",
                 "PREDMKT-CLS-" + suffix,
                 "PREDMKT-CLS-" + suffix + "-NO",
+                null,
+                null,
+                List.of(),
                 "it",
                 "CLOSED",
                 "USD",
                 new BigDecimal("0.01"),
                 new BigDecimal("1.00"),
-                Instant.parse("2030-06-01T00:00:00Z"));
+                Instant.parse("2030-06-01T00:00:00Z"),
+                null);
 
         assertThat(repository.listAll("OPEN")).allMatch(r -> "OPEN".equals(r.status()));
         assertThat(repository.listAll("CLOSED")).anyMatch(r -> slug.equals(r.slug()));
@@ -88,11 +97,15 @@ class PredictionMarketContractRepositoryIntegrationTest {
                 "Blank filter",
                 "PREDMKT-BLK-" + suffix,
                 "PREDMKT-BLK-" + suffix + "-NO",
+                null,
+                null,
+                List.of(),
                 "it",
                 "HALTED",
                 "USD",
                 new BigDecimal("0.01"),
                 new BigDecimal("1.00"),
+                null,
                 null);
 
         assertThat(repository.listAll("   ")).anyMatch(r -> slug.equals(r.slug()));
@@ -108,5 +121,40 @@ class PredictionMarketContractRepositoryIntegrationTest {
                     assertThat(r.noSymbol()).isEqualTo("PREDMKT-TEST-1-NO");
                 });
         assertThat(repository.findBySlug("missing-slug-" + UUID.randomUUID())).isEmpty();
+    }
+
+    @Test
+    void insert_persistsDescriptionCriteriaLinksAndResolvesAt() {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String slug = "content-" + suffix;
+        var links =
+                List.of(new PredictionMarketReferenceLinks.Link("Source", "https://example.com/article"));
+        var inserted =
+                repository.insert(
+                        slug,
+                        "Content contract",
+                        "PREDMKT-CNT-" + suffix,
+                        "PREDMKT-CNT-" + suffix + "-NO",
+                        "Longer market narrative.",
+                        "YES if the event occurs by 2030-12-31.",
+                        links,
+                        "it-oracle",
+                        "OPEN",
+                        "USD",
+                        new BigDecimal("0.01"),
+                        new BigDecimal("1.00"),
+                        Instant.parse("2030-01-15T12:00:00Z"),
+                        Instant.parse("2030-01-16T12:00:00Z"));
+
+        assertThat(repository.findBySlug(slug))
+                .isPresent()
+                .get()
+                .satisfies(r -> {
+                    assertThat(r.description()).isEqualTo("Longer market narrative.");
+                    assertThat(r.resolutionCriteria()).isEqualTo("YES if the event occurs by 2030-12-31.");
+                    assertThat(r.referenceLinks()).hasSize(1);
+                    assertThat(r.referenceLinks().getFirst().url()).isEqualTo("https://example.com/article");
+                    assertThat(r.resolvesAt()).isEqualTo(inserted.resolvesAt());
+                });
     }
 }

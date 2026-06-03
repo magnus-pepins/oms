@@ -1,13 +1,10 @@
 package com.balh.oms.predictionmarket;
 
-import com.balh.oms.AbstractPostgresIntegrationTest;
-import com.zaxxer.hikari.HikariConfig;
+import com.balh.oms.IntegrationTestPostgresSupport;
 import com.zaxxer.hikari.HikariDataSource;
 import java.math.BigDecimal;
 import java.time.Instant;
-import java.util.Map;
 import java.util.UUID;
-import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -28,21 +25,7 @@ class PredictionMarketContractRepositoryIntegrationTest {
 
     @BeforeAll
     void startPostgresAndMigrate() {
-        HikariConfig hc = new HikariConfig();
-        hc.setJdbcUrl(AbstractPostgresIntegrationTest.integrationTestJdbcUrl());
-        hc.setUsername(AbstractPostgresIntegrationTest.integrationTestJdbcUser());
-        hc.setPassword(AbstractPostgresIntegrationTest.integrationTestJdbcPassword());
-        hc.setMaximumPoolSize(2);
-        hc.setPoolName("prediction-market-contract-repo-it");
-        dataSource = new HikariDataSource(hc);
-
-        Flyway.configure()
-                .dataSource(dataSource)
-                .locations("classpath:db/migration")
-                .configuration(Map.of("flyway.postgresql.transactional.lock", "false"))
-                .load()
-                .migrate();
-
+        dataSource = IntegrationTestPostgresSupport.newDataSource("prediction-market-contract-repo-it");
         repository = new PredictionMarketContractRepository(new NamedParameterJdbcTemplate(dataSource));
     }
 

@@ -25,7 +25,8 @@ public final class PredictionMarketContractDto {
             String tickSize,
             String payoutPerContract,
             Instant closesAt,
-            Instant resolvesAt) {}
+            Instant resolvesAt,
+            java.util.List<String> jurisdictionTags) {}
 
     public record ContractListResponse(java.util.List<ContractResponse> items) {}
 
@@ -51,6 +52,7 @@ public final class PredictionMarketContractDto {
                 row.tickSize().stripTrailingZeros().toPlainString(),
                 row.payoutPerContract().stripTrailingZeros().toPlainString(),
                 row.closesAt(),
-                row.resolvesAt());
+                row.resolvesAt(),
+                row.jurisdictionTags());
     }
 }

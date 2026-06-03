@@ -40,6 +40,7 @@ public class PredictionMarketContractsAdminController {
             String payoutPerContract,
             Instant closesAt,
             Instant resolvesAt,
+            java.util.List<String> jurisdictionTags,
             String status) {}
 
     public record UpdateBody(
@@ -53,6 +54,7 @@ public class PredictionMarketContractsAdminController {
             String payoutPerContract,
             Instant closesAt,
             Instant resolvesAt,
+            java.util.List<String> jurisdictionTags,
             String status) {}
 
     private final PredictionMarketContractRepository repository;
@@ -105,6 +107,7 @@ public class PredictionMarketContractsAdminController {
                                     parseDecimal(body.payoutPerContract()),
                                     body.closesAt(),
                                     body.resolvesAt(),
+                                    body.jurisdictionTags(),
                                     body.status()));
             return ResponseEntity.status(HttpStatus.CREATED).body(PredictionMarketContractDto.toResponse(row));
         } catch (IllegalArgumentException e) {
@@ -141,6 +144,7 @@ public class PredictionMarketContractsAdminController {
                                     parseDecimal(body.payoutPerContract()),
                                     body.closesAt(),
                                     body.resolvesAt(),
+                                    body.jurisdictionTags(),
                                     body.status()))
                     .map(row -> ResponseEntity.ok(PredictionMarketContractDto.toResponse(row)))
                     .orElse(ResponseEntity.notFound().build());

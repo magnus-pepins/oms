@@ -43,7 +43,8 @@ class PredictionMarketContractServiceTest {
                         before.tickSize(),
                         before.payoutPerContract(),
                         before.closesAt(),
-                        before.resolvesAt());
+                        before.resolvesAt(),
+                        before.jurisdictionTags());
         assertFalse(PredictionMarketContractService.requiresVenueRegistrySync(before, after));
     }
 
@@ -66,7 +67,8 @@ class PredictionMarketContractServiceTest {
                         before.tickSize(),
                         before.payoutPerContract(),
                         before.closesAt(),
-                        before.resolvesAt());
+                        before.resolvesAt(),
+                        before.jurisdictionTags());
         assertTrue(PredictionMarketContractService.requiresVenueRegistrySync(before, after));
     }
 
@@ -87,6 +89,7 @@ class PredictionMarketContractServiceTest {
                 new BigDecimal(tick),
                 new BigDecimal("1.00"),
                 null,
-                null);
+                null,
+                List.of("SE"));
     }
 }

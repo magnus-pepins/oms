@@ -23,12 +23,13 @@ firing alerts as a prompt to investigate rather than as definitive evidence of a
 | Apply-execution-report p99 | rolling 5 min | > 5 ms for 10 min | > 25 ms for 5 min | `oms.cluster.client.commit_round_trip{command="apply_execution_report",outcome="commit"}` (slice 4c) |
 | Projector lag | sample (per scrape) | > 5 s for 10 min | > 30 s for 5 min | `oms.projector.lag_seconds` (slice 4d) |
 | FIX-egress lag | sample (per scrape) | > 5 s for 10 min | > 30 s for 5 min | `oms.fix_egress.lag_seconds` (slice 4d) |
+| Venue-egress lag (bytes) | sample (per scrape) | > 4096 for 5 min | > 16384 for 2 min | `oms.venue.egress.lag_bytes` (prediction-market hardening 2026-06-03; aligns with `VenueAdmissionGate` max-lag-bytes) |
 | Snapshot freshness | sample (per scrape) | > 1 h for 30 min | > 4 h for 30 min | `oms.cluster.snapshot.age_seconds` (slice 4h, this slice) |
 | Cluster ↔ projector open orders | sample (per scrape) | `oms_cluster_reconcile_in_sync == 0` for 5 min | — | `oms_cluster_reconcile_in_sync`, `oms_drift{kind="open_orders"}` (recovery hardening Phase 3) |
 | Reconcile poll freshness | sample (per scrape) | `oms_cluster_reconcile_age_seconds > 180` for 5 min | — | `oms_cluster_reconcile_age_seconds` (30 s default poll) |
 | Cluster readiness (HTTP) | probe | `/actuator/oms-cluster-readiness` not READY for 2 min | — | `probe_success{job="oms-ingress-readiness"}` (configure blackbox probe on pop) |
 | Cluster-node up | sample (per scrape) | — | `up == 0` for 2 min | scrape-target up state |
-| Lag publisher producing data | sample (per scrape) | `lag == -1` for 10 min after boot | — | `oms.projector.lag_seconds`, `oms.fix_egress.lag_seconds` (slice 4d sentinel) |
+| Lag publisher producing data | sample (per scrape) | `lag == -1` for 10 min after boot | — | `oms.projector.lag_seconds`, `oms.fix_egress.lag_seconds`, `oms.venue.egress.lag_bytes` (slice 4d / PM hardening sentinel) |
 
 The Prometheus exporter rewrites Micrometer names: `oms.cluster.client.commit_round_trip` →
 `oms_cluster_client_commit_round_trip_seconds_bucket` (Timer), etc. The alert expressions below

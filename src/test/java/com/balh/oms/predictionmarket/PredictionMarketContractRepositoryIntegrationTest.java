@@ -54,7 +54,8 @@ class PredictionMarketContractRepositoryIntegrationTest {
                 new BigDecimal("0.01"),
                 new BigDecimal("1.00"),
                 Instant.parse("2030-01-01T00:00:00Z"),
-                null);
+                null,
+                List.of());
 
         var rows = repository.listAll(null);
 
@@ -81,7 +82,8 @@ class PredictionMarketContractRepositoryIntegrationTest {
                 new BigDecimal("0.01"),
                 new BigDecimal("1.00"),
                 Instant.parse("2030-06-01T00:00:00Z"),
-                null);
+                null,
+                List.of());
 
         assertThat(repository.listAll("OPEN")).allMatch(r -> "OPEN".equals(r.status()));
         assertThat(repository.listAll("CLOSED")).anyMatch(r -> slug.equals(r.slug()));
@@ -106,7 +108,8 @@ class PredictionMarketContractRepositoryIntegrationTest {
                 new BigDecimal("0.01"),
                 new BigDecimal("1.00"),
                 null,
-                null);
+                null,
+                List.of());
 
         assertThat(repository.listAll("   ")).anyMatch(r -> slug.equals(r.slug()));
     }
@@ -144,7 +147,8 @@ class PredictionMarketContractRepositoryIntegrationTest {
                         new BigDecimal("0.01"),
                         new BigDecimal("1.00"),
                         Instant.parse("2030-01-15T12:00:00Z"),
-                        Instant.parse("2030-01-16T12:00:00Z"));
+                        Instant.parse("2030-01-16T12:00:00Z"),
+                        List.of("SE", "LV"));
 
         assertThat(repository.findBySlug(slug))
                 .isPresent()
@@ -155,6 +159,7 @@ class PredictionMarketContractRepositoryIntegrationTest {
                     assertThat(r.referenceLinks()).hasSize(1);
                     assertThat(r.referenceLinks().getFirst().url()).isEqualTo("https://example.com/article");
                     assertThat(r.resolvesAt()).isEqualTo(inserted.resolvesAt());
+                    assertThat(r.jurisdictionTags()).containsExactly("SE", "LV");
                 });
     }
 }

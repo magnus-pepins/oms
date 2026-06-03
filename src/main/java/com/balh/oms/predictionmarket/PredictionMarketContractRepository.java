@@ -27,13 +27,14 @@ public class PredictionMarketContractRepository {
             BigDecimal tickSize,
             BigDecimal payoutPerContract,
             Instant closesAt,
-            Instant resolvesAt) {}
+            Instant resolvesAt,
+            List<String> jurisdictionTags) {}
 
     private static final String SELECT_COLUMNS =
             """
                     id, slug, title, yes_symbol, no_symbol, description, resolution_criteria,
                     reference_links, resolution_source, status, settlement_currency, tick_size,
-                    payout_per_contract, closes_at, resolves_at
+                    payout_per_contract, closes_at, resolves_at, jurisdiction_tags
                     """;
 
     private static final String LIST_OPEN =
@@ -172,18 +173,20 @@ public class PredictionMarketContractRepository {
             BigDecimal tickSize,
             BigDecimal payoutPerContract,
             Instant closesAt,
-            Instant resolvesAt) {
+            Instant resolvesAt,
+            List<String> jurisdictionTags) {
         Long id =
                 jdbc.queryForObject(
                         """
                                 INSERT INTO prediction_market_contract (
                                     slug, title, yes_symbol, no_symbol, description, resolution_criteria,
                                     reference_links, resolution_source, status, settlement_currency,
-                                    tick_size, payout_per_contract, closes_at, resolves_at
+                                    tick_size, payout_per_contract, closes_at, resolves_at, jurisdiction_tags
                                 ) VALUES (
                                     :slug, :title, :yesSymbol, :noSymbol, :description, :resolutionCriteria,
                                     CAST(:referenceLinks AS JSONB), :resolutionSource, :status,
-                                    :settlementCurrency, :tickSize, :payoutPerContract, :closesAt, :resolvesAt
+                                    :settlementCurrency, :tickSize, :payoutPerContract, :closesAt, :resolvesAt,
+                                    CAST(:jurisdictionTags AS JSONB)
                                 )
                                 RETURNING id
                                 """,
@@ -201,7 +204,8 @@ public class PredictionMarketContractRepository {
                                 tickSize,
                                 payoutPerContract,
                                 closesAt,
-                                resolvesAt),
+                                resolvesAt,
+                                jurisdictionTags),
                         Long.class);
         return findById(id).orElseThrow();
     }
@@ -218,7 +222,8 @@ public class PredictionMarketContractRepository {
             BigDecimal tickSize,
             BigDecimal payoutPerContract,
             Instant closesAt,
-            Instant resolvesAt) {
+            Instant resolvesAt,
+            List<String> jurisdictionTags) {
         jdbc.update(
                 """
                         UPDATE prediction_market_contract
@@ -232,7 +237,8 @@ public class PredictionMarketContractRepository {
                             tick_size = :tickSize,
                             payout_per_contract = :payoutPerContract,
                             closes_at = :closesAt,
-                            resolves_at = :resolvesAt
+                            resolves_at = :resolvesAt,
+                            jurisdiction_tags = CAST(:jurisdictionTags AS JSONB)
                         WHERE id = :id
                         """,
                 bindWrite(
@@ -249,7 +255,8 @@ public class PredictionMarketContractRepository {
                                 tickSize,
                                 payoutPerContract,
                                 closesAt,
-                                resolvesAt)
+                                resolvesAt,
+                                jurisdictionTags)
                         .addValue("id", id));
         return findById(id).orElseThrow();
     }
@@ -268,7 +275,8 @@ public class PredictionMarketContractRepository {
             BigDecimal tickSize,
             BigDecimal payoutPerContract,
             Instant closesAt,
-            Instant resolvesAt) {
+            Instant resolvesAt,
+            List<String> jurisdictionTags) {
         MapSqlParameterSource params = new MapSqlParameterSource();
         if (slug != null) {
             params.addValue("slug", slug);
@@ -295,6 +303,12 @@ public class PredictionMarketContractRepository {
         params.addValue("payoutPerContract", payoutPerContract);
         params.addValue("closesAt", closesAt == null ? null : Timestamp.from(closesAt));
         params.addValue("resolvesAt", resolvesAt == null ? null : Timestamp.from(resolvesAt));
+        params.addValue(
+                "jurisdictionTags",
+                PredictionMarketJurisdictionTags.toJson(
+                        jurisdictionTags == null
+                                ? PredictionMarketJurisdictionTags.empty()
+                                : jurisdictionTags));
         return params;
     }
 
@@ -316,6 +330,7 @@ public class PredictionMarketContractRepository {
                 rs.getBigDecimal("tick_size"),
                 rs.getBigDecimal("payout_per_contract"),
                 closes == null ? null : closes.toInstant(),
-                resolves == null ? null : resolves.toInstant());
+                resolves == null ? null : resolves.toInstant(),
+                PredictionMarketJurisdictionTags.fromJson(rs.getString("jurisdiction_tags")));
     }
 }

@@ -44,6 +44,7 @@ public class PredictionMarketContractService {
             BigDecimal payoutPerContract,
             Instant closesAt,
             Instant resolvesAt,
+            List<String> jurisdictionTags,
             String status) {}
 
     public record UpdateRequest(
@@ -57,6 +58,7 @@ public class PredictionMarketContractService {
             BigDecimal payoutPerContract,
             Instant closesAt,
             Instant resolvesAt,
+            List<String> jurisdictionTags,
             String status) {}
 
     public PredictionMarketContractRepository.ContractRow create(CreateRequest req) {
@@ -77,6 +79,8 @@ public class PredictionMarketContractService {
                 PredictionMarketReferenceLinks.normalizeResolutionCriteria(req.resolutionCriteria());
         List<PredictionMarketReferenceLinks.Link> referenceLinks =
                 PredictionMarketReferenceLinks.normalize(req.referenceLinks());
+        List<String> jurisdictionTags =
+                PredictionMarketJurisdictionTags.normalize(req.jurisdictionTags());
         PredictionMarketContractRepository.ContractRow row =
                 repository.insert(
                         slug,
@@ -92,7 +96,8 @@ public class PredictionMarketContractService {
                         tickSize,
                         payout,
                         req.closesAt(),
-                        req.resolvesAt());
+                        req.resolvesAt(),
+                        jurisdictionTags);
         venueRegistry.syncContract(row);
         return row;
     }
@@ -143,6 +148,11 @@ public class PredictionMarketContractService {
                                     req.closesAt() != null ? req.closesAt() : existing.closesAt();
                             Instant resolvesAt =
                                     req.resolvesAt() != null ? req.resolvesAt() : existing.resolvesAt();
+                            List<String> jurisdictionTags =
+                                    req.jurisdictionTags() != null
+                                            ? PredictionMarketJurisdictionTags.normalize(
+                                                    req.jurisdictionTags())
+                                            : existing.jurisdictionTags();
                             PredictionMarketContractRepository.ContractRow updated =
                                     repository.update(
                                             id,
@@ -156,7 +166,8 @@ public class PredictionMarketContractService {
                                             tickSize,
                                             payout,
                                             closesAt,
-                                            resolvesAt);
+                                            resolvesAt,
+                                            jurisdictionTags);
                             syncVenueRegistryAfterUpdate(existing, updated);
                             return updated;
                         });

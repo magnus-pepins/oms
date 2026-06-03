@@ -536,6 +536,7 @@ const apps = [
       OMS_VENUE_EGRESS_AERON_DIR: AERON_MEDIA_DRIVER,
       OMS_VENUE_EGRESS_CLUSTER_CLIENT_AERON_DIR: AERON_MEDIA_DRIVER,
       OMS_VENUE_GRPC_TARGET: 'localhost:50051',
+      OMS_VENUE_GRPC_CALL_TIMEOUT_MS: '15000',
       OMS_VENUE_SYMBOL_PREFIX_ROUTING_ENABLED: 'true',
       OMS_VENUE_SYMBOL_PREFIX: 'PREDMKT',
       // 8095/8092 are oms-fix-ingress on pop.
@@ -567,6 +568,12 @@ const apps = [
       // reconciler) all activate normally under this profile.
       SPRING_PROFILES_ACTIVE: 'oms-ingress-replica',
       OMS_CLUSTER_CLIENT_AERON_DIRECTORY: AERON_MEDIA_DRIVER,
+      // Venue-egress health circuit breaker (VenueAdmissionGate): refuse PREDMKT/* accepts when
+      // oms-venue-egress is behind the projector, so we never admit orders the venue can't see.
+      // Reads aeron_projector_cursor + oms_venue_egress_cursor from the shared oms projector DB.
+      OMS_VENUE_SYMBOL_PREFIX: 'PREDMKT',
+      OMS_VENUE_ADMISSION_GATE_ENABLED: 'true',
+      OMS_VENUE_ADMISSION_GATE_MAX_LAG_BYTES: '4096',
     },
     ...COMMON_PM2,
   },

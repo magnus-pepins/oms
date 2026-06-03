@@ -1028,11 +1028,17 @@ public class OmsConfig {
 
         private String grpcHost = "127.0.0.1";
         private int grpcPort = 50051;
+        /** Blocking stub deadline for RouteOrder / RouteCancel / RouteReplace on oms-venue-egress. */
+        private long grpcCallTimeoutMs = 15_000L;
         private String venueId = "balh-internal-venue";
         /** Phase C: push catalog creates/updates to balh-venue registry over gRPC. */
         private boolean registrySyncEnabled = true;
         /** Phase B: hold Ledger posting until this window elapses (default 2h). */
         private long resolutionDisputeWindowMs = DEFAULT_RESOLUTION_DISPUTE_WINDOW_MS;
+        /** Pre-admission circuit breaker: refuse venue-routed accepts when oms-venue-egress is behind. */
+        private final AdmissionGate admissionGate = new AdmissionGate();
+
+        public AdmissionGate getAdmissionGate() { return admissionGate; }
 
         public String getGrpcHost() { return grpcHost; }
         public void setGrpcHost(String grpcHost) {
@@ -1042,6 +1048,14 @@ public class OmsConfig {
         public int getGrpcPort() { return grpcPort; }
         public void setGrpcPort(int grpcPort) {
             this.grpcPort = grpcPort <= 0 ? 50051 : grpcPort;
+        }
+
+        public long getGrpcCallTimeoutMs() {
+            return grpcCallTimeoutMs;
+        }
+
+        public void setGrpcCallTimeoutMs(long grpcCallTimeoutMs) {
+            this.grpcCallTimeoutMs = grpcCallTimeoutMs > 0 ? grpcCallTimeoutMs : 15_000L;
         }
 
         public String getVenueId() { return venueId; }
@@ -1063,6 +1077,30 @@ public class OmsConfig {
                     resolutionDisputeWindowMs > 0
                             ? resolutionDisputeWindowMs
                             : DEFAULT_RESOLUTION_DISPUTE_WINDOW_MS;
+        }
+
+        /**
+         * Venue-egress health gate evaluated on the order-accept path (HTTP + gRPC) for
+         * venue-routed (e.g. {@code PREDMKT/*}) symbols only. When {@code oms-venue-egress} falls
+         * more than {@link #maxLagBytes} Aeron-log bytes behind the projector — i.e. accepted
+         * orders are not reaching {@code balh-venue} — admission of new venue-routed orders is
+         * refused with HTTP 503 {@code venue_unavailable}. Equities / FIX-routed flow is never
+         * gated. See {@link com.balh.oms.ingress.VenueAdmissionGate}.
+         */
+        public static class AdmissionGate {
+            /** A handful of cluster events (~100-300 bytes each); steady-state egress lag is ~0. */
+            private static final long DEFAULT_MAX_LAG_BYTES = 4_096L;
+
+            private boolean enabled = true;
+            private long maxLagBytes = DEFAULT_MAX_LAG_BYTES;
+
+            public boolean isEnabled() { return enabled; }
+            public void setEnabled(boolean enabled) { this.enabled = enabled; }
+
+            public long getMaxLagBytes() { return maxLagBytes; }
+            public void setMaxLagBytes(long maxLagBytes) {
+                this.maxLagBytes = maxLagBytes > 0 ? maxLagBytes : DEFAULT_MAX_LAG_BYTES;
+            }
         }
     }
 

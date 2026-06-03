@@ -38,7 +38,7 @@ public final class VenueRoutingSymbols {
         return !matchesVenuePrefix(venueSymbolPrefix(config), instrumentSymbol);
     }
 
-    static boolean matchesVenuePrefix(String prefix, String instrumentSymbol) {
+    public static boolean matchesVenuePrefix(String prefix, String instrumentSymbol) {
         String p = Objects.requireNonNullElse(prefix, DEFAULT_VENUE_SYMBOL_PREFIX).trim().toUpperCase(Locale.ROOT);
         if (p.isEmpty()) {
             return false;

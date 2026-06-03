@@ -14,6 +14,7 @@ import com.balh.oms.observability.metrics.OmsPipelineMetrics;
 import com.balh.oms.venue.VenueGrpcExecutionReportMapper;
 import com.balh.oms.routing.VenueRoutingSymbols;
 import com.balh.oms.venue.VenueRouteOrderClient;
+import com.balh.oms.venue.VenueRouteTransportException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.aeron.Aeron;
 import io.aeron.Subscription;
@@ -959,27 +960,36 @@ public class OmsVenueEgressService {
             int typeId = buffer.getInt(offset + OmsClusterWireFormat.HEADER_TYPE_ID_OFFSET);
             long newPosition = header.position();
             boolean advanced;
-            switch (typeId) {
-                case OmsClusterWireFormat.TYPE_ID_ORDER_ADMITTED -> {
-                    OrderAdmittedEvent ev = OrderAdmittedEvent.decode(buffer, offset, length);
-                    advanced = applyAdmittedEvent(ev, newPosition);
+            try {
+                switch (typeId) {
+                    case OmsClusterWireFormat.TYPE_ID_ORDER_ADMITTED -> {
+                        OrderAdmittedEvent ev = OrderAdmittedEvent.decode(buffer, offset, length);
+                        advanced = applyAdmittedEvent(ev, newPosition);
+                    }
+                    case OmsClusterWireFormat.TYPE_ID_ORDER_CANCEL_REQUESTED -> {
+                        OrderCancelRequestedEvent ev =
+                                OrderCancelRequestedEvent.decode(buffer, offset, length);
+                        advanced = applyCancelRequestedEvent(ev, newPosition);
+                    }
+                    case OmsClusterWireFormat.TYPE_ID_ORDER_REPLACE_REQUESTED -> {
+                        OrderReplaceRequestedEvent ev =
+                                OrderReplaceRequestedEvent.decode(buffer, offset, length);
+                        advanced = applyReplaceRequestedEvent(ev, newPosition);
+                    }
+                    default -> {
+                        // Other typeIds (ExecutionApplied / OrderRejected / OrderCancelApplied / ...)
+                        // are handled by other services; the FIX egress only consumes the venue-
+                        // outbound side. Advance the cursor so we don't loop on them.
+                        advanced = applyCursorOnly(newPosition);
+                    }
                 }
-                case OmsClusterWireFormat.TYPE_ID_ORDER_CANCEL_REQUESTED -> {
-                    OrderCancelRequestedEvent ev =
-                            OrderCancelRequestedEvent.decode(buffer, offset, length);
-                    advanced = applyCancelRequestedEvent(ev, newPosition);
-                }
-                case OmsClusterWireFormat.TYPE_ID_ORDER_REPLACE_REQUESTED -> {
-                    OrderReplaceRequestedEvent ev =
-                            OrderReplaceRequestedEvent.decode(buffer, offset, length);
-                    advanced = applyReplaceRequestedEvent(ev, newPosition);
-                }
-                default -> {
-                    // Other typeIds (ExecutionApplied / OrderRejected / OrderCancelApplied / ...)
-                    // are handled by other services; the FIX egress only consumes the venue-
-                    // outbound side. Advance the cursor so we don't loop on them.
-                    advanced = applyCursorOnly(newPosition);
-                }
+            } catch (RuntimeException e) {
+                log.error(
+                        "oms-venue-egress fragment apply failed (cursor not advanced): typeId={} position={}",
+                        typeId,
+                        newPosition,
+                        e);
+                advanced = false;
             }
             if (advanced) {
                 lastAppliedPosition.set(newPosition);
@@ -1031,7 +1041,18 @@ public class OmsVenueEgressService {
             return advanceCursor(newPosition);
         }
         if (venueRouteOrderClient != null && clusterIngressClient != null) {
-            Optional<com.balh.venue.grpc.v1.ExecutionReport> erOpt = routeVenueOrderOnce(ev);
+            Optional<com.balh.venue.grpc.v1.ExecutionReport> erOpt;
+            try {
+                erOpt = routeVenueOrderOnce(ev);
+            } catch (VenueRouteTransportException e) {
+                venueRouteResultByOrderId.remove(ev.orderId());
+                log.error(
+                        "oms-venue-egress: venue RouteOrder transport failed (will retry fragment): orderId={} symbol={}",
+                        ev.orderId(),
+                        ev.instrumentSymbol(),
+                        e);
+                return false;
+            }
             if (erOpt.isEmpty()) {
                 venueRouteResultByOrderId.remove(ev.orderId());
                 return advanceCursor(newPosition);
@@ -1055,7 +1076,19 @@ public class OmsVenueEgressService {
             return advanceCursor(newPosition);
         }
         if (venueRouteOrderClient != null && clusterIngressClient != null) {
-            var erOpt = venueRouteOrderClient.routeCancelRequested(ev);
+            Optional<com.balh.venue.grpc.v1.ExecutionReport> erOpt;
+            try {
+                erOpt = venueRouteOrderClient.routeCancelRequested(ev);
+            } catch (VenueRouteTransportException e) {
+                // Best-effort cancel during backlog replay: order may never have reached the venue
+                // (egress lag). Advancing avoids wedging the entire journal behind one cancel.
+                log.warn(
+                        "oms-venue-egress: venue RouteCancel transport failed; advancing cursor (best-effort): orderId={} symbol={}",
+                        ev.orderId(),
+                        ev.instrumentSymbol(),
+                        e);
+                return advanceCursor(newPosition);
+            }
             if (!submitVenueExecutionReport(ev.orderId(), erOpt, ev.requestedAtMillis(), ev.sideCode(), (byte) 0)) {
                 return erOpt.isEmpty() ? advanceCursor(newPosition) : false;
             }
@@ -1068,7 +1101,17 @@ public class OmsVenueEgressService {
             return advanceCursor(newPosition);
         }
         if (venueRouteOrderClient != null && clusterIngressClient != null) {
-            var erOpt = venueRouteOrderClient.routeReplaceRequested(ev);
+            Optional<com.balh.venue.grpc.v1.ExecutionReport> erOpt;
+            try {
+                erOpt = venueRouteOrderClient.routeReplaceRequested(ev);
+            } catch (VenueRouteTransportException e) {
+                log.warn(
+                        "oms-venue-egress: venue RouteReplace transport failed; advancing cursor (best-effort): orderId={} symbol={}",
+                        ev.orderId(),
+                        ev.instrumentSymbol(),
+                        e);
+                return advanceCursor(newPosition);
+            }
             if (!submitVenueExecutionReport(ev.orderId(), erOpt, ev.requestedAtMillis(), ev.sideCode(), ev.timeInForceCode())) {
                 return erOpt.isEmpty() ? advanceCursor(newPosition) : false;
             }

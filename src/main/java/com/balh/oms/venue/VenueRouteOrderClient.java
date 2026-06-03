@@ -15,6 +15,7 @@ import com.balh.venue.grpc.v1.RouteReplaceResponse;
 import com.balh.venue.grpc.v1.VenueOrderServiceGrpc;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
+import io.grpc.StatusRuntimeException;
 import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -25,6 +26,8 @@ import org.springframework.stereotype.Component;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
+
 @Component
 @Profile(OmsProfiles.VENUE_EGRESS)
 @ConditionalOnProperty(name = "oms.routing.backend", havingValue = "internal-venue")
@@ -34,14 +37,20 @@ public class VenueRouteOrderClient {
 
     private final ManagedChannel channel;
     private final VenueOrderServiceGrpc.VenueOrderServiceBlockingStub blockingStub;
+    private final long grpcCallTimeoutMs;
 
     public VenueRouteOrderClient(OmsConfig omsConfig) {
+        this.grpcCallTimeoutMs = omsConfig.getVenue().getGrpcCallTimeoutMs();
         this.channel =
                 ManagedChannelBuilder.forAddress(
                                 omsConfig.getVenue().getGrpcHost(), omsConfig.getVenue().getGrpcPort())
                         .usePlaintext()
                         .build();
         this.blockingStub = VenueOrderServiceGrpc.newBlockingStub(channel);
+    }
+
+    private VenueOrderServiceGrpc.VenueOrderServiceBlockingStub stubWithDeadline() {
+        return blockingStub.withDeadlineAfter(grpcCallTimeoutMs, MILLISECONDS);
     }
 
     public Optional<ExecutionReport> routeAdmittedOrder(OrderAdmittedEvent ev) {
@@ -54,7 +63,14 @@ public class VenueRouteOrderClient {
                         .setSide(ev.side())
                         .setCounterpartyId(ev.accountId())
                         .build();
-        RouteOrderResponse response = blockingStub.routeOrder(request);
+        RouteOrderResponse response;
+        try {
+            response = stubWithDeadline().routeOrder(request);
+        } catch (StatusRuntimeException e) {
+            throw new VenueRouteTransportException(
+                    "venue RouteOrder transport failure orderId=" + ev.orderId() + " symbol=" + ev.instrumentSymbol(),
+                    e);
+        }
         if (!response.getAccepted()) {
             log.warn(
                     "venue RouteOrder rejected orderId={} reason={}",
@@ -69,25 +85,39 @@ public class VenueRouteOrderClient {
     }
 
     public Optional<ExecutionReport> routeCancelRequested(OrderCancelRequestedEvent ev) {
-        RouteCancelResponse response =
-                blockingStub.routeCancel(
-                        RouteCancelRequest.newBuilder()
-                                .setOmsOrderId(ev.orderId().toString())
-                                .setInstrumentSymbol(ev.instrumentSymbol())
-                                .build());
+        RouteCancelResponse response;
+        try {
+            response =
+                    stubWithDeadline().routeCancel(
+                            RouteCancelRequest.newBuilder()
+                                    .setOmsOrderId(ev.orderId().toString())
+                                    .setInstrumentSymbol(ev.instrumentSymbol())
+                                    .build());
+        } catch (StatusRuntimeException e) {
+            throw new VenueRouteTransportException(
+                    "venue RouteCancel transport failure orderId=" + ev.orderId() + " symbol=" + ev.instrumentSymbol(),
+                    e);
+        }
         return acceptedExecutionReport(response.getAccepted(), response.getRejectReason(), ev.orderId(), response.hasExecutionReport(), response.getExecutionReport());
     }
 
     public Optional<ExecutionReport> routeReplaceRequested(OrderReplaceRequestedEvent ev) {
-        RouteReplaceResponse response =
-                blockingStub.routeReplace(
-                        RouteReplaceRequest.newBuilder()
-                                .setOmsOrderId(ev.orderId().toString())
-                                .setInstrumentSymbol(ev.instrumentSymbol())
-                                .setNewQuantityScaled(ev.newQuantityScaled())
-                                .setNewLimitPriceScaled(ev.newLimitPriceScaledOrZero())
-                                .setSide(ev.sideCode())
-                                .build());
+        RouteReplaceResponse response;
+        try {
+            response =
+                    stubWithDeadline().routeReplace(
+                            RouteReplaceRequest.newBuilder()
+                                    .setOmsOrderId(ev.orderId().toString())
+                                    .setInstrumentSymbol(ev.instrumentSymbol())
+                                    .setNewQuantityScaled(ev.newQuantityScaled())
+                                    .setNewLimitPriceScaled(ev.newLimitPriceScaledOrZero())
+                                    .setSide(ev.sideCode())
+                                    .build());
+        } catch (StatusRuntimeException e) {
+            throw new VenueRouteTransportException(
+                    "venue RouteReplace transport failure orderId=" + ev.orderId() + " symbol=" + ev.instrumentSymbol(),
+                    e);
+        }
         return acceptedExecutionReport(response.getAccepted(), response.getRejectReason(), ev.orderId(), response.hasExecutionReport(), response.getExecutionReport());
     }
 

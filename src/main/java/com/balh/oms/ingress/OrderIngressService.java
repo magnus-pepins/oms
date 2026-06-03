@@ -124,6 +124,11 @@ public class OrderIngressService {
      * keyed by {@code accountId} hash without changing this call site.
      */
     private final OmsClusterShardRouter clusterShardRouter;
+    /**
+     * Pre-admission venue-health circuit breaker. Refuses venue-routed ({@code PREDMKT/*}) accepts
+     * when {@code oms-venue-egress} is behind so the OMS never admits an order the venue cannot see.
+     */
+    private final VenueAdmissionGate venueAdmissionGate;
 
     public OrderIngressService(
             OrdersRepository orders,
@@ -136,7 +141,8 @@ public class OrderIngressService {
             ObjectProvider<FxCustomerFlowNettingService> customerFlowNetting,
             MeterRegistry meterRegistry,
             OrderControlAdmission orderControlAdmission,
-            OmsClusterShardRouter clusterShardRouter) {
+            OmsClusterShardRouter clusterShardRouter,
+            VenueAdmissionGate venueAdmissionGate) {
         this.orders = orders;
         this.config = config;
         this.piiHash = piiHash;
@@ -148,6 +154,7 @@ public class OrderIngressService {
         this.meterRegistry = meterRegistry;
         this.orderControlAdmission = orderControlAdmission;
         this.clusterShardRouter = clusterShardRouter;
+        this.venueAdmissionGate = venueAdmissionGate;
     }
 
     /**
@@ -230,6 +237,9 @@ public class OrderIngressService {
             //   2. FX quote-lock recall (§8.4; in-memory map lookup, opt-in).
             //   3. Aeron cluster admit (CompletableFuture wait; pulled out of tx in D-1).
             // All can fail and short-circuit before any Postgres conn is acquired.
+            // Venue-health circuit breaker first: refuse venue-routed orders the egress cannot
+            // currently deliver to balh-venue, before we admit anything into the OMS cluster.
+            venueAdmissionGate.assertVenueAdmissible(req.instrumentSymbol());
             maybeVerifyLedgerBalanceBinding(req);
             Optional<FxQuoteService.CachedQuote> lockedQuote = maybeRecallFxQuoteOrReject(req);
 

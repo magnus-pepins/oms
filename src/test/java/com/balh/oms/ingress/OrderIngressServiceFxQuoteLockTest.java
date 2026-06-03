@@ -63,6 +63,7 @@ class OrderIngressServiceFxQuoteLockTest {
 
     private OmsConfig config;
     private OrderIngressService service;
+    private VenueAdmissionGate venueAdmissionGate;
 
     @BeforeEach
     @SuppressWarnings("unchecked")
@@ -108,10 +109,16 @@ class OrderIngressServiceFxQuoteLockTest {
         when(nettingProvider.getIfAvailable()).thenReturn(null);
 
         OmsClusterShardRouter router = new OmsClusterShardRouter(1, Map.of(0, cluster));
+        // AAPL orders only; gate short-circuits before the cursor repos (mocks keep it safe).
+        venueAdmissionGate = new VenueAdmissionGate(
+                config,
+                mock(com.balh.oms.projector.AeronProjectorCursorRepository.class),
+                mock(com.balh.oms.venueegress.OmsVenueEgressCursorRepository.class),
+                new SimpleMeterRegistry());
         service = new OrderIngressService(
                 orders, config, piiHash,
                 ledgerInflight, ledgerInflightCoalescer, ledgerBalance, fxProvider, nettingProvider,
-                new SimpleMeterRegistry(), orderControlAdmission, router);
+                new SimpleMeterRegistry(), orderControlAdmission, router, venueAdmissionGate);
     }
 
     @Test
@@ -275,7 +282,7 @@ class OrderIngressServiceFxQuoteLockTest {
         OmsClusterShardRouter router = new OmsClusterShardRouter(1, Map.of(0, cluster));
         OrderIngressService noFxService = new OrderIngressService(
                 orders, config, piiHash, ledgerInflight, coal, bal, noFx, nettingProvider,
-                new SimpleMeterRegistry(), orderControlAdmission, router);
+                new SimpleMeterRegistry(), orderControlAdmission, router, venueAdmissionGate);
 
         CreateOrderRequest req = buildRequest("q_test", new BigDecimal("100.00"));
 

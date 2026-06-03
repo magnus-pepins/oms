@@ -5,6 +5,7 @@ import com.balh.oms.cluster.OmsClusterIngressClient;
 import com.balh.oms.cluster.OrderAdmittedEvent;
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.venue.VenueRouteOrderClient;
+import com.balh.oms.venue.VenueRouteTransportException;
 import com.balh.venue.grpc.v1.ExecType;
 import com.balh.venue.grpc.v1.ExecutionReport;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -25,6 +26,7 @@ import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -50,7 +52,9 @@ class OmsVenueEgressServiceTest {
                         routeClient,
                         clusterIngressClient);
         service.setCurrentRecordingIdForTesting(3L);
-        when(cursorRepository.advanceWithRecording(any(), anyInt(), eq(3L), anyLong())).thenReturn(true);
+        lenient()
+                .when(cursorRepository.advanceWithRecording(any(), anyInt(), eq(3L), anyLong()))
+                .thenReturn(true);
     }
 
     @Test
@@ -168,5 +172,34 @@ class OmsVenueEgressServiceTest {
 
         verify(routeClient, times(1)).routeAdmittedOrder(ev);
         verify(clusterIngressClient, times(2)).submitApplyExecutionReport(any(), any());
+    }
+
+    @Test
+    void applyAdmittedEvent_venueTransportFailure_doesNotAdvanceCursor() throws Exception {
+        OrderAdmittedEvent ev =
+                new OrderAdmittedEvent(
+                        UUID.randomUUID(),
+                        1L,
+                        1L,
+                        10_000_000_000L,
+                        650_000L,
+                        0,
+                        0,
+                        (byte) 0,
+                        (byte) 0,
+                        (byte) 2,
+                        "a",
+                        "i",
+                        "h",
+                        "PREDMKT-TEST-1",
+                        null,
+                        null);
+        when(routeClient.routeAdmittedOrder(ev))
+                .thenThrow(new VenueRouteTransportException("down", new RuntimeException("refused")));
+
+        assertThat(service.applyAdmittedEvent(ev, 100L)).isFalse();
+
+        verify(cursorRepository, times(0)).advanceWithRecording(any(), anyInt(), anyLong(), anyLong());
+        verify(clusterIngressClient, times(0)).submitApplyExecutionReport(any(), any());
     }
 }

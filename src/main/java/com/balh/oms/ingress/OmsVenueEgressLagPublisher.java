@@ -13,6 +13,7 @@ import io.micrometer.core.instrument.Tags;
 
 import jakarta.annotation.PostConstruct;
 
+import org.springframework.beans.factory.annotation.Autowired;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.annotation.Profile;
@@ -50,6 +51,7 @@ public class OmsVenueEgressLagPublisher {
 
     private final AtomicLong cachedLagBytes = new AtomicLong((long) NO_DATA_LAG_BYTES);
 
+    @Autowired
     public OmsVenueEgressLagPublisher(
             AeronProjectorCursorRepository projectorCursor,
             OmsVenueEgressCursorRepository venueEgressCursor,

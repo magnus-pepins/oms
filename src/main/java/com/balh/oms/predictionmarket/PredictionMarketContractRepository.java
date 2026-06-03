@@ -73,6 +73,14 @@ public class PredictionMarketContractRepository {
                     """
                     .formatted(SELECT_COLUMNS);
 
+    private static final String FIND_BY_SLUG =
+            """
+                    SELECT %s
+                    FROM prediction_market_contract
+                    WHERE slug = :slug
+                    """
+                    .formatted(SELECT_COLUMNS);
+
     private static final String FIND_TICK_BY_SYMBOL =
             """
                     SELECT tick_size
@@ -112,6 +120,18 @@ public class PredictionMarketContractRepository {
                 jdbc.query(
                         FIND_BY_YES,
                         new MapSqlParameterSource("yesSymbol", yesSymbol.trim()),
+                        this::mapRow);
+        return rows.isEmpty() ? Optional.empty() : Optional.of(rows.getFirst());
+    }
+
+    public Optional<ContractRow> findBySlug(String slug) {
+        if (slug == null || slug.isBlank()) {
+            return Optional.empty();
+        }
+        List<ContractRow> rows =
+                jdbc.query(
+                        FIND_BY_SLUG,
+                        new MapSqlParameterSource("slug", slug.trim()),
                         this::mapRow);
         return rows.isEmpty() ? Optional.empty() : Optional.of(rows.getFirst());
     }

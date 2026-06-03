@@ -97,4 +97,16 @@ class PredictionMarketContractRepositoryIntegrationTest {
 
         assertThat(repository.listAll("   ")).anyMatch(r -> slug.equals(r.slug()));
     }
+
+    @Test
+    void findBySlug_returnsSeededTestContract() {
+        assertThat(repository.findBySlug("TEST-1"))
+                .isPresent()
+                .get()
+                .satisfies(r -> {
+                    assertThat(r.yesSymbol()).isEqualTo("PREDMKT-TEST-1");
+                    assertThat(r.noSymbol()).isEqualTo("PREDMKT-TEST-1-NO");
+                });
+        assertThat(repository.findBySlug("missing-slug-" + UUID.randomUUID())).isEmpty();
+    }
 }

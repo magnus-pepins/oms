@@ -144,7 +144,8 @@ public final class EmbeddedVenueStack implements AutoCloseable {
                         "aeron:udp?endpoint=localhost:0",
                         "0=localhost:30110",
                         "aeron:udp?endpoint=localhost:0",
-                        0);
+                        0,
+                        1_000L);
         clusterIngressClient = VenueClusterIngressClient.connect(gatewayConfig);
         VenueOrderGrpcService grpcService = new VenueOrderGrpcService(clusterIngressClient);
         try {

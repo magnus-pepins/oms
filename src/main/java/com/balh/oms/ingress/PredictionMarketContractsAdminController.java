@@ -48,11 +48,15 @@ public class PredictionMarketContractsAdminController {
 
     private final PredictionMarketContractRepository repository;
     private final PredictionMarketContractService service;
+    private final com.balh.oms.venue.VenueContractRegistryClient venueRegistry;
 
     public PredictionMarketContractsAdminController(
-            PredictionMarketContractRepository repository, PredictionMarketContractService service) {
+            PredictionMarketContractRepository repository,
+            PredictionMarketContractService service,
+            com.balh.oms.venue.VenueContractRegistryClient venueRegistry) {
         this.repository = repository;
         this.service = service;
+        this.venueRegistry = venueRegistry;
     }
 
     @GetMapping
@@ -85,6 +89,18 @@ public class PredictionMarketContractsAdminController {
         } catch (IllegalArgumentException e) {
             return ResponseEntity.badRequest().build();
         }
+    }
+
+    @PostMapping("/{id}/sync-venue")
+    public ResponseEntity<Void> syncVenue(@PathVariable long id) {
+        return repository
+                .findById(id)
+                .map(
+                        row -> {
+                            venueRegistry.syncContract(row);
+                            return ResponseEntity.noContent().<Void>build();
+                        })
+                .orElse(ResponseEntity.notFound().build());
     }
 
     @PatchMapping("/{id}")

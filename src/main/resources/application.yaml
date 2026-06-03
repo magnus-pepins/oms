@@ -175,6 +175,10 @@ oms:
     nbbo-stub-ask-price: ${OMS_ROUTING_NBBO_STUB_ASK_PRICE:0}
     venue-symbol-prefix-routing-enabled: ${OMS_VENUE_SYMBOL_PREFIX_ROUTING_ENABLED:false}
     venue-symbol-prefix: ${OMS_VENUE_SYMBOL_PREFIX:PREDMKT}
+  venue:
+    grpc-host: ${OMS_VENUE_GRPC_HOST:127.0.0.1}
+    grpc-port: ${OMS_VENUE_GRPC_PORT:50051}
+    registry-sync-enabled: ${OMS_VENUE_REGISTRY_SYNC_ENABLED:true}
   settlement:
     # Must match a row in custody_accounts (Flyway V11 seeds DEFAULT omnibus).
     default-custody-account-id: ${OMS_SETTLEMENT_DEFAULT_CUSTODY_ACCOUNT_ID:a0000001-0000-4000-8000-000000000001}

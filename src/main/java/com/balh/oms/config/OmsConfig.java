@@ -1029,6 +1029,8 @@ public class OmsConfig {
         private String grpcHost = "127.0.0.1";
         private int grpcPort = 50051;
         private String venueId = "balh-internal-venue";
+        /** Phase C: push catalog creates/updates to balh-venue registry over gRPC. */
+        private boolean registrySyncEnabled = true;
         /** Phase B: hold Ledger posting until this window elapses (default 2h). */
         private long resolutionDisputeWindowMs = DEFAULT_RESOLUTION_DISPUTE_WINDOW_MS;
 
@@ -1045,6 +1047,11 @@ public class OmsConfig {
         public String getVenueId() { return venueId; }
         public void setVenueId(String venueId) {
             this.venueId = venueId == null || venueId.isBlank() ? "balh-internal-venue" : venueId.trim();
+        }
+
+        public boolean isRegistrySyncEnabled() { return registrySyncEnabled; }
+        public void setRegistrySyncEnabled(boolean registrySyncEnabled) {
+            this.registrySyncEnabled = registrySyncEnabled;
         }
 
         public long getResolutionDisputeWindowMs() {

@@ -1,5 +1,6 @@
 package com.balh.oms.predictionmarket;
 
+import com.balh.oms.venue.VenueContractRegistryClient;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.Locale;
@@ -15,9 +16,12 @@ public class PredictionMarketContractService {
     private static final String SYMBOL_PREFIX = "PREDMKT-";
 
     private final PredictionMarketContractRepository repository;
+    private final VenueContractRegistryClient venueRegistry;
 
-    public PredictionMarketContractService(PredictionMarketContractRepository repository) {
+    public PredictionMarketContractService(
+            PredictionMarketContractRepository repository, VenueContractRegistryClient venueRegistry) {
         this.repository = repository;
+        this.venueRegistry = venueRegistry;
     }
 
     public record CreateRequest(
@@ -54,17 +58,20 @@ public class PredictionMarketContractService {
         if (tickSize.signum() <= 0 || payout.signum() <= 0) {
             throw new IllegalArgumentException("tickSize and payoutPerContract must be positive");
         }
-        return repository.insert(
-                slug,
-                title,
-                yesSymbol,
-                noSymbol,
-                trimToNull(req.resolutionSource()),
-                status,
-                settlementCurrency,
-                tickSize,
-                payout,
-                req.closesAt());
+        PredictionMarketContractRepository.ContractRow row =
+                repository.insert(
+                        slug,
+                        title,
+                        yesSymbol,
+                        noSymbol,
+                        trimToNull(req.resolutionSource()),
+                        status,
+                        settlementCurrency,
+                        tickSize,
+                        payout,
+                        req.closesAt());
+        venueRegistry.syncContract(row);
+        return row;
     }
 
     public Optional<PredictionMarketContractRepository.ContractRow> update(long id, UpdateRequest req) {
@@ -98,15 +105,18 @@ public class PredictionMarketContractService {
                             }
                             Instant closesAt =
                                     req.closesAt() != null ? req.closesAt() : existing.closesAt();
-                            return repository.update(
-                                    id,
-                                    title,
-                                    resolutionSource,
-                                    status,
-                                    settlementCurrency,
-                                    tickSize,
-                                    payout,
-                                    closesAt);
+                            PredictionMarketContractRepository.ContractRow updated =
+                                    repository.update(
+                                            id,
+                                            title,
+                                            resolutionSource,
+                                            status,
+                                            settlementCurrency,
+                                            tickSize,
+                                            payout,
+                                            closesAt);
+                            venueRegistry.syncContract(updated);
+                            return updated;
                         });
     }
 

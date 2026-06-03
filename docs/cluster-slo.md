@@ -24,6 +24,8 @@ firing alerts as a prompt to investigate rather than as definitive evidence of a
 | Projector lag | sample (per scrape) | > 5 s for 10 min | > 30 s for 5 min | `oms.projector.lag_seconds` (slice 4d) |
 | FIX-egress lag | sample (per scrape) | > 5 s for 10 min | > 30 s for 5 min | `oms.fix_egress.lag_seconds` (slice 4d) |
 | Venue-egress lag (bytes) | sample (per scrape) | > 4096 for 5 min | > 16384 for 2 min | `oms.venue.egress.lag_bytes` (prediction-market hardening 2026-06-03; aligns with `VenueAdmissionGate` max-lag-bytes) |
+| Venue-egress lag (seconds) | sample (per scrape) | > 5 s for 10 min | > 30 s for 5 min | `oms.venue.egress.lag_seconds` on `oms-venue-egress` JVM |
+| Venue projector lag (seconds) | sample (per scrape) | > 5 s for 10 min | > 30 s for 5 min | `venue.projector.lag_seconds` on `venue-postgres-projector` |
 | Snapshot freshness | sample (per scrape) | > 1 h for 30 min | > 4 h for 30 min | `oms.cluster.snapshot.age_seconds` (slice 4h, this slice) |
 | Cluster ↔ projector open orders | sample (per scrape) | `oms_cluster_reconcile_in_sync == 0` for 5 min | — | `oms_cluster_reconcile_in_sync`, `oms_drift{kind="open_orders"}` (recovery hardening Phase 3) |
 | Reconcile poll freshness | sample (per scrape) | `oms_cluster_reconcile_age_seconds > 180` for 5 min | — | `oms_cluster_reconcile_age_seconds` (30 s default poll) |

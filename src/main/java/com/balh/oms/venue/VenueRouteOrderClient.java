@@ -5,6 +5,8 @@ import com.balh.oms.cluster.OrderCancelRequestedEvent;
 import com.balh.oms.cluster.OrderReplaceRequestedEvent;
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.config.OmsProfiles;
+import com.balh.oms.observability.metrics.OmsVenueGrpcMetrics;
+import io.micrometer.core.instrument.MeterRegistry;
 import com.balh.venue.grpc.v1.ExecutionReport;
 import com.balh.venue.grpc.v1.RouteCancelRequest;
 import com.balh.venue.grpc.v1.RouteCancelResponse;
@@ -38,8 +40,10 @@ public class VenueRouteOrderClient {
     private final ManagedChannel channel;
     private final VenueOrderServiceGrpc.VenueOrderServiceBlockingStub blockingStub;
     private final long grpcCallTimeoutMs;
+    private final MeterRegistry meterRegistry;
 
-    public VenueRouteOrderClient(OmsConfig omsConfig) {
+    public VenueRouteOrderClient(OmsConfig omsConfig, MeterRegistry meterRegistry) {
+        this.meterRegistry = meterRegistry;
         this.grpcCallTimeoutMs = omsConfig.getVenue().getGrpcCallTimeoutMs();
         this.channel =
                 ManagedChannelBuilder.forAddress(
@@ -67,6 +71,7 @@ public class VenueRouteOrderClient {
         try {
             response = stubWithDeadline().routeOrder(request);
         } catch (StatusRuntimeException e) {
+            OmsVenueGrpcMetrics.recordEgressFailure(meterRegistry, OmsVenueGrpcMetrics.RPC_ROUTE_ORDER, e);
             throw new VenueRouteTransportException(
                     "venue RouteOrder transport failure orderId=" + ev.orderId() + " symbol=" + ev.instrumentSymbol(),
                     e);
@@ -94,6 +99,7 @@ public class VenueRouteOrderClient {
                                     .setInstrumentSymbol(ev.instrumentSymbol())
                                     .build());
         } catch (StatusRuntimeException e) {
+            OmsVenueGrpcMetrics.recordEgressFailure(meterRegistry, OmsVenueGrpcMetrics.RPC_ROUTE_CANCEL, e);
             throw new VenueRouteTransportException(
                     "venue RouteCancel transport failure orderId=" + ev.orderId() + " symbol=" + ev.instrumentSymbol(),
                     e);
@@ -114,6 +120,7 @@ public class VenueRouteOrderClient {
                                     .setSide(ev.sideCode())
                                     .build());
         } catch (StatusRuntimeException e) {
+            OmsVenueGrpcMetrics.recordEgressFailure(meterRegistry, OmsVenueGrpcMetrics.RPC_ROUTE_REPLACE, e);
             throw new VenueRouteTransportException(
                     "venue RouteReplace transport failure orderId=" + ev.orderId() + " symbol=" + ev.instrumentSymbol(),
                     e);

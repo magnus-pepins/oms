@@ -54,6 +54,45 @@ class OmsVenueEgressServiceTest {
     }
 
     @Test
+    void applyAdmittedEvent_skipsNonVenueSymbolWhenPrefixRoutingEnabled() throws Exception {
+        OmsConfig config = new OmsConfig();
+        config.getRouting().setVenueSymbolPrefixRoutingEnabled(true);
+        service =
+                new OmsVenueEgressService(
+                        config,
+                        cursorRepository,
+                        new SimpleMeterRegistry(),
+                        new ObjectMapper(),
+                        Clock.systemUTC(),
+                        routeClient,
+                        clusterIngressClient);
+        service.setCurrentRecordingIdForTesting(3L);
+
+        OrderAdmittedEvent ev =
+                new OrderAdmittedEvent(
+                        UUID.randomUUID(),
+                        1L,
+                        1L,
+                        10_000_000_000L,
+                        650_000L,
+                        0,
+                        0,
+                        (byte) 0,
+                        (byte) 0,
+                        (byte) 2,
+                        "a",
+                        "i",
+                        "h",
+                        "AAPL",
+                        null,
+                        null);
+
+        assertThat(service.applyAdmittedEvent(ev, 100L)).isTrue();
+        verify(routeClient, times(0)).routeAdmittedOrder(any());
+        verify(clusterIngressClient, times(0)).submitApplyExecutionReport(any(), any());
+    }
+
+    @Test
     void applyAdmittedEvent_routesToVenueAndSubmitsExecutionReport() throws Exception {
         OrderAdmittedEvent ev =
                 new OrderAdmittedEvent(

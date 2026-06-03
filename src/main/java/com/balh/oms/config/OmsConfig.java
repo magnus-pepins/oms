@@ -958,6 +958,13 @@ public class OmsConfig {
         private boolean nbboReferenceInMarketContextEnabled = false;
         private BigDecimal nbboStubBidPrice = BigDecimal.ZERO;
         private BigDecimal nbboStubAskPrice = BigDecimal.ZERO;
+        /**
+         * When {@code true}, {@code oms-venue-egress} routes only symbols matching
+         * {@link #venueSymbolPrefix} and {@code oms-fix-egress} skips those symbols. Required when
+         * both egress JVMs run on pop (equities → FIX, prediction markets → venue).
+         */
+        private boolean venueSymbolPrefixRoutingEnabled = false;
+        private String venueSymbolPrefix = "PREDMKT";
 
         public String getBackend() { return backend; }
         public void setBackend(String v) { this.backend = v == null ? "noop" : v; }
@@ -993,6 +1000,25 @@ public class OmsConfig {
 
         public void setNbboStubAskPrice(BigDecimal nbboStubAskPrice) {
             this.nbboStubAskPrice = nbboStubAskPrice == null ? BigDecimal.ZERO : nbboStubAskPrice;
+        }
+
+        public boolean isVenueSymbolPrefixRoutingEnabled() {
+            return venueSymbolPrefixRoutingEnabled;
+        }
+
+        public void setVenueSymbolPrefixRoutingEnabled(boolean venueSymbolPrefixRoutingEnabled) {
+            this.venueSymbolPrefixRoutingEnabled = venueSymbolPrefixRoutingEnabled;
+        }
+
+        public String getVenueSymbolPrefix() {
+            return venueSymbolPrefix;
+        }
+
+        public void setVenueSymbolPrefix(String venueSymbolPrefix) {
+            this.venueSymbolPrefix =
+                    venueSymbolPrefix == null || venueSymbolPrefix.isBlank()
+                            ? "PREDMKT"
+                            : venueSymbolPrefix.trim().toUpperCase(Locale.ROOT);
         }
     }
 

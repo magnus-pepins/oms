@@ -13,6 +13,7 @@ import com.balh.oms.fix.FixOrderCancelReplaceRequestBuilder;
 import com.balh.oms.fix.FixOrderCancelRequestBuilder;
 import com.balh.oms.fix.FixOutboundSessionSend;
 import com.balh.oms.observability.metrics.OmsPipelineMetrics;
+import com.balh.oms.routing.VenueRoutingSymbols;
 import io.aeron.Aeron;
 import io.aeron.Subscription;
 import io.aeron.archive.client.AeronArchive;
@@ -1027,6 +1028,9 @@ public class OmsFixEgressService {
      *     {@code false} if the apply was aborted (shutdown during session-not-ready wait).
      */
     boolean applyAdmittedEvent(OrderAdmittedEvent ev, long newPosition) {
+        if (!VenueRoutingSymbols.routesToFixBroker(config, ev.instrumentSymbol())) {
+            return advanceCursor(newPosition);
+        }
         boolean fixSendObserved = false;
         if (newOrderSingleBuilder != null && fixOutboundSessionSend != null) {
             NewOrderSingle nos = newOrderSingleBuilder.build(ev);
@@ -1056,6 +1060,9 @@ public class OmsFixEgressService {
      * ClOrdID is derived deterministically from {@code orderId + clientRequestKey}).
      */
     boolean applyCancelRequestedEvent(OrderCancelRequestedEvent ev, long newPosition) {
+        if (!VenueRoutingSymbols.routesToFixBroker(config, ev.instrumentSymbol())) {
+            return advanceCursor(newPosition);
+        }
         if (orderCancelRequestBuilder == null || fixOutboundSessionSend == null) {
             // Context-only ITs where FIX beans are absent — cursor-only fallback (mirrors
             // applyAdmittedEvent's cursor-only mode for NOS).
@@ -1075,6 +1082,9 @@ public class OmsFixEgressService {
      * as {@link #applyCancelRequestedEvent}.
      */
     boolean applyReplaceRequestedEvent(OrderReplaceRequestedEvent ev, long newPosition) {
+        if (!VenueRoutingSymbols.routesToFixBroker(config, ev.instrumentSymbol())) {
+            return advanceCursor(newPosition);
+        }
         if (orderCancelReplaceRequestBuilder == null || fixOutboundSessionSend == null) {
             return advanceCursor(newPosition);
         }

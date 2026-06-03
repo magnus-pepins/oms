@@ -173,6 +173,8 @@ oms:
     nbbo-reference-in-market-context-enabled: ${OMS_ROUTING_NBBO_REFERENCE_IN_MARKET_CONTEXT_ENABLED:false}
     nbbo-stub-bid-price: ${OMS_ROUTING_NBBO_STUB_BID_PRICE:0}
     nbbo-stub-ask-price: ${OMS_ROUTING_NBBO_STUB_ASK_PRICE:0}
+    venue-symbol-prefix-routing-enabled: ${OMS_VENUE_SYMBOL_PREFIX_ROUTING_ENABLED:false}
+    venue-symbol-prefix: ${OMS_VENUE_SYMBOL_PREFIX:PREDMKT}
   settlement:
     # Must match a row in custody_accounts (Flyway V11 seeds DEFAULT omnibus).
     default-custody-account-id: ${OMS_SETTLEMENT_DEFAULT_CUSTODY_ACCOUNT_ID:a0000001-0000-4000-8000-000000000001}

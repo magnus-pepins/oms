@@ -12,6 +12,7 @@ import com.balh.oms.config.OmsConfig;
 import com.balh.oms.config.OmsProfiles;
 import com.balh.oms.observability.metrics.OmsPipelineMetrics;
 import com.balh.oms.venue.VenueGrpcExecutionReportMapper;
+import com.balh.oms.routing.VenueRoutingSymbols;
 import com.balh.oms.venue.VenueRouteOrderClient;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.aeron.Aeron;
@@ -1026,6 +1027,9 @@ public class OmsVenueEgressService {
      *     {@code false} if the apply was aborted (shutdown during session-not-ready wait).
      */
     boolean applyAdmittedEvent(OrderAdmittedEvent ev, long newPosition) {
+        if (!VenueRoutingSymbols.routesToInternalVenue(config, ev.instrumentSymbol())) {
+            return advanceCursor(newPosition);
+        }
         if (venueRouteOrderClient != null && clusterIngressClient != null) {
             Optional<com.balh.venue.grpc.v1.ExecutionReport> erOpt = routeVenueOrderOnce(ev);
             if (erOpt.isEmpty()) {
@@ -1047,6 +1051,9 @@ public class OmsVenueEgressService {
     }
 
     boolean applyCancelRequestedEvent(OrderCancelRequestedEvent ev, long newPosition) {
+        if (!VenueRoutingSymbols.routesToInternalVenue(config, ev.instrumentSymbol())) {
+            return advanceCursor(newPosition);
+        }
         if (venueRouteOrderClient != null && clusterIngressClient != null) {
             var erOpt = venueRouteOrderClient.routeCancelRequested(ev);
             if (!submitVenueExecutionReport(ev.orderId(), erOpt, ev.requestedAtMillis(), ev.sideCode(), (byte) 0)) {
@@ -1057,6 +1064,9 @@ public class OmsVenueEgressService {
     }
 
     boolean applyReplaceRequestedEvent(OrderReplaceRequestedEvent ev, long newPosition) {
+        if (!VenueRoutingSymbols.routesToInternalVenue(config, ev.instrumentSymbol())) {
+            return advanceCursor(newPosition);
+        }
         if (venueRouteOrderClient != null && clusterIngressClient != null) {
             var erOpt = venueRouteOrderClient.routeReplaceRequested(ev);
             if (!submitVenueExecutionReport(ev.orderId(), erOpt, ev.requestedAtMillis(), ev.sideCode(), ev.timeInForceCode())) {

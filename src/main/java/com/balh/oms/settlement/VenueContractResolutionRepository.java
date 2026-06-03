@@ -64,7 +64,31 @@ public class VenueContractResolutionRepository {
                            COUNT(o.id) FILTER (WHERE o.skipped_at IS NOT NULL) AS skipped_legs
                     FROM venue_contract_resolution r
                     LEFT JOIN prediction_market_ledger_outbox o ON o.resolution_id = r.id
-                    WHERE (:symbol IS NULL OR r.contract_symbol = :symbol)
+                    GROUP BY r.id
+                    ORDER BY r.created_at DESC
+                    LIMIT :lim
+                    """;
+
+    private static final String LIST_RECENT_BY_SYMBOL =
+            """
+                    SELECT r.id,
+                           r.contract_symbol,
+                           r.outcome,
+                           r.resolution_source,
+                           r.resolution_timestamp,
+                           r.evidence_hash,
+                           r.venue_id,
+                           r.dispute_until,
+                           r.posting_paused,
+                           r.orders_resolved_count,
+                           r.created_at,
+                           COUNT(o.id) FILTER (WHERE o.posted_at IS NOT NULL)     AS posted_legs,
+                           COUNT(o.id) FILTER (WHERE o.posted_at IS NULL
+                               AND o.skipped_at IS NULL)                         AS pending_legs,
+                           COUNT(o.id) FILTER (WHERE o.skipped_at IS NOT NULL) AS skipped_legs
+                    FROM venue_contract_resolution r
+                    LEFT JOIN prediction_market_ledger_outbox o ON o.resolution_id = r.id
+                    WHERE r.contract_symbol = :symbol
                     GROUP BY r.id
                     ORDER BY r.created_at DESC
                     LIMIT :lim
@@ -152,11 +176,15 @@ public class VenueContractResolutionRepository {
                 contractSymbol == null || contractSymbol.isBlank()
                         ? null
                         : contractSymbol.trim().toUpperCase();
+        int lim = Math.max(1, Math.min(limit, 200));
+        String sql = symbol == null ? LIST_RECENT : LIST_RECENT_BY_SYMBOL;
+        MapSqlParameterSource params = new MapSqlParameterSource("lim", lim);
+        if (symbol != null) {
+            params.addValue("symbol", symbol);
+        }
         return jdbc.query(
-                LIST_RECENT,
-                new MapSqlParameterSource()
-                        .addValue("lim", Math.max(1, Math.min(limit, 200)))
-                        .addValue("symbol", symbol),
+                sql,
+                params,
                 (rs, rowNum) ->
                         new ResolutionListRow(
                                 rs.getLong("id"),

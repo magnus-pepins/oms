@@ -431,6 +431,9 @@ const apps = [
     log: logPath('oms-cluster-node-combined', '.log'),
     env: {
       ...COMMON_ENV,
+      // Pop CI / fresh-wipe boots: empty archive replay must flip the Aeron readiness
+      // counter to READY (see OmsAdmissionClusteredService ENV_READINESS_ALLOW_EMPTY_REPLAY).
+      OMS_READINESS_ALLOW_EMPTY_REPLAY: 'true',
       // Cluster-node entry point is OmsClusterNodeBootstrap — a plain `public static
       // void main` JVM (no SpringApplication.run). SPRING_PROFILES_ACTIVE is dead
       // config for this role; the JVM reads OMS_AERON_* env directly. The other

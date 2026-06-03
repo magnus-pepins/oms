@@ -82,28 +82,35 @@ public class PredictionMarketResolutionService {
         writeDomainEvent(ev, symbol, outcomeLabel, resolutionId);
     }
 
-    private void resolveOpenOrders(String symbol) {
+    private void resolveOpenOrders(String baseSymbol) {
+        String noSymbol = noTradeSymbolForBase(baseSymbol);
         jdbc.update(
                 """
                         UPDATE orders
                         SET status = CAST(:resolved AS order_status), version = version + 1
-                        WHERE instrument_symbol = :symbol
+                        WHERE instrument_symbol IN (:yesSymbol, :noSymbol)
                           AND status IN (CAST(:working AS order_status), CAST(:partial AS order_status))
                         """,
                 new MapSqlParameterSource()
                         .addValue("resolved", OrderStatus.RESOLVED.name())
-                        .addValue("symbol", symbol)
+                        .addValue("yesSymbol", baseSymbol)
+                        .addValue("noSymbol", noSymbol)
                         .addValue("working", OrderStatus.WORKING.name())
                         .addValue("partial", OrderStatus.PARTIALLY_FILLED.name()));
     }
 
-    private void enqueuePayouts(long resolutionId, String symbol, byte outcomeCode) {
-        if (outcomeCode != OmsClusterWireFormat.OUTCOME_YES) {
-            zeroPositions(symbol);
-            return;
+    private void enqueuePayouts(long resolutionId, String baseSymbol, byte outcomeCode) {
+        if (outcomeCode == OmsClusterWireFormat.OUTCOME_YES) {
+            enqueuePayoutsForSymbol(resolutionId, baseSymbol, "YES");
+        } else if (outcomeCode == OmsClusterWireFormat.OUTCOME_NO) {
+            enqueuePayoutsForSymbol(resolutionId, noTradeSymbolForBase(baseSymbol), "NO");
         }
+        zeroContractPositions(baseSymbol);
+    }
+
+    private void enqueuePayoutsForSymbol(long resolutionId, String positionSymbol, String outcomeLabel) {
         List<PositionsRepository.AccountPositionKeyRow> holders =
-                positionsRepository.findNonZeroPositionsForSymbol(symbol);
+                positionsRepository.findNonZeroPositionsForSymbol(positionSymbol);
         for (PositionsRepository.AccountPositionKeyRow row : holders) {
             BigDecimal qty = row.quantityTotal();
             if (qty == null || qty.signum() <= 0) {
@@ -115,10 +122,10 @@ public class PredictionMarketResolutionService {
             payload.put("schemaVersion", 2);
             payload.put("template", TEMPLATE);
             payload.put("accountId", row.accountId().toString());
-            payload.put("instrumentSymbol", symbol);
+            payload.put("instrumentSymbol", positionSymbol);
             payload.put("payoutAmount", payout.toPlainString());
             payload.put("currency", currency);
-            payload.put("outcome", "YES");
+            payload.put("outcome", outcomeLabel);
             payload.put(
                     "collateralIndicator", COLLATERAL_INDICATOR_PREFIX + currency.trim().toUpperCase());
             ledgerOutbox.insertIgnore(
@@ -127,7 +134,20 @@ public class PredictionMarketResolutionService {
                     PredictionMarketLedgerOutboxRepository.LEG_PREDICTION_PAYOUT,
                     payload.toString());
         }
-        zeroPositions(symbol);
+    }
+
+    private void zeroContractPositions(String baseSymbol) {
+        String noSymbol = noTradeSymbolForBase(baseSymbol);
+        zeroPositions(baseSymbol);
+        zeroPositions(noSymbol);
+    }
+
+    private static String noTradeSymbolForBase(String baseSymbol) {
+        String base = baseSymbol.trim();
+        if (base.endsWith("-NO")) {
+            return base;
+        }
+        return base + "-NO";
     }
 
     private void zeroPositions(String symbol) {

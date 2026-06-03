@@ -59,6 +59,7 @@ class FixInToVenueRoundTripIT extends FixInWireItAcceptorSupport {
     private static final long EGRESS_BASELINE_STABLE_MS = 500L;
     private static final long EGRESS_BASELINE_POLL_MS = 50L;
     private static final String PREDMKT_SYMBOL = "PREDMKT-TEST-1";
+    private static final String PREDMKT_NO_SYMBOL = "PREDMKT-TEST-1-NO";
 
     private static final Path FIX_IN_ACCEPTOR_STORE;
     private static final int FIX_IN_ACCEPT_PORT;
@@ -247,6 +248,57 @@ class FixInToVenueRoundTripIT extends FixInWireItAcceptorSupport {
                         evidenceHash);
         assertThat(payout).contains("prediction_market_binary_resolution");
         assertThat(payout).contains("payoutAmount").contains("10.00");
+    }
+
+    @Test
+    void fixInFillNoLegThenNoResolution_enqueuesOutboxForNoSymbol() throws Exception {
+        embeddedVenue.seedRestingSell(PREDMKT_NO_SYMBOL, 10, 0.35);
+        await().atMost(LOGON_TIMEOUT).pollInterval(Duration.ofMillis(100)).untilAsserted(() ->
+                assertThat(fixInClient.isLoggedOn()).isTrue());
+
+        String clOrdId = "FVNO-" + UUID.randomUUID().toString().substring(0, 8);
+        fixInClient.sendNewOrderSingle(clOrdId, PREDMKT_NO_SYMBOL, 10, 0.35);
+
+        await().atMost(FLOW_TIMEOUT).pollInterval(Duration.ofMillis(100)).untilAsserted(() ->
+                assertThat(FixInClientCollectorApplication.RECEIVED.stream()
+                                .anyMatch(er -> clOrdId.equals(er.clOrdId()) && er.execType() == ExecType.FILL))
+                        .isTrue());
+
+        UUID accountId = UUID.fromString("a0000001-0000-4000-8000-000000000002");
+        await().atMost(FLOW_TIMEOUT).pollInterval(Duration.ofMillis(100)).untilAsserted(() -> {
+            BigDecimal qty = jdbc.queryForObject(
+                    """
+                            SELECT quantity_total FROM positions
+                            WHERE account_id = ? AND instrument_symbol = ?
+                            """,
+                    java.math.BigDecimal.class,
+                    accountId,
+                    PREDMKT_NO_SYMBOL);
+            assertThat(qty).isEqualByComparingTo("10");
+        });
+
+        String evidenceHash = "it-no-hash-" + UUID.randomUUID();
+        embeddedVenue.resolveContractNo(PREDMKT_SYMBOL, evidenceHash);
+
+        await().atMost(FLOW_TIMEOUT).pollInterval(Duration.ofMillis(100)).untilAsserted(() ->
+                assertThat(venueResolver.lastAppliedPosition()).isGreaterThan(0L));
+        await().atMost(FLOW_TIMEOUT).pollInterval(Duration.ofMillis(100)).untilAsserted(() -> {
+            String payout =
+                    jdbc.queryForObject(
+                            """
+                                    SELECT o.payload_json::text
+                                    FROM prediction_market_ledger_outbox o
+                                    JOIN venue_contract_resolution r ON r.id = o.resolution_id
+                                    WHERE r.evidence_hash = ?
+                                    LIMIT 1
+                                    """,
+                            String.class,
+                            evidenceHash);
+            assertThat(payout).contains("prediction_market_binary_resolution");
+            assertThat(payout).contains(PREDMKT_NO_SYMBOL);
+            assertThat(payout).contains("\"outcome\":\"NO\"");
+            assertThat(payout).contains("payoutAmount").contains("10.00");
+        });
     }
 
     private static int allocatePort() {

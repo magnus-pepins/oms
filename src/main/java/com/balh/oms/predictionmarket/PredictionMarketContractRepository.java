@@ -40,11 +40,19 @@ public class PredictionMarketContractRepository {
                     """
                     .formatted(SELECT_COLUMNS);
 
-    private static final String LIST_ALL =
+    private static final String LIST_ALL_UNFILTERED =
             """
                     SELECT %s
                     FROM prediction_market_contract
-                    WHERE (:status IS NULL OR status = :status)
+                    ORDER BY id DESC
+                    """
+                    .formatted(SELECT_COLUMNS);
+
+    private static final String LIST_ALL_BY_STATUS =
+            """
+                    SELECT %s
+                    FROM prediction_market_contract
+                    WHERE status = :status
                     ORDER BY id DESC
                     """
                     .formatted(SELECT_COLUMNS);
@@ -76,8 +84,13 @@ public class PredictionMarketContractRepository {
     }
 
     public List<ContractRow> listAll(String statusOrNull) {
-        MapSqlParameterSource params = new MapSqlParameterSource("status", statusOrNull);
-        return jdbc.query(LIST_ALL, params, this::mapRow);
+        if (statusOrNull == null || statusOrNull.isBlank()) {
+            return jdbc.query(LIST_ALL_UNFILTERED, new MapSqlParameterSource(), this::mapRow);
+        }
+        return jdbc.query(
+                LIST_ALL_BY_STATUS,
+                new MapSqlParameterSource("status", statusOrNull.trim().toUpperCase()),
+                this::mapRow);
     }
 
     public Optional<ContractRow> findById(long id) {

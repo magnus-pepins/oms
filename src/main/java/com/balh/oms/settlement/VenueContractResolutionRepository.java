@@ -45,6 +45,31 @@ public class VenueContractResolutionRepository {
     private static final String EXISTS_BY_ID =
             "SELECT EXISTS(SELECT 1 FROM venue_contract_resolution WHERE id = :id)";
 
+    private static final String LIST_RECENT =
+            """
+                    SELECT r.id,
+                           r.contract_symbol,
+                           r.outcome,
+                           r.resolution_source,
+                           r.resolution_timestamp,
+                           r.evidence_hash,
+                           r.venue_id,
+                           r.dispute_until,
+                           r.posting_paused,
+                           r.orders_resolved_count,
+                           r.created_at,
+                           COUNT(o.id) FILTER (WHERE o.posted_at IS NOT NULL)     AS posted_legs,
+                           COUNT(o.id) FILTER (WHERE o.posted_at IS NULL
+                               AND o.skipped_at IS NULL)                         AS pending_legs,
+                           COUNT(o.id) FILTER (WHERE o.skipped_at IS NOT NULL) AS skipped_legs
+                    FROM venue_contract_resolution r
+                    LEFT JOIN prediction_market_ledger_outbox o ON o.resolution_id = r.id
+                    WHERE (:symbol IS NULL OR r.contract_symbol = :symbol)
+                    GROUP BY r.id
+                    ORDER BY r.created_at DESC
+                    LIMIT :lim
+                    """;
+
     private final NamedParameterJdbcTemplate jdbc;
 
     public VenueContractResolutionRepository(NamedParameterJdbcTemplate jdbc) {
@@ -104,5 +129,49 @@ public class VenueContractResolutionRepository {
                         SET_POSTING_PAUSED,
                         new MapSqlParameterSource().addValue("id", resolutionId).addValue("paused", paused))
                 > 0;
+    }
+
+    public record ResolutionListRow(
+            long id,
+            String contractSymbol,
+            String outcome,
+            String resolutionSource,
+            Instant resolutionTimestamp,
+            String evidenceHash,
+            String venueId,
+            Instant disputeUntil,
+            boolean postingPaused,
+            int ordersResolvedCount,
+            Instant createdAt,
+            int postedLegs,
+            int pendingLegs,
+            int skippedLegs) {}
+
+    public List<ResolutionListRow> listRecent(int limit, String contractSymbol) {
+        String symbol =
+                contractSymbol == null || contractSymbol.isBlank()
+                        ? null
+                        : contractSymbol.trim().toUpperCase();
+        return jdbc.query(
+                LIST_RECENT,
+                new MapSqlParameterSource()
+                        .addValue("lim", Math.max(1, Math.min(limit, 200)))
+                        .addValue("symbol", symbol),
+                (rs, rowNum) ->
+                        new ResolutionListRow(
+                                rs.getLong("id"),
+                                rs.getString("contract_symbol"),
+                                rs.getString("outcome"),
+                                rs.getString("resolution_source"),
+                                rs.getTimestamp("resolution_timestamp").toInstant(),
+                                rs.getString("evidence_hash"),
+                                rs.getString("venue_id"),
+                                rs.getTimestamp("dispute_until").toInstant(),
+                                rs.getBoolean("posting_paused"),
+                                rs.getInt("orders_resolved_count"),
+                                rs.getTimestamp("created_at").toInstant(),
+                                rs.getInt("posted_legs"),
+                                rs.getInt("pending_legs"),
+                                rs.getInt("skipped_legs")));
     }
 }

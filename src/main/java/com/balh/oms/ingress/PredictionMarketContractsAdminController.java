@@ -59,6 +59,14 @@ public class PredictionMarketContractsAdminController {
         this.venueRegistry = venueRegistry;
     }
 
+    @GetMapping("/{id}")
+    public ResponseEntity<PredictionMarketContractDto.ContractResponse> getById(@PathVariable long id) {
+        return repository
+                .findById(id)
+                .map(row -> ResponseEntity.ok(PredictionMarketContractDto.toResponse(row)))
+                .orElse(ResponseEntity.notFound().build());
+    }
+
     @GetMapping
     public ResponseEntity<PredictionMarketContractDto.ContractListResponse> list(
             @RequestParam(required = false) String status) {

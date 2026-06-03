@@ -977,7 +977,11 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                 cmd.ledgerBalanceIdOrNull(),
                 /* version = */ 0,
                 clusterTimestampMillis,
-                /* statusCode = */ STATUS_WORKING,
+                // Admitted at OMS (risk/credit gate) and about to be routed; NOT yet live at the venue.
+                // Promotion to WORKING happens only when the venue acknowledges (EXEC_TYPE_VENUE_NEW)
+                // or a fill arrives. This is the same lifecycle for every routing backend (internal
+                // venue gRPC and external FIX venues).
+                /* statusCode = */ STATUS_PENDING_NEW,
                 /* cumQtyScaled = */ 0L,
                 cmd.shardId());
         idempotencyIndex.put(key, admitted);
@@ -1098,6 +1102,16 @@ public class OmsAdmissionClusteredService implements ClusteredService {
             }
             case ApplyExecutionReportCommand.EXEC_TYPE_CANCEL -> newStatus = STATUS_CANCELLED;
             case ApplyExecutionReportCommand.EXEC_TYPE_VENUE_REJECT -> newStatus = STATUS_REJECTED;
+            case ApplyExecutionReportCommand.EXEC_TYPE_VENUE_NEW -> {
+                // Venue acceptance of a still-pending order. Promote PENDING_NEW / NEW -> WORKING.
+                // Idempotent: an order already past PENDING_NEW (WORKING / PARTIALLY_FILLED / FILLED,
+                // or a late venue-new after a fast fill) must not flap back to WORKING; we drop the
+                // event with no mutation and no second ExecutionAppliedEvent.
+                if (order.statusCode() != STATUS_PENDING_NEW && order.statusCode() != STATUS_NEW) {
+                    return;
+                }
+                newStatus = STATUS_WORKING;
+            }
             case ApplyExecutionReportCommand.EXEC_TYPE_REPLACE -> {
                 // Wed-demo addition. ER ET=5 (REPLACED) from the broker carries the
                 // authoritative new total OrderQty and limit price; cumQty is unchanged.
@@ -1117,13 +1131,16 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                 if (cmd.lastPxScaled() > 0L) {
                     newLimitPriceScaledOrZero = cmd.lastPxScaled();
                 }
-                // Status derived from cumQty vs new qty (mirrors TRADE branch).
+                // Status derived from cumQty vs new qty (mirrors TRADE branch). With no fill the
+                // replace only changes qty/price and must preserve the order's lifecycle status —
+                // a replace of a PENDING_NEW order stays PENDING_NEW (venue acceptance is signalled
+                // separately by EXEC_TYPE_VENUE_NEW), and a replace of a WORKING order stays WORKING.
                 if (newCumQty >= newQuantityScaled) {
                     newStatus = STATUS_FILLED;
                 } else if (newCumQty > 0L) {
                     newStatus = STATUS_PARTIALLY_FILLED;
                 } else {
-                    newStatus = STATUS_WORKING;
+                    newStatus = order.statusCode();
                 }
             }
             case ApplyExecutionReportCommand.EXEC_TYPE_CANCEL_REJECT, ApplyExecutionReportCommand.EXEC_TYPE_REPLACE_REJECT -> {
@@ -1803,7 +1820,13 @@ public class OmsAdmissionClusteredService implements ClusteredService {
     // the snapshot schema version and reviewing every call site that compares against these
     // constants.
 
-    /** Equivalent to {@code OrderStatus.WORKING.ordinal()}. */
+    /** Equivalent to {@code OrderStatus.PENDING_NEW.ordinal()}. Admitted at OMS, routed, awaiting venue ack. */
+    static final byte STATUS_PENDING_NEW = 0;
+
+    /** Equivalent to {@code OrderStatus.NEW.ordinal()}. */
+    static final byte STATUS_NEW = 1;
+
+    /** Equivalent to {@code OrderStatus.WORKING.ordinal()}. Live at the venue (venue acceptance received). */
     static final byte STATUS_WORKING = 2;
 
     /** Equivalent to {@code OrderStatus.PARTIALLY_FILLED.ordinal()}. */

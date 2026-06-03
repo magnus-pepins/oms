@@ -2,6 +2,7 @@ package com.balh.oms.fix;
 
 import com.balh.oms.returnpath.ExecutionCancelCommand;
 import com.balh.oms.returnpath.ExecutionTradeCommand;
+import com.balh.oms.returnpath.ExecutionVenueNewCommand;
 import com.balh.oms.returnpath.ExecutionVenueRejectCommand;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -102,6 +103,32 @@ public class FixExecutionReportMapper {
                 : BigDecimal.ZERO;
         return Optional.of(new ExecutionTradeCommand(
                 orderId, venueId, venueTs, venueExecRef, newOrderQty, newLimitPx, leaves, cum));
+    }
+
+    /**
+     * {@code ExecutionReport} with {@code ExecType=New} (150=0) — the venue acknowledged a
+     * {@code NewOrderSingle} we routed and the order is now live/working at the venue. Maps to a
+     * venue-new return-path command which drives the cluster's PENDING_NEW &rarr; WORKING transition.
+     *
+     * <p>A New ER carries no fill (LastQty/LastPx absent or zero); we record only the acceptance.
+     * Venues that skip the New ER and go straight to a fill are handled by the trade path, which
+     * promotes the order through PARTIALLY_FILLED / FILLED regardless of the prior PENDING_NEW state.
+     */
+    public Optional<ExecutionVenueNewCommand> tryParseVenueNew(Message msg, String venueId) throws FieldNotFound {
+        if (msg.getChar(ExecType.FIELD) != ExecType.NEW) {
+            return Optional.empty();
+        }
+        UUID orderId = parseClOrdId(msg);
+        if (orderId == null) {
+            return Optional.empty();
+        }
+        Instant venueTs = parseTransactTime(msg).orElse(Instant.now());
+        // ExecID (tag 17) is the natural per-ER dedupe key; fall back to a deterministic synthetic
+        // ref keyed on the order id so a venue that omits ExecID on the New ER still dedupes.
+        String venueExecRef = msg.isSetField(ExecID.FIELD)
+                ? msg.getString(ExecID.FIELD)
+                : "venue-new-" + orderId;
+        return Optional.of(new ExecutionVenueNewCommand(orderId, venueId, venueTs, venueExecRef));
     }
 
     public Optional<ExecutionCancelCommand> tryParseCancel(Message msg, String venueId) throws FieldNotFound {

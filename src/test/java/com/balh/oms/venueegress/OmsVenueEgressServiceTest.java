@@ -175,7 +175,7 @@ class OmsVenueEgressServiceTest {
     }
 
     @Test
-    void applyAdmittedEvent_venueTransportFailure_advancesCursorBestEffort() throws Exception {
+    void applyAdmittedEvent_venueTransportFailure_submitsVenueRejectAndAdvancesCursor() throws Exception {
         OrderAdmittedEvent ev =
                 new OrderAdmittedEvent(
                         UUID.randomUUID(),
@@ -200,6 +200,12 @@ class OmsVenueEgressServiceTest {
         assertThat(service.applyAdmittedEvent(ev, 100L)).isTrue();
 
         verify(cursorRepository, times(1)).advanceWithRecording(any(), anyInt(), anyLong(), eq(100L));
-        verify(clusterIngressClient, times(0)).submitApplyExecutionReport(any(), any());
+        verify(clusterIngressClient, times(1))
+                .submitApplyExecutionReport(
+                        org.mockito.ArgumentMatchers.argThat(
+                                cmd ->
+                                        cmd.execTypeCode()
+                                                == ApplyExecutionReportCommand.EXEC_TYPE_VENUE_REJECT),
+                        any());
     }
 }

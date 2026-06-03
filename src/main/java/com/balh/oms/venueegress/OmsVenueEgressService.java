@@ -10,6 +10,7 @@ import com.balh.oms.cluster.OrderCancelRequestedEvent;
 import com.balh.oms.cluster.OrderReplaceRequestedEvent;
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.config.OmsProfiles;
+import com.balh.oms.domain.RejectCode;
 import com.balh.oms.observability.metrics.OmsPipelineMetrics;
 import com.balh.oms.venue.VenueGrpcExecutionReportMapper;
 import com.balh.oms.routing.VenueRoutingSymbols;
@@ -33,6 +34,7 @@ import org.springframework.stereotype.Component;
 
 import java.time.Clock;
 import java.time.Duration;
+import java.util.concurrent.TimeUnit;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -1046,20 +1048,35 @@ public class OmsVenueEgressService {
                 erOpt = routeVenueOrderOnce(ev);
             } catch (VenueRouteTransportException e) {
                 venueRouteResultByOrderId.remove(ev.orderId());
-                // Do not wedge the entire OMS journal behind one admit when the venue gateway was
-                // down (cluster restart, gRPC UNKNOWN). Cancels/replaces already advance best-effort
-                // on transport failure; admits must do the same so later orders and live tail keep
-                // flowing. The admit may remain WORKING in Postgres without a venue rest — operator
-                // reconciliation or a customer cancel is required (see prediction-market-quotes smoke).
                 log.warn(
-                        "oms-venue-egress: venue RouteOrder transport failed; advancing cursor (best-effort): orderId={} symbol={}",
+                        "oms-venue-egress: venue RouteOrder transport failed; submitting VENUE_REJECT: orderId={} symbol={}",
                         ev.orderId(),
                         ev.instrumentSymbol(),
                         e);
+                if (!submitVenueRouteFailedReject(
+                        ev.orderId(),
+                        "venue_route_transport_failed",
+                        ev.acceptedAtMillis(),
+                        ev.side(),
+                        ev.timeInForceCode())) {
+                    return false;
+                }
                 return advanceCursor(newPosition);
             }
             if (erOpt.isEmpty()) {
                 venueRouteResultByOrderId.remove(ev.orderId());
+                log.warn(
+                        "oms-venue-egress: venue RouteOrder rejected (no ER); submitting VENUE_REJECT: orderId={} symbol={}",
+                        ev.orderId(),
+                        ev.instrumentSymbol());
+                if (!submitVenueRouteFailedReject(
+                        ev.orderId(),
+                        "venue_route_rejected",
+                        ev.acceptedAtMillis(),
+                        ev.side(),
+                        ev.timeInForceCode())) {
+                    return false;
+                }
                 return advanceCursor(newPosition);
             }
             if (!submitVenueExecutionReport(
@@ -1122,6 +1139,43 @@ public class OmsVenueEgressService {
             }
         }
         return advanceCursor(newPosition);
+    }
+
+    private boolean submitVenueRouteFailedReject(
+            UUID orderId,
+            String reason,
+            long acceptedAtMillis,
+            byte side,
+            byte timeInForceCode) {
+        long venueTsNanos = TimeUnit.MILLISECONDS.toNanos(acceptedAtMillis);
+        ApplyExecutionReportCommand cmd =
+                new ApplyExecutionReportCommand(
+                        0L,
+                        orderId,
+                        0L,
+                        0L,
+                        venueTsNanos,
+                        0,
+                        ApplyExecutionReportCommand.EXEC_TYPE_VENUE_REJECT,
+                        (byte) RejectCode.VENUE_REJECT.ordinal(),
+                        config.getVenue().getVenueId(),
+                        "venue-route-failed-" + orderId,
+                        "",
+                        "{\"reason\":\"" + reason + "\"}");
+        Duration submitTimeout = Duration.ofMillis(config.getCluster().getClient().getSubmitTimeoutMs());
+        try {
+            clusterIngressClient.submitApplyExecutionReport(cmd, submitTimeout);
+            long latencyMs = wallClock.millis() - acceptedAtMillis;
+            OmsPipelineMetrics.recordClusterAdmitToFixNos(
+                    meterRegistry, EGRESS_ID, side, timeInForceCode, latencyMs);
+            return true;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        } catch (Exception e) {
+            log.warn("oms-venue-egress: cluster VENUE_REJECT submit failed for orderId={}", orderId, e);
+            return false;
+        }
     }
 
     private boolean submitVenueExecutionReport(

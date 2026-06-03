@@ -102,6 +102,16 @@ public record ApplyExecutionReportCommand(
     /** Mirror of {@link #EXEC_TYPE_CANCEL_REJECT} for a 35=9 against a 35=G replace. */
     public static final byte EXEC_TYPE_REPLACE_REJECT = 5;
 
+    /**
+     * Venue acceptance of a previously-admitted order (FIX {@code 35=8} {@code ExecType=New (150=0)} /
+     * {@code OrdStatus=New (39=0)}, or an internal-venue gRPC rest ack with no fill). Promotes the
+     * order from {@code PENDING_NEW} (admitted at OMS, routed, awaiting venue) to {@code WORKING}
+     * (confirmed live at the venue). Idempotent: a second venue-new for an order already past
+     * {@code PENDING_NEW} (WORKING / PARTIALLY_FILLED / FILLED / terminal) is a no-op. Carries no
+     * fill quantity or price ({@code lastQtyScaled == 0}, {@code lastPxScaled == 0}).
+     */
+    public static final byte EXEC_TYPE_VENUE_NEW = 6;
+
     public ApplyExecutionReportCommand {
         Objects.requireNonNull(orderId, "orderId");
         Objects.requireNonNull(venueId, "venueId");

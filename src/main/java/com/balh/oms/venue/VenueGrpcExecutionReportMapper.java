@@ -19,8 +19,17 @@ public final class VenueGrpcExecutionReportMapper {
                 switch (er.getExecType()) {
                     case ExecType.EXEC_TYPE_CANCEL -> ApplyExecutionReportCommand.EXEC_TYPE_CANCEL;
                     case ExecType.EXEC_TYPE_REPLACE -> ApplyExecutionReportCommand.EXEC_TYPE_REPLACE;
+                    case ExecType.EXEC_TYPE_NEW -> ApplyExecutionReportCommand.EXEC_TYPE_VENUE_NEW;
                     default -> ApplyExecutionReportCommand.EXEC_TYPE_TRADE;
                 };
+        // The internal venue's pure-rest ack carries an empty venueExecRef; the cluster dedupes
+        // execution reports on (orderId, venueExecRef), so synthesise a deterministic, non-empty ref
+        // for the venue-new acknowledgement.
+        String venueExecRef = er.getVenueExecRef();
+        if (execTypeCode == ApplyExecutionReportCommand.EXEC_TYPE_VENUE_NEW
+                && (venueExecRef == null || venueExecRef.isEmpty())) {
+            venueExecRef = "venue-new-" + orderId;
+        }
         return new ApplyExecutionReportCommand(
                 0L,
                 orderId,
@@ -31,7 +40,7 @@ public final class VenueGrpcExecutionReportMapper {
                 execTypeCode,
                 (byte) 0,
                 venueId,
-                er.getVenueExecRef(),
+                venueExecRef,
                 "",
                 compactRawJson(er));
     }

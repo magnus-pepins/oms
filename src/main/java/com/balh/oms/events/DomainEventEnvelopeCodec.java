@@ -114,6 +114,28 @@ public class DomainEventEnvelopeCodec {
         return envelope("OrderWorking", order.id(), payload);
     }
 
+    /**
+     * {@code OrderWorking} emitted on venue acceptance (EXEC_TYPE_VENUE_NEW projection), where the
+     * trigger is a venue acknowledgement rather than a control-plane admission, so there is no
+     * {@link PendingControlEvent} in scope. Same wire shape as
+     * {@link #orderWorking(PendingControlEvent, Order, int)}; {@code shardId} / {@code accountIdHash}
+     * are read off the {@link Order} row.
+     */
+    public String orderWorking(Order order, int newSeq) throws JsonProcessingException {
+        var payload = new OrderWorkingEvent(
+                order.id(),
+                newSeq,
+                order.shardId(),
+                order.accountIdHash(),
+                order.side().name(),
+                order.instrumentSymbol(),
+                order.quantity(),
+                order.limitPrice(),
+                order.timeInForce(),
+                Instant.now());
+        return envelope("OrderWorking", order.id(), payload);
+    }
+
     public String orderPartiallyFilled(Order order, int newSeq, BigDecimal cumQty, BigDecimal lastQty,
             BigDecimal lastPx, String venueId, String venueExecRef) throws JsonProcessingException {
         var payload = new OrderPartiallyFilledEvent(

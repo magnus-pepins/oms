@@ -5,6 +5,7 @@ import com.balh.oms.cluster.OmsClusterIngressClient;
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.returnpath.ExecutionCancelCommand;
 import com.balh.oms.returnpath.ExecutionTradeCommand;
+import com.balh.oms.returnpath.ExecutionVenueNewCommand;
 import com.balh.oms.returnpath.ExecutionVenueRejectCommand;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -126,6 +127,13 @@ public class FixInboundClusterSink {
         if (reject.isPresent()) {
             ApplyExecutionReportCommand cmd = buildVenueReject(message, reject.get());
             submit(cmd, "venue_reject");
+            return;
+        }
+        // ExecType=New (venue acknowledged our NewOrderSingle): promote PENDING_NEW -> WORKING.
+        Optional<ExecutionVenueNewCommand> venueNew = mapper.tryParseVenueNew(message, venueId);
+        if (venueNew.isPresent()) {
+            ApplyExecutionReportCommand cmd = buildVenueNew(message, venueNew.get());
+            submit(cmd, "venue_new");
             return;
         }
         meterRegistry.counter(FixMetrics.METRIC_INBOUND_ER, FixMetrics.TAG_DISPOSITION, "ignored").increment();
@@ -263,6 +271,23 @@ public class FixInboundClusterSink {
                 rawReplaceJson(r));
     }
 
+    private ApplyExecutionReportCommand buildVenueNew(Message message, ExecutionVenueNewCommand v)
+            throws FieldNotFound {
+        return new ApplyExecutionReportCommand(
+                0L,
+                v.orderId(),
+                /* lastQtyScaled = */ 0L,
+                /* lastPxScaled = */ 0L,
+                instantToNanos(v.venueTs()),
+                msgSeqNum(message),
+                ApplyExecutionReportCommand.EXEC_TYPE_VENUE_NEW,
+                (byte) 0,
+                v.venueId(),
+                v.venueExecRef(),
+                senderCompId(message),
+                rawVenueNewJson(v));
+    }
+
     private ApplyExecutionReportCommand buildVenueReject(Message message, ExecutionVenueRejectCommand v)
             throws FieldNotFound {
         return new ApplyExecutionReportCommand(
@@ -336,6 +361,15 @@ public class FixInboundClusterSink {
         if (cmd.lastPrice() != null) {
             n.put("lastPrice", cmd.lastPrice().toPlainString());
         }
+        return writeJson(n);
+    }
+
+    private String rawVenueNewJson(ExecutionVenueNewCommand cmd) {
+        ObjectNode n = objectMapper.createObjectNode();
+        n.put("kind", "ExecutionReport");
+        n.put("execType", "NEW");
+        n.put("venueId", cmd.venueId());
+        n.put("venueExecRef", cmd.venueExecRef());
         return writeJson(n);
     }
 

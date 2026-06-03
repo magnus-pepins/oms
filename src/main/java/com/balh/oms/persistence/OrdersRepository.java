@@ -244,7 +244,7 @@ public class OrdersRepository {
                 .addValue("account_id", accountId)
                 .addValue("client_idempotency_key", ev.clientIdempotencyKey())
                 .addValue("shard_id", ev.shardId())
-                .addValue("status", OrderStatus.NEW.name())
+                .addValue("status", OrderStatus.PENDING_NEW.name())
                 .addValue("terminal_reason", null)
                 .addValue("side", AcceptOrderCommand.sideName(ev.side()))
                 .addValue("instrument_symbol", ev.instrumentSymbol())

@@ -76,6 +76,9 @@ enum ExecType {
   EXEC_TYPE_TRADE = 1;
   EXEC_TYPE_CANCEL = 2;
   EXEC_TYPE_REPLACE = 3;
+  // Venue accepted a new order that rested without (fully) filling — the order is now live/working
+  // at the venue. Drives the OMS PENDING_NEW -> WORKING transition. Carries no fill (last_qty=0).
+  EXEC_TYPE_NEW = 4;
 }
 
 message QuoteUpdate {

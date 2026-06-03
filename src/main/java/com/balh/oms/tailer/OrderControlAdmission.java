@@ -51,7 +51,6 @@ public class OrderControlAdmission {
 
     private static final String METRIC_REJECT_EVENTS = "oms_order_rejected_events_published_total";
     private static final String TAG_REJECT_CODE = "reject_code";
-    private static final String METRIC_WORKING_EVENTS = "oms_order_working_events_published_total";
     private static final String METRIC_STALE_REJECTS = "oms_control_jobs_rejected_stale_total";
 
     private final OrdersRepository orders;
@@ -196,20 +195,14 @@ public class OrderControlAdmission {
             }
         }
 
-        boolean updated = orders.updateWithCas(
-                event.orderId(),
-                event.orderVersion(),
-                OrderStatus.WORKING,
-                null,
-                event.orderTimestamp(),
-                null
-        );
-        if (!updated) {
-            log.debug("CAS skipped for orderId={} expectedVersion={} (someone else won the race)",
-                    event.orderId(), event.orderVersion());
-            return AdmissionResult.SKIPPED_VERSION_MISMATCH;
-        }
-        int newSeq = event.orderVersion() + 1;
+        // Control-plane admission PASSED. The order is NOT promoted to WORKING here: WORKING means
+        // "live at the venue" and is set only when the venue acknowledges the order
+        // (EXEC_TYPE_VENUE_NEW → {@link com.balh.oms.projector.OmsPostgresProjector#applyVenueNewProjection},
+        // or implicitly on first fill). Until then the order stays PENDING_NEW (admitted at OMS,
+        // routed, awaiting venue). This is the same lifecycle for every routing backend — internal
+        // venue gRPC and external FIX venues. We still record the control_decisions PASS audit row
+        // so the risk decision is captured at admission time; the OrderWorking domain event now
+        // fires from the venue-acceptance projection, not here.
         controlDecisions.record(
                 event.orderId(),
                 event.orderVersion(),
@@ -217,9 +210,6 @@ public class OrderControlAdmission {
                 null,
                 ControlRiskEvaluator.STAGE_CONTROL,
                 null);
-        orders.findById(event.orderId()).ifPresentOrElse(
-                o -> publishWorking(event, o, newSeq),
-                () -> log.warn("WORKING CAS succeeded but order {} not found for event publish", event.orderId()));
         return AdmissionResult.APPLIED;
     }
 
@@ -233,12 +223,4 @@ public class OrderControlAdmission {
         }
     }
 
-    private void publishWorking(PendingControlEvent event, Order order, int newSeq) {
-        try {
-            domainEventOutbox.insert(order.id(), envelopeCodec.orderWorking(event, order, newSeq));
-            meterRegistry.counter(METRIC_WORKING_EVENTS).increment();
-        } catch (JsonProcessingException e) {
-            throw new IllegalStateException("domain event envelope serialisation failed", e);
-        }
-    }
 }

@@ -250,14 +250,67 @@ class OmsAdmissionClusteredServiceTest {
     // ------------------------------------------------------------------------
 
     @Test
-    void admittedOrder_startsAtVersion0_workingStatus_zeroCumQty() {
+    void admittedOrder_startsAtVersion0_pendingNewStatus_zeroCumQty() {
         UUID orderId = UUID.fromString("00000000-0000-4000-8000-000000000100");
         deliverCommand(sampleAccept(1L, "acct", "idem", orderId), ANY_TIMESTAMP_MS);
 
         OmsAdmissionClusteredService.AdmittedOrder o = service.lookupByOrderId(orderId);
         assertThat(o.version()).isZero();
-        assertThat(o.statusCode()).isEqualTo(OmsAdmissionClusteredService.STATUS_WORKING);
+        // Admitted at OMS but not yet acknowledged by the venue: PENDING_NEW, not WORKING.
+        assertThat(o.statusCode()).isEqualTo(OmsAdmissionClusteredService.STATUS_PENDING_NEW);
         assertThat(o.cumQtyScaled()).isZero();
+    }
+
+    @Test
+    void applyVenueNew_pendingOrder_transitionsToWorking() {
+        UUID orderId = UUID.fromString("00000000-0000-4000-8000-000000000150");
+        deliverCommand(sampleAccept(1L, "acct", "idem", orderId), ANY_TIMESTAMP_MS);
+        capturedAdmittedEvents.clear();
+
+        deliverCommand(
+                new ApplyExecutionReportCommand(
+                        2L, orderId, 0L, 0L, ANY_TIMESTAMP_MS,
+                        /* msgSeqNum = */ 0,
+                        ApplyExecutionReportCommand.EXEC_TYPE_VENUE_NEW,
+                        /* rejectCodeOrZero = */ (byte) 0,
+                        "VENUE", "EXEC-NEW-1", "", "{}"),
+                ANY_TIMESTAMP_MS + 1);
+
+        assertThat(capturedAdmittedEvents).hasSize(1);
+        ExecutionAppliedEvent ev = ExecutionAppliedEvent.decode(
+                new UnsafeBuffer(capturedAdmittedEvents.get(0)), 0, capturedAdmittedEvents.get(0).length);
+        assertThat(ev.execTypeCode()).isEqualTo(ApplyExecutionReportCommand.EXEC_TYPE_VENUE_NEW);
+        assertThat(ev.newStatusCode()).isEqualTo(OmsAdmissionClusteredService.STATUS_WORKING);
+
+        OmsAdmissionClusteredService.AdmittedOrder o = service.lookupByOrderId(orderId);
+        assertThat(o.statusCode()).isEqualTo(OmsAdmissionClusteredService.STATUS_WORKING);
+        assertThat(o.version()).isEqualTo(1);
+    }
+
+    @Test
+    void applyVenueNew_alreadyWorking_isNoOp() {
+        UUID orderId = UUID.fromString("00000000-0000-4000-8000-000000000151");
+        deliverCommand(sampleAccept(1L, "acct", "idem", orderId), ANY_TIMESTAMP_MS);
+        deliverCommand(
+                new ApplyExecutionReportCommand(
+                        2L, orderId, 0L, 0L, ANY_TIMESTAMP_MS,
+                        0, ApplyExecutionReportCommand.EXEC_TYPE_VENUE_NEW, (byte) 0,
+                        "VENUE", "EXEC-NEW-1", "", "{}"),
+                ANY_TIMESTAMP_MS + 1);
+        capturedAdmittedEvents.clear();
+
+        // Second venue-new (duplicate / late) must not emit a second event or flap state.
+        deliverCommand(
+                new ApplyExecutionReportCommand(
+                        3L, orderId, 0L, 0L, ANY_TIMESTAMP_MS,
+                        0, ApplyExecutionReportCommand.EXEC_TYPE_VENUE_NEW, (byte) 0,
+                        "VENUE", "EXEC-NEW-2", "", "{}"),
+                ANY_TIMESTAMP_MS + 2);
+
+        assertThat(capturedAdmittedEvents).isEmpty();
+        OmsAdmissionClusteredService.AdmittedOrder o = service.lookupByOrderId(orderId);
+        assertThat(o.statusCode()).isEqualTo(OmsAdmissionClusteredService.STATUS_WORKING);
+        assertThat(o.version()).isEqualTo(1);
     }
 
     @Test
@@ -327,7 +380,7 @@ class OmsAdmissionClusteredServiceTest {
 
         assertThat(capturedAdmittedEvents).isEmpty();
         OmsAdmissionClusteredService.AdmittedOrder o = service.lookupByOrderId(orderId);
-        assertThat(o.statusCode()).isEqualTo(OmsAdmissionClusteredService.STATUS_WORKING);
+        assertThat(o.statusCode()).isEqualTo(OmsAdmissionClusteredService.STATUS_PENDING_NEW);
         assertThat(o.version()).isZero();
         assertThat(o.cumQtyScaled()).isZero();
     }
@@ -1143,7 +1196,7 @@ class OmsAdmissionClusteredServiceTest {
                 .as("REPLACE ER must bump version (orders-row mutation)")
                 .isEqualTo(beforeReplace.version() + 1);
         assertThat(afterReplace.statusCode())
-                .as("REPLACE with no fill keeps order WORKING")
+                .as("REPLACE with no fill preserves the order's lifecycle status")
                 .isEqualTo(beforeReplace.statusCode());
         assertThat(capturedAdmittedEvents).hasSize(eventsBefore + 1);
     }

@@ -1271,6 +1271,7 @@ public class OmsPostgresProjector {
             case ApplyExecutionReportCommand.EXEC_TYPE_TRADE -> applyTradeProjection(ev, order);
             case ApplyExecutionReportCommand.EXEC_TYPE_CANCEL -> applyCancelProjection(ev, order);
             case ApplyExecutionReportCommand.EXEC_TYPE_VENUE_REJECT -> applyVenueRejectProjection(ev, order);
+            case ApplyExecutionReportCommand.EXEC_TYPE_VENUE_NEW -> applyVenueNewProjection(ev, order);
             case ApplyExecutionReportCommand.EXEC_TYPE_REPLACE -> applyReplaceProjection(ev, order);
             case ApplyExecutionReportCommand.EXEC_TYPE_CANCEL_REJECT -> applyCancelRejectProjection(ev, order);
             case ApplyExecutionReportCommand.EXEC_TYPE_REPLACE_REJECT -> applyReplaceRejectProjection(ev, order);
@@ -1749,6 +1750,51 @@ public class OmsPostgresProjector {
         } catch (JsonProcessingException e) {
             throw new IllegalStateException(
                     "domain event serialisation failed for REPLACE_REJECT of order " + order.id(), e);
+        }
+        return true;
+    }
+
+    /**
+     * Projects a venue acceptance (EXEC_TYPE_VENUE_NEW): the venue acknowledged a previously-admitted
+     * order (FIX {@code 35=8 ExecType=New}, or an internal-venue gRPC rest ack), so the order moves
+     * from {@code PENDING_NEW} (admitted at OMS, awaiting venue) to {@code WORKING} (live at the venue).
+     *
+     * <p>No {@code executions} row — venue acceptance is not a fill. Idempotency is guarded on the
+     * order's current status rather than an executions dedupe key: a replay (cursor rewind) sees the
+     * order already {@code WORKING} (or further along / terminal) and is a no-op, so the
+     * {@code OrderWorking} envelope is written exactly once. This is the only place {@code WORKING}
+     * is now produced; control-plane admission no longer sets it (see
+     * {@link com.balh.oms.tailer.OrderControlAdmission}).
+     */
+    private boolean applyVenueNewProjection(ExecutionAppliedEvent ev, Order order) {
+        if (order.status() != OrderStatus.PENDING_NEW && order.status() != OrderStatus.NEW) {
+            // Already promoted past PENDING_NEW (WORKING / PARTIALLY_FILLED / FILLED / terminal) —
+            // duplicate or late venue-new. No mutation, no second envelope.
+            meterRegistry.counter(METRIC_EXECUTIONS_APPLIED, TAG_OUTCOME, OUTCOME_DUPLICATE).increment();
+            return false;
+        }
+        int pgExpectedVersion = order.version();
+        boolean cas = ordersRepository.updateWithCas(
+                order.id(),
+                pgExpectedVersion,
+                OrderStatus.WORKING,
+                /* terminalReason = */ null,
+                /* acceptedAt = */ appliedAtInstant(ev),
+                /* terminalAt = */ null);
+        if (!cas) {
+            log.warn(
+                    "Projector: orders CAS missed on VENUE_NEW projection for order {} (pgExpectedVersion={}).",
+                    order.id(),
+                    pgExpectedVersion);
+            return true;
+        }
+        meterRegistry.counter(METRIC_EXECUTIONS_APPLIED, TAG_OUTCOME, OUTCOME_INSERTED).increment();
+        int newSeq = pgExpectedVersion + 1;
+        Order refreshed = ordersRepository.findById(order.id()).orElse(order);
+        try {
+            domainEventOutboxRepository.insert(order.id(), envelopeCodec.orderWorking(refreshed, newSeq));
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("domain event serialisation failed for VENUE_NEW of order " + order.id(), e);
         }
         return true;
     }

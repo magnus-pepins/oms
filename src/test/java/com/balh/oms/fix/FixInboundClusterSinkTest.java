@@ -225,11 +225,38 @@ class FixInboundClusterSinkTest {
     }
 
     @Test
+    void newExecutionReport_buildsVenueNewCommand_promotesPendingToWorking() throws Exception {
+        UUID orderId = UUID.fromString("55555555-5555-5555-5555-555555555555");
+        Message m = newExecutionReport();
+        m.setChar(ExecType.FIELD, ExecType.NEW); // venue acknowledged our NewOrderSingle (39=0 New).
+        m.setString(ClOrdID.FIELD, orderId.toString());
+        m.setString(ExecID.FIELD, "exec-new-1");
+        m.setString(LastQty.FIELD, "0");
+        m.setString(LeavesQty.FIELD, "10");
+        m.setString(CumQty.FIELD, "0");
+        m.getHeader().setString(SenderCompID.FIELD, "BROKER_ACCEPT");
+        m.getHeader().setInt(MsgSeqNum.FIELD, 99);
+
+        sink.handleExecutionReport(m);
+
+        ApplyExecutionReportCommand sent = captureSubmitted();
+        assertThat(sent.execTypeCode()).isEqualTo(ApplyExecutionReportCommand.EXEC_TYPE_VENUE_NEW);
+        assertThat(sent.orderId()).isEqualTo(orderId);
+        assertThat(sent.venueExecRef()).isEqualTo("exec-new-1");
+        assertThat(sent.lastQtyScaled()).isZero();
+        assertThat(sent.lastPxScaled()).isZero();
+        assertThat(sent.senderCompId()).isEqualTo("BROKER_ACCEPT");
+        assertThat(sent.msgSeqNum()).isEqualTo(99);
+        assertThat(sent.rawEnvelopeJson()).contains("\"execType\":\"NEW\"");
+    }
+
+    @Test
     void executionReport_unrecognisedExecType_isDropped_withoutClusterSubmit() throws Exception {
         Message m = newExecutionReport();
-        m.setChar(ExecType.FIELD, ExecType.NEW); // ER for an order acknowledgement, not for state apply.
+        // SUSPENDED is not a state transition we project (not New / fill / cancel / replace / reject).
+        m.setChar(ExecType.FIELD, ExecType.SUSPENDED);
         m.setString(ClOrdID.FIELD, UUID.randomUUID().toString());
-        m.setString(ExecID.FIELD, "exec-new-1");
+        m.setString(ExecID.FIELD, "exec-suspended-1");
         m.setString(LastQty.FIELD, "0");
         m.setString(LeavesQty.FIELD, "10");
         m.setString(CumQty.FIELD, "0");

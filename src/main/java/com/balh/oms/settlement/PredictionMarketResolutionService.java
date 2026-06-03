@@ -6,6 +6,7 @@ import com.balh.oms.config.OmsConfig;
 import com.balh.oms.domain.OrderStatus;
 import com.balh.oms.persistence.DomainEventOutboxRepository;
 import com.balh.oms.persistence.PositionsRepository;
+import com.balh.oms.predictionmarket.PredictionMarketContractRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
@@ -22,11 +23,13 @@ import java.util.UUID;
 @Service
 public class PredictionMarketResolutionService {
 
-    private static final BigDecimal BINARY_PAYOUT_PER_CONTRACT = BigDecimal.ONE;
+    private static final BigDecimal DEFAULT_PAYOUT_PER_CONTRACT = BigDecimal.ONE;
+    private static final String DEFAULT_SETTLEMENT_CURRENCY = "USD";
     private static final String TEMPLATE = "prediction_market_binary_resolution";
     private static final String COLLATERAL_INDICATOR_PREFIX = "@Prediction-Market-Collateral-";
 
     private final VenueContractResolutionRepository resolutionRepository;
+    private final PredictionMarketContractRepository contractRepository;
     private final PredictionMarketLedgerOutboxRepository ledgerOutbox;
     private final PositionsRepository positionsRepository;
     private final DomainEventOutboxRepository domainEventOutboxRepository;
@@ -36,6 +39,7 @@ public class PredictionMarketResolutionService {
 
     public PredictionMarketResolutionService(
             VenueContractResolutionRepository resolutionRepository,
+            PredictionMarketContractRepository contractRepository,
             PredictionMarketLedgerOutboxRepository ledgerOutbox,
             PositionsRepository positionsRepository,
             DomainEventOutboxRepository domainEventOutboxRepository,
@@ -43,6 +47,7 @@ public class PredictionMarketResolutionService {
             OmsConfig config,
             ObjectMapper objectMapper) {
         this.resolutionRepository = resolutionRepository;
+        this.contractRepository = contractRepository;
         this.ledgerOutbox = ledgerOutbox;
         this.positionsRepository = positionsRepository;
         this.domainEventOutboxRepository = domainEventOutboxRepository;
@@ -82,6 +87,18 @@ public class PredictionMarketResolutionService {
         writeDomainEvent(ev, symbol, outcomeLabel, resolutionId);
     }
 
+    private PredictionMarketContractRepository.ContractRow contractTermsForBase(String baseSymbol) {
+        String trimmed = baseSymbol.trim();
+        final String yesSymbol =
+                trimmed.endsWith("-NO") ? trimmed.substring(0, trimmed.length() - 3) : trimmed;
+        return contractRepository
+                .findByYesSymbol(yesSymbol)
+                .orElseThrow(
+                        () ->
+                                new IllegalStateException(
+                                        "prediction_market_contract missing for yes_symbol=" + yesSymbol));
+    }
+
     private void resolveOpenOrders(String baseSymbol) {
         String noSymbol = noTradeSymbolForBase(baseSymbol);
         jdbc.update(
@@ -100,15 +117,30 @@ public class PredictionMarketResolutionService {
     }
 
     private void enqueuePayouts(long resolutionId, String baseSymbol, byte outcomeCode) {
+        PredictionMarketContractRepository.ContractRow terms = contractTermsForBase(baseSymbol);
+        BigDecimal payoutPerContract =
+                terms.payoutPerContract() != null
+                        ? terms.payoutPerContract()
+                        : DEFAULT_PAYOUT_PER_CONTRACT;
+        String currency =
+                terms.settlementCurrency() != null && !terms.settlementCurrency().isBlank()
+                        ? terms.settlementCurrency().trim().toUpperCase()
+                        : DEFAULT_SETTLEMENT_CURRENCY;
         if (outcomeCode == OmsClusterWireFormat.OUTCOME_YES) {
-            enqueuePayoutsForSymbol(resolutionId, baseSymbol, "YES");
+            enqueuePayoutsForSymbol(resolutionId, baseSymbol, "YES", payoutPerContract, currency);
         } else if (outcomeCode == OmsClusterWireFormat.OUTCOME_NO) {
-            enqueuePayoutsForSymbol(resolutionId, noTradeSymbolForBase(baseSymbol), "NO");
+            enqueuePayoutsForSymbol(
+                    resolutionId, noTradeSymbolForBase(baseSymbol), "NO", payoutPerContract, currency);
         }
         zeroContractPositions(baseSymbol);
     }
 
-    private void enqueuePayoutsForSymbol(long resolutionId, String positionSymbol, String outcomeLabel) {
+    private void enqueuePayoutsForSymbol(
+            long resolutionId,
+            String positionSymbol,
+            String outcomeLabel,
+            BigDecimal payoutPerContract,
+            String currency) {
         List<PositionsRepository.AccountPositionKeyRow> holders =
                 positionsRepository.findNonZeroPositionsForSymbol(positionSymbol);
         for (PositionsRepository.AccountPositionKeyRow row : holders) {
@@ -116,8 +148,7 @@ public class PredictionMarketResolutionService {
             if (qty == null || qty.signum() <= 0) {
                 continue;
             }
-            BigDecimal payout = qty.multiply(BINARY_PAYOUT_PER_CONTRACT).setScale(2, RoundingMode.HALF_UP);
-            String currency = "USD";
+            BigDecimal payout = qty.multiply(payoutPerContract).setScale(2, RoundingMode.HALF_UP);
             ObjectNode payload = objectMapper.createObjectNode();
             payload.put("schemaVersion", 2);
             payload.put("template", TEMPLATE);

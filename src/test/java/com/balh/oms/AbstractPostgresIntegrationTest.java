@@ -15,6 +15,7 @@ import com.balh.oms.events.DomainEventEnvelopeCodec;
 import com.balh.oms.persistence.DomainEventOutboxRepository;
 import com.balh.oms.persistence.LedgerInflightOutboxRepository;
 import com.balh.oms.persistence.OrdersRepository;
+import com.balh.oms.predictionmarket.PredictionMarketContractRepository;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
@@ -595,9 +596,12 @@ public abstract class AbstractPostgresIntegrationTest {
                             omsConfig, orders, executionsRepository, positionsRepository);
             ObjectMapper resolutionObjectMapper = new ObjectMapper();
             resolutionObjectMapper.registerModule(new JavaTimeModule());
+            PredictionMarketContractRepository predictionMarketContractRepository =
+                    new PredictionMarketContractRepository(jdbc);
             PredictionMarketResolutionService predictionMarketResolutionService =
                     new PredictionMarketResolutionService(
                             venueContractResolutionRepository,
+                            predictionMarketContractRepository,
                             predictionMarketLedgerOutboxRepository,
                             positionsRepository,
                             domainEventOutbox,

@@ -4,6 +4,17 @@ OMS already updates **`positions`** and **`position_history`** when **`execution
 
 > **Status (2026-05-19 — V39 multi-leg outbox LANDED in OMS):** the single-row, single-Ledger-`POST /settlement-outbox` shape described in §"Proposed outbox shape (Flyway V16)" / §"Payload contract (versioned)" below is **superseded** by the multi-leg model in §"Multi-leg outbox v2 (V39, default in OMS HEAD)" at the bottom of this file. The V16 prose is kept for history because the older `LedgerSettlementOutbox*IntegrationTest` fixtures still reference the v1 schema vocabulary; new code paths read `leg_kind` and call Ledger `/transactions` per leg.
 
+## Settlement template registry (H6, Phase D)
+
+Flyway **`V92__settlement_template_registry.sql`** defines **`settlement_template`** rows keyed by **`(template_id, version)`** with an **`outbox_table`** binding:
+
+| template_id | version | outbox_table |
+|-------------|---------|----------------|
+| `prediction_market_binary_resolution` | 1 | `prediction_market_ledger_outbox` |
+| `equity_broker_eod_v1` | 1 | `ledger_settlement_outbox` |
+
+Outbox **`payload_json`** carries **`template`** and **`templateVersion`**. **`SettlementTemplateRegistry`** validates them before **`LedgerSettlementLegPoster`** posts. Legacy rows without those fields default to **`equity_broker_eod_v1` v1** on the equities outbox path and **`prediction_market_binary_resolution` v1** on the PM outbox path.
+
 ## Principles
 
 1. **Same transactional boundary** as OMS settlement state change: any Ledger API call that must align with a given **`settled`** (or future **failed** cash leg) transition should be **outboxed** in the same Postgres transaction as `executions.updateSettlementStatusIf` / `PositionsRepository.record*Settled`, then processed by an existing reconciler pattern (see **`ledger_inflight_outbox`**).

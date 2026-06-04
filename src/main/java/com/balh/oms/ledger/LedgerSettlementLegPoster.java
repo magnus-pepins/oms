@@ -4,6 +4,9 @@ import com.balh.oms.corporateaction.CorporateActionCashLedgerBookingService;
 import com.balh.oms.settlement.LedgerSettlementOutboxRepository;
 import com.balh.oms.settlement.PredictionMarketLedgerOutboxRepository;
 import com.balh.oms.settlement.SettlementFailPenaltyBookingService;
+import com.balh.oms.settlement.SettlementTemplateIds;
+import com.balh.oms.settlement.SettlementTemplatePayload;
+import com.balh.oms.settlement.SettlementTemplateRegistry;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -56,6 +59,7 @@ public final class LedgerSettlementLegPoster implements LedgerSettlementPostingC
     private final RestClient http;
     private final String apiKey;
     private final ObjectMapper objectMapper;
+    private final SettlementTemplateRegistry templateRegistry;
 
     /**
      * Cache of {@code "inv-<accountId>-<ccy>" -> balanceId} resolutions. Customer balances
@@ -67,13 +71,15 @@ public final class LedgerSettlementLegPoster implements LedgerSettlementPostingC
      */
     private final ConcurrentHashMap<String, String> customerBalanceIdCache = new ConcurrentHashMap<>();
 
-    public LedgerSettlementLegPoster(RestClient http, String apiKey, ObjectMapper objectMapper) {
+    public LedgerSettlementLegPoster(
+            RestClient http, String apiKey, ObjectMapper objectMapper, SettlementTemplateRegistry templateRegistry) {
         if (apiKey == null || apiKey.isBlank()) {
             throw new IllegalStateException("oms.ledger.api-key is required for settlement leg posting");
         }
         this.http = http;
         this.apiKey = apiKey;
         this.objectMapper = objectMapper;
+        this.templateRegistry = templateRegistry;
     }
 
     @Override
@@ -89,6 +95,11 @@ public final class LedgerSettlementLegPoster implements LedgerSettlementPostingC
         if (legKind == null || legKind.isBlank()) {
             throw new LedgerSettlementPostingException("legKind required");
         }
+        validateTemplate(
+                p,
+                SettlementTemplateIds.EQUITY_BROKER_EOD_V1,
+                SettlementTemplateIds.EQUITY_BROKER_EOD_V1_VERSION,
+                SettlementTemplateRegistry.OUTBOX_LEDGER_SETTLEMENT);
 
         switch (legKind) {
             case LedgerSettlementOutboxRepository.LEG_CASH -> postCashSingleCurrency(outboxId, p);
@@ -96,8 +107,6 @@ public final class LedgerSettlementLegPoster implements LedgerSettlementPostingC
             case LedgerSettlementOutboxRepository.LEG_CASH_QUOTE -> postCashCrossCurrency(outboxId, p, false);
             case LedgerSettlementOutboxRepository.LEG_FEE -> postFee(outboxId, p);
             case LedgerSettlementOutboxRepository.LEG_PENALTY -> postPenalty(outboxId, p);
-            case PredictionMarketLedgerOutboxRepository.LEG_PREDICTION_PAYOUT ->
-                    postPredictionMarketPayout(outboxId, p);
             default -> throw new LedgerSettlementPostingException("unknown legKind: " + legKind);
         }
     }
@@ -111,10 +120,27 @@ public final class LedgerSettlementLegPoster implements LedgerSettlementPostingC
         } catch (JsonProcessingException e) {
             throw new LedgerSettlementPostingException("invalid prediction-market outbox payload_json", e);
         }
+        validateTemplate(
+                p,
+                SettlementTemplateIds.PREDICTION_MARKET_BINARY_RESOLUTION,
+                SettlementTemplateIds.PREDICTION_MARKET_BINARY_RESOLUTION_VERSION,
+                SettlementTemplateRegistry.OUTBOX_PREDICTION_MARKET);
         if (PredictionMarketLedgerOutboxRepository.LEG_PREDICTION_PAYOUT.equals(legKind)) {
             postPredictionMarketPayout(outboxId, p);
         } else {
             throw new LedgerSettlementPostingException("unknown prediction-market legKind: " + legKind);
+        }
+    }
+
+    private void validateTemplate(
+            JsonNode payload, String defaultTemplateId, int defaultVersion, String expectedOutboxTable)
+            throws LedgerSettlementPostingException {
+        String templateId = SettlementTemplatePayload.templateId(payload, defaultTemplateId);
+        int version = SettlementTemplatePayload.templateVersion(payload, defaultVersion);
+        try {
+            templateRegistry.requireForOutbox(templateId, version, expectedOutboxTable);
+        } catch (IllegalArgumentException e) {
+            throw new LedgerSettlementPostingException(e.getMessage(), e);
         }
     }
 

@@ -25,7 +25,6 @@ public class PredictionMarketResolutionService {
 
     private static final BigDecimal DEFAULT_PAYOUT_PER_CONTRACT = BigDecimal.ONE;
     private static final String DEFAULT_SETTLEMENT_CURRENCY = "USD";
-    private static final String TEMPLATE = "prediction_market_binary_resolution";
     private static final String COLLATERAL_INDICATOR_PREFIX = "@Prediction-Market-Collateral-";
 
     private final VenueContractResolutionRepository resolutionRepository;
@@ -151,7 +150,10 @@ public class PredictionMarketResolutionService {
             BigDecimal payout = qty.multiply(payoutPerContract).setScale(2, RoundingMode.HALF_UP);
             ObjectNode payload = objectMapper.createObjectNode();
             payload.put("schemaVersion", 2);
-            payload.put("template", TEMPLATE);
+            SettlementTemplatePayload.enrich(
+                    payload,
+                    SettlementTemplateIds.PREDICTION_MARKET_BINARY_RESOLUTION,
+                    SettlementTemplateIds.PREDICTION_MARKET_BINARY_RESOLUTION_VERSION);
             payload.put("accountId", row.accountId().toString());
             payload.put("instrumentSymbol", positionSymbol);
             payload.put("payoutAmount", payout.toPlainString());

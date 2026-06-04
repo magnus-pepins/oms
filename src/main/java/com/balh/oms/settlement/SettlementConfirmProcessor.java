@@ -358,6 +358,7 @@ public class SettlementConfirmProcessor {
                 cash.put("settledAt", Instant.now().toString());
                 iskSettlementMetadata.enrich(
                         cash, snapshot.accountId(), snapshot.side(), LedgerSettlementOutboxRepository.LEG_CASH);
+                stampEquityBrokerEodTemplate(cash);
                 cashInserted = ledgerSettlementOutbox.insertIgnore(
                         snapshot.executionId(),
                         "settled",
@@ -393,6 +394,7 @@ public class SettlementConfirmProcessor {
                 fee.put("settledAt", Instant.now().toString());
                 iskSettlementMetadata.enrich(
                         fee, snapshot.accountId(), snapshot.side(), LedgerSettlementOutboxRepository.LEG_FEE);
+                stampEquityBrokerEodTemplate(fee);
                 feeInserted = ledgerSettlementOutbox.insertIgnore(
                         snapshot.executionId(),
                         "settled",
@@ -454,6 +456,7 @@ public class SettlementConfirmProcessor {
             cash.put("settledAt", Instant.now().toString());
             iskSettlementMetadata.enrich(
                     cash, snapshot.accountId(), snapshot.side(), LedgerSettlementOutboxRepository.LEG_CASH);
+            stampEquityBrokerEodTemplate(cash);
             return ledgerSettlementOutbox.insertIgnore(
                     snapshot.executionId(),
                     "settled",
@@ -481,6 +484,7 @@ public class SettlementConfirmProcessor {
         base.put("settledAt", Instant.now().toString());
         iskSettlementMetadata.enrich(
                 base, snapshot.accountId(), snapshot.side(), LedgerSettlementOutboxRepository.LEG_CASH_BASE);
+        stampEquityBrokerEodTemplate(base);
 
         // cash-quote: @FX-Suspense-<tradeCcy> ↔ @Nostro-<tradeCcy>-Bank, amount in tradeCurrency.
         ObjectNode quote = objectMapper.createObjectNode();
@@ -502,6 +506,7 @@ public class SettlementConfirmProcessor {
         quote.put("settledAt", Instant.now().toString());
         iskSettlementMetadata.enrich(
                 quote, snapshot.accountId(), snapshot.side(), LedgerSettlementOutboxRepository.LEG_CASH_QUOTE);
+        stampEquityBrokerEodTemplate(quote);
 
         int baseInserted = ledgerSettlementOutbox.insertIgnore(
                 snapshot.executionId(),
@@ -614,5 +619,12 @@ public class SettlementConfirmProcessor {
 
     private void noteMarkFailed(MarkTradeFailedResult r) {
         meterRegistry.counter(METRIC_MARK_FAILED, List.of(Tag.of("result", r.name()))).increment();
+    }
+
+    private void stampEquityBrokerEodTemplate(ObjectNode payload) {
+        SettlementTemplatePayload.enrich(
+                payload,
+                SettlementTemplateIds.EQUITY_BROKER_EOD_V1,
+                SettlementTemplateIds.EQUITY_BROKER_EOD_V1_VERSION);
     }
 }

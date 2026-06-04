@@ -147,7 +147,8 @@ public final class EmbeddedVenueStack implements AutoCloseable {
                         0,
                         1_000L);
         clusterIngressClient = VenueClusterIngressClient.connect(gatewayConfig);
-        VenueOrderGrpcService grpcService = new VenueOrderGrpcService(clusterIngressClient);
+        VenueOrderGrpcService grpcService =
+                new VenueOrderGrpcService(clusterIngressClient, new io.micrometer.core.instrument.simple.SimpleMeterRegistry());
         try {
             grpcServer = ServerBuilder.forPort(0).addService(grpcService).build().start();
             grpcPort = grpcServer.getPort();

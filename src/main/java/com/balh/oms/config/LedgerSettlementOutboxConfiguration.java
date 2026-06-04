@@ -6,6 +6,7 @@ import com.balh.oms.reconciler.LedgerSettlementOutboxReconciler;
 import com.balh.oms.reconciler.PredictionMarketLedgerOutboxReconciler;
 import com.balh.oms.settlement.LedgerSettlementOutboxRepository;
 import com.balh.oms.settlement.PredictionMarketLedgerOutboxRepository;
+import com.balh.oms.settlement.SettlementTemplateRegistry;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -34,14 +35,15 @@ public class LedgerSettlementOutboxConfiguration {
     LedgerSettlementPostingClient ledgerSettlementPostingClient(
             @Qualifier("omsLedgerRestClient") org.springframework.web.client.RestClient omsLedgerRestClient,
             OmsConfig config,
-            ObjectMapper objectMapper) {
+            ObjectMapper objectMapper,
+            SettlementTemplateRegistry settlementTemplateRegistry) {
         String key = config.getLedger().getApiKey();
         if (key == null || key.isBlank()) {
             throw new IllegalStateException("oms.ledger.api-key is required when settlement outbox reconciler is enabled");
         }
         // V39 multi-leg poster: posts one Ledger /transactions per outbox row, dispatched by leg_kind.
         // settlement-posting-http-path is no longer consulted; ignore or remove the property.
-        return new LedgerSettlementLegPoster(omsLedgerRestClient, key, objectMapper);
+        return new LedgerSettlementLegPoster(omsLedgerRestClient, key, objectMapper, settlementTemplateRegistry);
     }
 
     @Bean

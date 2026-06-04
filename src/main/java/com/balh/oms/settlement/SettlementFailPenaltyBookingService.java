@@ -62,6 +62,10 @@ public class SettlementFailPenaltyBookingService {
         try {
             ObjectNode payload = objectMapper.createObjectNode();
             payload.put("schemaVersion", 2);
+            SettlementTemplatePayload.enrich(
+                    payload,
+                    SettlementTemplateIds.EQUITY_BROKER_EOD_V1,
+                    SettlementTemplateIds.EQUITY_BROKER_EOD_V1_VERSION);
             payload.put("event", "SETTLEMENT_FAIL_PENALTY");
             payload.put("leg", LedgerSettlementOutboxRepository.LEG_PENALTY);
             payload.put("executionId", executionId);

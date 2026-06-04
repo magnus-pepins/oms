@@ -2,7 +2,9 @@ package com.balh.oms.ledger;
 
 import com.balh.oms.ledger.LedgerSettlementPostingClient.LedgerSettlementPostingException;
 import com.balh.oms.settlement.LedgerSettlementOutboxRepository;
+import com.balh.oms.settlement.SettlementTemplateRegistry;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.mockito.Mockito;
 import com.github.tomakehurst.wiremock.WireMockServer;
 import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
 import com.github.tomakehurst.wiremock.matching.RequestPatternBuilder;
@@ -22,6 +24,9 @@ import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlPathEqualTo;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.doNothing;
 
 /**
  * Unit-level coverage of the leg dispatch and Ledger transaction body shape.
@@ -40,7 +45,7 @@ class LedgerSettlementLegPosterTest {
         ledger = new WireMockServer(WireMockConfiguration.wireMockConfig().dynamicPort());
         ledger.start();
         RestClient http = RestClient.builder().baseUrl("http://127.0.0.1:" + ledger.port()).build();
-        poster = new LedgerSettlementLegPoster(http, "test-key", new ObjectMapper());
+        poster = new LedgerSettlementLegPoster(http, "test-key", new ObjectMapper(), noopTemplateRegistry());
         ledger.stubFor(post(urlPathEqualTo("/transactions"))
                 .willReturn(aResponse()
                         .withStatus(201)
@@ -352,9 +357,18 @@ class LedgerSettlementLegPosterTest {
     void missingApiKeyAtConstructionIsRejected() {
         assertThatThrownBy(() ->
                         new LedgerSettlementLegPoster(
-                                RestClient.builder().baseUrl("http://localhost").build(), "", new ObjectMapper()))
+                                RestClient.builder().baseUrl("http://localhost").build(),
+                                "",
+                                new ObjectMapper(),
+                                noopTemplateRegistry()))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("api-key is required");
+    }
+
+    private static SettlementTemplateRegistry noopTemplateRegistry() {
+        SettlementTemplateRegistry registry = Mockito.mock(SettlementTemplateRegistry.class);
+        doNothing().when(registry).requireForOutbox(anyString(), anyInt(), anyString());
+        return registry;
     }
 
     private static RequestPatternBuilder postWith() {

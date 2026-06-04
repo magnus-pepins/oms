@@ -653,6 +653,81 @@ class OmsAdmissionClusteredServiceTest {
         }
     }
 
+    @Test
+    void onTakeSnapshot_payloadExceedingMaxMessageLength_chunksAcrossMessages_andRoundTrips() {
+        // Regression for the 2026-06-04 pop crash: at 25,847 live orders the admission snapshot
+        // encoded to 10.9 MiB and onTakeSnapshot's single offer() threw "message exceeds
+        // maxMessageLength of 8388608", force-exiting the JVM on every boot (PM2 restart loop, every
+        // dependent role timing out on the shared MediaDriver). The writer must split the snapshot
+        // across messages no larger than maxMessageLength, and the loader must reassemble them.
+        final int maxMessageLength = 8 * 1024 * 1024;
+        // Each string field is capped at MAX_STRING_BYTES (256), so inflate per-order size by
+        // padding several fields to ~200 bytes each (~900 bytes/order). ~12k orders then clear the
+        // 8 MiB single-message cap with margin — same regime as the 25,847-order / 10.9 MiB crash.
+        String pad = "x".repeat(200);
+        int orderCount = 12_000;
+        for (int i = 0; i < orderCount; i++) {
+            UUID orderId = new UUID(0x4000_0000_0000_0000L, i + 1);
+            AcceptOrderCommand cmd = new AcceptOrderCommand(
+                    i + 1,
+                    orderId,
+                    /* clientTimestampNanos = */ 0L,
+                    /* quantityScaled = */ 10_000_000_000L,
+                    /* limitPriceScaledOrZero = */ 0L,
+                    /* shardId = */ 0,
+                    AcceptOrderCommand.SIDE_BUY,
+                    AcceptOrderCommand.TIF_DAY,
+                    "acct-" + i + "-" + pad,
+                    "idem-" + i + "-" + pad,
+                    "hash-" + i + "-" + pad,
+                    "PREDMKT-" + i,
+                    /* ledgerBalanceIdOrNull = */ "ledg-" + i + "-" + pad);
+            deliverCommand(cmd, ANY_TIMESTAMP_MS + i);
+        }
+        assertThat(service.admittedOrderCount()).isEqualTo(orderCount);
+
+        // Enforcing publication: reproduces real Aeron — a single offer() of a message larger than
+        // maxMessageLength throws IllegalArgumentException. Captures the chunks in publication order.
+        ExpandableArrayBuffer accumulator = new ExpandableArrayBuffer(16 * 1024 * 1024);
+        int[] written = {0};
+        int[] offerCount = {0};
+        ExclusivePublication snapshotPub = mock(ExclusivePublication.class);
+        when(snapshotPub.maxMessageLength()).thenReturn(maxMessageLength);
+        when(snapshotPub.offer(any(DirectBuffer.class), anyInt(), anyInt())).thenAnswer(inv -> {
+            DirectBuffer src = inv.getArgument(0);
+            int off = inv.getArgument(1);
+            int len = inv.getArgument(2);
+            if (len > maxMessageLength) {
+                throw new IllegalArgumentException(
+                        "Encoded message exceeds maxMessageLength of " + maxMessageLength + ", length=" + len);
+            }
+            accumulator.putBytes(written[0], src, off, len);
+            written[0] += len;
+            offerCount[0]++;
+            return 1L;
+        });
+
+        // Old code threw here; chunking must not.
+        service.onTakeSnapshot(snapshotPub);
+
+        assertThat(written[0])
+                .as("snapshot must exceed the single-message cap so this test exercises the fix")
+                .isGreaterThan(maxMessageLength);
+        assertThat(offerCount[0]).as("snapshot must be split across multiple messages").isGreaterThan(1);
+
+        byte[] snapshotBytes = new byte[written[0]];
+        accumulator.getBytes(0, snapshotBytes);
+
+        // Load the multi-message snapshot back, delivering it as several fragments (each treated as
+        // a complete message by ImageFragmentAssembler) to prove the loader reassembles across
+        // onFragment calls — the inverse of the chunked write.
+        OmsAdmissionClusteredService restored =
+                newServiceFromMultiFragmentSnapshot(snapshotBytes, maxMessageLength);
+        assertThat(restored.admittedOrderCount()).isEqualTo(orderCount);
+        assertThat(restored.lookupByOrderId(new UUID(0x4000_0000_0000_0000L, 1))).isNotNull();
+        assertThat(restored.lookupByOrderId(new UUID(0x4000_0000_0000_0000L, orderCount))).isNotNull();
+    }
+
     private static ApplyExecutionReportCommand sampleTrade(
             UUID orderId, long lastQtyScaled, long lastPxScaled, String venueExecRef) {
         return new ApplyExecutionReportCommand(
@@ -993,6 +1068,9 @@ class OmsAdmissionClusteredServiceTest {
         ExpandableArrayBuffer accumulator = new ExpandableArrayBuffer(1024);
         int[] written = {0};
         ExclusivePublication snapshotPub = mock(ExclusivePublication.class);
+        // onTakeSnapshot now publishes in chunks of <= maxMessageLength; mirror a real publication
+        // (8 MiB at the 64 MiB term buffer these clusters run) so the chunk loop terminates.
+        when(snapshotPub.maxMessageLength()).thenReturn(8 * 1024 * 1024);
         when(snapshotPub.offer(any(DirectBuffer.class), anyInt(), anyInt())).thenAnswer(inv -> {
             DirectBuffer src = inv.getArgument(0);
             int off = inv.getArgument(1);
@@ -1032,6 +1110,44 @@ class OmsAdmissionClusteredServiceTest {
             return 1;
         });
         return image;
+    }
+
+    /**
+     * Build a fresh service primed from {@code snapshotBytes} delivered as multiple complete
+     * messages of up to {@code fragmentSize} bytes — the load-side mirror of the chunked write in
+     * {@link OmsAdmissionClusteredService#onTakeSnapshot}. Each fragment carries
+     * {@link io.aeron.logbuffer.FrameDescriptor#UNFRAGMENTED} so {@link io.aeron.ImageFragmentAssembler}
+     * passes it straight to the loader, which must accumulate across the N {@code onFragment} calls.
+     */
+    private static OmsAdmissionClusteredService newServiceFromMultiFragmentSnapshot(
+            byte[] snapshotBytes, int fragmentSize) {
+        OmsAdmissionClusteredService restored = new OmsAdmissionClusteredService();
+        Cluster mockCluster = mock(Cluster.class);
+        when(mockCluster.role()).thenReturn(Cluster.Role.FOLLOWER);
+        Aeron aeronMock = mock(Aeron.class);
+        ExclusivePublication eventsPub = mock(ExclusivePublication.class);
+        when(eventsPub.offer(any(DirectBuffer.class), anyInt(), anyInt())).thenReturn(1L);
+        OmsAdmissionClusteredServiceTestFixtures.wireClusterAeronMocks(aeronMock, eventsPub);
+        when(mockCluster.aeron()).thenReturn(aeronMock);
+
+        Image image = mock(Image.class);
+        io.aeron.logbuffer.Header header = mock(io.aeron.logbuffer.Header.class);
+        when(header.flags()).thenReturn(io.aeron.logbuffer.FrameDescriptor.UNFRAGMENTED);
+        UnsafeBuffer buffer = new UnsafeBuffer(snapshotBytes);
+        int[] cursor = {0};
+        when(image.isEndOfStream()).thenAnswer(inv -> cursor[0] >= snapshotBytes.length);
+        when(image.poll(any(FragmentHandler.class), anyInt())).thenAnswer(inv -> {
+            if (cursor[0] >= snapshotBytes.length) {
+                return 0;
+            }
+            FragmentHandler handler = inv.getArgument(0);
+            int len = Math.min(fragmentSize, snapshotBytes.length - cursor[0]);
+            handler.onFragment(buffer, cursor[0], len, header);
+            cursor[0] += len;
+            return 1;
+        });
+        restored.onStart(mockCluster, image);
+        return restored;
     }
 
     // ========================================================================

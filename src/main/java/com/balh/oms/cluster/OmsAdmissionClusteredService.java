@@ -20,6 +20,7 @@ import org.agrona.CloseHelper;
 import org.agrona.DirectBuffer;
 import org.agrona.ExpandableArrayBuffer;
 import org.agrona.MutableDirectBuffer;
+import org.agrona.concurrent.UnsafeBuffer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -745,14 +746,35 @@ public class OmsAdmissionClusteredService implements ClusteredService {
         // worse than no snapshot, because Aeron retains it across restarts.
         verifySnapshotRoundTrip(buffer, p);
 
-        long pos;
-        while ((pos = snapshotPublication.offer(buffer, 0, p)) < 0L) {
-            // BACK_PRESSURED / NOT_CONNECTED / ADMIN_ACTION — retry.
-            // Aeron's standard snapshot publish loop. No external IO, no allocation here.
-            if (pos == ExclusivePublication.CLOSED || pos == ExclusivePublication.MAX_POSITION_EXCEEDED) {
-                throw new IllegalStateException("snapshot publication closed; pos=" + pos);
+        // Publish the snapshot in chunks no larger than the publication's maxMessageLength. A single
+        // offer() of a message larger than maxMessageLength (= termBufferLength/8; 8 MiB at the 64 MiB
+        // term buffer these clusters run) throws IllegalArgumentException synchronously — the
+        // 2026-06-04 pop crash, where a 25,847-order snapshot encoded to 10.9 MiB and bricked the
+        // cluster on every onTakeSnapshot (FATAL agent error -> JVM exit -> PM2 restart loop). Aeron
+        // delivers the chunks in publication order on one image; the loader (loadSnapshot /
+        // SnapshotLoader) accumulates the raw bytes across messages and decodes the concatenation
+        // once, so the split point is arbitrary and needs no per-chunk framing. A snapshot small
+        // enough to fit in one message is published as exactly one message — wire-identical to the
+        // pre-chunking behaviour, and the loader reads legacy single-message snapshots unchanged.
+        final int maxChunkBytes = snapshotPublication.maxMessageLength();
+        if (maxChunkBytes <= 0) {
+            // Real publications always report a positive max; fail fast rather than spin forever.
+            throw new IllegalStateException(
+                    "snapshot publication reported non-positive maxMessageLength=" + maxChunkBytes);
+        }
+        int sent = 0;
+        while (sent < p) {
+            int chunk = Math.min(maxChunkBytes, p - sent);
+            long pos;
+            while ((pos = snapshotPublication.offer(buffer, sent, chunk)) < 0L) {
+                // BACK_PRESSURED / NOT_CONNECTED / ADMIN_ACTION — retry.
+                // Aeron's standard snapshot publish loop. No external IO, no allocation here.
+                if (pos == ExclusivePublication.CLOSED || pos == ExclusivePublication.MAX_POSITION_EXCEEDED) {
+                    throw new IllegalStateException("snapshot publication closed; pos=" + pos);
+                }
+                Thread.yield();
             }
-            Thread.yield();
+            sent += chunk;
         }
         sample.stop(snapshotWriteTimer);
         snapshotWriteCounter.increment();
@@ -829,6 +851,10 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                     Thread.yield();
                 }
             }
+            // Decode the full payload (one or more chunk-messages, concatenated by the loader) into
+            // live state now that the image is fully drained. A pre-chunking single-message snapshot
+            // accumulates as one chunk and decodes identically.
+            loader.parseAccumulated();
             sample.stop(snapshotLoadTimer);
             snapshotLoadCounter.increment();
             snapshotLoadBytes.record(loader.totalBytes);
@@ -1730,19 +1756,51 @@ public class OmsAdmissionClusteredService implements ClusteredService {
     private final class SnapshotLoader implements io.aeron.logbuffer.FragmentHandler {
 
         /**
-         * Total bytes seen by this loader. Always equals the full snapshot payload size because
-         * {@link #loadSnapshot} wraps this loader in {@link ImageFragmentAssembler}: a snapshot
-         * that spans multiple Aeron fragments is reassembled into a single {@link #onFragment}
-         * call before the magic+length header is validated. The pre-assembler code assumed
-         * snapshots fit in one fragment, which broke as soon as cluster state exceeded MTU
-         * (the 2026-05-23 pop incident — see oms/docs/runbooks/oms-cluster-recovery-incident.md).
+         * Total bytes seen by this loader across all snapshot messages — equals the full snapshot
+         * payload size. {@link #loadSnapshot} wraps this loader in {@link ImageFragmentAssembler} so
+         * each message's MTU fragments are reassembled into one {@link #onFragment} call (the
+         * 2026-05-23 pop incident — see oms/docs/runbooks/oms-cluster-recovery-incident.md), and the
+         * snapshot may now span multiple messages (the 2026-06-04 maxMessageLength fix), which the
+         * loader accumulates and decodes together in {@link #parseAccumulated()}.
          */
         private long totalBytes;
 
+        /**
+         * Raw snapshot payload accumulated across Aeron messages. {@link #onTakeSnapshot} publishes
+         * the snapshot as one or more messages, each capped at the publication's maxMessageLength
+         * (the 2026-06-04 fix: a single &gt;8 MiB message throws on offer and bricked the cluster).
+         * Aeron delivers those messages in publication order on one image and
+         * {@link ImageFragmentAssembler} reassembles each message's MTU fragments into one
+         * {@link #onFragment} call; we append the bytes here and {@link #parseAccumulated()} decodes
+         * the concatenation once the image drains. A legacy single-message snapshot accumulates as
+         * one chunk and decodes identically.
+         */
+        private final ExpandableArrayBuffer accumulator = new ExpandableArrayBuffer(INITIAL_BUFFER_CAPACITY);
+
+        private int accumulatedLength;
+
         @Override
         public void onFragment(DirectBuffer buffer, int offset, int length, Header header) {
+            accumulator.putBytes(accumulatedLength, buffer, offset, length);
+            accumulatedLength += length;
             totalBytes += length;
-            int p = offset;
+        }
+
+        /**
+         * Decode the full accumulated payload into live state. Called once by {@link #loadSnapshot}
+         * after the snapshot image is fully drained. An empty image (no fragments) is a valid empty
+         * snapshot and leaves all indexes empty.
+         */
+        void parseAccumulated() {
+            if (accumulatedLength == 0) {
+                return;
+            }
+            // Bound the view to exactly the bytes received. The accumulator is an over-allocated
+            // ExpandableArrayBuffer, so reading past accumulatedLength would silently return zeros
+            // and mask a truncated/corrupt snapshot; a length-bounded UnsafeBuffer instead throws
+            // IndexOutOfBoundsException, which loadSnapshot catches and self-heals (rebuild from log).
+            final DirectBuffer buffer = new UnsafeBuffer(accumulator, 0, accumulatedLength);
+            int p = 0;
             int magic = buffer.getInt(p);
             p += Integer.BYTES;
             if (magic != SNAPSHOT_MAGIC) {

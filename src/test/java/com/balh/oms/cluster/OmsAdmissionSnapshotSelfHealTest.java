@@ -75,7 +75,7 @@ class OmsAdmissionSnapshotSelfHealTest {
         // Valid magic + version header, then nothing — the orderCount read will throw IndexOutOfBoundsException.
         UnsafeBuffer truncated = new UnsafeBuffer(new byte[Integer.BYTES * 2]);
         truncated.putInt(0, 0x4F4D5341); // "OMSA"
-        truncated.putInt(Integer.BYTES, 4); // SNAPSHOT_SCHEMA_VERSION
+        truncated.putInt(Integer.BYTES, OmsAdmissionClusteredService.SNAPSHOT_SCHEMA_VERSION);
         Image image = mockSnapshotImage(java.util.Arrays.copyOf(truncated.byteArray(), Integer.BYTES * 2));
 
         svc.onStart(clusterMockWithAeron(), image);
@@ -104,12 +104,13 @@ class OmsAdmissionSnapshotSelfHealTest {
     @Test
     void emptyValidSnapshot_loadsCleanlyWithoutSelfHealFlag() {
         OmsAdmissionClusteredService svc = freshService();
-        UnsafeBuffer empty = new UnsafeBuffer(new byte[Integer.BYTES * 5]);
+        UnsafeBuffer empty = new UnsafeBuffer(new byte[Integer.BYTES * 6]);
         empty.putInt(0, 0x4F4D5341);
-        empty.putInt(Integer.BYTES, 4);
+        empty.putInt(Integer.BYTES, OmsAdmissionClusteredService.SNAPSHOT_SCHEMA_VERSION);
         empty.putInt(Integer.BYTES * 2, /* orderCount = */ 0);
         empty.putInt(Integer.BYTES * 3, /* orderCountWithRefs = */ 0);
         empty.putInt(Integer.BYTES * 4, /* senderCountWithSeqs = */ 0);
+        empty.putInt(Integer.BYTES * 5, /* resolvedContractKeyCount = */ 0);
         Image image = mockSnapshotImage(java.util.Arrays.copyOf(empty.byteArray(), empty.capacity()));
 
         svc.onStart(clusterMockWithAeron(), image);
@@ -125,19 +126,20 @@ class OmsAdmissionSnapshotSelfHealTest {
     void writeSideRoundTripVerify_passesForEmptyState() {
         OmsAdmissionClusteredService svc = freshService();
         svc.onStart(clusterMockWithAeron(), null);
-        // No orders admitted — the encoder writes just the 5-int header. The round-trip verify
+        // No orders admitted — the encoder writes just the 6-int header. The round-trip verify
         // must accept it; if it didn't, every healthy snapshot would abort.
         byte[] bytes = takeSnapshotBytes(svc);
         assertThat(bytes.length)
-                .as("empty snapshot is magic(4) + version(4) + orderCount(0) + execRefCount(0) + senderCount(0) = 20 bytes")
-                .isEqualTo(Integer.BYTES * 5);
+                .as("empty snapshot is magic + version + orderCount(0) + execRefCount(0)"
+                        + " + senderCount(0) + resolvedContractKeyCount(0) = 6 ints = 24 bytes")
+                .isEqualTo(Integer.BYTES * 6);
     }
 
     @Test
     void writeSideRoundTripVerify_rejectsWrongMagic() {
         ExpandableArrayBuffer buf = new ExpandableArrayBuffer(64);
         buf.putInt(0, 0xDEADBEEF); // wrong magic
-        buf.putInt(Integer.BYTES, 4);
+        buf.putInt(Integer.BYTES, OmsAdmissionClusteredService.SNAPSHOT_SCHEMA_VERSION);
         buf.putInt(Integer.BYTES * 2, 0);
         buf.putInt(Integer.BYTES * 3, 0);
         buf.putInt(Integer.BYTES * 4, 0);
@@ -152,7 +154,7 @@ class OmsAdmissionSnapshotSelfHealTest {
     void writeSideRoundTripVerify_rejectsWrongLengthDeclaration() {
         ExpandableArrayBuffer buf = new ExpandableArrayBuffer(64);
         buf.putInt(0, 0x4F4D5341);
-        buf.putInt(Integer.BYTES, 4);
+        buf.putInt(Integer.BYTES, OmsAdmissionClusteredService.SNAPSHOT_SCHEMA_VERSION);
         buf.putInt(Integer.BYTES * 2, /* orderCount = */ 0);
         buf.putInt(Integer.BYTES * 3, /* orderCountWithRefs = */ 0);
         buf.putInt(Integer.BYTES * 4, /* senderCountWithSeqs = */ 0);
@@ -168,12 +170,13 @@ class OmsAdmissionSnapshotSelfHealTest {
     void writeSideRoundTripVerify_acceptsValidEmptySnapshot() {
         ExpandableArrayBuffer buf = new ExpandableArrayBuffer(64);
         buf.putInt(0, 0x4F4D5341);
-        buf.putInt(Integer.BYTES, 4);
-        buf.putInt(Integer.BYTES * 2, 0);
-        buf.putInt(Integer.BYTES * 3, 0);
-        buf.putInt(Integer.BYTES * 4, 0);
-        // Should not throw.
-        OmsAdmissionClusteredService.verifySnapshotRoundTrip(buf, Integer.BYTES * 5);
+        buf.putInt(Integer.BYTES, OmsAdmissionClusteredService.SNAPSHOT_SCHEMA_VERSION);
+        buf.putInt(Integer.BYTES * 2, /* orderCount = */ 0);
+        buf.putInt(Integer.BYTES * 3, /* orderCountWithRefs = */ 0);
+        buf.putInt(Integer.BYTES * 4, /* senderCountWithSeqs = */ 0);
+        buf.putInt(Integer.BYTES * 5, /* resolvedContractKeyCount = */ 0);
+        // Should not throw — a valid empty snapshot is the 6-int header (24 bytes).
+        OmsAdmissionClusteredService.verifySnapshotRoundTrip(buf, Integer.BYTES * 6);
     }
 
     // ---- mock plumbing ----------------------------------------------------------------------
@@ -221,6 +224,7 @@ class OmsAdmissionSnapshotSelfHealTest {
         ExpandableArrayBuffer accumulator = new ExpandableArrayBuffer(1024);
         int[] written = {0};
         ExclusivePublication snapshotPub = mock(ExclusivePublication.class);
+        when(snapshotPub.maxMessageLength()).thenReturn(8 * 1024 * 1024);
         when(snapshotPub.offer(any(DirectBuffer.class), anyInt(), anyInt())).thenAnswer(inv -> {
             DirectBuffer src = inv.getArgument(0);
             int off = inv.getArgument(1);

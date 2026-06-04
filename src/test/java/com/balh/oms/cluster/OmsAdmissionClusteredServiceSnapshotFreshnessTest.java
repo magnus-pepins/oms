@@ -62,6 +62,7 @@ class OmsAdmissionClusteredServiceSnapshotFreshnessTest {
         assertThat(ageBefore).isGreaterThan(0.0);
 
         ExclusivePublication snapshotPub = mock(ExclusivePublication.class);
+        when(snapshotPub.maxMessageLength()).thenReturn(8 * 1024 * 1024);
         ExpandableArrayBuffer accumulator = new ExpandableArrayBuffer(256);
         int[] written = {0};
         when(snapshotPub.offer(any(DirectBuffer.class), anyInt(), anyInt())).thenAnswer(inv -> {

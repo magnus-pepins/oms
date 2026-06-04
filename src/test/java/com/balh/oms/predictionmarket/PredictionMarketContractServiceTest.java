@@ -49,6 +49,21 @@ class PredictionMarketContractServiceTest {
     }
 
     @Test
+    void shouldSyncVenueRegistry_onlyForOpenOrHalted() {
+        assertFalse(PredictionMarketContractService.shouldSyncVenueRegistry("DRAFT"));
+        assertTrue(PredictionMarketContractService.shouldSyncVenueRegistry("OPEN"));
+        assertTrue(PredictionMarketContractService.shouldSyncVenueRegistry("HALTED"));
+        assertFalse(PredictionMarketContractService.shouldSyncVenueRegistry("CLOSED"));
+    }
+
+    @Test
+    void requiresVenueRegistrySync_trueWhenPublishingDraftToOpen() {
+        var before = sampleRow("DRAFT", "0.01", null, null);
+        var after = sampleRow("OPEN", "0.01", null, null);
+        assertTrue(PredictionMarketContractService.requiresVenueRegistrySync(before, after));
+    }
+
+    @Test
     void requiresVenueRegistrySync_trueWhenStatusChanges() {
         var before = sampleRow("OPEN", "0.01", null, null);
         var after =

@@ -18,7 +18,8 @@ public class PredictionMarketContractService {
 
     private static final Logger log = LoggerFactory.getLogger(PredictionMarketContractService.class);
 
-    private static final Set<String> ALLOWED_STATUS = Set.of("OPEN", "HALTED", "CLOSED", "RESOLVED");
+    private static final Set<String> ALLOWED_STATUS =
+            Set.of("DRAFT", "OPEN", "HALTED", "CLOSED", "RESOLVED");
     private static final String SYMBOL_PREFIX = "PREDMKT-";
 
     private final PredictionMarketContractRepository repository;
@@ -67,7 +68,7 @@ public class PredictionMarketContractService {
         String settlementCurrency = normalizeCurrency(req.settlementCurrency());
         String yesSymbol = normalizeYesSymbol(req.yesSymbol(), slug);
         String noSymbol = normalizeNoSymbol(req.noSymbol(), yesSymbol);
-        String status = normalizeStatus(req.status(), "OPEN");
+        String status = normalizeStatus(req.status(), "DRAFT");
         BigDecimal tickSize = req.tickSize() != null ? req.tickSize() : new BigDecimal("0.01");
         BigDecimal payout =
                 req.payoutPerContract() != null ? req.payoutPerContract() : new BigDecimal("1.00");
@@ -98,8 +99,15 @@ public class PredictionMarketContractService {
                         req.closesAt(),
                         req.resolvesAt(),
                         jurisdictionTags);
-        venueRegistry.syncContract(row);
+        if (shouldSyncVenueRegistry(status)) {
+            venueRegistry.syncContract(row);
+        }
         return row;
+    }
+
+    /** Venue registry is only needed for tradeable lifecycle states. */
+    static boolean shouldSyncVenueRegistry(String status) {
+        return "OPEN".equals(status) || "HALTED".equals(status);
     }
 
     public Optional<PredictionMarketContractRepository.ContractRow> update(long id, UpdateRequest req) {
@@ -180,8 +188,13 @@ public class PredictionMarketContractService {
     static boolean requiresVenueRegistrySync(
             PredictionMarketContractRepository.ContractRow before,
             PredictionMarketContractRepository.ContractRow after) {
-        return before.tickSize().compareTo(after.tickSize()) != 0
-                || !Objects.equals(before.status(), after.status());
+        if (before.tickSize().compareTo(after.tickSize()) != 0) {
+            return shouldSyncVenueRegistry(after.status());
+        }
+        if (!Objects.equals(before.status(), after.status())) {
+            return shouldSyncVenueRegistry(before.status()) || shouldSyncVenueRegistry(after.status());
+        }
+        return false;
     }
 
     private void syncVenueRegistryAfterUpdate(

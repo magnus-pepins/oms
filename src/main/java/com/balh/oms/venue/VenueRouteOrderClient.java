@@ -8,6 +8,9 @@ import com.balh.oms.config.OmsProfiles;
 import com.balh.oms.observability.metrics.OmsVenueGrpcMetrics;
 import io.micrometer.core.instrument.MeterRegistry;
 import com.balh.venue.grpc.v1.ExecutionReport;
+import com.balh.venue.grpc.v1.OrderLiveness;
+import com.balh.venue.grpc.v1.QueryOrderStatusRequest;
+import com.balh.venue.grpc.v1.QueryOrderStatusResponse;
 import com.balh.venue.grpc.v1.RouteCancelRequest;
 import com.balh.venue.grpc.v1.RouteCancelResponse;
 import com.balh.venue.grpc.v1.RouteOrderRequest;
@@ -26,6 +29,7 @@ import org.springframework.context.annotation.Profile;
 import org.springframework.stereotype.Component;
 
 import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
@@ -126,6 +130,29 @@ public class VenueRouteOrderClient {
                     e);
         }
         return acceptedExecutionReport(response.getAccepted(), response.getRejectReason(), ev.orderId(), response.hasExecutionReport(), response.getExecutionReport());
+    }
+
+    /**
+     * Golden-copy liveness check for one order: ask the venue whether {@code orderId} is still
+     * resting for {@code instrumentSymbol}. Used by {@code VenueOrderReconciler}. Returns the venue's
+     * {@link OrderLiveness}; transport failures propagate as {@link VenueRouteTransportException} so
+     * the reconciler skips (never terminates an order on an inconclusive answer).
+     */
+    public OrderLiveness queryOrderStatus(UUID orderId, String instrumentSymbol) {
+        QueryOrderStatusResponse response;
+        try {
+            response =
+                    stubWithDeadline().queryOrderStatus(
+                            QueryOrderStatusRequest.newBuilder()
+                                    .setOmsOrderId(orderId.toString())
+                                    .setInstrumentSymbol(instrumentSymbol)
+                                    .build());
+        } catch (StatusRuntimeException e) {
+            OmsVenueGrpcMetrics.recordEgressFailure(meterRegistry, OmsVenueGrpcMetrics.RPC_QUERY_ORDER_STATUS, e);
+            throw new VenueRouteTransportException(
+                    "venue QueryOrderStatus transport failure orderId=" + orderId + " symbol=" + instrumentSymbol, e);
+        }
+        return response.getLiveness();
     }
 
     private Optional<ExecutionReport> acceptedExecutionReport(

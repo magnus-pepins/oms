@@ -13,6 +13,7 @@ public final class OmsVenueGrpcMetrics {
     public static final String RPC_ROUTE_ORDER = "route_order";
     public static final String RPC_ROUTE_CANCEL = "route_cancel";
     public static final String RPC_ROUTE_REPLACE = "route_replace";
+    public static final String RPC_QUERY_ORDER_STATUS = "query_order_status";
 
     private OmsVenueGrpcMetrics() {}
 

@@ -358,6 +358,40 @@ public class OrdersRepository {
         return jdbc.query(SELECT_DESK_ACTIVE_SNAPSHOT_SQL, params, DESK_SNAPSHOT_ROW_MAPPER);
     }
 
+    /** Minimal projection for venue order-state reconciliation. */
+    public record VenueReconcileCandidate(UUID id, String instrumentSymbol, int version) {}
+
+    private static final RowMapper<VenueReconcileCandidate> VENUE_RECONCILE_ROW_MAPPER = (rs, rowNum) ->
+            new VenueReconcileCandidate(
+                    (UUID) rs.getObject("id"),
+                    rs.getString("instrument_symbol"),
+                    rs.getInt("version"));
+
+    // WORKING = confirmed live at the venue (set on venue-new ack). Bounded by accepted_at so the
+    // reconciler only ever looks at orders old enough that an in-flight venue fill would already have
+    // propagated back through the resolver — see OmsConfig.Cluster.VenueReconciler#minOrderAgeMs.
+    // Oldest-first so a capped pass drains the longest-standing potential orphans first.
+    private static final String SELECT_VENUE_RECONCILE_CANDIDATES_SQL = """
+            SELECT id, instrument_symbol, version
+            FROM orders
+            WHERE status = 'WORKING'
+              AND accepted_at IS NOT NULL
+              AND accepted_at < :older_than
+            ORDER BY accepted_at ASC
+            LIMIT :limit
+            """;
+
+    /**
+     * WORKING orders whose {@code accepted_at} is older than {@code olderThan}, oldest first, capped
+     * at {@code limit}. The caller filters to venue-routed symbols and queries the venue for each.
+     */
+    public List<VenueReconcileCandidate> findWorkingVenueReconcileCandidates(Instant olderThan, int limit) {
+        var params = new MapSqlParameterSource()
+                .addValue("older_than", Timestamp.from(olderThan))
+                .addValue("limit", limit);
+        return jdbc.query(SELECT_VENUE_RECONCILE_CANDIDATES_SQL, params, VENUE_RECONCILE_ROW_MAPPER);
+    }
+
     /**
      * Terminal-orders snapshot for the trading desk blotter, date-windowed. The window's lower
      * bound is enforced by the caller (DeskSnapshotController clamps to snapshot-max-age-hours);

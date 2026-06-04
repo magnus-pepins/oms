@@ -12,6 +12,12 @@ service VenueOrderService {
   rpc RouteReplace(RouteReplaceRequest) returns (RouteReplaceResponse);
   rpc StreamExecutionReports(StreamExecutionReportsRequest) returns (stream ExecutionReport);
   rpc StreamQuotes(StreamQuotesRequest) returns (stream QuoteUpdate);
+  // Golden-copy point liveness query: "is this order (by oms_order_id) still resting in the
+  // book right now?" Answered from the authoritative in-cluster matching state, not the Postgres
+  // mirror. Used by OMS startup / periodic order-state reconciliation to detect and terminate
+  // orders OMS believes are WORKING but the venue has dropped (e.g. rejected on replay after a
+  // matching-semantics change). See system-documentation/plans/oms-internal-venue-and-prediction-market.md.
+  rpc QueryOrderStatus(QueryOrderStatusRequest) returns (QueryOrderStatusResponse);
 }
 
 message RouteOrderRequest {
@@ -86,4 +92,27 @@ message QuoteUpdate {
   int64 bid_scaled = 2;
   int64 ask_scaled = 3;
   int64 published_at_nanos = 4;
+}
+
+message QueryOrderStatusRequest {
+  string oms_order_id = 1;
+  string instrument_symbol = 2;
+}
+
+message QueryOrderStatusResponse {
+  string oms_order_id = 1;
+  OrderLiveness liveness = 2;
+  // Meaningful only when liveness == ORDER_LIVENESS_LIVE; 0 otherwise.
+  int64 remaining_qty_scaled = 3;
+  int64 limit_price_scaled = 4;
+}
+
+enum OrderLiveness {
+  ORDER_LIVENESS_UNSPECIFIED = 0;
+  // The order is currently resting in the canonical book for its symbol.
+  ORDER_LIVENESS_LIVE = 1;
+  // The order is not resting: it filled, was cancelled, was rejected (including on replay), or was
+  // never known to this venue. The venue does not retain terminal order history, so these cases are
+  // indistinguishable here; the caller disambiguates using its own order state + an age gate.
+  ORDER_LIVENESS_NOT_LIVE = 2;
 }

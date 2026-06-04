@@ -3164,12 +3164,14 @@ public class OmsConfig {
         private final FixEgress fixEgress = new FixEgress();
         private final VenueEgress venueEgress = new VenueEgress();
         private final VenueResolver venueResolver = new VenueResolver();
+        private final VenueReconciler venueReconciler = new VenueReconciler();
 
         public Client getClient() { return client; }
         public Projector getProjector() { return projector; }
         public FixEgress getFixEgress() { return fixEgress; }
         public VenueEgress getVenueEgress() { return venueEgress; }
         public VenueResolver getVenueResolver() { return venueResolver; }
+        public VenueReconciler getVenueReconciler() { return venueReconciler; }
 
         /**
          * Phase 3 of the Aeron Cluster substrate plan: configuration for the
@@ -3459,6 +3461,63 @@ public class OmsConfig {
             public long getOfferTimeoutMs() { return offerTimeoutMs; }
             public void setOfferTimeoutMs(long offerTimeoutMs) {
                 this.offerTimeoutMs = Math.max(1_000L, offerTimeoutMs);
+            }
+        }
+
+        /**
+         * Golden-copy order-state reconciliation against the in-house venue. On the
+         * {@code oms-venue-egress} JVM (which already holds the venue gRPC stub and the cluster
+         * ingress client), the {@code VenueOrderReconciler} periodically asks the venue — the
+         * authoritative source for resting-order state — which of OMS's WORKING venue-routed orders
+         * are still live, and terminates the ones the venue has dropped (e.g. rejected on replay
+         * after a matching-semantics change), so OMS state self-heals instead of drifting.
+         *
+         * <p>{@link #minOrderAgeMs} is the race guard: a venue fill propagates to OMS via the
+         * resolver tail, so only orders that have been WORKING longer than the resolver's worst-case
+         * lag are reconciled. A still-WORKING order older than that, which the venue reports NOT_LIVE,
+         * has no in-flight fill and is a genuine orphan.
+         */
+        public static class VenueReconciler {
+
+            private static final long DEFAULT_POLL_INTERVAL_MS = 60_000L;
+            private static final long DEFAULT_INITIAL_DELAY_MS = 15_000L;
+            private static final long DEFAULT_MIN_ORDER_AGE_MS = 120_000L;
+            private static final int DEFAULT_MAX_ORDERS_PER_PASS = 200;
+            private static final long DEFAULT_QUERY_TIMEOUT_MS = 5_000L;
+
+            private boolean enabled = false;
+            private long pollIntervalMs = DEFAULT_POLL_INTERVAL_MS;
+            private long initialDelayMs = DEFAULT_INITIAL_DELAY_MS;
+            private long minOrderAgeMs = DEFAULT_MIN_ORDER_AGE_MS;
+            private int maxOrdersPerPass = DEFAULT_MAX_ORDERS_PER_PASS;
+            private long queryTimeoutMs = DEFAULT_QUERY_TIMEOUT_MS;
+
+            public boolean isEnabled() { return enabled; }
+            public void setEnabled(boolean enabled) { this.enabled = enabled; }
+
+            public long getPollIntervalMs() { return pollIntervalMs; }
+            public void setPollIntervalMs(long pollIntervalMs) {
+                this.pollIntervalMs = Math.max(1_000L, pollIntervalMs);
+            }
+
+            public long getInitialDelayMs() { return initialDelayMs; }
+            public void setInitialDelayMs(long initialDelayMs) {
+                this.initialDelayMs = Math.max(0L, initialDelayMs);
+            }
+
+            public long getMinOrderAgeMs() { return minOrderAgeMs; }
+            public void setMinOrderAgeMs(long minOrderAgeMs) {
+                this.minOrderAgeMs = Math.max(0L, minOrderAgeMs);
+            }
+
+            public int getMaxOrdersPerPass() { return maxOrdersPerPass; }
+            public void setMaxOrdersPerPass(int maxOrdersPerPass) {
+                this.maxOrdersPerPass = Math.max(1, maxOrdersPerPass);
+            }
+
+            public long getQueryTimeoutMs() { return queryTimeoutMs; }
+            public void setQueryTimeoutMs(long queryTimeoutMs) {
+                this.queryTimeoutMs = Math.max(100L, queryTimeoutMs);
             }
         }
 

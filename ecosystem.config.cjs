@@ -311,14 +311,12 @@ const COMMON_ENV = {
   // below — same pattern as OMS_FX_AUTO_HEDGER_ENGINE_ENABLED so the gauges
   // are published from a single source and don't double-tick.
 
-  // Phase 1.5 FX mid subscriber. When 'true', OmsFxMidSubscriber connects to
-  // EMQX on EMQX_MQTT_BROKER_URL (defaults to tcp://127.0.0.1:1883) and
-  // subscribes to fx/+/+/quote, replacing FxQuoteService.STUB_MIDS with live
-  // PB mids. Falls back to STUB_MIDS when the subscriber is absent or stale.
-  // Enabled on the bench once the Massive websocket plan was active (2026-05-19).
-  OMS_FX_MID_SUBSCRIBER_ENABLED: 'true',
-  // Maps to Spring property oms.fx.mid-subscriber.enabled via the
-  // SPRING_APPLICATION_JSON below.
+  // Phase 1.5 FX mid subscriber — default OFF in COMMON_ENV. Each EMQX subscription to
+  // fx/+/+/quote receives every live FX tick; enabling this on every JVM that inherits
+  // COMMON_ENV (ingress + both egress roles + fix-ingress) multiplied broker fan-out ~5×
+  // and pegged EMQX CPU on pop. Enable only on JVMs that actually consume mids:
+  //   oms-ingress (FxQuoteService) and oms-postgres-projector (customer-quote tick).
+  OMS_FX_MID_SUBSCRIBER_ENABLED: 'false',
 
   // Hedge event publisher: emits fx/hedge/event on every fx_hedge_actions
   // status change so the trading-desk Treasury page streams the audit row
@@ -482,6 +480,8 @@ const apps = [
       // §8.3 — tier MQTT publisher runs on this role ONLY (single instance).
       OMS_FX_CUSTOMER_QUOTE_PUBLISHER_ENABLED: 'true',
       OMS_FX_CUSTOMER_QUOTE_PUBLISHER_TIERS: 'basic,premium,elite,admin,business',
+      // Live vendor mids for the tier MQTT tick (pairs with customer-quote publisher).
+      OMS_FX_MID_SUBSCRIBER_ENABLED: 'true',
       // Auto-hedger engine (plan B1): advisory drift + recommendations only.
       // Do NOT set on oms-ingress — duplicate ENGINE_ENABLED=true on two JVMs
       // can double-insert recommendations. auto-fire stays off (plan B1.3).
@@ -577,6 +577,8 @@ const apps = [
       OMS_VENUE_SYMBOL_PREFIX: 'PREDMKT',
       OMS_VENUE_ADMISSION_GATE_ENABLED: 'true',
       OMS_VENUE_ADMISSION_GATE_MAX_LAG_BYTES: '4096',
+      // Sole HTTP order-accept JVM that needs live FX mids (FxQuoteService).
+      OMS_FX_MID_SUBSCRIBER_ENABLED: 'true',
     },
     ...COMMON_PM2,
   },

@@ -28,13 +28,18 @@ public class PredictionMarketContractRepository {
             BigDecimal payoutPerContract,
             Instant closesAt,
             Instant resolvesAt,
-            List<String> jurisdictionTags) {}
+            List<String> jurisdictionTags,
+            String category,
+            List<String> tags,
+            String cardImageUrl,
+            int displayOrder) {}
 
     private static final String SELECT_COLUMNS =
             """
                     id, slug, title, yes_symbol, no_symbol, description, resolution_criteria,
                     reference_links, resolution_source, status, settlement_currency, tick_size,
-                    payout_per_contract, closes_at, resolves_at, jurisdiction_tags
+                    payout_per_contract, closes_at, resolves_at, jurisdiction_tags,
+                    category, tags, card_image_url, display_order
                     """;
 
     private static final String LIST_OPEN =
@@ -42,7 +47,7 @@ public class PredictionMarketContractRepository {
                     SELECT %s
                     FROM prediction_market_contract
                     WHERE status = 'OPEN'
-                    ORDER BY closes_at NULLS LAST, id
+                    ORDER BY display_order ASC, id ASC
                     """
                     .formatted(SELECT_COLUMNS);
 
@@ -174,19 +179,25 @@ public class PredictionMarketContractRepository {
             BigDecimal payoutPerContract,
             Instant closesAt,
             Instant resolvesAt,
-            List<String> jurisdictionTags) {
+            List<String> jurisdictionTags,
+            String category,
+            List<String> tags,
+            String cardImageUrl,
+            int displayOrder) {
         Long id =
                 jdbc.queryForObject(
                         """
                                 INSERT INTO prediction_market_contract (
                                     slug, title, yes_symbol, no_symbol, description, resolution_criteria,
                                     reference_links, resolution_source, status, settlement_currency,
-                                    tick_size, payout_per_contract, closes_at, resolves_at, jurisdiction_tags
+                                    tick_size, payout_per_contract, closes_at, resolves_at, jurisdiction_tags,
+                                    category, tags, card_image_url, display_order
                                 ) VALUES (
                                     :slug, :title, :yesSymbol, :noSymbol, :description, :resolutionCriteria,
                                     CAST(:referenceLinks AS JSONB), :resolutionSource, :status,
                                     :settlementCurrency, :tickSize, :payoutPerContract, :closesAt, :resolvesAt,
-                                    CAST(:jurisdictionTags AS JSONB)
+                                    CAST(:jurisdictionTags AS JSONB), :category, CAST(:tags AS JSONB),
+                                    :cardImageUrl, :displayOrder
                                 )
                                 RETURNING id
                                 """,
@@ -205,7 +216,11 @@ public class PredictionMarketContractRepository {
                                 payoutPerContract,
                                 closesAt,
                                 resolvesAt,
-                                jurisdictionTags),
+                                jurisdictionTags,
+                                category,
+                                tags,
+                                cardImageUrl,
+                                displayOrder),
                         Long.class);
         return findById(id).orElseThrow();
     }
@@ -223,7 +238,11 @@ public class PredictionMarketContractRepository {
             BigDecimal payoutPerContract,
             Instant closesAt,
             Instant resolvesAt,
-            List<String> jurisdictionTags) {
+            List<String> jurisdictionTags,
+            String category,
+            List<String> tags,
+            String cardImageUrl,
+            int displayOrder) {
         jdbc.update(
                 """
                         UPDATE prediction_market_contract
@@ -238,7 +257,11 @@ public class PredictionMarketContractRepository {
                             payout_per_contract = :payoutPerContract,
                             closes_at = :closesAt,
                             resolves_at = :resolvesAt,
-                            jurisdiction_tags = CAST(:jurisdictionTags AS JSONB)
+                            jurisdiction_tags = CAST(:jurisdictionTags AS JSONB),
+                            category = :category,
+                            tags = CAST(:tags AS JSONB),
+                            card_image_url = :cardImageUrl,
+                            display_order = :displayOrder
                         WHERE id = :id
                         """,
                 bindWrite(
@@ -256,7 +279,11 @@ public class PredictionMarketContractRepository {
                                 payoutPerContract,
                                 closesAt,
                                 resolvesAt,
-                                jurisdictionTags)
+                                jurisdictionTags,
+                                category,
+                                tags,
+                                cardImageUrl,
+                                displayOrder)
                         .addValue("id", id));
         return findById(id).orElseThrow();
     }
@@ -276,7 +303,11 @@ public class PredictionMarketContractRepository {
             BigDecimal payoutPerContract,
             Instant closesAt,
             Instant resolvesAt,
-            List<String> jurisdictionTags) {
+            List<String> jurisdictionTags,
+            String category,
+            List<String> tags,
+            String cardImageUrl,
+            int displayOrder) {
         MapSqlParameterSource params = new MapSqlParameterSource();
         if (slug != null) {
             params.addValue("slug", slug);
@@ -309,6 +340,13 @@ public class PredictionMarketContractRepository {
                         jurisdictionTags == null
                                 ? PredictionMarketJurisdictionTags.empty()
                                 : jurisdictionTags));
+        params.addValue("category", category);
+        params.addValue(
+                "tags",
+                PredictionMarketCatalogTags.toJson(
+                        tags == null ? PredictionMarketCatalogTags.empty() : tags));
+        params.addValue("cardImageUrl", cardImageUrl);
+        params.addValue("displayOrder", displayOrder);
         return params;
     }
 
@@ -331,6 +369,10 @@ public class PredictionMarketContractRepository {
                 rs.getBigDecimal("payout_per_contract"),
                 closes == null ? null : closes.toInstant(),
                 resolves == null ? null : resolves.toInstant(),
-                PredictionMarketJurisdictionTags.fromJson(rs.getString("jurisdiction_tags")));
+                PredictionMarketJurisdictionTags.fromJson(rs.getString("jurisdiction_tags")),
+                rs.getString("category"),
+                PredictionMarketCatalogTags.fromJson(rs.getString("tags")),
+                rs.getString("card_image_url"),
+                rs.getInt("display_order"));
     }
 }

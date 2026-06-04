@@ -55,7 +55,11 @@ class PredictionMarketContractRepositoryIntegrationTest {
                 new BigDecimal("1.00"),
                 Instant.parse("2030-01-01T00:00:00Z"),
                 null,
-                List.of());
+                List.of(),
+                null,
+                List.of(),
+                null,
+                0);
 
         var rows = repository.listAll(null);
 
@@ -83,7 +87,11 @@ class PredictionMarketContractRepositoryIntegrationTest {
                 new BigDecimal("1.00"),
                 Instant.parse("2030-06-01T00:00:00Z"),
                 null,
-                List.of());
+                List.of(),
+                null,
+                List.of(),
+                null,
+                0);
 
         assertThat(repository.listAll("OPEN")).allMatch(r -> "OPEN".equals(r.status()));
         assertThat(repository.listAll("CLOSED")).anyMatch(r -> slug.equals(r.slug()));
@@ -109,7 +117,11 @@ class PredictionMarketContractRepositoryIntegrationTest {
                 new BigDecimal("1.00"),
                 null,
                 null,
-                List.of());
+                List.of(),
+                null,
+                List.of(),
+                null,
+                0);
 
         assertThat(repository.listAll("   ")).anyMatch(r -> slug.equals(r.slug()));
     }
@@ -148,7 +160,11 @@ class PredictionMarketContractRepositoryIntegrationTest {
                         new BigDecimal("1.00"),
                         Instant.parse("2030-01-15T12:00:00Z"),
                         Instant.parse("2030-01-16T12:00:00Z"),
-                        List.of("SE", "LV"));
+                        List.of("SE", "LV"),
+                        "Politics",
+                        List.of("election", "eu"),
+                        "https://cdn.example.com/card.png",
+                        42);
 
         assertThat(repository.findBySlug(slug))
                 .isPresent()
@@ -160,6 +176,70 @@ class PredictionMarketContractRepositoryIntegrationTest {
                     assertThat(r.referenceLinks().getFirst().url()).isEqualTo("https://example.com/article");
                     assertThat(r.resolvesAt()).isEqualTo(inserted.resolvesAt());
                     assertThat(r.jurisdictionTags()).containsExactly("SE", "LV");
+                    assertThat(r.category()).isEqualTo("Politics");
+                    assertThat(r.tags()).containsExactly("election", "eu");
+                    assertThat(r.cardImageUrl()).isEqualTo("https://cdn.example.com/card.png");
+                    assertThat(r.displayOrder()).isEqualTo(42);
                 });
+    }
+
+    @Test
+    void listOpen_ordersByDisplayOrderThenId() {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        repository.insert(
+                "sort-b-" + suffix,
+                "Sort B",
+                "PREDMKT-SB-" + suffix,
+                "PREDMKT-SB-" + suffix + "-NO",
+                null,
+                null,
+                List.of(),
+                "it",
+                "OPEN",
+                "USD",
+                new BigDecimal("0.01"),
+                new BigDecimal("1.00"),
+                null,
+                null,
+                List.of(),
+                null,
+                List.of(),
+                null,
+                20);
+        repository.insert(
+                "sort-a-" + suffix,
+                "Sort A",
+                "PREDMKT-SA-" + suffix,
+                "PREDMKT-SA-" + suffix + "-NO",
+                null,
+                null,
+                List.of(),
+                "it",
+                "OPEN",
+                "USD",
+                new BigDecimal("0.01"),
+                new BigDecimal("1.00"),
+                null,
+                null,
+                List.of(),
+                null,
+                List.of(),
+                null,
+                10);
+
+        var open = repository.listOpen();
+        int idxA = -1;
+        int idxB = -1;
+        for (int i = 0; i < open.size(); i++) {
+            if (open.get(i).slug().equals("sort-a-" + suffix)) {
+                idxA = i;
+            }
+            if (open.get(i).slug().equals("sort-b-" + suffix)) {
+                idxB = i;
+            }
+        }
+        assertThat(idxA).isGreaterThanOrEqualTo(0);
+        assertThat(idxB).isGreaterThanOrEqualTo(0);
+        assertThat(idxA).isLessThan(idxB);
     }
 }

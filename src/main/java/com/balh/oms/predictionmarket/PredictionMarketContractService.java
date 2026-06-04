@@ -46,6 +46,10 @@ public class PredictionMarketContractService {
             Instant closesAt,
             Instant resolvesAt,
             List<String> jurisdictionTags,
+            String category,
+            List<String> tags,
+            String cardImageUrl,
+            Integer displayOrder,
             String status) {}
 
     public record UpdateRequest(
@@ -60,6 +64,10 @@ public class PredictionMarketContractService {
             Instant closesAt,
             Instant resolvesAt,
             List<String> jurisdictionTags,
+            String category,
+            List<String> tags,
+            String cardImageUrl,
+            Integer displayOrder,
             String status) {}
 
     public PredictionMarketContractRepository.ContractRow create(CreateRequest req) {
@@ -82,6 +90,11 @@ public class PredictionMarketContractService {
                 PredictionMarketReferenceLinks.normalize(req.referenceLinks());
         List<String> jurisdictionTags =
                 PredictionMarketJurisdictionTags.normalize(req.jurisdictionTags());
+        String category = PredictionMarketCatalogPresentation.normalizeCategory(req.category());
+        List<String> tags = PredictionMarketCatalogTags.normalize(req.tags());
+        String cardImageUrl =
+                PredictionMarketCatalogPresentation.normalizeCardImageUrl(req.cardImageUrl());
+        int displayOrder = PredictionMarketCatalogPresentation.normalizeDisplayOrder(req.displayOrder());
         PredictionMarketContractRepository.ContractRow row =
                 repository.insert(
                         slug,
@@ -98,7 +111,11 @@ public class PredictionMarketContractService {
                         payout,
                         req.closesAt(),
                         req.resolvesAt(),
-                        jurisdictionTags);
+                        jurisdictionTags,
+                        category,
+                        tags,
+                        cardImageUrl,
+                        displayOrder);
         if (shouldSyncVenueRegistry(status)) {
             venueRegistry.syncContract(row);
         }
@@ -161,6 +178,25 @@ public class PredictionMarketContractService {
                                             ? PredictionMarketJurisdictionTags.normalize(
                                                     req.jurisdictionTags())
                                             : existing.jurisdictionTags();
+                            String category =
+                                    req.category() != null
+                                            ? PredictionMarketCatalogPresentation.normalizeCategory(
+                                                    req.category())
+                                            : existing.category();
+                            List<String> tags =
+                                    req.tags() != null
+                                            ? PredictionMarketCatalogTags.normalize(req.tags())
+                                            : existing.tags();
+                            String cardImageUrl =
+                                    req.cardImageUrl() != null
+                                            ? PredictionMarketCatalogPresentation.normalizeCardImageUrl(
+                                                    req.cardImageUrl())
+                                            : existing.cardImageUrl();
+                            int displayOrder =
+                                    req.displayOrder() != null
+                                            ? PredictionMarketCatalogPresentation.normalizeDisplayOrder(
+                                                    req.displayOrder())
+                                            : existing.displayOrder();
                             PredictionMarketContractRepository.ContractRow updated =
                                     repository.update(
                                             id,
@@ -175,7 +211,11 @@ public class PredictionMarketContractService {
                                             payout,
                                             closesAt,
                                             resolvesAt,
-                                            jurisdictionTags);
+                                            jurisdictionTags,
+                                            category,
+                                            tags,
+                                            cardImageUrl,
+                                            displayOrder);
                             syncVenueRegistryAfterUpdate(existing, updated);
                             return updated;
                         });

@@ -44,7 +44,11 @@ class PredictionMarketContractServiceTest {
                         before.payoutPerContract(),
                         before.closesAt(),
                         before.resolvesAt(),
-                        before.jurisdictionTags());
+                        before.jurisdictionTags(),
+                        before.category(),
+                        before.tags(),
+                        before.cardImageUrl(),
+                        before.displayOrder());
         assertFalse(PredictionMarketContractService.requiresVenueRegistrySync(before, after));
     }
 
@@ -83,7 +87,11 @@ class PredictionMarketContractServiceTest {
                         before.payoutPerContract(),
                         before.closesAt(),
                         before.resolvesAt(),
-                        before.jurisdictionTags());
+                        before.jurisdictionTags(),
+                        before.category(),
+                        before.tags(),
+                        before.cardImageUrl(),
+                        before.displayOrder());
         assertTrue(PredictionMarketContractService.requiresVenueRegistrySync(before, after));
     }
 
@@ -105,6 +113,10 @@ class PredictionMarketContractServiceTest {
                 new BigDecimal("1.00"),
                 null,
                 null,
-                List.of("SE"));
+                List.of("SE"),
+                null,
+                List.of(),
+                null,
+                0);
     }
 }

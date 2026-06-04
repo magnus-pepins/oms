@@ -39,8 +39,13 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -207,6 +212,14 @@ public class OmsVenueEgressService {
      */
     private int cursorFlushEvery = 1;
 
+    /**
+     * Design A pipeline (slice: venue egress pipelining). Non-null only when
+     * {@code oms.cluster.venue-egress.venue-route-max-in-flight > 1} <em>and</em> the venue clients
+     * are wired. When null, the replay loop runs the exact pre-pipelining serial path. Owned by the
+     * replay thread; see {@link EgressRoutePipeline}.
+     */
+    private EgressRoutePipeline pipeline;
+
     // Slice 4l H2 batched-flush bookkeeping. Single-writer (replay thread) for the increment;
     // the shutdown final flush also runs on the replay thread (in replayLoop's finally block),
     // so plain ints/longs are safe. lastAppliedPosition stays atomic because lastAppliedPosition()
@@ -342,6 +355,14 @@ public class OmsVenueEgressService {
         // belt-and-braces clamp here to fail closed on pathological injection.
         cursorFlushEvery = Math.max(1, config.getCluster().getVenueEgress().getCursorFlushEvery());
         boolean venueWired = venueRouteOrderClient != null && clusterIngressClient != null;
+        int maxInFlight = Math.max(1, config.getCluster().getVenueEgress().getVenueRouteMaxInFlight());
+        if (venueWired && maxInFlight > 1) {
+            pipeline = new EgressRoutePipeline(maxInFlight);
+            log.info(
+                    "oms-venue-egress pipelined RouteOrderStream active: venueRouteMaxInFlight={} (cursor advances over the contiguous-completed prefix; crash redelivery window <= {} RouteOrders, deduped by the venue)",
+                    maxInFlight,
+                    maxInFlight);
+        }
         if (savedCursor.isPresent()) {
             log.info(
                     "oms-venue-egress starting ({}); resuming from recording {} at log position {} (egressId={}, streamId={}); cursorFlushEvery={}",
@@ -391,6 +412,9 @@ public class OmsVenueEgressService {
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
+        }
+        if (pipeline != null) {
+            pipeline.shutdown();
         }
     }
 
@@ -728,8 +752,21 @@ public class OmsVenueEgressService {
 
                 while (running.get()) {
                     int polled = replay.poll(handler, cfg.getFragmentLimit());
+                    if (pipeline != null) {
+                        // Advance the persisted cursor over any newly-contiguous completed routes.
+                        pipeline.drainContiguous();
+                    }
                     if (polled > 0) {
                         continue;
+                    }
+                    if (pipeline != null) {
+                        // Before any recording-boundary decision, fully quiesce in-flight routes and
+                        // advance the cursor to the drained position. This keeps the recording-walk's
+                        // (recording_id, position) invariant intact — we never roll forward to a
+                        // successor recording with routes still outstanding against the current one.
+                        if (!pipeline.quiesce()) {
+                            return; // shutdown requested during drain
+                        }
                     }
                     // No fragments. Three cases — mirrors OmsPostgresProjector.runReplayLoopWithRecordingWalk:
                     //   (a) live-tail wait on the cluster's currently-active recording — park.
@@ -1027,6 +1064,10 @@ public class OmsVenueEgressService {
                 io.aeron.logbuffer.Header header) {
             int typeId = buffer.getInt(offset + OmsClusterWireFormat.HEADER_TYPE_ID_OFFSET);
             long newPosition = header.position();
+            if (pipeline != null) {
+                pipeline.onFragment(typeId, buffer, offset, length, newPosition);
+                return;
+            }
             boolean advanced;
             try {
                 switch (typeId) {
@@ -1284,5 +1325,249 @@ public class OmsVenueEgressService {
             eventsSinceCursorFlush = 0;
         }
         return true;
+    }
+
+    /**
+     * Pipelined-mode cursor advance: persists the contiguous-completed prefix immediately (no batched
+     * deferral — the in-flight window already bounds how often this fires, ≤ once per poll batch). The
+     * in-flight window <em>is</em> the durability boundary, so the persisted position is exactly the
+     * highest fragment whose route + ER-submit fully completed. Runs only on the replay thread, so it
+     * shares the same single-writer guarantee as {@link #advanceCursor} for {@code
+     * pendingCursorPosition} / {@code eventsSinceCursorFlush} / {@code currentRecordingId}.
+     */
+    private void advanceCursorContiguous(long position) {
+        lastAppliedPosition.set(position);
+        pendingCursorPosition = position;
+        eventsSinceCursorFlush = 0;
+        cursorRepository.advanceWithRecording(
+                EGRESS_ID,
+                OmsClusterWireFormat.EVENTS_STREAM_ID,
+                requireCurrentRecordingId(),
+                position);
+    }
+
+    /**
+     * Design A pipeline: dispatches venue {@code RouteOrder}s over the ordered {@code RouteOrderStream}
+     * in cluster-log order (preserving venue price-time priority), completes acks asynchronously, and
+     * lets the replay thread advance the persisted cursor only over the contiguous-completed prefix
+     * (via {@link EgressCompletionTracker}). See
+     * {@code system-documentation/plans/oms-venue-egress-pipelining.md}.
+     *
+     * <h2>Ordering &amp; correctness</h2>
+     *
+     * <ul>
+     *   <li><strong>Venue priority.</strong> Venue-routed admits are written to the stream on the
+     *       replay thread in poll order ⇒ the venue cluster offers (hence assigns FIFO sequence) in
+     *       OMS admission order.</li>
+     *   <li><strong>Per-order ordering / non-admit fragments.</strong> Cancel/replace and any
+     *       non-venue / cursor-only fragment are <em>quiesce points</em>: the pipeline drains all
+     *       in-flight admits (advancing the cursor) before the fragment is applied synchronously via
+     *       the existing serial apply methods. So a cancel for order X can never reach the venue
+     *       before X's admit, and the cursor stays a contiguous prefix.</li>
+     *   <li><strong>Crash recovery.</strong> The cursor only advances over fully-completed fragments;
+     *       in-flight fragments beyond the prefix are replayed on restart (≤ {@code maxInFlight}
+     *       duplicate RouteOrders, deduped by the venue) — the same at-least-once-at-venue contract
+     *       the serial path documents for {@code cursorFlushEvery}.</li>
+     * </ul>
+     */
+    private final class EgressRoutePipeline {
+
+        /** Park between non-progress passes while quiescing the in-flight window. */
+        private static final long QUIESCE_PARK_NANOS = 50_000L;
+
+        private final Semaphore permits;
+        private final EgressCompletionTracker tracker = new EgressCompletionTracker();
+        private final java.util.concurrent.Executor completionExecutor;
+        private final ExecutorService ownedExecutor;
+
+        EgressRoutePipeline(int maxInFlight) {
+            // Sized to the in-flight window so the per-ack OMS-cluster ApplyExecutionReport submits run
+            // concurrently (the OmsClusterIngressClient is pipelined) instead of re-serialising on one
+            // thread. Concurrent completions are safe: submit* is thread-safe and the cursor is advanced
+            // only on the replay thread (drainContiguous / quiesce), never here.
+            this.permits = new Semaphore(maxInFlight);
+            java.util.concurrent.atomic.AtomicLong seq = new java.util.concurrent.atomic.AtomicLong();
+            ExecutorService pool =
+                    Executors.newFixedThreadPool(
+                            maxInFlight,
+                            r -> {
+                                Thread t = new Thread(r, "oms-venue-egress-completion-" + seq.getAndIncrement());
+                                t.setDaemon(true);
+                                return t;
+                            });
+            this.completionExecutor = pool;
+            this.ownedExecutor = pool;
+        }
+
+        /** Test seam: inject a (typically caller-runs) executor for deterministic completion. */
+        EgressRoutePipeline(int maxInFlight, java.util.concurrent.Executor completionExecutor) {
+            this.permits = new Semaphore(maxInFlight);
+            this.completionExecutor = completionExecutor;
+            this.ownedExecutor = null;
+        }
+
+        /** Called on the replay thread for each polled fragment, in cluster-log order. */
+        void onFragment(int typeId, org.agrona.DirectBuffer buffer, int offset, int length, long newPosition) {
+            if (typeId == OmsClusterWireFormat.TYPE_ID_ORDER_ADMITTED) {
+                OrderAdmittedEvent ev = OrderAdmittedEvent.decode(buffer, offset, length);
+                if (venueRouteOrderClient != null
+                        && clusterIngressClient != null
+                        && VenueRoutingSymbols.routesToInternalVenue(config, ev.instrumentSymbol())) {
+                    dispatchAdmitAsync(ev, newPosition);
+                    return;
+                }
+                // Non-venue admit: cursor-only, but still ordered behind in-flight routes.
+                applySyncAfterQuiesce(() -> applyAdmittedEvent(ev, newPosition), newPosition);
+                return;
+            }
+            applySyncAfterQuiesce(
+                    () -> applyNonAdmitFragmentSync(typeId, buffer, offset, length, newPosition), newPosition);
+        }
+
+        private void dispatchAdmitAsync(OrderAdmittedEvent ev, long newPosition) {
+            try {
+                permits.acquire();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return; // shutdown — fragment replays from the cursor on restart
+            }
+            tracker.register(newPosition);
+            CompletableFuture<Optional<com.balh.venue.grpc.v1.ExecutionReport>> future;
+            try {
+                future = venueRouteOrderClient.routeAdmittedOrderAsync(ev);
+            } catch (RuntimeException e) {
+                future = CompletableFuture.failedFuture(e);
+            }
+            future.whenCompleteAsync(
+                    (erOpt, err) -> {
+                        try {
+                            completeRoute(ev, erOpt, err);
+                        } finally {
+                            tracker.complete(newPosition);
+                            permits.release();
+                        }
+                    },
+                    completionExecutor);
+        }
+
+        /** Runs on the completion executor — applies the venue ack to the OMS cluster. */
+        private void completeRoute(
+                OrderAdmittedEvent ev,
+                Optional<com.balh.venue.grpc.v1.ExecutionReport> erOpt,
+                Throwable err) {
+            if (err != null) {
+                log.warn(
+                        "oms-venue-egress (pipelined): venue RouteOrder failed; submitting VENUE_REJECT: orderId={} symbol={}",
+                        ev.orderId(),
+                        ev.instrumentSymbol(),
+                        err);
+                submitVenueRouteFailedReject(
+                        ev.orderId(),
+                        "venue_route_transport_failed",
+                        ev.acceptedAtMillis(),
+                        ev.side(),
+                        ev.timeInForceCode());
+                return;
+            }
+            if (erOpt.isEmpty()) {
+                log.warn(
+                        "oms-venue-egress (pipelined): venue RouteOrder rejected (no ER); submitting VENUE_REJECT: orderId={} symbol={}",
+                        ev.orderId(),
+                        ev.instrumentSymbol());
+                submitVenueRouteFailedReject(
+                        ev.orderId(),
+                        "venue_route_rejected",
+                        ev.acceptedAtMillis(),
+                        ev.side(),
+                        ev.timeInForceCode());
+                return;
+            }
+            submitVenueExecutionReport(
+                    ev.orderId(), erOpt, ev.acceptedAtMillis(), ev.side(), ev.timeInForceCode());
+        }
+
+        private boolean applyNonAdmitFragmentSync(
+                int typeId, org.agrona.DirectBuffer buffer, int offset, int length, long newPosition) {
+            return switch (typeId) {
+                case OmsClusterWireFormat.TYPE_ID_ORDER_CANCEL_REQUESTED -> applyCancelRequestedEvent(
+                        OrderCancelRequestedEvent.decode(buffer, offset, length), newPosition);
+                case OmsClusterWireFormat.TYPE_ID_ORDER_REPLACE_REQUESTED -> applyReplaceRequestedEvent(
+                        OrderReplaceRequestedEvent.decode(buffer, offset, length), newPosition);
+                default -> applyCursorOnly(newPosition);
+            };
+        }
+
+        /**
+         * Drain all in-flight routes, then apply {@code syncApply} (a serial apply that advances the
+         * cursor inline). Used for every non-async fragment so it lands strictly after the routes that
+         * precede it. If shutdown is requested mid-drain the fragment is not applied and replays from
+         * the cursor on restart.
+         */
+        private void applySyncAfterQuiesce(java.util.function.BooleanSupplier syncApply, long newPosition) {
+            if (!quiesce()) {
+                return;
+            }
+            if (syncApply.getAsBoolean()) {
+                lastAppliedPosition.set(newPosition);
+            }
+        }
+
+        /** Non-blocking: advance the cursor over whatever contiguous prefix has completed since last call. */
+        void drainContiguous() {
+            OptionalLong contiguous = tracker.pollContiguous();
+            if (contiguous.isPresent()) {
+                advanceCursorContiguous(contiguous.getAsLong());
+            }
+        }
+
+        /**
+         * Block (advancing the cursor as completions arrive) until every dispatched route has completed
+         * and the cursor reflects the drained position. Returns {@code false} if shutdown was requested
+         * before the drain finished.
+         */
+        boolean quiesce() {
+            while (true) {
+                drainContiguous();
+                if (tracker.isDrained()) {
+                    return true;
+                }
+                if (!running.get()) {
+                    return false;
+                }
+                LockSupport.parkNanos(QUIESCE_PARK_NANOS);
+            }
+        }
+
+        void shutdown() {
+            if (ownedExecutor != null) {
+                ownedExecutor.shutdownNow();
+            }
+        }
+    }
+
+    // ---- Test seams for the pipeline (production drives it via init() + EgressFragmentHandler) ----
+
+    void enablePipelineForTesting(int maxInFlight, java.util.concurrent.Executor completionExecutor) {
+        this.pipeline = new EgressRoutePipeline(maxInFlight, completionExecutor);
+    }
+
+    void markRunningForTesting() {
+        running.set(true);
+    }
+
+    void pipelineDispatchAdmitForTesting(OrderAdmittedEvent ev, long newPosition) {
+        pipeline.dispatchAdmitAsync(ev, newPosition);
+    }
+
+    void pipelineDrainContiguousForTesting() {
+        pipeline.drainContiguous();
+    }
+
+    boolean pipelineQuiesceForTesting() {
+        return pipeline.quiesce();
+    }
+
+    boolean pipelineIsDrainedForTesting() {
+        return pipeline.tracker.isDrained();
     }
 }

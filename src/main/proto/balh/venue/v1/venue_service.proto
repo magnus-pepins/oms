@@ -8,6 +8,13 @@ option java_outer_classname = "VenueServiceProto";
 
 service VenueOrderService {
   rpc RouteOrder(RouteOrderRequest) returns (RouteOrderResponse);
+  // Pipelined, order-preserving variant of RouteOrder. The client writes RouteOrderRequests in
+  // admission order on one stream; the gateway offers each to the venue cluster in that stream
+  // order on a single thread, so cluster apply order (hence price-time priority) matches the
+  // client's send order. Acks return asynchronously on the response stream (correlate by
+  // oms_order_id, NOT by response order). One stream == one ordered cluster session. See
+  // system-documentation/plans/oms-venue-egress-pipelining.md.
+  rpc RouteOrderStream(stream RouteOrderRequest) returns (stream RouteOrderResponse);
   rpc RouteCancel(RouteCancelRequest) returns (RouteCancelResponse);
   rpc RouteReplace(RouteReplaceRequest) returns (RouteReplaceResponse);
   rpc StreamExecutionReports(StreamExecutionReportsRequest) returns (stream ExecutionReport);
@@ -33,6 +40,9 @@ message RouteOrderResponse {
   bool accepted = 1;
   string reject_reason = 2;
   ExecutionReport execution_report = 3;
+  // Always set, so the streaming caller can demux a response to its request even when there is no
+  // execution_report (reject). On the unary RouteOrder path this is redundant with the request.
+  string oms_order_id = 4;
 }
 
 message RouteCancelRequest {

@@ -3311,6 +3311,7 @@ public class OmsConfig {
             private static final long DEFAULT_RECORDING_LOOKUP_PARK_MS = 100L;
             private static final int DEFAULT_REPLAY_STREAM_ID = 4324;
             private static final int DEFAULT_CURSOR_FLUSH_EVERY = 1;
+            private static final int DEFAULT_VENUE_ROUTE_MAX_IN_FLIGHT = 1;
 
             private boolean enabled = false;
             private String aeronDirectory = "";
@@ -3322,6 +3323,7 @@ public class OmsConfig {
             private int fragmentLimit = DEFAULT_FRAGMENT_LIMIT;
             private long recordingLookupParkMs = DEFAULT_RECORDING_LOOKUP_PARK_MS;
             private int cursorFlushEvery = DEFAULT_CURSOR_FLUSH_EVERY;
+            private int venueRouteMaxInFlight = DEFAULT_VENUE_ROUTE_MAX_IN_FLIGHT;
 
             public boolean isEnabled() { return enabled; }
             public void setEnabled(boolean enabled) { this.enabled = enabled; }
@@ -3383,6 +3385,22 @@ public class OmsConfig {
             public int getCursorFlushEvery() { return cursorFlushEvery; }
             public void setCursorFlushEvery(int cursorFlushEvery) {
                 this.cursorFlushEvery = Math.max(1, cursorFlushEvery);
+            }
+
+            /**
+             * Max venue {@code RouteOrder}s the egress keeps in flight concurrently over the ordered
+             * {@code RouteOrderStream}. {@code 1} (default) is the exact pre-pipelining serial path
+             * (one fragment routed + ER-submitted + cursor-advanced before the next is dispatched);
+             * {@code >1} activates the pipeline: dispatch in cluster-log order (preserving venue
+             * price-time priority), complete acks asynchronously, and advance the cursor only over
+             * the contiguous-completed prefix. Wider value ⇒ higher OMS→venue throughput and a wider
+             * crash redelivery window (up to {@code N} duplicate {@code RouteOrder}s, deduped by the
+             * venue — same trade-off as {@link #getCursorFlushEvery()}). See
+             * {@code system-documentation/plans/oms-venue-egress-pipelining.md}.
+             */
+            public int getVenueRouteMaxInFlight() { return venueRouteMaxInFlight; }
+            public void setVenueRouteMaxInFlight(int venueRouteMaxInFlight) {
+                this.venueRouteMaxInFlight = Math.max(1, venueRouteMaxInFlight);
             }
         }
 

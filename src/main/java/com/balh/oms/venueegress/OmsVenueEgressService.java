@@ -1384,6 +1384,8 @@ public class OmsVenueEgressService {
         private final EgressCompletionTracker tracker = new EgressCompletionTracker();
         private final java.util.concurrent.Executor erSubmitExecutor;
         private final ExecutorService ownedErSubmitExecutor;
+        /** Serialises cursor persistence between the replay thread and ER-submit completions. */
+        private final Object contiguousDrainLock = new Object();
 
         EgressRoutePipeline(int maxInFlight) {
             this.maxInFlight = maxInFlight;
@@ -1485,6 +1487,9 @@ public class OmsVenueEgressService {
                                         completeRoute(ev, erOpt, err);
                                     } finally {
                                         tracker.complete(newPosition);
+                                        // Advance the persisted cursor promptly so VenueAdmissionGate
+                                        // does not confuse ER-submit backlog with a wedged egress.
+                                        drainContiguous();
                                     }
                                 });
                     });
@@ -1557,11 +1562,13 @@ public class OmsVenueEgressService {
             drainContiguous();
         }
 
-        /** Non-blocking: advance the cursor over whatever contiguous prefix has completed since last call. */
+        /** Advance the cursor over whatever contiguous prefix has completed since last call. */
         void drainContiguous() {
-            OptionalLong contiguous = tracker.pollContiguous();
-            if (contiguous.isPresent()) {
-                advanceCursorContiguous(contiguous.getAsLong());
+            synchronized (contiguousDrainLock) {
+                OptionalLong contiguous = tracker.pollContiguous();
+                if (contiguous.isPresent()) {
+                    advanceCursorContiguous(contiguous.getAsLong());
+                }
             }
         }
 

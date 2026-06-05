@@ -42,6 +42,11 @@
 #   OMS_BURST_LIMIT_PRICE    150
 #   OMS_BURST_REQUEST_TIMEOUT_S  30
 #   OMS_BURST_WARMUP         0      requests whose RTT is excluded from the HdrHistogram
+#   OMS_BURST_LEDGER_BALANCE_ID          (unset) single balance ID or CSV when using
+#                                        OMS_BURST_LEDGER_BALANCE_POOL_SIZE numeric mode
+#   OMS_BURST_LEDGER_BALANCE_POOL_SIZE   (unset) optional: CSV balance IDs, or integer N to
+#                                        use first N IDs from OMS_BURST_LEDGER_BALANCE_ID
+#   OMS_BURST_LEDGER_IDENTITY_ID         (unset) required when ledgerBalanceId is present
 
 set -euo pipefail
 

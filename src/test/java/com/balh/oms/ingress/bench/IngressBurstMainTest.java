@@ -148,6 +148,26 @@ final class IngressBurstMainTest {
                 IngressBurstMain.parseUrls(" http://a/o , http://b/o ,, http://c/o ", "ignored"));
     }
 
+    @Test
+    void parseLedgerBalancePool_acceptsCsvAndNumericPoolSize() {
+        assertEquals(
+                List.of("bal-1", "bal-2", "bal-3"),
+                IngressBurstMain.parseLedgerBalancePool("ignored-legacy", " bal-1, bal-2 , bal-3 "));
+        assertEquals(
+                List.of("bal-1", "bal-2"),
+                IngressBurstMain.parseLedgerBalancePool("bal-1,bal-2,bal-3", "2"));
+    }
+
+    @Test
+    void selectLedgerBalanceId_roundRobinsByRequestIndex() {
+        List<String> pool = List.of("bal-a", "bal-b", "bal-c");
+        assertEquals("bal-a", IngressBurstMain.selectLedgerBalanceId(pool, 0));
+        assertEquals("bal-b", IngressBurstMain.selectLedgerBalanceId(pool, 1));
+        assertEquals("bal-c", IngressBurstMain.selectLedgerBalanceId(pool, 2));
+        assertEquals("bal-a", IngressBurstMain.selectLedgerBalanceId(pool, 3));
+        assertEquals("bal-b", IngressBurstMain.selectLedgerBalanceId(pool, 4));
+    }
+
     private static HttpServer startStubServer(String apiKey, ConcurrentHashMap<Integer, AtomicInteger> seenByPort) throws IOException {
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         int port = server.getAddress().getPort();

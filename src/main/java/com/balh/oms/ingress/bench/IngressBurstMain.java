@@ -69,6 +69,11 @@ import java.util.concurrent.locks.LockSupport;
  *                                       path (sync HTTP at MAX_SIZE=1, async outbox at
  *                                       OMS_LEDGER_INFLIGHT_ASYNC_ENABLED=true). Requires
  *                                       OMS_BURST_LEDGER_IDENTITY_ID to be set as well.
+ *   OMS_BURST_LEDGER_BALANCE_POOL_SIZE
+ *                                (off)  optional round-robin pool for ledgerBalanceId.
+ *                                       Supports either comma-separated balance IDs directly,
+ *                                       or integer size N (uses first N IDs from
+ *                                       OMS_BURST_LEDGER_BALANCE_ID, which must then be CSV).
  *   OMS_BURST_LEDGER_IDENTITY_ID (off)  slice 4p: companion to OMS_BURST_LEDGER_BALANCE_ID.
  * </pre>
  *
@@ -111,6 +116,7 @@ public final class IngressBurstMain {
      * guard).
      */
     public static final String ENV_LEDGER_BALANCE_ID = "OMS_BURST_LEDGER_BALANCE_ID";
+    public static final String ENV_LEDGER_BALANCE_POOL_SIZE = "OMS_BURST_LEDGER_BALANCE_POOL_SIZE";
     /**
      * Slice 4p: optional ledgerIdentityId. Required by ingress when {@code ledgerBalanceId} is
      * set ({@code OrderIngressService.maybeVerifyLedgerBalanceBinding} returns a 400 otherwise).
@@ -129,6 +135,7 @@ public final class IngressBurstMain {
     public static final int DEFAULT_REQUEST_TIMEOUT_S = 30;
     public static final int DEFAULT_WARMUP = 0;
     public static final String DEFAULT_LEDGER_BALANCE_ID = "";
+    public static final String DEFAULT_LEDGER_BALANCE_POOL_SIZE = "";
     public static final String DEFAULT_LEDGER_IDENTITY_ID = "";
 
     /** Lossless histogram covers 100 µs .. 60 s with 3 sig digits — total memory ~1 MB. */
@@ -294,8 +301,9 @@ public final class IngressBurstMain {
                 .append("\"timeInForce\":\"DAY\"");
         // Slice 4p: opt-in inflight-hold exercise. Both fields are required by ingress when set
         // (Config validates the pairing); leaving them off preserves slice 4m/4n burst shape.
-        if (!cfg.ledgerBalanceId.isEmpty()) {
-            sb.append(",\"ledgerBalanceId\":\"").append(cfg.ledgerBalanceId).append('"')
+        String ledgerBalanceId = selectLedgerBalanceId(cfg.ledgerBalanceIds, requestIndex);
+        if (!ledgerBalanceId.isEmpty()) {
+            sb.append(",\"ledgerBalanceId\":\"").append(ledgerBalanceId).append('"')
               .append(",\"ledgerIdentityId\":\"").append(cfg.ledgerIdentityId).append('"');
         }
         sb.append('}');
@@ -341,10 +349,11 @@ public final class IngressBurstMain {
         public final int warmup;
         /**
          * Slice 4p. Empty when no hold path should be exercised; otherwise injected verbatim into
-         * every burst body (a single hold target is fine for benchmarking — the hold path locks
-         * by {@code (ledgerBalanceId, side)}, but burst sends BUY only).
+         * every burst body. With {@link #ENV_LEDGER_BALANCE_POOL_SIZE} set, burst requests
+         * round-robin over {@link #ledgerBalanceIds} to avoid single-balance OCC serialization.
          */
         public final String ledgerBalanceId;
+        public final List<String> ledgerBalanceIds;
         public final String ledgerIdentityId;
 
         public Config(
@@ -371,6 +380,7 @@ public final class IngressBurstMain {
                     requestTimeoutSeconds,
                     warmup,
                     DEFAULT_LEDGER_BALANCE_ID,
+                    DEFAULT_LEDGER_BALANCE_POOL_SIZE,
                     DEFAULT_LEDGER_IDENTITY_ID);
         }
 
@@ -398,6 +408,7 @@ public final class IngressBurstMain {
                     requestTimeoutSeconds,
                     warmup,
                     DEFAULT_LEDGER_BALANCE_ID,
+                    DEFAULT_LEDGER_BALANCE_POOL_SIZE,
                     DEFAULT_LEDGER_IDENTITY_ID);
         }
 
@@ -414,6 +425,7 @@ public final class IngressBurstMain {
                 int requestTimeoutSeconds,
                 int warmup,
                 String ledgerBalanceId,
+                String ledgerBalancePoolSpec,
                 String ledgerIdentityId) {
             if (apiKey == null || apiKey.isBlank()) {
                 throw new IllegalArgumentException("apiKey must be set (env " + ENV_API_KEY + ")");
@@ -457,12 +469,14 @@ public final class IngressBurstMain {
             // flight.
             String balance = ledgerBalanceId == null ? "" : ledgerBalanceId.trim();
             String identity = ledgerIdentityId == null ? "" : ledgerIdentityId.trim();
-            if (!balance.isEmpty() && identity.isEmpty()) {
+            List<String> balancePool = parseLedgerBalancePool(balance, ledgerBalancePoolSpec);
+            if (!balancePool.isEmpty() && identity.isEmpty()) {
                 throw new IllegalArgumentException(
                         ENV_LEDGER_BALANCE_ID + " was set but " + ENV_LEDGER_IDENTITY_ID
                                 + " is empty; ingress requires both when exercising the hold path");
             }
-            this.ledgerBalanceId = balance;
+            this.ledgerBalanceId = balancePool.isEmpty() ? "" : balancePool.get(0);
+            this.ledgerBalanceIds = Collections.unmodifiableList(new ArrayList<>(balancePool));
             this.ledgerIdentityId = identity;
         }
 
@@ -482,6 +496,7 @@ public final class IngressBurstMain {
                     parseInt(ENV_REQUEST_TIMEOUT_S, DEFAULT_REQUEST_TIMEOUT_S),
                     parseInt(ENV_WARMUP, DEFAULT_WARMUP),
                     envOrDefault(ENV_LEDGER_BALANCE_ID, DEFAULT_LEDGER_BALANCE_ID),
+                    envOrDefault(ENV_LEDGER_BALANCE_POOL_SIZE, DEFAULT_LEDGER_BALANCE_POOL_SIZE),
                     envOrDefault(ENV_LEDGER_IDENTITY_ID, DEFAULT_LEDGER_IDENTITY_ID));
         }
 
@@ -494,7 +509,7 @@ public final class IngressBurstMain {
                     + ", accountPool=" + accountPoolSize
                     + ", instrument=" + instrument
                     + ", warmup=" + warmup
-                    + ", ledgerBalanceId=" + (ledgerBalanceId.isEmpty() ? "(unset)" : ledgerBalanceId)
+                    + ", ledgerBalancePool=" + (ledgerBalanceIds.isEmpty() ? "(unset)" : ledgerBalanceIds)
                     + "}";
         }
     }
@@ -521,6 +536,69 @@ public final class IngressBurstMain {
             return Collections.singletonList(fallback);
         }
         return urls;
+    }
+
+    static List<String> parseLedgerBalancePool(String legacyBalanceIds, String poolSpec) {
+        String legacy = legacyBalanceIds == null ? "" : legacyBalanceIds.trim();
+        if (poolSpec == null || poolSpec.isBlank()) {
+            return parseCsvValues(legacy);
+        }
+        String trimmed = poolSpec.trim();
+        if (trimmed.indexOf(',') >= 0) {
+            List<String> explicit = parseCsvValues(trimmed);
+            if (explicit.isEmpty()) {
+                throw new IllegalArgumentException(
+                        ENV_LEDGER_BALANCE_POOL_SIZE + " was set but no balance IDs were parsed");
+            }
+            return explicit;
+        }
+        int parsedPoolSize = tryParsePositiveInt(trimmed);
+        if (parsedPoolSize > 0) {
+            List<String> fromLegacy = parseCsvValues(legacy);
+            if (fromLegacy.size() < parsedPoolSize) {
+                throw new IllegalArgumentException(
+                        ENV_LEDGER_BALANCE_POOL_SIZE + "=" + parsedPoolSize
+                                + " requires at least that many comma-separated IDs in "
+                                + ENV_LEDGER_BALANCE_ID + " (found " + fromLegacy.size() + ")");
+            }
+            return new ArrayList<>(fromLegacy.subList(0, parsedPoolSize));
+        }
+        if ("0".equals(trimmed)) {
+            throw new IllegalArgumentException(ENV_LEDGER_BALANCE_POOL_SIZE + " must be > 0 when numeric");
+        }
+        // Non-numeric non-CSV value: treat as a single explicit balance ID.
+        return List.of(trimmed);
+    }
+
+    static String selectLedgerBalanceId(List<String> balanceIds, int requestIndex) {
+        if (balanceIds == null || balanceIds.isEmpty()) {
+            return "";
+        }
+        return balanceIds.get(requestIndex % balanceIds.size());
+    }
+
+    private static List<String> parseCsvValues(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return Collections.emptyList();
+        }
+        String[] parts = raw.split(",");
+        List<String> values = new ArrayList<>(parts.length);
+        for (String p : parts) {
+            String trimmed = p.trim();
+            if (!trimmed.isEmpty()) {
+                values.add(trimmed);
+            }
+        }
+        return values;
+    }
+
+    private static int tryParsePositiveInt(String value) {
+        try {
+            int parsed = Integer.parseInt(value);
+            return parsed > 0 ? parsed : -1;
+        } catch (NumberFormatException e) {
+            return -1;
+        }
     }
 
     private static String requireUrl(String url) {

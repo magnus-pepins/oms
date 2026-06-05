@@ -1154,6 +1154,13 @@ export OMS_LEDGER_INFLIGHT_COMPENSATOR_ENABLED=true
 export OMS_LEDGER_INFLIGHT_COMPENSATOR_ATTEMPTS_THRESHOLD=3
 export OMS_BURST_LEDGER_BALANCE_ID='<EUR customer balance with funds>'
 export OMS_BURST_LEDGER_IDENTITY_ID='<identity owning that balance>'
+# Optional: spread inflight-hold contention across multiple source balances.
+# Supports either:
+#   - explicit CSV IDs in OMS_BURST_LEDGER_BALANCE_POOL_SIZE
+#   - numeric N in OMS_BURST_LEDGER_BALANCE_POOL_SIZE with first N IDs taken
+#     from OMS_BURST_LEDGER_BALANCE_ID (which must then be CSV).
+export OMS_BURST_LEDGER_BALANCE_ID='<balance-1>,<balance-2>,<balance-3>'
+export OMS_BURST_LEDGER_BALANCE_POOL_SIZE='3'
 ```
 
 `scripts/launch-bench-stack.sh <role>` (added in slice 4p) is a thin convenience wrapper

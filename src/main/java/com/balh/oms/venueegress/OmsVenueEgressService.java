@@ -1557,15 +1557,22 @@ public class OmsVenueEgressService {
             this.routeOfferThread = null;
         }
 
-        /** Production consumer: strictly serial {@code dispatchRoute} / {@code onNext} drain. */
+        /**
+         * Production consumer: strictly serial {@code dispatchRoute} / {@code onNext} drain.
+         * Must not exit when {@code running} is still false at pipeline construction — the thread
+         * starts before {@link OmsVenueEgressService#running} is set true in {@code init()}.
+         */
         private void routeOfferLoop() {
-            while (running.get() || !routeOfferQueue.isEmpty()) {
+            while (true) {
                 PendingRouteOffer item = routeOfferQueue.poll();
-                if (item == null) {
-                    LockSupport.parkNanos(ROUTE_OFFER_IDLE_PARK_NANOS);
+                if (item != null) {
+                    dispatchRoute(item.ev(), item.position());
                     continue;
                 }
-                dispatchRoute(item.ev(), item.position());
+                if (!running.get() && routeOfferQueue.isEmpty()) {
+                    return;
+                }
+                LockSupport.parkNanos(ROUTE_OFFER_IDLE_PARK_NANOS);
             }
         }
 

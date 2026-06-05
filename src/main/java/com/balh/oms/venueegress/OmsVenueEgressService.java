@@ -1700,13 +1700,16 @@ public class OmsVenueEgressService {
                 ErCompletion item;
                 boolean progressed = false;
                 while ((item = erCompletionQueue.poll()) != null) {
-                    try {
-                        completeRoute(item.ev(), item.erOpt(), item.err());
-                    } finally {
-                        tracker.complete(item.position());
-                        unparkReplayThread();
-                        progressed = true;
+                    boolean applied = completeRoute(item.ev(), item.erOpt(), item.err());
+                    if (!applied) {
+                        // Mirror serial replay semantics: do not advance the in-flight tracker
+                        // (or cursor) past a fragment whose cluster ER submit failed.
+                        erCompletionQueue.add(item);
+                        break;
                     }
+                    tracker.complete(item.position());
+                    unparkReplayThread();
+                    progressed = true;
                 }
                 if (progressed) {
                     scheduleDrainContiguous();
@@ -1747,8 +1750,13 @@ public class OmsVenueEgressService {
             }
         }
 
-        /** Runs on the completion executor — applies the venue ack to the OMS cluster. */
-        private void completeRoute(
+        /**
+         * Runs on the completion executor — applies the venue ack to the OMS cluster.
+         *
+         * @return {@code true} when the cluster ER was submitted (fix_nos timer recorded);
+         *         {@code false} when submit failed and the fragment must stay in-flight for retry
+         */
+        private boolean completeRoute(
                 OrderAdmittedEvent ev,
                 Optional<com.balh.venue.grpc.v1.ExecutionReport> erOpt,
                 Throwable err) {
@@ -1758,28 +1766,26 @@ public class OmsVenueEgressService {
                         ev.orderId(),
                         ev.instrumentSymbol(),
                         err);
-                submitVenueRouteFailedReject(
+                return submitVenueRouteFailedReject(
                         ev.orderId(),
                         "venue_route_transport_failed",
                         ev.acceptedAtMillis(),
                         ev.side(),
                         ev.timeInForceCode());
-                return;
             }
             if (erOpt.isEmpty()) {
                 log.warn(
                         "oms-venue-egress (pipelined): venue RouteOrder rejected (no ER); submitting VENUE_REJECT: orderId={} symbol={}",
                         ev.orderId(),
                         ev.instrumentSymbol());
-                submitVenueRouteFailedReject(
+                return submitVenueRouteFailedReject(
                         ev.orderId(),
                         "venue_route_rejected",
                         ev.acceptedAtMillis(),
                         ev.side(),
                         ev.timeInForceCode());
-                return;
             }
-            submitVenueExecutionReport(
+            return submitVenueExecutionReport(
                     ev.orderId(), erOpt, ev.acceptedAtMillis(), ev.side(), ev.timeInForceCode());
         }
 

@@ -20,9 +20,12 @@ import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.http.client.SimpleClientHttpRequestFactory;
+import org.springframework.http.client.JdkClientHttpRequestFactory;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.web.client.RestClient;
+
+import java.net.http.HttpClient;
+import java.time.Duration;
 
 /**
  * Wires a typed {@link RestClient} + {@link LedgerBalanceClient} when
@@ -41,9 +44,11 @@ public class LedgerConfiguration {
         while (base.endsWith("/")) {
             base = base.substring(0, base.length() - 1);
         }
-        SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
-        factory.setConnectTimeout((int) config.getLedger().getConnectTimeoutMs());
-        factory.setReadTimeout((int) config.getLedger().getReadTimeoutMs());
+        HttpClient httpClient = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofMillis(config.getLedger().getConnectTimeoutMs()))
+                .build();
+        JdkClientHttpRequestFactory factory = new JdkClientHttpRequestFactory(httpClient);
+        factory.setReadTimeout(Duration.ofMillis(config.getLedger().getReadTimeoutMs()));
         return RestClient.builder()
                 .baseUrl(base)
                 .requestFactory(factory)

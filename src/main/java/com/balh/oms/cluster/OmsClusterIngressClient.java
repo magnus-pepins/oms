@@ -593,12 +593,19 @@ public class OmsClusterIngressClient {
      * @throws TimeoutException if back-pressure persists past {@code timeout}.
      * @throws InterruptedException if the calling thread is interrupted while parked.
      */
-    public void submitApplyExecutionReport(ApplyExecutionReportCommand cmd, Duration timeout)
-            throws TimeoutException, InterruptedException {
+    /**
+     * Enqueues an ER cluster offer and returns immediately. The returned future completes once the
+     * ER-offer daemon has accepted the command into the Aeron cluster log (or completes exceptionally
+     * on timeout / disconnect). Callers that need wall-clock timing for Prometheus should attach
+     * {@code whenComplete} rather than blocking a hot-path thread on {@link #submitApplyExecutionReport}.
+     */
+    public CompletableFuture<Void> submitApplyExecutionReportAsync(
+            ApplyExecutionReportCommand cmd, Duration timeout) {
         Objects.requireNonNull(cmd, "cmd");
         Objects.requireNonNull(timeout, "timeout");
         if (client == null) {
-            throw new IllegalStateException("OMS cluster client is not connected");
+            return CompletableFuture.failedFuture(
+                    new IllegalStateException("OMS cluster client is not connected"));
         }
 
         ExpandableArrayBuffer buffer = OFFER_BUFFER.get();
@@ -608,30 +615,54 @@ public class OmsClusterIngressClient {
 
         long deadlineNanos = System.nanoTime() + timeout.toNanos();
         CompletableFuture<Void> waiter = new CompletableFuture<>();
-
-        Timer.Sample sample = Timer.start(meterRegistry);
-        Outcome outcome = Outcome.ERROR;
         PendingErSubmit submit = new PendingErSubmit(wireBytes, written, deadlineNanos, waiter);
+
         try {
             while (true) {
                 if (closing) {
-                    throw new IllegalStateException("OMS cluster client is closing");
+                    return CompletableFuture.failedFuture(
+                            new IllegalStateException("OMS cluster client is closing"));
                 }
                 if (erOfferQueue.offer(submit)) {
-                    break;
+                    signalErOfferDaemon();
+                    return waiter;
                 }
                 if (System.nanoTime() > deadlineNanos) {
                     erOfferQueue.remove(submit);
-                    outcome = Outcome.TIMEOUT;
-                    throw new TimeoutException(
-                            "ER-offer queue full past deadline for correlationId=" + cmd.correlationId());
+                    return CompletableFuture.failedFuture(
+                            new TimeoutException(
+                                    "ER-offer queue full past deadline for correlationId="
+                                            + cmd.correlationId()));
                 }
-                parkOrThrow(ER_OFFER_ENQUEUE_PARK_NANOS);
+                if (Thread.interrupted()) {
+                    erOfferQueue.remove(submit);
+                    return CompletableFuture.failedFuture(new InterruptedException());
+                }
+                LockSupport.parkNanos(ER_OFFER_ENQUEUE_PARK_NANOS);
+                if (Thread.interrupted()) {
+                    erOfferQueue.remove(submit);
+                    return CompletableFuture.failedFuture(new InterruptedException());
+                }
             }
+        } catch (RuntimeException e) {
+            erOfferQueue.remove(submit);
+            return CompletableFuture.failedFuture(e);
+        }
+    }
 
+    public void submitApplyExecutionReport(ApplyExecutionReportCommand cmd, Duration timeout)
+            throws TimeoutException, InterruptedException {
+        Objects.requireNonNull(cmd, "cmd");
+        Objects.requireNonNull(timeout, "timeout");
+
+        Timer.Sample sample = Timer.start(meterRegistry);
+        Outcome outcome = Outcome.ERROR;
+        try {
+            CompletableFuture<Void> waiter = submitApplyExecutionReportAsync(cmd, timeout);
+            long deadlineNanos = System.nanoTime() + timeout.toNanos();
             long remainingNanos = deadlineNanos - System.nanoTime();
             if (remainingNanos <= 0L) {
-                if (drainCompletedErFuture(submit)) {
+                if (waiter.isDone() && !waiter.isCompletedExceptionally()) {
                     outcome = Outcome.COMMIT;
                     return;
                 }
@@ -643,24 +674,24 @@ public class OmsClusterIngressClient {
                 waiter.get(remainingNanos, TimeUnit.NANOSECONDS);
                 outcome = Outcome.COMMIT;
             } catch (java.util.concurrent.TimeoutException e) {
-                if (drainCompletedErFuture(submit)) {
-                    outcome = Outcome.COMMIT;
-                    return;
-                }
                 outcome = Outcome.TIMEOUT;
                 throw new TimeoutException(
                         "ER-offer timeout for correlationId=" + cmd.correlationId());
             } catch (ExecutionException e) {
                 Throwable cause = e.getCause();
+                if (cause instanceof InterruptedException ie) {
+                    throw ie;
+                }
+                if (cause instanceof TimeoutException te) {
+                    outcome = Outcome.TIMEOUT;
+                    throw te;
+                }
                 if (cause instanceof RuntimeException re) {
                     throw re;
                 }
                 throw new RuntimeException(
                         "ER-offer unexpected failure for correlationId=" + cmd.correlationId(), cause);
             }
-        } catch (InterruptedException ie) {
-            erOfferQueue.remove(submit);
-            throw ie;
         } finally {
             sample.stop(applyExecutionReportTimers.get(outcome));
         }
@@ -1186,6 +1217,18 @@ public class OmsClusterIngressClient {
         }
     }
 
+    /** Wake the ER-offer daemon so a freshly enqueued frame is offered without waiting a full park. */
+    void signalErOfferDaemonForTest() {
+        signalErOfferDaemon();
+    }
+
+    private void signalErOfferDaemon() {
+        Thread daemon = erOfferDaemonThread;
+        if (daemon != null) {
+            LockSupport.unpark(daemon);
+        }
+    }
+
     /**
      * Drain all currently queued egress fragments in one lock hold. Returns the number of
      * {@link AeronCluster#pollEgress()} calls that returned a positive fragment count.
@@ -1244,9 +1287,9 @@ public class OmsClusterIngressClient {
 
         while (!closing) {
             try {
-                PendingErSubmit head =
-                        erOfferQueue.poll(ER_OFFER_DRAIN_INTERVAL_NANOS, TimeUnit.NANOSECONDS);
+                PendingErSubmit head = erOfferQueue.poll();
                 if (head == null) {
+                    LockSupport.parkNanos(ER_OFFER_DRAIN_INTERVAL_NANOS);
                     continue;
                 }
                 do {

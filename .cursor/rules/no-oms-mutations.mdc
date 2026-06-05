@@ -32,6 +32,19 @@ Same as demo-freeze list above for any non-pop host that runs the OMS stack. No 
 
 On staging/production, `./gradlew clusterSnapshot` and `wipe-and-restart-pop-oms-cluster.sh` are operator-only regardless of host naming.
 
+## Pop preflight (mandatory before any OMS mutation)
+
+Before `restart-pop-oms-cluster.sh`, `wipe-and-restart-pop-oms-cluster.sh`, deploy scripts that build OMS jars, or soak/bench on pop:
+
+1. **SSH with NVM** — non-interactive `ssh pop` must export NVM so `pm2` works:
+   `export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh";`
+2. **Run preflight first** (read-only; fails fast on blockers):
+   `bash ~/system-documentation/scripts/preflight-pop-oms.sh`
+3. **If preflight fails on missing jar** — run `./gradlew bootJarClusterNode bootJar bootJarPostgresProjector bootJarFixEgress bootJarVenueEgress` in `~/oms` and re-run preflight. **Never** `pm2 start oms-cluster-node` until jars exist.
+4. **If PM2 shows crash loop** (`waiting restart`, `Unable to access jarfile` in `~/oms/logs/oms-cluster-node-err.log`) — `pm2 stop oms-cluster-node`, build jars, then sanctioned restart script — not another blind `pm2 start`.
+
+Delegating to a background agent without these checks is forbidden for OMS pop work.
+
 ## On pop when there is no demo freeze (default)
 
 You **MAY** perform OMS work the operator asked for, including:

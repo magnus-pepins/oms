@@ -78,6 +78,12 @@ message StreamQuotesRequest {
   string symbol = 1;
 }
 
+enum LiquidityRole {
+  LIQUIDITY_ROLE_UNSPECIFIED = 0;
+  LIQUIDITY_ROLE_TAKER = 1;
+  LIQUIDITY_ROLE_MAKER = 2;
+}
+
 message ExecutionReport {
   string oms_order_id = 1;
   string venue_exec_ref = 2;
@@ -85,6 +91,7 @@ message ExecutionReport {
   int64 last_px_scaled = 4;
   int64 venue_ts_nanos = 5;
   ExecType exec_type = 6;
+  LiquidityRole liquidity_role = 7;
 }
 
 enum ExecType {

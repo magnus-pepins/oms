@@ -91,6 +91,7 @@ oms:
     read-timeout-ms: ${OMS_LEDGER_READ_TIMEOUT_MS:5000}
     inflight-reservation-enabled: ${OMS_LEDGER_INFLIGHT_RESERVATION_ENABLED:false}
     inflight-async-enabled: ${OMS_LEDGER_INFLIGHT_ASYNC_ENABLED:false}
+    inflight-pre-admit-hold-enabled: ${OMS_LEDGER_INFLIGHT_PRE_ADMIT_HOLD_ENABLED:true}
     inflight-outbox-reconciler-age-ms: ${OMS_LEDGER_INFLIGHT_OUTBOX_RECONCILER_AGE_MS:2000}
     inflight-outbox-reconciler-batch-size: ${OMS_LEDGER_INFLIGHT_OUTBOX_RECONCILER_BATCH_SIZE:50}
     inflight-outbox-reconciler-interval-ms: ${OMS_LEDGER_INFLIGHT_OUTBOX_RECONCILER_INTERVAL_MS:500}
@@ -179,6 +180,10 @@ oms:
     grpc-host: ${OMS_VENUE_GRPC_HOST:127.0.0.1}
     grpc-port: ${OMS_VENUE_GRPC_PORT:50051}
     registry-sync-enabled: ${OMS_VENUE_REGISTRY_SYNC_ENABLED:true}
+    registry-sync-on-startup-enabled: ${OMS_VENUE_REGISTRY_SYNC_ON_STARTUP_ENABLED:true}
+    registry-sync-on-startup-max-attempts: ${OMS_VENUE_REGISTRY_SYNC_ON_STARTUP_MAX_ATTEMPTS:12}
+    registry-sync-on-startup-retry-backoff-ms: ${OMS_VENUE_REGISTRY_SYNC_ON_STARTUP_RETRY_BACKOFF_MS:5000}
+    registry-sync-on-startup-initial-delay-ms: ${OMS_VENUE_REGISTRY_SYNC_ON_STARTUP_INITIAL_DELAY_MS:2000}
     admission-gate:
       enabled: ${OMS_VENUE_ADMISSION_GATE_ENABLED:true}
       # Max *excess* lag (raw − pipelined floor) before HTTP 503 venue_unavailable.

@@ -220,6 +220,14 @@ public final class RestLedgerInflightReservationClient implements LedgerInflight
         if (balanceId == null || balanceId.isBlank()) {
             return defaultCurrency;
         }
+        // Single-currency stack (empty per-ccy dest map): every source balance shares
+        // oms.ledger.inflight-reservation-currency. Skips a redundant GET /balances on
+        // the hold hot path — identity verify already hit the same endpoint via
+        // CachingLedgerBalanceClient, but that cache is separate. Bench pop EUR stacks
+        // and legacy USD-only deployments both use this fast path.
+        if (destinationBalanceIdByCurrency.isEmpty()) {
+            return defaultCurrency;
+        }
         String cached = balanceCurrencyCache.get(balanceId);
         if (cached != null) {
             return cached;

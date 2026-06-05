@@ -242,6 +242,30 @@ public class OrdersRepository {
         return new ProjectorAdmitInsert(fresh, fields.order());
     }
 
+    /** Phase E: pin fee model + estimated taker fee quoted at cluster admit (PREDMKT orders). */
+    public void pinPredictionMarketFeeAtAdmit(
+            UUID orderId,
+            String feeModelId,
+            int feeScheduleVersion,
+            BigDecimal estimatedFee,
+            String feeCurrency) {
+        jdbc.update(
+                """
+                        UPDATE orders
+                           SET pinned_fee_model_id = :feeModelId,
+                               pinned_fee_schedule_version = :feeScheduleVersion,
+                               pinned_estimated_fee = :estimatedFee,
+                               pinned_fee_currency = :feeCurrency
+                         WHERE id = :id
+                        """,
+                new MapSqlParameterSource()
+                        .addValue("id", orderId)
+                        .addValue("feeModelId", feeModelId)
+                        .addValue("feeScheduleVersion", feeScheduleVersion)
+                        .addValue("estimatedFee", estimatedFee)
+                        .addValue("feeCurrency", feeCurrency));
+    }
+
     /**
      * In-memory {@link Order} view matching the row {@link #insertFromAdmittedEvent} just wrote
      * (version 0, {@link OrderStatus#PENDING_NEW}). Lets the projector hot path skip a

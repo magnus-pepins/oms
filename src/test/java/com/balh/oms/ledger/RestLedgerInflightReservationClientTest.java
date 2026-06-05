@@ -50,26 +50,46 @@ class RestLedgerInflightReservationClientTest {
         }
     }
 
+    /** Cross-currency client: non-empty dest map forces per-balance currency lookup. */
+    private RestLedgerInflightReservationClient crossCurrencyClient() {
+        return new RestLedgerInflightReservationClient(
+                RestClient.builder().baseUrl(wireMock.baseUrl()).build(),
+                "test-key",
+                objectMapper,
+                "balance_destination",
+                java.util.Map.of("EUR", "balance_eur_dest"),
+                "USD",
+                100);
+    }
+
+    @Test
+    void resolveBalanceCurrency_singleCurrencyStack_skipsLookupUsesConfiguredDefault() {
+        wireMock.stop();
+        assertThat(client.resolveBalanceCurrency("bal_eur")).isEqualTo("USD");
+    }
+
     @Test
     void resolveBalanceCurrency_returnsLedgerCurrencyOn2xx() {
+        RestLedgerInflightReservationClient cross = crossCurrencyClient();
         wireMock.stubFor(get(urlPathEqualTo("/balances/bal_eur"))
                 .willReturn(aResponse()
                         .withStatus(200)
                         .withHeader("Content-Type", "application/json")
                         .withBody("{\"currency\":\"EUR\",\"availableBalance\":\"1000000\"}")));
-        String ccy = client.resolveBalanceCurrency("bal_eur");
+        String ccy = cross.resolveBalanceCurrency("bal_eur");
         assertThat(ccy).isEqualTo("EUR");
     }
 
     @Test
     void resolveBalanceCurrency_cachesResult_secondCallSkipsHttp() {
+        RestLedgerInflightReservationClient cross = crossCurrencyClient();
         wireMock.stubFor(get(urlPathEqualTo("/balances/bal_eur"))
                 .willReturn(aResponse()
                         .withStatus(200)
                         .withHeader("Content-Type", "application/json")
                         .withBody("{\"currency\":\"EUR\"}")));
-        String first = client.resolveBalanceCurrency("bal_eur");
-        String second = client.resolveBalanceCurrency("bal_eur");
+        String first = cross.resolveBalanceCurrency("bal_eur");
+        String second = cross.resolveBalanceCurrency("bal_eur");
         assertThat(first).isEqualTo("EUR");
         assertThat(second).isEqualTo("EUR");
         wireMock.verify(1, WireMock.getRequestedFor(urlPathEqualTo("/balances/bal_eur")));
@@ -77,9 +97,10 @@ class RestLedgerInflightReservationClientTest {
 
     @Test
     void resolveBalanceCurrency_falls_back_on_404() {
+        RestLedgerInflightReservationClient cross = crossCurrencyClient();
         wireMock.stubFor(get(urlPathEqualTo("/balances/bal_missing"))
                 .willReturn(aResponse().withStatus(404).withBody("{\"error\":\"not_found\"}")));
-        String ccy = client.resolveBalanceCurrency("bal_missing");
+        String ccy = cross.resolveBalanceCurrency("bal_missing");
         // Fallback so the POST below still runs; Ledger will surface the
         // real error on the POST path.
         assertThat(ccy).isEqualTo("USD");
@@ -87,20 +108,22 @@ class RestLedgerInflightReservationClientTest {
 
     @Test
     void resolveBalanceCurrency_falls_back_on_5xx() {
+        RestLedgerInflightReservationClient cross = crossCurrencyClient();
         wireMock.stubFor(get(urlPathEqualTo("/balances/bal_unstable"))
                 .willReturn(aResponse().withStatus(503).withBody("")));
-        String ccy = client.resolveBalanceCurrency("bal_unstable");
+        String ccy = cross.resolveBalanceCurrency("bal_unstable");
         assertThat(ccy).isEqualTo("USD");
     }
 
     @Test
     void resolveBalanceCurrency_falls_back_on_missing_currency_field() {
+        RestLedgerInflightReservationClient cross = crossCurrencyClient();
         wireMock.stubFor(get(urlPathEqualTo("/balances/bal_bad_shape"))
                 .willReturn(aResponse()
                         .withStatus(200)
                         .withHeader("Content-Type", "application/json")
                         .withBody("{\"availableBalance\":\"100\"}")));
-        String ccy = client.resolveBalanceCurrency("bal_bad_shape");
+        String ccy = cross.resolveBalanceCurrency("bal_bad_shape");
         assertThat(ccy).isEqualTo("USD");
     }
 
@@ -115,9 +138,10 @@ class RestLedgerInflightReservationClientTest {
     void primedCache_skipsHttpEntirely() {
         // Belt-and-braces: even if the WireMock server were down, primed
         // entries take precedence.
-        client.primeBalanceCurrencyCache("bal_pre", "GBP");
+        RestLedgerInflightReservationClient cross = crossCurrencyClient();
+        cross.primeBalanceCurrencyCache("bal_pre", "GBP");
         wireMock.stop();
-        String ccy = client.resolveBalanceCurrency("bal_pre");
+        String ccy = cross.resolveBalanceCurrency("bal_pre");
         assertThat(ccy).isEqualTo("GBP");
     }
 
@@ -226,10 +250,11 @@ class RestLedgerInflightReservationClientTest {
 
     @Test
     void doesNotCache_404OrTransientFailure() {
+        RestLedgerInflightReservationClient cross = crossCurrencyClient();
         // First call: 404 (real problem). Second call: 200 (resolved).
         wireMock.stubFor(get(urlPathEqualTo("/balances/bal_recover"))
                 .willReturn(aResponse().withStatus(404)));
-        assertThat(client.resolveBalanceCurrency("bal_recover")).isEqualTo("USD");
+        assertThat(cross.resolveBalanceCurrency("bal_recover")).isEqualTo("USD");
 
         wireMock.resetAll();
         wireMock.stubFor(get(urlPathEqualTo("/balances/bal_recover"))
@@ -237,6 +262,6 @@ class RestLedgerInflightReservationClientTest {
                         .withStatus(200)
                         .withHeader("Content-Type", "application/json")
                         .withBody("{\"currency\":\"NOK\"}")));
-        assertThat(client.resolveBalanceCurrency("bal_recover")).isEqualTo("NOK");
+        assertThat(cross.resolveBalanceCurrency("bal_recover")).isEqualTo("NOK");
     }
 }

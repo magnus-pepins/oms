@@ -28,5 +28,13 @@ class SettlementTemplateRegistryIntegrationTest extends AbstractPostgresIntegrat
                             assertThat(def.outboxTable()).isEqualTo(SettlementTemplateRegistry.OUTBOX_LEDGER_SETTLEMENT);
                             assertThat(def.active()).isTrue();
                         });
+        assertThat(registry.find(SettlementTemplateIds.PREDICTION_MARKET_TRADE_FEE, 1))
+                .isPresent()
+                .get()
+                .satisfies(
+                        def -> {
+                            assertThat(def.outboxTable()).isEqualTo(SettlementTemplateRegistry.OUTBOX_PREDICTION_MARKET);
+                            assertThat(def.active()).isTrue();
+                        });
     }
 }

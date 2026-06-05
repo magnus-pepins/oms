@@ -144,6 +144,8 @@ public class OmsAdmissionClusteredService implements ClusteredService {
     private static final String ENV_READINESS_ALLOW_EMPTY_REPLAY = "OMS_READINESS_ALLOW_EMPTY_REPLAY";
     private static final String ENV_TERMINAL_TOMBSTONE_RETENTION_MILLIS =
             "OMS_TERMINAL_TOMBSTONE_RETENTION_MILLIS";
+    private static final String ENV_TERMINAL_TOMBSTONE_PRUNE_EVERY_N_MESSAGES =
+            "OMS_TERMINAL_TOMBSTONE_PRUNE_EVERY_N_MESSAGES";
     private static final String ENV_SNAPSHOT_BUFFER_REUSE_MAX_BYTES =
             "OMS_SNAPSHOT_BUFFER_REUSE_MAX_BYTES";
 
@@ -152,6 +154,11 @@ public class OmsAdmissionClusteredService implements ClusteredService {
     private static final long MINUTES_PER_HOUR = 60L;
     private static final long DEFAULT_TERMINAL_TOMBSTONE_RETENTION_MILLIS =
             6L * MINUTES_PER_HOUR * SECONDS_PER_MINUTE * MILLIS_PER_SECOND;
+    /**
+     * Amortise {@link #pruneExpiredTerminalTombstones(long)} — a full {@link #orderIndex} scan on
+     * every cluster log entry was the same O(book) cost as the pre-incremental open-order counter.
+     */
+    private static final int DEFAULT_TERMINAL_TOMBSTONE_PRUNE_EVERY_N_MESSAGES = 256;
     private static final int DEFAULT_SNAPSHOT_BUFFER_REUSE_MAX_BYTES = 4 * 1024 * 1024;
 
     /** Initial buffer capacity for command processing. Grown on demand. */
@@ -228,6 +235,7 @@ public class OmsAdmissionClusteredService implements ClusteredService {
     private final ExpandableArrayBuffer eventsBuffer = new ExpandableArrayBuffer(INITIAL_BUFFER_CAPACITY);
     private ExpandableArrayBuffer snapshotBuffer = new ExpandableArrayBuffer(INITIAL_BUFFER_CAPACITY);
     private final long terminalTombstoneRetentionMillis;
+    private final int terminalTombstonePruneEveryNMessages;
     private final int snapshotBufferReuseMaxBytes;
 
     // ---- Phase 4 slice 4b: snapshot observability ----
@@ -379,6 +387,7 @@ public class OmsAdmissionClusteredService implements ClusteredService {
         this(
                 meterRegistry,
                 parseTerminalTombstoneRetentionMillisFromEnv(),
+                parseTerminalTombstonePruneEveryNMessagesFromEnv(),
                 parseSnapshotBufferReuseMaxBytesFromEnv());
     }
 
@@ -386,8 +395,22 @@ public class OmsAdmissionClusteredService implements ClusteredService {
             MeterRegistry meterRegistry,
             long terminalTombstoneRetentionMillis,
             int snapshotBufferReuseMaxBytes) {
+        this(
+                meterRegistry,
+                terminalTombstoneRetentionMillis,
+                DEFAULT_TERMINAL_TOMBSTONE_PRUNE_EVERY_N_MESSAGES,
+                snapshotBufferReuseMaxBytes);
+    }
+
+    OmsAdmissionClusteredService(
+            MeterRegistry meterRegistry,
+            long terminalTombstoneRetentionMillis,
+            int terminalTombstonePruneEveryNMessages,
+            int snapshotBufferReuseMaxBytes) {
         this.meterRegistry = Objects.requireNonNull(meterRegistry, "meterRegistry");
         this.terminalTombstoneRetentionMillis = terminalTombstoneRetentionMillis;
+        this.terminalTombstonePruneEveryNMessages =
+                Math.max(1, terminalTombstonePruneEveryNMessages);
         this.snapshotBufferReuseMaxBytes = snapshotBufferReuseMaxBytes;
         Tags writeTags = Tags.of("outcome", "write");
         Tags loadTags = Tags.of("outcome", "load");
@@ -583,7 +606,10 @@ public class OmsAdmissionClusteredService implements ClusteredService {
             int length,
             Header header) {
         sessionMessageCountSinceStart++;
-        pruneExpiredTerminalTombstones(timestamp);
+        if (terminalTombstoneRetentionMillis > 0L
+                && sessionMessageCountSinceStart % terminalTombstonePruneEveryNMessages == 0L) {
+            pruneExpiredTerminalTombstones(timestamp);
+        }
         if (length < OmsClusterWireFormat.HEADER_LENGTH) {
             // Malformed; ignore. Logging here would break determinism on replay if log writes throw.
             return;
@@ -1026,6 +1052,19 @@ public class OmsAdmissionClusteredService implements ClusteredService {
         return parseNonNegativeLongFromEnv(
                 ENV_TERMINAL_TOMBSTONE_RETENTION_MILLIS,
                 DEFAULT_TERMINAL_TOMBSTONE_RETENTION_MILLIS);
+    }
+
+    private static int parseTerminalTombstonePruneEveryNMessagesFromEnv() {
+        long parsed = parseNonNegativeLongFromEnv(
+                ENV_TERMINAL_TOMBSTONE_PRUNE_EVERY_N_MESSAGES,
+                DEFAULT_TERMINAL_TOMBSTONE_PRUNE_EVERY_N_MESSAGES);
+        if (parsed < 1L) {
+            return DEFAULT_TERMINAL_TOMBSTONE_PRUNE_EVERY_N_MESSAGES;
+        }
+        if (parsed > Integer.MAX_VALUE) {
+            return Integer.MAX_VALUE;
+        }
+        return (int) parsed;
     }
 
     private static int parseSnapshotBufferReuseMaxBytesFromEnv() {

@@ -50,6 +50,8 @@ import java.util.concurrent.locks.LockSupport;
  * <pre>
  *   OMS_INTERNAL_API_KEY=...     required; must match the running ingress-replica's secret
  *   OMS_BURST_URL                http://127.0.0.1:8088/internal/v1/orders
+ *   OMS_URL                      http://127.0.0.1:8088  alias; /internal/v1/orders appended when
+ *                                OMS_BURST_URL unset (wrapper scripts on pop use this name)
  *   OMS_BURST_URLS               comma-separated list, overrides OMS_BURST_URL when set; the
  *                                burst tool round-robins requests across the URLs. Use this to
  *                                drive N ingress-replicas without standing up an external load
@@ -482,7 +484,16 @@ public final class IngressBurstMain {
 
         public static Config fromEnv() {
             String apiKey = requireEnv(ENV_API_KEY);
-            List<String> urls = parseUrls(System.getenv(ENV_URLS), envOrDefault(ENV_URL, DEFAULT_URL));
+            String urlFallback = envOrDefault(ENV_URL, "");
+            if (urlFallback.isBlank()) {
+                String omsUrl = envOrDefault("OMS_URL", "");
+                if (!omsUrl.isBlank()) {
+                    urlFallback = omsUrl.trim().replaceAll("/+$", "") + "/internal/v1/orders";
+                } else {
+                    urlFallback = DEFAULT_URL;
+                }
+            }
+            List<String> urls = parseUrls(System.getenv(ENV_URLS), urlFallback);
             return new Config(
                     apiKey,
                     urls,

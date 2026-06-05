@@ -210,6 +210,7 @@ public class OmsPostgresProjector {
      */
     private final SettlementDateCalculator settlementDateCalculator;
     private final PredictionMarketResolutionService predictionMarketResolutionService;
+    private final com.balh.oms.settlement.VenueTradeFeeProjectionService venueTradeFeeProjectionService;
     /**
      * Phase 4 Tier 2.5 phase E-2 — pre-registered counter for the defensive shard guard in
      * {@link #applyAdmittedEvent}. See {@link #METRIC_SHARD_MISMATCH_DROPPED} for the contract.
@@ -242,6 +243,14 @@ public class OmsPostgresProjector {
     private final AtomicReference<AeronProjectorCursorRepository.RecordedCursor> startupCursor =
             new AtomicReference<>(null);
     private Thread replayThread;
+    /**
+     * When true (only on the replay thread inside {@link #applyPollBatch}), per-fragment cursor
+     * UPSERTs coalesce to a single {@link AeronProjectorCursorRepository#advanceWithRecording} at
+     * the max fragment position before COMMIT — the prior per-fragment updates were redundant
+     * within the same transaction and capped drain at 5k admits/s.
+     */
+    private boolean deferPollBatchCursorAdvance;
+    private long deferredPollBatchMaxPosition = -1L;
 
     @Autowired
     public OmsPostgresProjector(
@@ -260,7 +269,8 @@ public class OmsPostgresProjector {
             ObjectMapper objectMapper,
             PlatformTransactionManager transactionManager,
             SettlementDateCalculator settlementDateCalculator,
-            PredictionMarketResolutionService predictionMarketResolutionService) {
+            PredictionMarketResolutionService predictionMarketResolutionService,
+            com.balh.oms.settlement.VenueTradeFeeProjectionService venueTradeFeeProjectionService) {
         this(
                 config,
                 cursorRepository,
@@ -278,7 +288,8 @@ public class OmsPostgresProjector {
                 transactionManager,
                 Clock.systemUTC(),
                 settlementDateCalculator,
-                predictionMarketResolutionService);
+                predictionMarketResolutionService,
+                venueTradeFeeProjectionService);
     }
 
     /**
@@ -303,7 +314,8 @@ public class OmsPostgresProjector {
             PlatformTransactionManager transactionManager,
             Clock wallClock,
             SettlementDateCalculator settlementDateCalculator,
-            PredictionMarketResolutionService predictionMarketResolutionService) {
+            PredictionMarketResolutionService predictionMarketResolutionService,
+            com.balh.oms.settlement.VenueTradeFeeProjectionService venueTradeFeeProjectionService) {
         this.config = config;
         this.cursorRepository = cursorRepository;
         this.ordersRepository = ordersRepository;
@@ -320,6 +332,7 @@ public class OmsPostgresProjector {
         this.wallClock = wallClock;
         this.settlementDateCalculator = settlementDateCalculator;
         this.predictionMarketResolutionService = predictionMarketResolutionService;
+        this.venueTradeFeeProjectionService = venueTradeFeeProjectionService;
         this.shardMismatchCounter = Counter.builder(METRIC_SHARD_MISMATCH_DROPPED)
                 .description(
                         "Cluster events whose shard id did not match this projector's "
@@ -328,9 +341,9 @@ public class OmsPostgresProjector {
                 .register(meterRegistry);
         // Programmatic boundary: the replay loop is a non-Spring thread, so AOP-proxied
         // @Transactional on this bean's own methods would not be intercepted. A
-        // TransactionTemplate guarantees each poll batch (up to fragmentLimit fragments)
+        // TransactionTemplate guarantees each poll batch (up to maxFragmentsPerCommit fragments)
         // commits (or rolls back) as one unit — amortising BEGIN/COMMIT overhead that
-        // otherwise caps drain rate at ~150 fragments/s on pop.
+        // otherwise caps drain rate when fragmentLimit is left at the legacy 64 default.
         this.transactionTemplate = new TransactionTemplate(transactionManager);
     }
 
@@ -685,9 +698,8 @@ public class OmsPostgresProjector {
                         projectorCfg.getReplayStreamId());
 
                 while (running.get()) {
-                    int polled = replay.poll(handler, projectorCfg.getFragmentLimit());
-                    if (polled > 0) {
-                        handler.flushPollBatch();
+                    int polledBurst = pollReplayBurst(replay, handler, projectorCfg);
+                    if (polledBurst > 0) {
                         continue;
                     }
                     // No fragments. Three cases:
@@ -962,15 +974,74 @@ public class OmsPostgresProjector {
         }
         long pollBatchCommitStartNanos = System.nanoTime();
         long lastPosition = batch.get(batch.size() - 1).position();
-        transactionTemplate.executeWithoutResult(status -> {
-            for (PendingFragment fragment : batch) {
-                applyPendingFragment(fragment);
-            }
-        });
+        deferPollBatchCursorAdvance = true;
+        deferredPollBatchMaxPosition = -1L;
+        try {
+            transactionTemplate.executeWithoutResult(status -> {
+                for (PendingFragment fragment : batch) {
+                    applyPendingFragment(fragment);
+                }
+                flushDeferredPollBatchCursorAdvance();
+            });
+        } finally {
+            deferPollBatchCursorAdvance = false;
+            deferredPollBatchMaxPosition = -1L;
+        }
         lastAppliedPosition.set(lastPosition);
         meterRegistry
                 .timer(TIMER_POLL_BATCH_COMMIT)
                 .record(System.nanoTime() - pollBatchCommitStartNanos, TimeUnit.NANOSECONDS);
+    }
+
+    /**
+     * Tight-spin drain: poll Aeron repeatedly while fragments are available, flushing one or more
+     * Postgres batches (each bounded by {@link OmsConfig.Cluster.Projector#getMaxFragmentsPerCommit()})
+     * before idle park or recording-walk logic runs. Mirrors {@code OmsVenueEgressService#pollReplayBurst}.
+     */
+    int pollReplayBurst(
+            Subscription replay, ProjectingFragmentHandler handler, OmsConfig.Cluster.Projector projectorCfg) {
+        int fragmentLimit = projectorCfg.getFragmentLimit();
+        int maxFragmentsPerCommit = projectorCfg.getMaxFragmentsPerCommit();
+        int totalPolled = 0;
+        int polled;
+        do {
+            polled = replay.poll(handler, fragmentLimit);
+            totalPolled += polled;
+            if (handler.pendingFragmentCount() >= maxFragmentsPerCommit) {
+                handler.flushPollBatch();
+            }
+        } while (polled > 0 && running.get());
+        if (handler.pendingFragmentCount() > 0) {
+            handler.flushPollBatch();
+        }
+        if (totalPolled > 0) {
+            Thread.onSpinWait();
+        }
+        return totalPolled;
+    }
+
+    private void advanceCursorAtPosition(long newPosition) {
+        if (deferPollBatchCursorAdvance) {
+            deferredPollBatchMaxPosition = Math.max(deferredPollBatchMaxPosition, newPosition);
+            return;
+        }
+        cursorRepository.advanceWithRecording(
+                PROJECTOR_ID,
+                OmsClusterWireFormat.EVENTS_STREAM_ID,
+                requireCurrentRecordingId(),
+                newPosition);
+    }
+
+    private void flushDeferredPollBatchCursorAdvance() {
+        if (deferredPollBatchMaxPosition < 0L) {
+            return;
+        }
+        cursorRepository.advanceWithRecording(
+                PROJECTOR_ID,
+                OmsClusterWireFormat.EVENTS_STREAM_ID,
+                requireCurrentRecordingId(),
+                deferredPollBatchMaxPosition);
+        deferredPollBatchMaxPosition = -1L;
     }
 
     private void applyPendingFragment(PendingFragment fragment) {
@@ -980,12 +1051,7 @@ public class OmsPostgresProjector {
             case PendingFragment.OrderCancelApplied(var ev, var pos) -> applyOrderCancelAppliedEvent(ev, pos);
             case PendingFragment.VenueResolutionApplied(var ev, var pos) ->
                     applyVenueResolutionAppliedEvent(ev, pos);
-            case PendingFragment.CursorOnly(var pos) ->
-                    cursorRepository.advanceWithRecording(
-                            PROJECTOR_ID,
-                            OmsClusterWireFormat.EVENTS_STREAM_ID,
-                            requireCurrentRecordingId(),
-                            pos);
+            case PendingFragment.CursorOnly(var pos) -> advanceCursorAtPosition(pos);
         }
     }
 
@@ -1030,6 +1096,10 @@ public class OmsPostgresProjector {
             List<PendingFragment> batch = List.copyOf(pollBatch);
             pollBatch.clear();
             applyPollBatch(batch);
+        }
+
+        int pendingFragmentCount() {
+            return pollBatch.size();
         }
     }
 
@@ -1082,11 +1152,7 @@ public class OmsPostgresProjector {
         log.warn(
                 "projector shard mismatch: event orderId={} shardId={} but this projector serves shardId={}; dropping event without applying",
                 orderId, eventShardId, expectedShardId);
-        cursorRepository.advanceWithRecording(
-                PROJECTOR_ID,
-                OmsClusterWireFormat.EVENTS_STREAM_ID,
-                requireCurrentRecordingId(),
-                newPosition);
+        advanceCursorAtPosition(newPosition);
         return true;
     }
 
@@ -1132,6 +1198,9 @@ public class OmsPostgresProjector {
                     toPendingControlEvent(ev),
                     admitInsert.order(),
                     skipVenueControlPassAudit(ev));
+            if (venueTradeFeeProjectionService != null) {
+                venueTradeFeeProjectionService.pinFeeAtAdmit(ev);
+            }
         }
         // Phase 4 Tier 2.5 phase D-9: project the BUY-async ledger_inflight_outbox row from
         // the cluster's authoritative OrderAdmittedEvent. D-1 introduced this as a crash-window
@@ -1144,11 +1213,7 @@ public class OmsPostgresProjector {
         // idempotent on replay because the V4 uq_ledger_inflight_outbox_order_id unique
         // index + ON CONFLICT DO NOTHING make this a safe no-op when the row already exists.
         recordLedgerInflightOutboxIfNeeded(ev);
-        cursorRepository.advanceWithRecording(
-                PROJECTOR_ID,
-                OmsClusterWireFormat.EVENTS_STREAM_ID,
-                requireCurrentRecordingId(),
-                newPosition);
+        advanceCursorAtPosition(newPosition);
         // Phase 4j per-event histogram: cluster-admit -> projector-applied. Recorded after the last
         // SQL operation in this fragment's transaction; the actual COMMIT happens when the wrapping
         // TransactionTemplate lambda returns (sub-ms after this point in the fast-path). If any of
@@ -1183,12 +1248,13 @@ public class OmsPostgresProjector {
     }
 
     /**
-     * BUY inflight hold is now always placed before cluster admit in ingress.
+     * Phase 4 Tier 2.5 phase D-9 — primary writer of {@code ledger_inflight_outbox} for the
+     * BUY-with-async-hold case, driven from {@link OrderAdmittedEvent} on the projector.
      *
-     * <p>When {@code oms.ledger.inflight-async-enabled=true}, writing a projector outbox row would
-     * make {@link com.balh.oms.reconciler.LedgerInflightOutboxReconciler} POST a second hold attempt
-     * for the same {@code oms:order:{id}} reference. Keep projector admission deterministic but skip
-     * outbox projection in this mode.
+     * <p>Skipped when {@code oms.ledger.inflight-pre-admit-hold-enabled=true}: ingress already
+     * placed the hold synchronously before cluster admit (b625f5d) and
+     * {@link com.balh.oms.ingress.OrderIngressService#maybePersistLifecycleTrackingRow} records the
+     * txn id for the lifecycle reconciler.
      */
     private void recordLedgerInflightOutboxIfNeeded(OrderAdmittedEvent ev) {
         if (!config.getLedger().isInflightReservationEnabled()) {
@@ -1197,7 +1263,64 @@ public class OmsPostgresProjector {
         if (!config.getLedger().isInflightAsyncEnabled()) {
             return;
         }
-        return;
+        if (config.getLedger().isInflightPreAdmitHoldEnabled()) {
+            return;
+        }
+        if (ev.side() != AcceptOrderCommand.SIDE_BUY) {
+            return;
+        }
+        if (ev.ledgerBalanceIdOrNull() == null || ev.ledgerBalanceIdOrNull().isBlank()) {
+            return;
+        }
+        if (ev.limitPriceScaledOrZero() == 0L) {
+            return;
+        }
+
+        BigDecimal quantity = BigDecimal.valueOf(ev.quantityScaled())
+                .divide(BigDecimal.valueOf(AcceptOrderCommand.QUANTITY_SCALE), 10, RoundingMode.UNNECESSARY);
+        BigDecimal limitPrice = BigDecimal.valueOf(ev.limitPriceScaledOrZero())
+                .divide(BigDecimal.valueOf(AcceptOrderCommand.PRICE_SCALE), 10, RoundingMode.UNNECESSARY);
+        Order holdSizing =
+                new Order(
+                        ev.orderId(),
+                        UUID.fromString(ev.accountId()),
+                        ev.clientIdempotencyKey(),
+                        ev.shardId(),
+                        ev.version(),
+                        OrderStatus.NEW,
+                        null,
+                        Side.BUY,
+                        ev.instrumentSymbol(),
+                        quantity,
+                        limitPrice,
+                        AcceptOrderCommand.timeInForceName(ev.timeInForceCode()),
+                        Instant.ofEpochSecond(0, ev.clientTimestampNanos()),
+                        Instant.ofEpochMilli(ev.acceptedAtMillis()),
+                        null,
+                        ev.accountIdHash(),
+                        ev.ledgerBalanceIdOrNull(),
+                        BigDecimal.ZERO,
+                        AcceptOrderCommand.ordTypeName(ev.ordTypeCode()));
+        Optional<BigDecimal> holdAmount = BuyFundsRequirement.requiredBuyFunds(holdSizing, config);
+        if (holdAmount.isEmpty()) {
+            return;
+        }
+        Optional<BigDecimal> feeAmount = BuyFundsRequirement.estimatedFee(holdSizing, config);
+
+        var node = objectMapper.createObjectNode();
+        node.put("ledgerBalanceId", ev.ledgerBalanceIdOrNull());
+        node.put("quantity", quantity.toPlainString());
+        node.put("limitPrice", limitPrice.toPlainString());
+        node.put("holdAmount", holdAmount.get().toPlainString());
+        feeAmount.ifPresent(f -> node.put("feeAmount", f.toPlainString()));
+        String payload;
+        try {
+            payload = objectMapper.writeValueAsString(node);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException(
+                    "ledger inflight outbox payload serialisation failed for orderId=" + ev.orderId(), e);
+        }
+        ledgerInflightOutboxRepository.insertIfAbsent(ev.orderId(), payload);
     }
 
     /**
@@ -1290,11 +1413,7 @@ public class OmsPostgresProjector {
                     "Projector: ExecutionAppliedEvent for unknown order {} (venueExecRef={}); skipping.",
                     ev.orderId(),
                     ev.venueExecRef());
-            cursorRepository.advanceWithRecording(
-                PROJECTOR_ID,
-                OmsClusterWireFormat.EVENTS_STREAM_ID,
-                requireCurrentRecordingId(),
-                newPosition);
+            advanceCursorAtPosition(newPosition);
             return;
         }
         Order order = opt.get();
@@ -1324,11 +1443,7 @@ public class OmsPostgresProjector {
                     ev.orderId(),
                     ev.venueExecRef());
         }
-        cursorRepository.advanceWithRecording(
-                PROJECTOR_ID,
-                OmsClusterWireFormat.EVENTS_STREAM_ID,
-                requireCurrentRecordingId(),
-                newPosition);
+        advanceCursorAtPosition(newPosition);
     }
 
     /**
@@ -1370,11 +1485,7 @@ public class OmsPostgresProjector {
                     "Projector: OrderCancelAppliedEvent for unknown order {} (reason={}); skipping.",
                     ev.orderId(),
                     ev.reason());
-            cursorRepository.advanceWithRecording(
-                PROJECTOR_ID,
-                OmsClusterWireFormat.EVENTS_STREAM_ID,
-                requireCurrentRecordingId(),
-                newPosition);
+            advanceCursorAtPosition(newPosition);
             return;
         }
         Order order = opt.get();
@@ -1385,11 +1496,7 @@ public class OmsPostgresProjector {
             log.debug(
                     "Projector: OrderCancelAppliedEvent already projected for order {}; advancing cursor only.",
                     ev.orderId());
-            cursorRepository.advanceWithRecording(
-                PROJECTOR_ID,
-                OmsClusterWireFormat.EVENTS_STREAM_ID,
-                requireCurrentRecordingId(),
-                newPosition);
+            advanceCursorAtPosition(newPosition);
             return;
         }
         int pgExpectedVersion = order.version();
@@ -1411,11 +1518,7 @@ public class OmsPostgresProjector {
                     order.id(),
                     pgExpectedVersion,
                     order.status());
-            cursorRepository.advanceWithRecording(
-                PROJECTOR_ID,
-                OmsClusterWireFormat.EVENTS_STREAM_ID,
-                requireCurrentRecordingId(),
-                newPosition);
+            advanceCursorAtPosition(newPosition);
             return;
         }
         int newSeq = pgExpectedVersion + 1;
@@ -1431,20 +1534,12 @@ public class OmsPostgresProjector {
             throw new IllegalStateException(
                     "domain event serialisation failed for OMS-cancel of order " + refreshed.id(), e);
         }
-        cursorRepository.advanceWithRecording(
-                PROJECTOR_ID,
-                OmsClusterWireFormat.EVENTS_STREAM_ID,
-                requireCurrentRecordingId(),
-                newPosition);
+        advanceCursorAtPosition(newPosition);
     }
 
     void applyVenueResolutionAppliedEvent(VenueResolutionAppliedEvent ev, long newPosition) {
         predictionMarketResolutionService.apply(ev);
-        cursorRepository.advanceWithRecording(
-                PROJECTOR_ID,
-                OmsClusterWireFormat.EVENTS_STREAM_ID,
-                requireCurrentRecordingId(),
-                newPosition);
+        advanceCursorAtPosition(newPosition);
     }
 
     /**
@@ -1502,6 +1597,10 @@ public class OmsPostgresProjector {
             return false;
         }
         meterRegistry.counter(METRIC_EXECUTIONS_APPLIED, TAG_OUTCOME, OUTCOME_INSERTED).increment();
+
+        if (venueTradeFeeProjectionService != null) {
+            venueTradeFeeProjectionService.applyTradeFee(insertedId.get(), ev, order);
+        }
 
         // Slice 3e-2: free-riding attribution links must be appended to the just-inserted row
         // before the orders CAS so the link write commits in the same transaction. Excludes the

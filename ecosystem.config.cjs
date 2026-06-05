@@ -422,7 +422,7 @@ const apps = [
     name: 'oms-cluster-node',
     script: JAVA,
     args: [...LOW_LATENCY_JVM_FLAGS, '-jar', ROLE_JAR('cluster-node')],
-    max_memory_restart: '4G',
+    max_memory_restart: '12G',
     min_uptime: '20s',
     output: logPath('oms-cluster-node-out', '.log'),
     error: logPath('oms-cluster-node-err', '.log'),
@@ -601,7 +601,7 @@ const apps = [
       // Pop! D-6 bench (57k rps): max=8 + flush=50 µs beat max=16; at ~150 RPS the 50 µs
       // coalesce window fills ~8 admits before flush.
       OMS_CLUSTER_CLIENT_ADMIT_BATCH_ENABLED: 'true',
-      OMS_CLUSTER_CLIENT_ADMIT_BATCH_MAX_SIZE: '8',
+      OMS_CLUSTER_CLIENT_ADMIT_BATCH_MAX_SIZE: '32',
       OMS_CLUSTER_CLIENT_ADMIT_BATCH_FLUSH_INTERVAL_NANOS: '50000',
       OMS_CLUSTER_CLIENT_ADMIT_BATCH_QUEUE_CAPACITY: '8192',
     },

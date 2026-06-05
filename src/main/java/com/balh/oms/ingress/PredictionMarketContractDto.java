@@ -30,7 +30,11 @@ public final class PredictionMarketContractDto {
             String category,
             java.util.List<String> tags,
             String cardImageUrl,
-            int displayOrder) {}
+            int displayOrder,
+            String feeModelId,
+            int feeScheduleVersion,
+            String feeParamsJson,
+            String retailFeeModelId) {}
 
     public record ContractListResponse(java.util.List<ContractResponse> items) {}
 
@@ -61,6 +65,10 @@ public final class PredictionMarketContractDto {
                 row.category(),
                 row.tags(),
                 row.cardImageUrl(),
-                row.displayOrder());
+                row.displayOrder(),
+                row.feeModelId(),
+                row.feeScheduleVersion(),
+                row.feeParamsJson(),
+                row.retailFeeModelId());
     }
 }

@@ -259,7 +259,7 @@ public class OmsVenueResolverService {
                         venueId,
                         event.venueExecRef(),
                         "",
-                        "{\"source\":\"balh-venue-maker-fill\"}");
+                        "{\"source\":\"balh-venue-maker-fill\",\"liquidityRole\":\"MAKER\"}");
         clusterIngressClient.submitApplyExecutionReport(
                 cmd, Duration.ofMillis(config.getCluster().getVenueResolver().getOfferTimeoutMs()));
         log.debug(

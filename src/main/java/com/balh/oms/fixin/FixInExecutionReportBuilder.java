@@ -21,9 +21,12 @@ import quickfix.field.Side;
 import quickfix.field.Symbol;
 import quickfix.field.Text;
 import quickfix.field.TimeInForce;
+import quickfix.field.LastLiquidityInd;
 import quickfix.field.LastPx;
 import quickfix.field.LastQty;
 import quickfix.field.TransactTime;
+import com.balh.oms.settlement.VenueLiquidityRole;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import quickfix.fix44.ExecutionReport;
 import quickfix.fix44.OrderCancelReject;
 
@@ -35,6 +38,12 @@ import java.util.UUID;
 @Component
 @Profile(OmsProfiles.FIX_INGRESS)
 public class FixInExecutionReportBuilder {
+
+    private final ObjectMapper objectMapper;
+
+    public FixInExecutionReportBuilder(ObjectMapper objectMapper) {
+        this.objectMapper = objectMapper;
+    }
 
     public ExecutionReport buildNew(UUID omsOrderId, FixInParsedNewOrder parsed) {
         ExecutionReport er = baseReport(omsOrderId, parsed, ExecType.NEW, OrdStatus.NEW);
@@ -93,6 +102,14 @@ public class FixInExecutionReportBuilder {
         }
         if (ev.lastPxScaled() > 0) {
             er.setString(LastPx.FIELD, plain(unscalePrice(ev.lastPxScaled())));
+        }
+        if (ev.execTypeCode() == ApplyExecutionReportCommand.EXEC_TYPE_TRADE) {
+            VenueLiquidityRole role =
+                    VenueLiquidityRole.fromExecutionEnvelope(ev.rawEnvelopeJson(), objectMapper);
+            char ind = role.fixLastLiquidityInd();
+            if (ind != '0') {
+                er.set(new LastLiquidityInd(ind));
+            }
         }
         return er;
     }

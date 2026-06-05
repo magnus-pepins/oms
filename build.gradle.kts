@@ -597,6 +597,14 @@ tasks.register<JavaExec>("bootRunBurst") {
     standardInput = System.`in`
 }
 
+tasks.register("printBurstClasspath") {
+    group = "help"
+    description = "Print runtime classpath for IngressBurstMain (bench scripts)"
+    doLast {
+        println(sourceSets["main"].runtimeClasspath.asPath)
+    }
+}
+
 /**
  * Micrometer's prometheus registry pins {@code io.prometheus:prometheus-metrics-*} 1.2.x while the OTel
  * Prometheus exporter brings 1.3.x textformats — mixed jars cause {@code NoSuchMethodError} at startup.

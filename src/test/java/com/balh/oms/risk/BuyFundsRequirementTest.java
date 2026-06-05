@@ -25,6 +25,13 @@ class BuyFundsRequirementTest {
     }
 
     @Test
+    void venueRoutedSymbolUsesNotionalOnlyWithoutStockMinFee() {
+        OmsConfig cfg = new OmsConfig();
+        Order order = predmktBuyOrder(new BigDecimal("1"), new BigDecimal("0.03"));
+        assertThat(BuyFundsRequirement.requiredBuyFunds(order, cfg)).contains(new BigDecimal("0.03"));
+    }
+
+    @Test
     void marketBuyWithoutReferencePriceIsEmpty() {
         OmsConfig cfg = new OmsConfig();
         Order order = buyOrder(new BigDecimal("1"), null);
@@ -33,6 +40,14 @@ class BuyFundsRequirementTest {
     }
 
     private static Order buyOrder(BigDecimal qty, BigDecimal limit) {
+        return orderWithSymbol("AAPL", qty, limit);
+    }
+
+    private static Order predmktBuyOrder(BigDecimal qty, BigDecimal limit) {
+        return orderWithSymbol("PREDMKT-WC26_TEST", qty, limit);
+    }
+
+    private static Order orderWithSymbol(String symbol, BigDecimal qty, BigDecimal limit) {
         Instant now = Instant.now();
         return new Order(
                 UUID.randomUUID(),
@@ -43,7 +58,7 @@ class BuyFundsRequirementTest {
                 OrderStatus.NEW,
                 null,
                 Side.BUY,
-                "AAPL",
+                symbol,
                 qty,
                 limit,
                 "DAY",

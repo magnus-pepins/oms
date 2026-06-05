@@ -48,7 +48,11 @@ class PredictionMarketContractServiceTest {
                         before.category(),
                         before.tags(),
                         before.cardImageUrl(),
-                        before.displayOrder());
+                        before.displayOrder(),
+                        before.feeModelId(),
+                        before.feeScheduleVersion(),
+                        before.feeParamsJson(),
+                        before.retailFeeModelId());
         assertFalse(PredictionMarketContractService.requiresVenueRegistrySync(before, after));
     }
 
@@ -91,7 +95,11 @@ class PredictionMarketContractServiceTest {
                         before.category(),
                         before.tags(),
                         before.cardImageUrl(),
-                        before.displayOrder());
+                        before.displayOrder(),
+                        before.feeModelId(),
+                        before.feeScheduleVersion(),
+                        before.feeParamsJson(),
+                        before.retailFeeModelId());
         assertTrue(PredictionMarketContractService.requiresVenueRegistrySync(before, after));
     }
 
@@ -117,6 +125,10 @@ class PredictionMarketContractServiceTest {
                 null,
                 List.of(),
                 null,
-                0);
+                0,
+                "ZERO",
+                1,
+                "{}",
+                "TAKER_ONLY");
     }
 }

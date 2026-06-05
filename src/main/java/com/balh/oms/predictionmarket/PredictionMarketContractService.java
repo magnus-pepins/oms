@@ -50,7 +50,11 @@ public class PredictionMarketContractService {
             List<String> tags,
             String cardImageUrl,
             Integer displayOrder,
-            String status) {}
+            String status,
+            String feeModelId,
+            Integer feeScheduleVersion,
+            String feeParamsJson,
+            String retailFeeModelId) {}
 
     public record UpdateRequest(
             String title,
@@ -68,7 +72,11 @@ public class PredictionMarketContractService {
             List<String> tags,
             String cardImageUrl,
             Integer displayOrder,
-            String status) {}
+            String status,
+            String feeModelId,
+            Integer feeScheduleVersion,
+            String feeParamsJson,
+            String retailFeeModelId) {}
 
     public PredictionMarketContractRepository.ContractRow create(CreateRequest req) {
         String slug = normalizeSlug(req.slug());
@@ -115,7 +123,11 @@ public class PredictionMarketContractService {
                         category,
                         tags,
                         cardImageUrl,
-                        displayOrder);
+                        displayOrder,
+                        normalizeFeeModelId(req.feeModelId(), "TAKER_ONLY"),
+                        req.feeScheduleVersion(),
+                        req.feeParamsJson(),
+                        trimToNull(req.retailFeeModelId()));
         if (shouldSyncVenueRegistry(status)) {
             venueRegistry.syncContract(row);
         }
@@ -197,6 +209,17 @@ public class PredictionMarketContractService {
                                             ? PredictionMarketCatalogPresentation.normalizeDisplayOrder(
                                                     req.displayOrder())
                                             : existing.displayOrder();
+                            String feeModelId =
+                                    req.feeModelId() != null
+                                            ? normalizeFeeModelId(req.feeModelId(), existing.feeModelId())
+                                            : null;
+                            Integer feeScheduleVersion =
+                                    req.feeScheduleVersion() != null ? req.feeScheduleVersion() : null;
+                            String feeParamsJson = req.feeParamsJson();
+                            String retailFeeModelId =
+                                    req.retailFeeModelId() != null
+                                            ? trimToNull(req.retailFeeModelId())
+                                            : existing.retailFeeModelId();
                             PredictionMarketContractRepository.ContractRow updated =
                                     repository.update(
                                             id,
@@ -215,7 +238,11 @@ public class PredictionMarketContractService {
                                             category,
                                             tags,
                                             cardImageUrl,
-                                            displayOrder);
+                                            displayOrder,
+                                            feeModelId,
+                                            feeScheduleVersion,
+                                            feeParamsJson,
+                                            retailFeeModelId);
                             syncVenueRegistryAfterUpdate(existing, updated);
                             return updated;
                         });
@@ -308,6 +335,13 @@ public class PredictionMarketContractService {
             throw new IllegalArgumentException(field + " is required");
         }
         return value.trim();
+    }
+
+    private static String normalizeFeeModelId(String raw, String fallback) {
+        if (raw == null || raw.isBlank()) {
+            return fallback == null || fallback.isBlank() ? "ZERO" : fallback.trim().toUpperCase(Locale.ROOT);
+        }
+        return raw.trim().toUpperCase(Locale.ROOT);
     }
 
     private static String trimToNull(String value) {

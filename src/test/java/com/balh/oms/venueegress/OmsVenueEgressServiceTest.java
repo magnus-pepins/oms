@@ -55,6 +55,9 @@ class OmsVenueEgressServiceTest {
         lenient()
                 .when(cursorRepository.advanceWithRecording(any(), anyInt(), eq(3L), anyLong()))
                 .thenReturn(true);
+        lenient()
+                .when(clusterIngressClient.nextCorrelationId())
+                .thenReturn(1001L, 1002L, 1003L, 1004L, 1005L);
     }
 
     @Test
@@ -205,7 +208,87 @@ class OmsVenueEgressServiceTest {
                         org.mockito.ArgumentMatchers.argThat(
                                 cmd ->
                                         cmd.execTypeCode()
-                                                == ApplyExecutionReportCommand.EXEC_TYPE_VENUE_REJECT),
+                                                        == ApplyExecutionReportCommand
+                                                                .EXEC_TYPE_VENUE_REJECT
+                                                && cmd.correlationId() > 0L),
                         any());
+    }
+
+    @Test
+    void applyAdmittedEvent_venueTransportFailure_retriesVenueRejectSubmit() throws Exception {
+        OrderAdmittedEvent ev =
+                new OrderAdmittedEvent(
+                        UUID.randomUUID(),
+                        1L,
+                        1L,
+                        10_000_000_000L,
+                        650_000L,
+                        0,
+                        0,
+                        (byte) 0,
+                        (byte) 0,
+                        (byte) 2,
+                        "a",
+                        "i",
+                        "h",
+                        "PREDMKT-TEST-1",
+                        null,
+                        null);
+        when(routeClient.routeAdmittedOrder(ev))
+                .thenThrow(new VenueRouteTransportException("down", new RuntimeException("refused")));
+        doThrow(new java.util.concurrent.TimeoutException("cluster blip"))
+                .doNothing()
+                .when(clusterIngressClient)
+                .submitApplyExecutionReport(any(ApplyExecutionReportCommand.class), any());
+
+        assertThat(service.applyAdmittedEvent(ev, 100L)).isTrue();
+
+        verify(clusterIngressClient, times(2)).submitApplyExecutionReport(any(), any());
+    }
+
+    @Test
+    void applyAdmittedEvent_venueTransportFailure_venueRejectSubmitExhausted_doesNotAdvanceCursor()
+            throws Exception {
+        OmsConfig config = new OmsConfig();
+        config.getCluster().getVenueEgress().setVenueRejectSubmitMaxAttempts(2);
+        service =
+                new OmsVenueEgressService(
+                        config,
+                        cursorRepository,
+                        new SimpleMeterRegistry(),
+                        new ObjectMapper(),
+                        Clock.systemUTC(),
+                        routeClient,
+                        clusterIngressClient);
+        service.setCurrentRecordingIdForTesting(3L);
+
+        OrderAdmittedEvent ev =
+                new OrderAdmittedEvent(
+                        UUID.randomUUID(),
+                        1L,
+                        1L,
+                        10_000_000_000L,
+                        650_000L,
+                        0,
+                        0,
+                        (byte) 0,
+                        (byte) 0,
+                        (byte) 2,
+                        "a",
+                        "i",
+                        "h",
+                        "PREDMKT-TEST-1",
+                        null,
+                        null);
+        when(routeClient.routeAdmittedOrder(ev))
+                .thenThrow(new VenueRouteTransportException("down", new RuntimeException("refused")));
+        doThrow(new java.util.concurrent.TimeoutException("cluster down"))
+                .when(clusterIngressClient)
+                .submitApplyExecutionReport(any(ApplyExecutionReportCommand.class), any());
+
+        assertThat(service.applyAdmittedEvent(ev, 100L)).isFalse();
+
+        verify(cursorRepository, times(0)).advanceWithRecording(any(), anyInt(), anyLong(), anyLong());
+        verify(clusterIngressClient, times(2)).submitApplyExecutionReport(any(), any());
     }
 }

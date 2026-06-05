@@ -630,6 +630,14 @@ public class OrderIngressService {
         if (!config.getLedger().isInflightReservationEnabled()) {
             return BuyLedgerHoldPlacement.none();
         }
+        // Slice 4p async outbox path (bench default on pop): hold after cluster admit via projector +
+        // reconciler — do not block accept on Ledger HTTP. Pre-admit sync is opt-in via
+        // oms.ledger.inflight-pre-admit-hold-enabled (production retail default true, b625f5d).
+        if (config.getLedger().isInflightAsyncEnabled()
+                && !config.getLedger().isInflightPreAdmitHoldEnabled()
+                && !config.getLedger().isInflightCoalescerEnabled()) {
+            return BuyLedgerHoldPlacement.none();
+        }
         if (order.side() != Side.BUY) {
             return BuyLedgerHoldPlacement.none();
         }

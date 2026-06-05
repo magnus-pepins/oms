@@ -3,6 +3,7 @@ package com.balh.oms.risk;
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.domain.Order;
 import com.balh.oms.domain.Side;
+import com.balh.oms.routing.VenueRoutingSymbols;
 import com.balh.oms.settlement.StockCommissionCalculator;
 
 import java.math.BigDecimal;
@@ -46,6 +47,13 @@ public final class BuyFundsRequirement {
         BigDecimal notional = StockCommissionCalculator.notional(order.quantity(), price.get());
         if (notional.signum() <= 0) {
             return Optional.empty();
+        }
+        // Venue-routed prediction markets: collateral is contract notional at the limit price,
+        // not the equities min-fee schedule (€1 min on a €0.03 PREDMKT tick inflated soak holds
+        // 33× and exhausted bench balance after failed ledger-on runs on pop).
+        if (VenueRoutingSymbols.matchesVenuePrefix(
+                VenueRoutingSymbols.venueSymbolPrefix(config), order.instrumentSymbol())) {
+            return Optional.of(notional);
         }
         String market = config.getSettlement().getDefaultInstrumentMarket();
         StockCommissionCalculator.Schedule schedule = StockCommissionCalculator.defaultScheduleFor(market);

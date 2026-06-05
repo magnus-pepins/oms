@@ -83,4 +83,11 @@ public final class OmsProfiles {
      * for FIX {@code ExecutionReport}.
      */
     public static final String VENUE_EGRESS = "oms-venue-egress";
+
+    /**
+     * JVMs that push the OPEN prediction-market catalog into the venue registry on startup
+     * ({@code oms-ingress-replica} and {@code oms-venue-egress}). Complements the operator
+     * {@code sync-pop-prediction-market-venue.sh} hook after venue-cluster restart.
+     */
+    public static final String VENUE_REGISTRY_STARTUP_SYNC_PROFILE = "oms-ingress-replica | oms-venue-egress";
 }

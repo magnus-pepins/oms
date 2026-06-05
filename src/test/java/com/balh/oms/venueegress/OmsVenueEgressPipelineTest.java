@@ -78,6 +78,9 @@ class OmsVenueEgressPipelineTest {
         lenient()
                 .when(cursorRepository.advanceWithRecording(any(), anyInt(), eq(3L), anyLong()))
                 .thenReturn(true);
+        lenient()
+                .when(clusterIngressClient.submitApplyExecutionReportAsync(any(), any()))
+                .thenReturn(CompletableFuture.completedFuture(null));
         // Caller-runs executor: completing a future on the test thread runs the ack callback inline.
         service.enablePipelineForTesting(8, Runnable::run);
     }
@@ -120,7 +123,7 @@ class OmsVenueEgressPipelineTest {
         assertThat(service.pipelineIsDrainedForTesting()).isTrue();
 
         // All three execution reports were submitted to the OMS cluster.
-        verify(clusterIngressClient, times(3)).submitApplyExecutionReport(any(), any());
+        verify(clusterIngressClient, times(3)).submitApplyExecutionReportAsync(any(), any());
     }
 
     @Test
@@ -363,7 +366,7 @@ class OmsVenueEgressPipelineTest {
             assertThat(erFlushSubmissions.get())
                     .as("coalesced ER flush should not queue one executor task per completion")
                     .isLessThan(admitCount);
-            verify(clusterIngressClient, times(admitCount)).submitApplyExecutionReport(any(), any());
+            verify(clusterIngressClient, times(admitCount)).submitApplyExecutionReportAsync(any(), any());
         } finally {
             releaseEr.countDown();
             erPool.shutdown();
@@ -377,13 +380,22 @@ class OmsVenueEgressPipelineTest {
         int admitCount = maxInFlight * 2;
         CountDownLatch releaseEr = new CountDownLatch(1);
 
-        doAnswer(
+        when(clusterIngressClient.submitApplyExecutionReportAsync(any(), any()))
+                .thenAnswer(
                         inv -> {
-                            assertThat(releaseEr.await(5, TimeUnit.SECONDS)).isTrue();
-                            return null;
-                        })
-                .when(clusterIngressClient)
-                .submitApplyExecutionReport(any(), any());
+                            CompletableFuture<Void> pending = new CompletableFuture<>();
+                            CompletableFuture.runAsync(
+                                    () -> {
+                                        try {
+                                            assertThat(releaseEr.await(5, TimeUnit.SECONDS)).isTrue();
+                                            pending.complete(null);
+                                        } catch (InterruptedException e) {
+                                            Thread.currentThread().interrupt();
+                                            pending.completeExceptionally(e);
+                                        }
+                                    });
+                            return pending;
+                        });
 
         ExecutorService erPool = Executors.newVirtualThreadPerTaskExecutor();
         try {
@@ -415,6 +427,50 @@ class OmsVenueEgressPipelineTest {
     }
 
     @Test
+    void erBacklog_allowsDispatchUpToMaxPendingFragmentsWhileVenuePermitsRecycle() throws Exception {
+        int maxInFlight = 4;
+        int maxPending = maxInFlight * 2;
+        CountDownLatch releaseEr = new CountDownLatch(1);
+        CompletableFuture<Void> erBlock = new CompletableFuture<>();
+        var routeOfferPool = Executors.newSingleThreadExecutor();
+        try {
+            service.enablePipelineForTesting(maxInFlight, Runnable::run, Runnable::run, routeOfferPool);
+            service.markRunningForTesting();
+
+            when(routeClient.routeAdmittedOrderAsync(any()))
+                    .thenAnswer(
+                            inv -> {
+                                OrderAdmittedEvent ev = inv.getArgument(0);
+                                return CompletableFuture.completedFuture(Optional.of(er(ev)));
+                            });
+            when(clusterIngressClient.submitApplyExecutionReportAsync(any(), any()))
+                    .thenAnswer(
+                            inv -> {
+                                assertThat(releaseEr.await(5, TimeUnit.SECONDS)).isTrue();
+                                return erBlock;
+                            });
+
+            for (int i = 0; i < maxPending; i++) {
+                service.pipelineDispatchAdmitForTesting(admit("PREDMKT-TEST-1"), 10L * (i + 1));
+            }
+
+            await().atMost(Duration.ofSeconds(3))
+                    .untilAsserted(
+                            () -> verify(routeClient, times(maxPending)).routeAdmittedOrderAsync(any()));
+            assertThat(service.pipelineInFlightForTesting()).isEqualTo(maxPending);
+
+            releaseEr.countDown();
+            erBlock.complete(null);
+            assertThat(service.pipelineQuiesceForTesting()).isTrue();
+        } finally {
+            releaseEr.countDown();
+            erBlock.complete(null);
+            routeOfferPool.shutdown();
+            routeOfferPool.awaitTermination(2, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
     void backlogThrottle_reducesEffectiveInFlight_whenErQueueDepthIsHigh() throws Exception {
         OmsConfig config = new OmsConfig();
         config.getCluster().getVenueEgress().setVenueRouteMaxInFlight(8);
@@ -435,6 +491,9 @@ class OmsVenueEgressPipelineTest {
         lenient()
                 .when(cursorRepository.advanceWithRecording(any(), anyInt(), eq(3L), anyLong()))
                 .thenReturn(true);
+        lenient()
+                .when(clusterIngressClient.submitApplyExecutionReportAsync(any(), any()))
+                .thenReturn(CompletableFuture.completedFuture(null));
         service.enablePipelineForTesting(8, Runnable::run, Runnable::run, Runnable::run);
         service.markRunningForTesting();
 
@@ -471,16 +530,19 @@ class OmsVenueEgressPipelineTest {
         OrderAdmittedEvent ev = admit("PREDMKT-TEST-1");
         CompletableFuture<Optional<ExecutionReport>> f = new CompletableFuture<>();
         when(routeClient.routeAdmittedOrderAsync(ev)).thenReturn(f);
-        doThrow(new java.util.concurrent.TimeoutException("cluster down"))
-                .when(clusterIngressClient)
-                .submitApplyExecutionReport(any(), any());
+        when(clusterIngressClient.submitApplyExecutionReportAsync(any(), any()))
+                .thenReturn(
+                        CompletableFuture.failedFuture(
+                                new java.util.concurrent.TimeoutException("cluster down")));
 
         service.pipelineDispatchAdmitForTesting(ev, 10L);
         f.complete(Optional.of(er(ev)));
 
         await().atMost(Duration.ofSeconds(1))
                 .untilAsserted(
-                        () -> verify(clusterIngressClient, atLeast(1)).submitApplyExecutionReport(any(), any()));
+                        () ->
+                                verify(clusterIngressClient, atLeast(1))
+                                        .submitApplyExecutionReportAsync(any(), any()));
 
         service.pipelineDrainContiguousForTesting();
         verify(cursorRepository, never()).advanceWithRecording(any(), anyInt(), anyLong(), anyLong());

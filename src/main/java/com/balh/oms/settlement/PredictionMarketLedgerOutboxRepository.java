@@ -14,6 +14,7 @@ import java.util.UUID;
 public class PredictionMarketLedgerOutboxRepository {
 
     public static final String LEG_PREDICTION_PAYOUT = "prediction-payout";
+    public static final String LEG_PREDICTION_TRADE_FEE = "prediction-trade-fee";
 
     public record OutboxRow(
             long id,

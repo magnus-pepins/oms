@@ -586,4 +586,78 @@ public class ExecutionsRepository {
             }
         }
     }
+
+    public void updateTradeFee(
+            long executionId,
+            String liquidityRole,
+            BigDecimal feeAmount,
+            String feeCurrency,
+            String feeModelId,
+            int feeScheduleVersion) {
+        jdbc.update(
+                """
+                        UPDATE executions
+                        SET liquidity_role = :liquidityRole,
+                            fee_amount = :feeAmount,
+                            fee_currency = :feeCurrency,
+                            fee_model_id = :feeModelId,
+                            fee_schedule_version = :feeScheduleVersion
+                        WHERE id = :id
+                        """,
+                new MapSqlParameterSource()
+                        .addValue("id", executionId)
+                        .addValue("liquidityRole", liquidityRole)
+                        .addValue("feeAmount", feeAmount)
+                        .addValue("feeCurrency", feeCurrency)
+                        .addValue("feeModelId", feeModelId)
+                        .addValue("feeScheduleVersion", feeScheduleVersion));
+    }
+
+    public record AccountFeeTotal(UUID accountId, BigDecimal feeTotal, String feeCurrency) {}
+
+    public List<AccountFeeTotal> sumUncollectedTradeFeesForSymbols(java.util.List<String> symbols) {
+        if (symbols == null || symbols.isEmpty()) {
+            return List.of();
+        }
+        return jdbc.query(
+                """
+                        SELECT e.account_id, COALESCE(SUM(e.fee_amount), 0) AS fee_total,
+                               MAX(e.fee_currency) AS fee_currency
+                        FROM executions e
+                        JOIN orders o ON o.id = e.order_id
+                        WHERE o.instrument_symbol IN (:symbols)
+                          AND e.exec_type = CAST('TRADE' AS execution_exec_type)
+                          AND e.fee_amount IS NOT NULL
+                          AND e.fee_amount > 0
+                          AND e.fee_collected_at IS NULL
+                        GROUP BY e.account_id
+                        """,
+                new MapSqlParameterSource("symbols", symbols),
+                (rs, rowNum) ->
+                        new AccountFeeTotal(
+                                (UUID) rs.getObject("account_id"),
+                                rs.getBigDecimal("fee_total"),
+                                rs.getString("fee_currency")));
+    }
+
+    public int markTradeFeesCollectedForSymbols(java.util.List<String> symbols, Instant collectedAt) {
+        if (symbols == null || symbols.isEmpty()) {
+            return 0;
+        }
+        return jdbc.update(
+                """
+                        UPDATE executions e
+                        SET fee_collected_at = :ts
+                        FROM orders o
+                        WHERE o.id = e.order_id
+                          AND o.instrument_symbol IN (:symbols)
+                          AND e.exec_type = CAST('TRADE' AS execution_exec_type)
+                          AND e.fee_amount IS NOT NULL
+                          AND e.fee_amount > 0
+                          AND e.fee_collected_at IS NULL
+                        """,
+                new MapSqlParameterSource()
+                        .addValue("symbols", symbols)
+                        .addValue("ts", java.sql.Timestamp.from(collectedAt)));
+    }
 }

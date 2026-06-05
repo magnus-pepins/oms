@@ -120,13 +120,20 @@ public final class LedgerSettlementLegPoster implements LedgerSettlementPostingC
         } catch (JsonProcessingException e) {
             throw new LedgerSettlementPostingException("invalid prediction-market outbox payload_json", e);
         }
-        validateTemplate(
-                p,
-                SettlementTemplateIds.PREDICTION_MARKET_BINARY_RESOLUTION,
-                SettlementTemplateIds.PREDICTION_MARKET_BINARY_RESOLUTION_VERSION,
-                SettlementTemplateRegistry.OUTBOX_PREDICTION_MARKET);
         if (PredictionMarketLedgerOutboxRepository.LEG_PREDICTION_PAYOUT.equals(legKind)) {
+            validateTemplate(
+                    p,
+                    SettlementTemplateIds.PREDICTION_MARKET_BINARY_RESOLUTION,
+                    SettlementTemplateIds.PREDICTION_MARKET_BINARY_RESOLUTION_VERSION,
+                    SettlementTemplateRegistry.OUTBOX_PREDICTION_MARKET);
             postPredictionMarketPayout(outboxId, p);
+        } else if (PredictionMarketLedgerOutboxRepository.LEG_PREDICTION_TRADE_FEE.equals(legKind)) {
+            validateTemplate(
+                    p,
+                    SettlementTemplateIds.PREDICTION_MARKET_TRADE_FEE,
+                    SettlementTemplateIds.PREDICTION_MARKET_TRADE_FEE_VERSION,
+                    SettlementTemplateRegistry.OUTBOX_PREDICTION_MARKET);
+            postPredictionMarketTradeFee(outboxId, p);
         } else {
             throw new LedgerSettlementPostingException("unknown prediction-market legKind: " + legKind);
         }
@@ -142,6 +149,30 @@ public final class LedgerSettlementLegPoster implements LedgerSettlementPostingC
         } catch (IllegalArgumentException e) {
             throw new LedgerSettlementPostingException(e.getMessage(), e);
         }
+    }
+
+    private void postPredictionMarketTradeFee(long outboxId, JsonNode p) throws LedgerSettlementPostingException {
+        String accountId = required(p, "accountId");
+        String currency = required(p, "currency");
+        BigDecimal fee = bigDecimal(p, "feeAmount");
+        if (fee.signum() <= 0) {
+            log.debug("prediction trade fee skipped (amount<=0) outboxId={}", outboxId);
+            return;
+        }
+        String collateral =
+                textOrDefault(p, "collateralIndicator", "@Prediction-Market-Collateral-" + currency);
+        String revenue = textOrDefault(p, "revenueIndicator", "@Platform-Revenue-" + currency);
+        String customerBalance = resolveCustomerBalanceId(p, accountId, currency);
+        Map<String, Object> body =
+                legBody(
+                        customerBalance,
+                        revenue,
+                        fee,
+                        currency,
+                        "prediction-trade-fee-" + outboxId,
+                        "Prediction market trade fees symbol=" + textOrDefault(p, "instrumentSymbol", ""));
+        addLegMetaData(body, p, "prediction-trade-fee");
+        postLeg(body, outboxId, "prediction-trade-fee");
     }
 
     private void postPredictionMarketPayout(long outboxId, JsonNode p) throws LedgerSettlementPostingException {

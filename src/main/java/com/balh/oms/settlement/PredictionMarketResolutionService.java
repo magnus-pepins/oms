@@ -30,6 +30,7 @@ public class PredictionMarketResolutionService {
     private final VenueContractResolutionRepository resolutionRepository;
     private final PredictionMarketContractRepository contractRepository;
     private final PredictionMarketLedgerOutboxRepository ledgerOutbox;
+    private final com.balh.oms.persistence.ExecutionsRepository executionsRepository;
     private final PositionsRepository positionsRepository;
     private final DomainEventOutboxRepository domainEventOutboxRepository;
     private final NamedParameterJdbcTemplate jdbc;
@@ -40,6 +41,7 @@ public class PredictionMarketResolutionService {
             VenueContractResolutionRepository resolutionRepository,
             PredictionMarketContractRepository contractRepository,
             PredictionMarketLedgerOutboxRepository ledgerOutbox,
+            com.balh.oms.persistence.ExecutionsRepository executionsRepository,
             PositionsRepository positionsRepository,
             DomainEventOutboxRepository domainEventOutboxRepository,
             NamedParameterJdbcTemplate jdbc,
@@ -48,6 +50,7 @@ public class PredictionMarketResolutionService {
         this.resolutionRepository = resolutionRepository;
         this.contractRepository = contractRepository;
         this.ledgerOutbox = ledgerOutbox;
+        this.executionsRepository = executionsRepository;
         this.positionsRepository = positionsRepository;
         this.domainEventOutboxRepository = domainEventOutboxRepository;
         this.jdbc = jdbc;
@@ -83,6 +86,7 @@ public class PredictionMarketResolutionService {
 
         resolveOpenOrders(symbol);
         enqueuePayouts(resolutionId, symbol, ev.outcomeCode());
+        enqueueTradeFees(resolutionId, symbol);
         writeDomainEvent(ev, symbol, outcomeLabel, resolutionId);
     }
 
@@ -167,6 +171,41 @@ public class PredictionMarketResolutionService {
                     PredictionMarketLedgerOutboxRepository.LEG_PREDICTION_PAYOUT,
                     payload.toString());
         }
+    }
+
+    private void enqueueTradeFees(long resolutionId, String baseSymbol) {
+        String noSymbol = noTradeSymbolForBase(baseSymbol);
+        java.util.List<String> symbols = java.util.List.of(baseSymbol, noSymbol);
+        java.time.Instant collectedAt = java.time.Instant.now();
+        for (com.balh.oms.persistence.ExecutionsRepository.AccountFeeTotal row :
+                executionsRepository.sumUncollectedTradeFeesForSymbols(symbols)) {
+            if (row.feeTotal() == null || row.feeTotal().signum() <= 0) {
+                continue;
+            }
+            String currency =
+                    row.feeCurrency() != null && !row.feeCurrency().isBlank()
+                            ? row.feeCurrency().trim().toUpperCase()
+                            : DEFAULT_SETTLEMENT_CURRENCY;
+            ObjectNode payload = objectMapper.createObjectNode();
+            payload.put("schemaVersion", 1);
+            SettlementTemplatePayload.enrich(
+                    payload,
+                    SettlementTemplateIds.PREDICTION_MARKET_TRADE_FEE,
+                    SettlementTemplateIds.PREDICTION_MARKET_TRADE_FEE_VERSION);
+            payload.put("accountId", row.accountId().toString());
+            payload.put("instrumentSymbol", baseSymbol);
+            payload.put("feeAmount", row.feeTotal().toPlainString());
+            payload.put("currency", currency);
+            payload.put(
+                    "collateralIndicator", COLLATERAL_INDICATOR_PREFIX + currency.trim().toUpperCase());
+            payload.put("revenueIndicator", "@Platform-Revenue-" + currency);
+            ledgerOutbox.insertIgnore(
+                    resolutionId,
+                    row.accountId(),
+                    PredictionMarketLedgerOutboxRepository.LEG_PREDICTION_TRADE_FEE,
+                    payload.toString());
+        }
+        executionsRepository.markTradeFeesCollectedForSymbols(symbols, collectedAt);
     }
 
     private void zeroContractPositions(String baseSymbol) {

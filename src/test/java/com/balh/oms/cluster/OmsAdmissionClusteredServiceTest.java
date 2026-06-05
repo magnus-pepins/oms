@@ -1091,6 +1091,7 @@ class OmsAdmissionClusteredServiceTest {
         OmsAdmissionClusteredService svc = new OmsAdmissionClusteredService(
                 meterRegistry,
                 retentionMillis,
+                /* prune every message so retention IT stays deterministic */ 1,
                 4 * 1024 * 1024);
         Aeron aeronMock = mock(Aeron.class);
         ExclusivePublication eventsPub = mock(ExclusivePublication.class);

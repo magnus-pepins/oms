@@ -254,6 +254,17 @@ public class OmsConfig {
          * calls Ledger after commit.
          */
         private boolean inflightAsyncEnabled = false;
+        /**
+         * When {@code true} (default), BUY inflight holds are placed synchronously on the ingress
+         * thread <em>before</em> Aeron cluster admission so {@code INSUFFICIENT_FUNDS} returns HTTP
+         * 422 at accept and never reaches venue egress (b625f5d). When {@code false} with
+         * {@link #inflightAsyncEnabled} and coalescer off, holds are projected into
+         * {@code ledger_inflight_outbox} after admit and
+         * {@link com.balh.oms.reconciler.LedgerInflightOutboxReconciler} drives Ledger off the
+         * hot path (slice 4p bench throughput). Pop {@code ~/.oms-bench.env} sets this
+         * {@code false} for ledger-on soak; production retail keeps the default {@code true}.
+         */
+        private boolean inflightPreAdmitHoldEnabled = true;
         private long inflightOutboxReconcilerAgeMs = 2000L;
         private int inflightOutboxReconcilerBatchSize = 50;
         private long inflightOutboxReconcilerIntervalMs = 500L;
@@ -503,6 +514,8 @@ public class OmsConfig {
         public void setReadTimeoutMs(long v) { this.readTimeoutMs = v; }
         public boolean isInflightAsyncEnabled() { return inflightAsyncEnabled; }
         public void setInflightAsyncEnabled(boolean v) { this.inflightAsyncEnabled = v; }
+        public boolean isInflightPreAdmitHoldEnabled() { return inflightPreAdmitHoldEnabled; }
+        public void setInflightPreAdmitHoldEnabled(boolean v) { this.inflightPreAdmitHoldEnabled = v; }
         public long getInflightOutboxReconcilerAgeMs() { return inflightOutboxReconcilerAgeMs; }
         public void setInflightOutboxReconcilerAgeMs(long v) { this.inflightOutboxReconcilerAgeMs = v; }
         public int getInflightOutboxReconcilerBatchSize() { return inflightOutboxReconcilerBatchSize; }
@@ -3824,8 +3837,18 @@ public class OmsConfig {
             /** Default poll cadence inside the projector replay loop. */
             private static final long DEFAULT_POLL_PARK_NANOS = 1_000_000L;
 
-            /** Default fragment limit per replay poll. Keeps a single poll bounded. */
-            private static final int DEFAULT_FRAGMENT_LIMIT = 64;
+            /**
+             * Default fragments per {@code replay.poll} pass. Matches venue-egress (512): at 5k admits/s
+             * a limit of 64 caps drain at ~78 Postgres COMMITs/s and {@code projector_wall_lag_ms}
+             * climbs even when {@code ingress_cluster_accept} stays sub-ms.
+             */
+            private static final int DEFAULT_FRAGMENT_LIMIT = 512;
+
+            /**
+             * Safety cap on fragments per poll-batch COMMIT during catch-up bursts. Prevents a single
+             * multi-thousand-row transaction when the projector replays a deep Aeron backlog.
+             */
+            private static final int DEFAULT_MAX_FRAGMENTS_PER_COMMIT = 2048;
 
             /** Default backoff between {@code listRecordings} retries while waiting for the recording to appear. */
             private static final long DEFAULT_RECORDING_LOOKUP_PARK_MS = 100L;
@@ -3838,6 +3861,7 @@ public class OmsConfig {
             private int replayStreamId = 4321;
             private long pollParkNanos = DEFAULT_POLL_PARK_NANOS;
             private int fragmentLimit = DEFAULT_FRAGMENT_LIMIT;
+            private int maxFragmentsPerCommit = DEFAULT_MAX_FRAGMENTS_PER_COMMIT;
             private long recordingLookupParkMs = DEFAULT_RECORDING_LOOKUP_PARK_MS;
 
             public boolean isEnabled() { return enabled; }
@@ -3890,6 +3914,11 @@ public class OmsConfig {
             public int getFragmentLimit() { return fragmentLimit; }
             public void setFragmentLimit(int fragmentLimit) {
                 this.fragmentLimit = Math.max(1, fragmentLimit);
+            }
+
+            public int getMaxFragmentsPerCommit() { return maxFragmentsPerCommit; }
+            public void setMaxFragmentsPerCommit(int maxFragmentsPerCommit) {
+                this.maxFragmentsPerCommit = Math.max(1, maxFragmentsPerCommit);
             }
 
             public long getRecordingLookupParkMs() { return recordingLookupParkMs; }

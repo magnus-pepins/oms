@@ -603,6 +603,7 @@ public abstract class AbstractPostgresIntegrationTest {
                             venueContractResolutionRepository,
                             predictionMarketContractRepository,
                             predictionMarketLedgerOutboxRepository,
+                            executionsRepository,
                             positionsRepository,
                             domainEventOutbox,
                             jdbc,

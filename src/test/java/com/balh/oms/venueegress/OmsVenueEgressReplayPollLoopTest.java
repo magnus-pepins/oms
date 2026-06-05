@@ -8,9 +8,14 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import com.balh.oms.cluster.OmsClusterIngressClient;
+import com.balh.oms.cluster.OrderAdmittedEvent;
 import com.balh.oms.config.OmsConfig;
+import com.balh.oms.venue.VenueRouteOrderClient;
 import io.aeron.Subscription;
 import io.aeron.logbuffer.FragmentHandler;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -28,6 +33,8 @@ class OmsVenueEgressReplayPollLoopTest {
     private static final int FRAGMENT_LIMIT = 64;
 
     @Mock OmsVenueEgressCursorRepository cursorRepository;
+    @Mock VenueRouteOrderClient routeClient;
+    @Mock OmsClusterIngressClient clusterIngressClient;
 
     OmsVenueEgressService service;
 
@@ -57,6 +64,12 @@ class OmsVenueEgressReplayPollLoopTest {
         double maxIdleTailFragsPerSec =
                 (1_000_000_000.0 / cfg.getPollParkNanos()) * cfg.getFragmentLimit();
         assertThat(maxIdleTailFragsPerSec).isGreaterThanOrEqualTo(400.0);
+    }
+
+    @Test
+    void effectiveReplayFragmentLimit_floorsAt1024ForHighAdmitDrain() {
+        assertThat(OmsVenueEgressService.effectiveReplayFragmentLimit(512)).isEqualTo(1024);
+        assertThat(OmsVenueEgressService.effectiveReplayFragmentLimit(2048)).isEqualTo(2048);
     }
 
     @Test
@@ -107,5 +120,59 @@ class OmsVenueEgressReplayPollLoopTest {
 
         assertThat(service.pollReplayBurst(replay, handler)).isZero();
         verify(replay, times(1)).poll(any(), eq(FRAGMENT_LIMIT));
+    }
+
+    @Test
+    void parkReplayIdleAfterPoll_whenPipelineBacklog_doesNotParkConfiguredSlice() {
+        when(routeClient.routeAdmittedOrderAsync(any()))
+                .thenReturn(new CompletableFuture<>());
+        OmsVenueEgressService pipelined =
+                new OmsVenueEgressService(
+                        new OmsConfig(),
+                        cursorRepository,
+                        new io.micrometer.core.instrument.simple.SimpleMeterRegistry(),
+                        new com.fasterxml.jackson.databind.ObjectMapper(),
+                        routeClient,
+                        clusterIngressClient);
+        pipelined.markRunningForTesting();
+        pipelined.enablePipelineForTesting(4, Runnable::run, Runnable::run);
+        pipelined.pipelineDispatchAdmitForTesting(
+                new OrderAdmittedEvent(
+                        UUID.randomUUID(),
+                        1L,
+                        1L,
+                        10_000_000_000L,
+                        0L,
+                        0,
+                        0,
+                        (byte) 0,
+                        (byte) 0,
+                        (byte) 2,
+                        "acct",
+                        "intent",
+                        "hash",
+                        "PREDMKT-TEST",
+                        null,
+                        null),
+                128L);
+        assertThat(pipelined.pipelineInFlightForTesting()).isPositive();
+
+        long before = System.nanoTime();
+        pipelined.parkReplayIdleAfterPoll(pipelined.pipelineForTesting());
+        long elapsedNanos = System.nanoTime() - before;
+
+        assertThat(elapsedNanos).isLessThan(5_000_000L);
+    }
+
+    @Test
+    void parkReplayIdleAfterPoll_whenPipelineDrained_usesConfiguredPark() {
+        service.enablePipelineForTesting(4, Runnable::run, Runnable::run);
+        assertThat(service.pipelineInFlightForTesting()).isZero();
+
+        long before = System.nanoTime();
+        service.parkReplayIdleAfterPoll(service.pipelineForTesting());
+        long elapsedNanos = System.nanoTime() - before;
+
+        assertThat(elapsedNanos).isGreaterThanOrEqualTo(5_000L);
     }
 }

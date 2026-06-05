@@ -65,7 +65,7 @@ class FixInIngressServiceAdmissionTest {
                 new FixInOrderCancelReplaceRequestParser(new FixInSymbolMapper(omsConfig, new com.fasterxml.jackson.databind.ObjectMapper())),
                 new IngressAcceptOrderCommandFactory(new com.balh.oms.observability.PiiHash(omsConfig)),
                 new IngressLifecycleCommandFactory(),
-                new FixInExecutionReportBuilder(),
+                new FixInExecutionReportBuilder(new com.fasterxml.jackson.databind.ObjectMapper()),
                 accountBindingRepository,
                 orderMapRepository,
                 sessionRegistry,

@@ -3,6 +3,7 @@ package com.balh.oms.venue;
 import com.balh.oms.cluster.ApplyExecutionReportCommand;
 import com.balh.venue.grpc.v1.ExecType;
 import com.balh.venue.grpc.v1.ExecutionReport;
+import com.balh.venue.grpc.v1.LiquidityRole;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.util.UUID;
@@ -47,8 +48,16 @@ public final class VenueGrpcExecutionReportMapper {
 
     /** Compact audit blob — must fit {@link com.balh.oms.cluster.OmsClusterWireFormat#MAX_STRING_BYTES}. */
     private static String compactRawJson(ExecutionReport er) {
+        String liquidity =
+                switch (er.getLiquidityRole()) {
+                    case LIQUIDITY_ROLE_TAKER -> "TAKER";
+                    case LIQUIDITY_ROLE_MAKER -> "MAKER";
+                    default -> "UNSPECIFIED";
+                };
         return "{\"source\":\"venue-grpc\",\"execType\":"
                 + er.getExecType().getNumber()
-                + "}";
+                + ",\"liquidityRole\":\""
+                + liquidity
+                + "\"}";
     }
 }

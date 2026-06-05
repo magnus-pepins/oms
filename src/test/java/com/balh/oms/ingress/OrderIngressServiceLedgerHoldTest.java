@@ -127,6 +127,97 @@ class OrderIngressServiceLedgerHoldTest {
     }
 
     @Test
+    @SuppressWarnings("unchecked")
+    void asyncOutboxPath_skipsPreAdmitHoldWhenPreAdmitDisabled() throws Exception {
+        OmsConfig cfg = new OmsConfig();
+        cfg.getShard().setCount(1);
+        cfg.getCluster().getClient().setEnabled(true);
+        cfg.getCluster().getClient().setSubmitTimeoutMs(2_000L);
+        cfg.getLedger().setEnabled(true);
+        cfg.getLedger().setInflightReservationEnabled(true);
+        cfg.getLedger().setInflightAsyncEnabled(true);
+        cfg.getLedger().setInflightPreAdmitHoldEnabled(false);
+
+        OmsClusterIngressClient localCluster = mock(OmsClusterIngressClient.class);
+        when(localCluster.submitAcceptOrder(any(AcceptOrderCommand.class), any(Duration.class)))
+                .thenAnswer(inv -> {
+                    AcceptOrderCommand cmd = inv.getArgument(0);
+                    return new AdmissionResult.Accepted(
+                            new OrderAcceptedEvent(cmd.correlationId(), cmd.orderId(), 0, false, 1L));
+                });
+
+        ObjectProvider<LedgerInflightReservationClient> inflight =
+                (ObjectProvider<LedgerInflightReservationClient>) mock(ObjectProvider.class);
+        when(inflight.getIfAvailable()).thenReturn(ledgerClient);
+        ObjectProvider<LedgerInflightCoalescer> coalescerProvider =
+                (ObjectProvider<LedgerInflightCoalescer>) mock(ObjectProvider.class);
+        when(coalescerProvider.getIfAvailable()).thenReturn(null);
+        ObjectProvider<LedgerInflightOutboxRepository> outboxProvider =
+                (ObjectProvider<LedgerInflightOutboxRepository>) mock(ObjectProvider.class);
+        when(outboxProvider.getIfAvailable()).thenReturn(outboxRepository);
+        ObjectProvider<LedgerInflightLifecycleClient> lifecycleProvider =
+                (ObjectProvider<LedgerInflightLifecycleClient>) mock(ObjectProvider.class);
+        when(lifecycleProvider.getIfAvailable()).thenReturn(lifecycleClient);
+        ObjectProvider<LedgerBalanceClient> balanceProvider =
+                (ObjectProvider<LedgerBalanceClient>) mock(ObjectProvider.class);
+        when(balanceProvider.getIfAvailable()).thenReturn(ledgerBalanceClient);
+        when(ledgerBalanceClient.fetchIdentityIdForBalance("balance-1")).thenReturn("identity-1");
+        ObjectProvider<FxQuoteService> fxProvider =
+                (ObjectProvider<FxQuoteService>) mock(ObjectProvider.class);
+        when(fxProvider.getIfAvailable()).thenReturn(null);
+        ObjectProvider<FxCustomerFlowNettingService> nettingProvider =
+                (ObjectProvider<FxCustomerFlowNettingService>) mock(ObjectProvider.class);
+        when(nettingProvider.getIfAvailable()).thenReturn(null);
+
+        OmsClusterShardRouter router = new OmsClusterShardRouter(1, Map.of(0, localCluster));
+        VenueAdmissionGate venueAdmissionGate = new VenueAdmissionGate(
+                cfg, mock(OmsVenueEgressLagPublisher.class), new SimpleMeterRegistry());
+        PredictionMarketTickGate predictionMarketTickGate = new PredictionMarketTickGate(
+                cfg,
+                mock(com.balh.oms.predictionmarket.PredictionMarketContractRepository.class),
+                new SimpleMeterRegistry());
+
+        PiiHash pii = mock(PiiHash.class);
+        when(pii.hash(any())).thenReturn("hash");
+        OrderIngressService asyncService = new OrderIngressService(
+                mock(OrdersRepository.class),
+                cfg,
+                pii,
+                inflight,
+                coalescerProvider,
+                outboxProvider,
+                lifecycleProvider,
+                balanceProvider,
+                fxProvider,
+                nettingProvider,
+                new SimpleMeterRegistry(),
+                mock(OrderControlAdmission.class),
+                router,
+                venueAdmissionGate,
+                predictionMarketTickGate);
+
+        CreateOrderRequest req = new CreateOrderRequest(
+                UUID.fromString("00000000-0000-4000-8000-000000000333"),
+                "idem-async-outbox",
+                Side.BUY,
+                "AAPL",
+                new BigDecimal("1"),
+                new BigDecimal("0.03"),
+                "DAY",
+                "LIMIT",
+                "balance-1",
+                "identity-1",
+                null,
+                null);
+
+        OrderIngressService.IngressResult result = asyncService.persistAccepted(req);
+
+        assertThat(result.created()).isTrue();
+        verify(ledgerClient, never()).placeBuyFundsHold(any(UUID.class), any(), any(BigDecimal.class));
+        verify(localCluster, times(1)).submitAcceptOrder(any(), any());
+    }
+
+    @Test
     void insufficientFunds_rejectsBeforeClusterAdmit() throws Exception {
         doThrow(new LedgerInflightReservationClient.LedgerReservationException(
                 "ledger inflight hold failed: HTTP 422 {\"code\":\"INSUFFICIENT_FUNDS\"}"))

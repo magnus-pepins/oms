@@ -95,7 +95,8 @@ class OmsPostgresProjectorPollBatchTest {
                 pinned,
                 new com.balh.oms.settlement.SettlementDateCalculator(
                         com.balh.oms.settlement.SettlementDateCalculator.DEFAULT_CYCLE_FALLBACK),
-                org.mockito.Mockito.mock(com.balh.oms.settlement.PredictionMarketResolutionService.class));
+                org.mockito.Mockito.mock(com.balh.oms.settlement.PredictionMarketResolutionService.class),
+                null);
         projector.setCurrentRecordingIdForTesting(RECORDING_ID);
     }
 
@@ -117,12 +118,12 @@ class OmsPostgresProjectorPollBatchTest {
                 .as("one BEGIN/COMMIT envelope for the whole poll batch")
                 .isEqualTo(1);
         verify(ordersRepository, times(3)).insertFromAdmittedEventWithOrder(any());
-        verify(cursorRepository, times(3))
+        verify(cursorRepository, times(1))
                 .advanceWithRecording(
                         eq(OmsPostgresProjector.PROJECTOR_ID),
                         eq(OmsClusterWireFormat.EVENTS_STREAM_ID),
                         eq(RECORDING_ID),
-                        any(Long.class));
+                        eq(300L));
         assertThat(projector.lastAppliedPosition()).isEqualTo(300L);
     }
 

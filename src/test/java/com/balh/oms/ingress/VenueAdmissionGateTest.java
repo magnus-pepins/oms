@@ -56,11 +56,29 @@ class VenueAdmissionGateTest {
     }
 
     @Test
+    void throttledSnapshot_parksThenAllows() {
+        when(lagPublisher.currentHealthSnapshot())
+                .thenReturn(
+                        new OmsVenueEgressLagPublisher.VenueEgressHealthSnapshot(
+                                true,
+                                50_000L,
+                                null,
+                                new OmsVenueEgressLagPublisher.VenueEgressLagReading(
+                                        265_000L, 262_144L, 2_856L, true)));
+
+        long start = System.nanoTime();
+        assertThatCode(() -> gate.assertVenueAdmissible(VENUE_SYMBOL)).doesNotThrowAnyException();
+        assertThat(System.nanoTime() - start).isGreaterThanOrEqualTo(40_000L);
+    }
+
+    @Test
     void blockedSnapshot_trips503() {
         when(lagPublisher.currentHealthSnapshot())
                 .thenReturn(
                         OmsVenueEgressLagPublisher.VenueEgressHealthSnapshot.block(
-                                "venue egress lag 13568 bytes exceeds max 4096"));
+                                "venue egress excess lag 13568 bytes exceeds max 4096",
+                                new OmsVenueEgressLagPublisher.VenueEgressLagReading(
+                                        13568L, 0L, 13568L, true)));
 
         assertThatThrownBy(() -> gate.assertVenueAdmissible(VENUE_SYMBOL))
                 .isInstanceOfSatisfying(ClusterAdmissionException.class, e -> {

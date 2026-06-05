@@ -43,8 +43,10 @@ import java.util.OptionalLong;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedTransferQueue;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -213,6 +215,13 @@ public class OmsVenueEgressService {
     private int cursorFlushEvery = 1;
 
     /**
+     * Cached from {@link OmsConfig.Cluster.VenueEgress} at {@link #init()} so the replay hot path
+     * does not chase the config object on every {@code replay.poll}.
+     */
+    private int replayFragmentLimit = 256;
+    private long replayPollParkNanos = 1_000_000L;
+
+    /**
      * Design A pipeline (slice: venue egress pipelining). Non-null only when
      * {@code oms.cluster.venue-egress.venue-route-max-in-flight > 1} <em>and</em> the venue clients
      * are wired. When null, the replay loop runs the exact pre-pipelining serial path. Owned by the
@@ -354,6 +363,9 @@ public class OmsVenueEgressService {
         // chase the config object on every fragment. Min-clamped to 1 by the setter; we still
         // belt-and-braces clamp here to fail closed on pathological injection.
         cursorFlushEvery = Math.max(1, config.getCluster().getVenueEgress().getCursorFlushEvery());
+        OmsConfig.Cluster.VenueEgress venueEgressCfg = config.getCluster().getVenueEgress();
+        replayFragmentLimit = venueEgressCfg.getFragmentLimit();
+        replayPollParkNanos = venueEgressCfg.getPollParkNanos();
         boolean venueWired = venueRouteOrderClient != null && clusterIngressClient != null;
         int maxInFlight = Math.max(1, config.getCluster().getVenueEgress().getVenueRouteMaxInFlight());
         if (venueWired && maxInFlight > 1) {
@@ -387,7 +399,23 @@ public class OmsVenueEgressService {
         running.set(true);
         replayThread = new Thread(this::replayLoop, "oms-venue-egress-replay");
         replayThread.setDaemon(true);
+        applyReplayThreadPriority(replayThread, venueEgressCfg.getReplayThreadPriority());
         replayThread.start();
+    }
+
+    /**
+     * Sets {@link Thread#setPriority(int)} for the dedicated replay drain thread. Package-private
+     * so tests can assert clamping without starting Aeron.
+     */
+    static void applyReplayThreadPriority(Thread replayThread, int priority) {
+        try {
+            replayThread.setPriority(priority);
+        } catch (SecurityException e) {
+            log.warn(
+                    "oms-venue-egress: could not set replay thread priority to {} (SecurityManager?)",
+                    priority,
+                    e);
+        }
     }
 
     /**
@@ -695,7 +723,7 @@ public class OmsVenueEgressService {
                     savedPosition = successor.startPosition();
                     continue;
                 }
-                LockSupport.parkNanos(cfg.getPollParkNanos());
+                parkReplayIdle(replayPollParkNanos);
                 descriptor = findRecordingById(archive, recordingIdNow);
                 requireRecordingPresent(recordingIdNow, descriptor);
             }
@@ -751,12 +779,8 @@ public class OmsVenueEgressService {
                         cfg.getReplayStreamId());
 
                 while (running.get()) {
-                    int polled = replay.poll(handler, cfg.getFragmentLimit());
-                    if (pipeline != null) {
-                        // Advance the persisted cursor over any newly-contiguous completed routes.
-                        pipeline.drainContiguous();
-                    }
-                    if (polled > 0) {
+                    int polledBurst = pollReplayBurst(replay, handler);
+                    if (polledBurst > 0) {
                         continue;
                     }
                     if (pipeline != null) {
@@ -764,6 +788,7 @@ public class OmsVenueEgressService {
                         // advance the cursor to the drained position. This keeps the recording-walk's
                         // (recording_id, position) invariant intact — we never roll forward to a
                         // successor recording with routes still outstanding against the current one.
+                        pipeline.drainContiguous();
                         if (!pipeline.quiesce()) {
                             return; // shutdown requested during drain
                         }
@@ -816,12 +841,41 @@ public class OmsVenueEgressService {
                         eventsSinceCursorFlush = 0;
                         break; // exit inner poll loop -> outer loop reopens against successor
                     }
-                    LockSupport.parkNanos(cfg.getPollParkNanos());
+                    parkReplayIdle(replayPollParkNanos);
                 }
             } finally {
                 CloseHelper.quietClose(replay);
             }
         }
+    }
+
+    /**
+     * Tight-spin drain: call {@link Subscription#poll} repeatedly while Aeron delivers fragments,
+     * without idle park or recording-walk work between passes. Returns the fragment count for
+     * this burst (zero ⇒ caller should run idle / quiesce / walk-forward logic).
+     */
+    int pollReplayBurst(Subscription replay, FragmentHandler handler) {
+        int total = 0;
+        int polled;
+        do {
+            polled = replay.poll(handler, replayFragmentLimit);
+            total += polled;
+            if (polled > 0 && pipeline != null) {
+                pipeline.drainContiguous();
+            }
+        } while (polled > 0 && running.get());
+        if (total > 0) {
+            Thread.onSpinWait();
+        }
+        return total;
+    }
+
+    /**
+     * Idle park between replay polls when no fragments were available. Kept as a named helper so
+     * unit tests can assert the configured nanos without standing up Aeron Archive.
+     */
+    static void parkReplayIdle(long pollParkNanos) {
+        LockSupport.parkNanos(pollParkNanos);
     }
 
     /**
@@ -1369,11 +1423,40 @@ public class OmsVenueEgressService {
      *       duplicate RouteOrders, deduped by the venue) — the same at-least-once-at-venue contract
      *       the serial path documents for {@code cursorFlushEvery}.</li>
      * </ul>
+     *
+     * <h2>Route-offer throughput ceiling (measured @ 400 RPS admit on pop, 2026-06-05)</h2>
+     *
+     * <p>{@code RouteOrderStream} writes must preserve OMS admission order for venue price-time
+     * priority. {@link VenueRouteOrderClient#routeAdmittedOrderAsync} is explicitly single-writer
+     * ({@code streamLock} around {@code onNext}) — <strong>max safe stream-write parallelism = 1</strong>.
+     * Parallel {@code onNext} would race on {@code streamLock} without increasing ordered throughput
+     * and could reorder offers relative to cluster-log order if multiple callers interleave.
+     *
+     * <p>Observed @ 400 RPS: egress wall lag grows while venue {@code place_matched} stays ~0.01 ms
+     * and ER cluster offer stays ~0 ms — the bottleneck is egress offer dispatch, not venue apply or
+     * ER submit. With {@code maxInFlight} permits released on venue ack (not ER completion), replay
+     * can enqueue faster than the sole {@code route-offer} thread can drain {@code onNext} calls.
+     * Throughput ≈ {@code 1 / per-offer-latency}; at ~2.5 ms/offer that yields ~400 offers/s.
+     *
+     * <p>Within the single-writer constraint, this class:
+     * <ul>
+     *   <li>Registers each fragment on the replay thread ({@link #dispatchAdmitAsync}) so
+     *       {@link EgressCompletionTracker#register} does not consume offer-thread time.</li>
+     *   <li>Hands offers to a dedicated {@code oms-venue-egress-route-offer} consumer thread via a
+     *       {@link LinkedTransferQueue} (avoids per-admit {@code ExecutorService} runnable allocation).</li>
+     *   <li>Does <em>not</em> wait for venue ack before dequeuing the next offer (permits bound
+     *       in-flight stream depth only).</li>
+     * </ul>
+     * Batch {@code onNext} or multi-stream parallelism would require {@code VenueRouteOrderClient}
+     * changes and breaks global FIFO unless the venue shards sequence per instrument.
      */
     private final class EgressRoutePipeline {
 
         /** Park between non-progress passes while quiescing the in-flight window. */
         private static final long QUIESCE_PARK_NANOS = 50_000L;
+
+        /** Idle park for the dedicated route-offer consumer when the transfer queue is empty. */
+        private static final long ROUTE_OFFER_IDLE_PARK_NANOS = 50_000L;
 
         /** Outstanding fragments (venue ack pending or ER submit pending) before we stop dispatching. */
         private static final int PENDING_FRAGMENT_CAP_MULTIPLIER = 2;
@@ -1394,7 +1477,9 @@ public class OmsVenueEgressService {
          * place_matched ~0.01 ms and ER offer ~0).
          */
         private final java.util.concurrent.Executor routeOfferExecutor;
-        private final ExecutorService ownedRouteOfferExecutor;
+        private final LinkedTransferQueue<PendingRouteOffer> routeOfferQueue;
+        private final Thread routeOfferThread;
+        private record PendingRouteOffer(OrderAdmittedEvent ev, long position) {}
         /** Serialises cursor persistence between the replay thread and cursor-drain completions. */
         private final Object contiguousDrainLock = new Object();
         /**
@@ -1403,6 +1488,20 @@ public class OmsVenueEgressService {
          * redundant {@code advanceWithRecording} calls inflated {@code egress_wall_lag_ms}).
          */
         private final AtomicBoolean cursorDrainScheduled = new AtomicBoolean(false);
+        /**
+         * Coalesces {@link #completeRoute} + {@link EgressCompletionTracker#complete} so the
+         * virtual-thread ER pool queues one flush task per burst instead of one per venue ack
+         * (observed @ 400 routes/s: per-completion tasks amplified ingress {@code clientLock}
+         * churn even when {@code egress_ER_offer_ms} ~ 0).
+         */
+        private final ConcurrentLinkedQueue<ErCompletion> erCompletionQueue = new ConcurrentLinkedQueue<>();
+        private final AtomicBoolean erCompletionFlushScheduled = new AtomicBoolean(false);
+
+        private record ErCompletion(
+                OrderAdmittedEvent ev,
+                Optional<com.balh.venue.grpc.v1.ExecutionReport> erOpt,
+                Throwable err,
+                long position) {}
 
         EgressRoutePipeline(int maxInFlight) {
             this.maxInFlight = maxInFlight;
@@ -1424,15 +1523,12 @@ public class OmsVenueEgressService {
                             });
             this.cursorDrainExecutor = cursorPool;
             this.ownedCursorDrainExecutor = cursorPool;
-            ExecutorService offerPool =
-                    Executors.newSingleThreadExecutor(
-                            r -> {
-                                Thread t = new Thread(r, "oms-venue-egress-route-offer");
-                                t.setDaemon(true);
-                                return t;
-                            });
-            this.routeOfferExecutor = offerPool;
-            this.ownedRouteOfferExecutor = offerPool;
+            this.routeOfferQueue = new LinkedTransferQueue<>();
+            this.routeOfferExecutor = null;
+            Thread offerThread = new Thread(this::routeOfferLoop, "oms-venue-egress-route-offer");
+            offerThread.setDaemon(true);
+            offerThread.start();
+            this.routeOfferThread = offerThread;
         }
 
         /** Test seam: inject executors for deterministic ER completion and cursor-drain isolation. */
@@ -1457,7 +1553,29 @@ public class OmsVenueEgressService {
             this.cursorDrainExecutor = cursorDrainExecutor;
             this.ownedCursorDrainExecutor = null;
             this.routeOfferExecutor = routeOfferExecutor;
-            this.ownedRouteOfferExecutor = null;
+            this.routeOfferQueue = null;
+            this.routeOfferThread = null;
+        }
+
+        /** Production consumer: strictly serial {@code dispatchRoute} / {@code onNext} drain. */
+        private void routeOfferLoop() {
+            while (running.get() || !routeOfferQueue.isEmpty()) {
+                PendingRouteOffer item = routeOfferQueue.poll();
+                if (item == null) {
+                    LockSupport.parkNanos(ROUTE_OFFER_IDLE_PARK_NANOS);
+                    continue;
+                }
+                dispatchRoute(item.ev(), item.position());
+            }
+        }
+
+        private void enqueueRouteOffer(OrderAdmittedEvent ev, long newPosition) {
+            if (routeOfferQueue != null) {
+                routeOfferQueue.offer(new PendingRouteOffer(ev, newPosition));
+                LockSupport.unpark(routeOfferThread);
+                return;
+            }
+            routeOfferExecutor.execute(() -> dispatchRoute(ev, newPosition));
         }
 
         /** Bounds total pipeline depth when venue permits are released before ER submit completes. */
@@ -1514,16 +1632,18 @@ public class OmsVenueEgressService {
                 Thread.currentThread().interrupt();
                 return; // shutdown — fragment replays from the cursor on restart
             }
-            routeOfferExecutor.execute(() -> dispatchRoute(ev, newPosition));
+            // Register on the replay thread (poll order) before the offer consumer writes onNext —
+            // keeps tracker bookkeeping off the single-writer hot path.
+            tracker.register(newPosition);
+            enqueueRouteOffer(ev, newPosition);
         }
 
         /**
-         * Runs on {@link #routeOfferExecutor} — the sole {@code RouteOrderStream} writer. Registers the
-         * fragment, offers to the venue, and hands acks to the ER pool without blocking the replay poll
-         * loop on gRPC stream backpressure.
+         * Runs on the sole route-offer consumer — the only {@code RouteOrderStream} writer. Offers to
+         * the venue and hands acks to the ER pool without blocking the replay poll loop on gRPC stream
+         * backpressure.
          */
         private void dispatchRoute(OrderAdmittedEvent ev, long newPosition) {
-            tracker.register(newPosition);
             CompletableFuture<Optional<com.balh.venue.grpc.v1.ExecutionReport>> future;
             try {
                 future = venueRouteOrderClient.routeAdmittedOrderAsync(ev);
@@ -1537,20 +1657,47 @@ public class OmsVenueEgressService {
                     (erOpt, err) -> {
                         permits.release();
                         unparkReplayThread();
-                        erSubmitExecutor.execute(
-                                () -> {
-                                    try {
-                                        completeRoute(ev, erOpt, err);
-                                    } finally {
-                                        tracker.complete(newPosition);
-                                        unparkReplayThread();
-                                        // JDBC cursor persistence runs on a dedicated thread so ER-offer
-                                        // workers return immediately (observed on pop: pool threads
-                                        // blocked in advanceWithRecording inflated admit_to_fix_nos).
-                                        scheduleDrainContiguous();
-                                    }
-                                });
+                        erCompletionQueue.add(new ErCompletion(ev, erOpt, err, newPosition));
+                        scheduleErCompletionFlush();
                     });
+        }
+
+        /**
+         * Queues at most one coalesced ER-completion pass on {@link #erSubmitExecutor}. Further venue
+         * acks while a flush is already scheduled piggyback on that single task.
+         */
+        private void scheduleErCompletionFlush() {
+            if (!erCompletionFlushScheduled.compareAndSet(false, true)) {
+                return;
+            }
+            erSubmitExecutor.execute(this::runScheduledErCompletionFlush);
+        }
+
+        /**
+         * Runs on {@link #erSubmitExecutor}. Drains the completion queue in poll order, applies each
+         * ER to the cluster, and advances the tracker once per fragment before a single cursor drain.
+         */
+        private void runScheduledErCompletionFlush() {
+            while (true) {
+                ErCompletion item;
+                boolean progressed = false;
+                while ((item = erCompletionQueue.poll()) != null) {
+                    try {
+                        completeRoute(item.ev(), item.erOpt(), item.err());
+                    } finally {
+                        tracker.complete(item.position());
+                        unparkReplayThread();
+                        progressed = true;
+                    }
+                }
+                if (progressed) {
+                    scheduleDrainContiguous();
+                }
+                boolean rescheduled = erCompletionFlushScheduled.getAndSet(false);
+                if (!rescheduled && !progressed) {
+                    return;
+                }
+            }
         }
 
         /**
@@ -1678,8 +1825,13 @@ public class OmsVenueEgressService {
         }
 
         void shutdown() {
-            if (ownedRouteOfferExecutor != null) {
-                ownedRouteOfferExecutor.shutdownNow();
+            if (routeOfferThread != null) {
+                routeOfferThread.interrupt();
+                try {
+                    routeOfferThread.join(2_000L);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
             }
             if (ownedErSubmitExecutor != null) {
                 ownedErSubmitExecutor.shutdownNow();
@@ -1714,6 +1866,11 @@ public class OmsVenueEgressService {
 
     void markRunningForTesting() {
         running.set(true);
+    }
+
+    void setReplayPollConfigForTesting(int fragmentLimit, long pollParkNanos) {
+        this.replayFragmentLimit = fragmentLimit;
+        this.replayPollParkNanos = pollParkNanos;
     }
 
     void pipelineDispatchAdmitForTesting(OrderAdmittedEvent ev, long newPosition) {

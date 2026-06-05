@@ -80,9 +80,11 @@ import java.util.concurrent.locks.ReentrantLock;
  * Lock holds are bounded to single-digit microseconds in steady state, so per-JVM
  * commit throughput is limited by Aeron's {@code offer} rate, not by cluster RTT.
  *
- * <p>{@link #submitApplyExecutionReport(ApplyExecutionReportCommand, Duration)}
- * remains a single-flight offer (no egress reply expected); slice 4n did not
- * change its shape.
+ * <p>{@link #submitApplyExecutionReport(ApplyExecutionReportCommand, Duration)} is a
+ * fire-and-forget offer (no session egress reply). A dedicated ER-offer daemon serializes
+ * {@link AeronCluster#offer} under {@link #clientLock} and drains bursts of up to
+ * {@link #ER_OFFER_MAX_PER_LOCK_PASS} frames per lock acquisition so venue-egress virtual-thread
+ * completions do not contend on the lock at 400+ routes/s (wire format has no batch ER frame).
  *
  * <h2>Determinism (per ADR 0001 §Discipline)</h2>
  *
@@ -144,6 +146,18 @@ public class OmsClusterIngressClient {
 
     /** {@link Thread#join(long)} budget when stopping the egress poller thread on close. */
     private static final long POLLER_JOIN_MS = 2_000L;
+
+    /**
+     * ER-offer daemon bounds (venue-egress @ 400 routes/s). One daemon serializes
+     * {@link #submitApplyExecutionReport} cluster offers so N virtual-thread completions do not
+     * fight for {@link #clientLock}; {@link #ER_OFFER_MAX_PER_LOCK_PASS} amortises lock trips per
+     * drain pass. Wire format has no batch ER frame — this is transport coalescing only.
+     */
+    private static final int ER_OFFER_QUEUE_CAPACITY = 8_192;
+
+    private static final int ER_OFFER_MAX_PER_LOCK_PASS = 64;
+    private static final long ER_OFFER_DRAIN_INTERVAL_NANOS = 50_000L;
+    private static final long ER_OFFER_ENQUEUE_PARK_NANOS = 1_000L;
 
     private final OmsConfig.Cluster.Client config;
     private final AtomicLong correlationIds = new AtomicLong(1);
@@ -257,6 +271,11 @@ public class OmsClusterIngressClient {
         return pending.size();
     }
 
+    /** Visible for testing — ER offers queued but not yet offered to the cluster. */
+    int erOfferQueueDepthForTest() {
+        return erOfferQueue.size();
+    }
+
     private volatile AeronCluster client;
     private volatile Thread egressPollerThread;
     private volatile boolean closing;
@@ -277,6 +296,22 @@ public class OmsClusterIngressClient {
      */
     private final BlockingQueue<PendingBatchSubmit> admitBatchQueue;
     private volatile Thread admitBatcherThread;
+
+    /**
+     * One pre-encoded {@link ApplyExecutionReportCommand} awaiting offer by the ER daemon.
+     * Callers encode on their thread and copy wire bytes so the daemon only calls
+     * {@link AeronCluster#offer} under {@link #clientLock}.
+     */
+    private record PendingErSubmit(
+            byte[] wireBytes, int wireLength, long deadlineNanos, CompletableFuture<Void> future) {}
+
+    /**
+     * Bounded queue for {@link #submitApplyExecutionReport}. Always active — unlike admit-batching
+     * this does not change wire shape; it only serializes offers and drains bursts per lock hold.
+     */
+    private final BlockingQueue<PendingErSubmit> erOfferQueue =
+            new ArrayBlockingQueue<>(ER_OFFER_QUEUE_CAPACITY);
+    private volatile Thread erOfferDaemonThread;
 
     // ---- Phase 4 slice 4c: commit-round-trip timer ----
     // Single timer name `oms.cluster.client.commit_round_trip` covers both submit methods so a
@@ -448,6 +483,7 @@ public class OmsClusterIngressClient {
                                     : "disabled");
                     startEgressPollerLocked();
                     startAdmitBatcherLocked();
+                    startErOfferDaemonLocked();
                     return;
                 } catch (RuntimeException e) {
                     lastFailure = e;
@@ -487,6 +523,17 @@ public class OmsClusterIngressClient {
                 Thread.currentThread().interrupt();
             }
         }
+        Thread er = erOfferDaemonThread;
+        erOfferDaemonThread = null;
+        if (er != null) {
+            er.interrupt();
+            try {
+                er.join(POLLER_JOIN_MS);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        drainErOfferQueueOnClose();
         clientLock.lock();
         try {
             if (client != null) {
@@ -545,22 +592,70 @@ public class OmsClusterIngressClient {
             throws TimeoutException, InterruptedException {
         Objects.requireNonNull(cmd, "cmd");
         Objects.requireNonNull(timeout, "timeout");
+        if (client == null) {
+            throw new IllegalStateException("OMS cluster client is not connected");
+        }
 
         ExpandableArrayBuffer buffer = OFFER_BUFFER.get();
         int written = cmd.encode(buffer, 0);
+        byte[] wireBytes = new byte[written];
+        buffer.getBytes(0, wireBytes, 0, written);
 
         long deadlineNanos = System.nanoTime() + timeout.toNanos();
+        CompletableFuture<Void> waiter = new CompletableFuture<>();
 
         Timer.Sample sample = Timer.start(meterRegistry);
         Outcome outcome = Outcome.ERROR;
+        PendingErSubmit submit = new PendingErSubmit(wireBytes, written, deadlineNanos, waiter);
         try {
-            // Release the lock between back-pressure parks (same shape as submitAcceptOrder) so
-            // N pipelined venue-route completions do not serialize on one long lock hold.
-            offerWithBackpressure(buffer, written, deadlineNanos, cmd.correlationId());
-            outcome = Outcome.COMMIT;
-        } catch (TimeoutException e) {
-            outcome = Outcome.TIMEOUT;
-            throw e;
+            while (true) {
+                if (closing) {
+                    throw new IllegalStateException("OMS cluster client is closing");
+                }
+                if (erOfferQueue.offer(submit)) {
+                    break;
+                }
+                if (System.nanoTime() > deadlineNanos) {
+                    erOfferQueue.remove(submit);
+                    outcome = Outcome.TIMEOUT;
+                    throw new TimeoutException(
+                            "ER-offer queue full past deadline for correlationId=" + cmd.correlationId());
+                }
+                parkOrThrow(ER_OFFER_ENQUEUE_PARK_NANOS);
+            }
+
+            long remainingNanos = deadlineNanos - System.nanoTime();
+            if (remainingNanos <= 0L) {
+                if (drainCompletedErFuture(submit)) {
+                    outcome = Outcome.COMMIT;
+                    return;
+                }
+                outcome = Outcome.TIMEOUT;
+                throw new TimeoutException(
+                        "ER-offer timeout for correlationId=" + cmd.correlationId());
+            }
+            try {
+                waiter.get(remainingNanos, TimeUnit.NANOSECONDS);
+                outcome = Outcome.COMMIT;
+            } catch (java.util.concurrent.TimeoutException e) {
+                if (drainCompletedErFuture(submit)) {
+                    outcome = Outcome.COMMIT;
+                    return;
+                }
+                outcome = Outcome.TIMEOUT;
+                throw new TimeoutException(
+                        "ER-offer timeout for correlationId=" + cmd.correlationId());
+            } catch (ExecutionException e) {
+                Throwable cause = e.getCause();
+                if (cause instanceof RuntimeException re) {
+                    throw re;
+                }
+                throw new RuntimeException(
+                        "ER-offer unexpected failure for correlationId=" + cmd.correlationId(), cause);
+            }
+        } catch (InterruptedException ie) {
+            erOfferQueue.remove(submit);
+            throw ie;
         } finally {
             sample.stop(applyExecutionReportTimers.get(outcome));
         }
@@ -1117,6 +1212,146 @@ public class OmsClusterIngressClient {
             return waiter.getNow(null);
         }
         return null;
+    }
+
+    /** Caller must hold {@link #clientLock}. Starts the ER-offer daemon. Idempotent. */
+    private void startErOfferDaemonLocked() {
+        if (erOfferDaemonThread != null) {
+            return;
+        }
+        Thread t = new Thread(this::erOfferDaemonLoop, "oms-cluster-client-er-offer");
+        t.setDaemon(true);
+        erOfferDaemonThread = t;
+        t.start();
+    }
+
+    /**
+     * Daemon loop: drain up to {@link #ER_OFFER_MAX_PER_LOCK_PASS} pre-encoded ER frames per pass
+     * and offer as many as possible per {@link #clientLock} acquisition. Callers park on per-submit
+     * futures — no direct lock contention from venue-egress virtual-thread completions.
+     */
+    private void erOfferDaemonLoop() {
+        long parkNanos = config.getOfferBackpressureParkNanos();
+        List<PendingErSubmit> drained = new ArrayList<>(ER_OFFER_MAX_PER_LOCK_PASS);
+        org.agrona.concurrent.UnsafeBuffer offerScratch =
+                new org.agrona.concurrent.UnsafeBuffer(
+                        new byte[OmsClusterWireFormat.MAX_COMMAND_BYTES]);
+
+        while (!closing) {
+            try {
+                PendingErSubmit head =
+                        erOfferQueue.poll(ER_OFFER_DRAIN_INTERVAL_NANOS, TimeUnit.NANOSECONDS);
+                if (head == null) {
+                    continue;
+                }
+                do {
+                    drained.clear();
+                    drained.add(head);
+                    erOfferQueue.drainTo(drained, ER_OFFER_MAX_PER_LOCK_PASS - 1);
+                    offerErBurstWithBackpressure(drained, offerScratch, parkNanos);
+                    head = erOfferQueue.poll();
+                } while (head != null && !closing);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                return;
+            } catch (RuntimeException e) {
+                log.warn("ER-offer daemon loop error", e);
+                for (PendingErSubmit s : drained) {
+                    failErSubmit(s, e);
+                }
+            }
+        }
+        drainErOfferQueueOnClose();
+    }
+
+    /**
+     * Offer a drained burst. Holds {@link #clientLock} only long enough to offer sequential frames;
+     * releases and parks on cluster back-pressure before retrying the same index.
+     */
+    private void offerErBurstWithBackpressure(
+            List<PendingErSubmit> batch,
+            org.agrona.concurrent.UnsafeBuffer offerScratch,
+            long parkNanos) throws InterruptedException {
+        int idx = 0;
+        while (idx < batch.size() && !closing) {
+            PendingErSubmit current = batch.get(idx);
+            if (System.nanoTime() > current.deadlineNanos()) {
+                failErSubmit(current, new TimeoutException("ER-offer expired before cluster offer"));
+                idx++;
+                continue;
+            }
+            clientLock.lockInterruptibly();
+            try {
+                AeronCluster active = client;
+                if (active == null) {
+                    failErSubmit(current, new IllegalStateException("OMS cluster client is not connected"));
+                    idx++;
+                    continue;
+                }
+                while (idx < batch.size() && !closing) {
+                    current = batch.get(idx);
+                    if (System.nanoTime() > current.deadlineNanos()) {
+                        failErSubmit(current, new TimeoutException("ER-offer expired before cluster offer"));
+                        idx++;
+                        continue;
+                    }
+                    offerScratch.wrap(current.wireBytes());
+                    long offerResult;
+                    try {
+                        offerResult = active.offer(offerScratch, 0, current.wireLength());
+                    } catch (RuntimeException e) {
+                        failErSubmit(current, e);
+                        idx++;
+                        continue;
+                    }
+                    if (offerResult < 0L) {
+                        break;
+                    }
+                    current.future().complete(null);
+                    idx++;
+                }
+            } finally {
+                clientLock.unlock();
+            }
+            if (idx >= batch.size() || closing) {
+                continue;
+            }
+            if (System.nanoTime() > batch.get(idx).deadlineNanos()) {
+                failErSubmit(batch.get(idx), new TimeoutException("ER-offer back-pressure timeout"));
+                idx++;
+                continue;
+            }
+            signalEgressPoller();
+            parkOrThrow(parkNanos);
+        }
+        if (idx > 0) {
+            signalEgressPoller();
+        }
+    }
+
+    private void failErSubmit(PendingErSubmit submit, Throwable cause) {
+        submit.future().completeExceptionally(cause);
+    }
+
+    /**
+     * Race-resolution when the caller hits its deadline but the daemon completed the offer first.
+     */
+    private boolean drainCompletedErFuture(PendingErSubmit submit) {
+        if (erOfferQueue.remove(submit)) {
+            return false;
+        }
+        CompletableFuture<Void> waiter = submit.future();
+        return waiter.isDone() && !waiter.isCompletedExceptionally();
+    }
+
+    private void drainErOfferQueueOnClose() {
+        IllegalStateException reason =
+                new IllegalStateException("OMS cluster client closed while ER offer pending");
+        List<PendingErSubmit> remainder = new ArrayList<>();
+        erOfferQueue.drainTo(remainder);
+        for (PendingErSubmit s : remainder) {
+            s.future().completeExceptionally(reason);
+        }
     }
 
     /** Caller must hold {@link #clientLock}. */

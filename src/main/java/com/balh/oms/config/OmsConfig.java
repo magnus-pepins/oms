@@ -1030,6 +1030,12 @@ public class OmsConfig {
         private int grpcPort = 50051;
         /** Blocking stub deadline for RouteOrder / RouteCancel / RouteReplace on oms-venue-egress. */
         private long grpcCallTimeoutMs = 15_000L;
+        /**
+         * Per-route ack deadline on the pipelined {@code RouteOrderStream} (demux by {@code oms_order_id}).
+         * Align with venue gateway {@code BALH_VENUE_GRPC_ROUTE_TIMEOUT_S} (default 10s); shorter than
+         * {@link #grpcCallTimeoutMs} so in-flight windows fail fast instead of piling up at 400+ routes/s.
+         */
+        private long grpcStreamAckTimeoutMs = 10_000L;
         private String venueId = "balh-internal-venue";
         /** Phase C: push catalog creates/updates to balh-venue registry over gRPC. */
         private boolean registrySyncEnabled = true;
@@ -1058,6 +1064,14 @@ public class OmsConfig {
             this.grpcCallTimeoutMs = grpcCallTimeoutMs > 0 ? grpcCallTimeoutMs : 15_000L;
         }
 
+        public long getGrpcStreamAckTimeoutMs() {
+            return grpcStreamAckTimeoutMs;
+        }
+
+        public void setGrpcStreamAckTimeoutMs(long grpcStreamAckTimeoutMs) {
+            this.grpcStreamAckTimeoutMs = grpcStreamAckTimeoutMs > 0 ? grpcStreamAckTimeoutMs : 10_000L;
+        }
+
         public String getVenueId() { return venueId; }
         public void setVenueId(String venueId) {
             this.venueId = venueId == null || venueId.isBlank() ? "balh-internal-venue" : venueId.trim();
@@ -1081,15 +1095,31 @@ public class OmsConfig {
 
         /**
          * Venue-egress health gate evaluated on the order-accept path (HTTP + gRPC) for
-         * venue-routed (e.g. {@code PREDMKT/*}) symbols only. When {@code oms-venue-egress} falls
-         * more than {@link #maxLagBytes} Aeron-log bytes behind the projector — i.e. accepted
-         * orders are not reaching {@code balh-venue} — admission of new venue-routed orders is
-         * refused with HTTP 503 {@code venue_unavailable}. Equities / FIX-routed flow is never
-         * gated. See {@link com.balh.oms.ingress.VenueAdmissionGate}.
+         * venue-routed (e.g. {@code PREDMKT/*}) symbols only.
+         *
+         * <p><strong>Lag semantics (2026-06-05).</strong> Raw byte lag is
+         * {@code projector_position − egress_position} on the shared cluster events stream. With
+         * pipelined egress ({@code venue-route-max-in-flight > 1}) the projector legitimately leads
+         * by up to {@link #pipelinedFloorBytes(int)} while ER offers drain — that window is
+         * <em>not</em> actionable backlog. {@link #maxLagBytes} is the maximum <em>excess</em> lag
+         * (raw minus the pipelined floor) before HTTP 503 {@code venue_unavailable}; between
+         * {@link #throttleExcessLagBytes} and {@link #maxLagBytes} the gate applies a bounded
+         * accept-path delay instead of shedding. Equities / FIX-routed flow is never gated. See
+         * {@link com.balh.oms.ingress.VenueAdmissionGate} and
+         * {@link com.balh.oms.ingress.OmsVenueEgressLagPublisher}.
          */
         public static class AdmissionGate {
-            /** Steady-state / serial egress ({@code venue-route-max-in-flight=1}) lag budget. */
+            /** Max <em>excess</em> lag (beyond the pipelined floor) before hard 503. Serial egress uses this directly. */
             private static final long DEFAULT_MAX_LAG_BYTES = 4_096L;
+
+            /** Begin soft throttling when excess lag exceeds this (defaults to half of {@link #maxLagBytes}). */
+            private static final long DEFAULT_THROTTLE_EXCESS_LAG_BYTES = 2_048L;
+
+            /** Base accept-path delay at the start of the soft-throttle band (nanos). */
+            private static final long DEFAULT_THROTTLE_BASE_DELAY_NANOS = 500_000L;
+
+            /** Cap accept-path delay in the soft-throttle band (nanos). */
+            private static final long DEFAULT_MAX_THROTTLE_DELAY_NANOS = 25_000_000L;
 
             /**
              * Per in-flight pipelined admit, the projector can lead the egress cursor by roughly one
@@ -1100,6 +1130,9 @@ public class OmsConfig {
 
             private boolean enabled = true;
             private long maxLagBytes = DEFAULT_MAX_LAG_BYTES;
+            private long throttleExcessLagBytes = DEFAULT_THROTTLE_EXCESS_LAG_BYTES;
+            private long throttleBaseDelayNanos = DEFAULT_THROTTLE_BASE_DELAY_NANOS;
+            private long maxThrottleDelayNanos = DEFAULT_MAX_THROTTLE_DELAY_NANOS;
 
             public boolean isEnabled() { return enabled; }
             public void setEnabled(boolean enabled) { this.enabled = enabled; }
@@ -1109,24 +1142,76 @@ public class OmsConfig {
                 this.maxLagBytes = maxLagBytes > 0 ? maxLagBytes : DEFAULT_MAX_LAG_BYTES;
             }
 
+            public long getThrottleExcessLagBytes() { return throttleExcessLagBytes; }
+            public void setThrottleExcessLagBytes(long throttleExcessLagBytes) {
+                this.throttleExcessLagBytes =
+                        throttleExcessLagBytes > 0
+                                ? throttleExcessLagBytes
+                                : DEFAULT_THROTTLE_EXCESS_LAG_BYTES;
+            }
+
+            public long getThrottleBaseDelayNanos() { return throttleBaseDelayNanos; }
+            public void setThrottleBaseDelayNanos(long throttleBaseDelayNanos) {
+                this.throttleBaseDelayNanos =
+                        throttleBaseDelayNanos > 0
+                                ? throttleBaseDelayNanos
+                                : DEFAULT_THROTTLE_BASE_DELAY_NANOS;
+            }
+
+            public long getMaxThrottleDelayNanos() { return maxThrottleDelayNanos; }
+            public void setMaxThrottleDelayNanos(long maxThrottleDelayNanos) {
+                this.maxThrottleDelayNanos =
+                        maxThrottleDelayNanos > 0
+                                ? maxThrottleDelayNanos
+                                : DEFAULT_MAX_THROTTLE_DELAY_NANOS;
+            }
+
             public int getBytesPerPipelinedInFlightOrder() {
                 return BYTES_PER_PIPELINED_IN_FLIGHT_ORDER;
             }
 
             /**
-             * Lag budget for {@link com.balh.oms.ingress.VenueAdmissionGate}: serial path uses
-             * {@link #maxLagBytes}; pipelined egress raises the floor to
-             * {@code venue-route-max-in-flight × bytes-per-order} so healthy in-flight windows do not
-             * trip the gate while the egress cursor still waits for ER offers.
+             * Healthy pipelined in-flight window subtracted from raw lag before gate/throttle
+             * decisions. Zero for serial egress ({@code venue-route-max-in-flight <= 1}).
              */
-            public long effectiveMaxLagBytes(int venueRouteMaxInFlight) {
-                long configured = getMaxLagBytes();
+            public long pipelinedFloorBytes(int venueRouteMaxInFlight) {
                 if (venueRouteMaxInFlight <= 1) {
-                    return configured;
+                    return 0L;
                 }
-                long pipelinedFloor =
-                        (long) venueRouteMaxInFlight * BYTES_PER_PIPELINED_IN_FLIGHT_ORDER;
-                return Math.max(configured, pipelinedFloor);
+                return (long) venueRouteMaxInFlight * BYTES_PER_PIPELINED_IN_FLIGHT_ORDER;
+            }
+
+            /**
+             * Raw lag ceiling ({@code pipelinedFloor + maxLagBytes}) — the soak script {@code maxLagB}
+             * compares against this when measuring total projector−egress bytes.
+             */
+            public long hardBlockRawLagBytes(int venueRouteMaxInFlight) {
+                return pipelinedFloorBytes(venueRouteMaxInFlight) + getMaxLagBytes();
+            }
+
+            /**
+             * @deprecated Prefer {@link #hardBlockRawLagBytes(int)} — name kept for call-site clarity.
+             */
+            @Deprecated
+            public long effectiveMaxLagBytes(int venueRouteMaxInFlight) {
+                return hardBlockRawLagBytes(venueRouteMaxInFlight);
+            }
+
+            /**
+             * Bounded accept-path delay when {@code excessLag} sits in the soft-throttle band
+             * ({@code throttleExcessLagBytes < excessLag <= maxLagBytes}).
+             */
+            public long throttleDelayNanos(long excessLagBytes) {
+                if (excessLagBytes <= throttleExcessLagBytes || excessLagBytes > maxLagBytes) {
+                    return 0L;
+                }
+                long span = maxLagBytes - throttleExcessLagBytes;
+                if (span <= 0) {
+                    return maxThrottleDelayNanos;
+                }
+                long over = excessLagBytes - throttleExcessLagBytes;
+                long scaled = throttleBaseDelayNanos * over / span;
+                return Math.min(scaled, maxThrottleDelayNanos);
             }
         }
     }
@@ -3333,12 +3418,31 @@ public class OmsConfig {
          */
         public static class VenueEgress {
 
-            private static final long DEFAULT_POLL_PARK_NANOS = 1_000_000L;
-            private static final int DEFAULT_FRAGMENT_LIMIT = 256;
+            /**
+             * Idle park between replay polls when Aeron returns zero fragments. Kept short so the
+             * egress re-checks the live tail quickly under sustained admit load (pop @ 400 RPS:
+             * 1 ms park capped drain to ~1k polls/s even when fragments were available on the
+             * next slice).
+             */
+            private static final long DEFAULT_POLL_PARK_NANOS = 10_000L;
+
+            /**
+             * Fragments per {@code replay.poll} pass. Larger batches amortize poll overhead when
+             * draining cluster-log backlog ahead of ingress admit rate.
+             */
+            private static final int DEFAULT_FRAGMENT_LIMIT = 512;
+
             private static final long DEFAULT_RECORDING_LOOKUP_PARK_MS = 100L;
             private static final int DEFAULT_REPLAY_STREAM_ID = 4324;
             private static final int DEFAULT_CURSOR_FLUSH_EVERY = 1;
             private static final int DEFAULT_VENUE_ROUTE_MAX_IN_FLIGHT = 512;
+
+            /**
+             * {@link Thread#setPriority(int)} for {@code oms-venue-egress-replay}. Default
+             * {@link Thread#MAX_PRIORITY} keeps the Aeron drain ahead of generic worker pools on
+             * a loaded host; operators can lower via env when co-tenancy requires it.
+             */
+            private static final int DEFAULT_REPLAY_THREAD_PRIORITY = Thread.MAX_PRIORITY;
 
             private boolean enabled = false;
             private String aeronDirectory = "";
@@ -3351,6 +3455,7 @@ public class OmsConfig {
             private long recordingLookupParkMs = DEFAULT_RECORDING_LOOKUP_PARK_MS;
             private int cursorFlushEvery = DEFAULT_CURSOR_FLUSH_EVERY;
             private int venueRouteMaxInFlight = DEFAULT_VENUE_ROUTE_MAX_IN_FLIGHT;
+            private int replayThreadPriority = DEFAULT_REPLAY_THREAD_PRIORITY;
 
             public boolean isEnabled() { return enabled; }
             public void setEnabled(boolean enabled) { this.enabled = enabled; }
@@ -3428,6 +3533,12 @@ public class OmsConfig {
             public int getVenueRouteMaxInFlight() { return venueRouteMaxInFlight; }
             public void setVenueRouteMaxInFlight(int venueRouteMaxInFlight) {
                 this.venueRouteMaxInFlight = Math.max(1, venueRouteMaxInFlight);
+            }
+
+            public int getReplayThreadPriority() { return replayThreadPriority; }
+            public void setReplayThreadPriority(int replayThreadPriority) {
+                this.replayThreadPriority =
+                        Math.clamp(replayThreadPriority, Thread.MIN_PRIORITY, Thread.MAX_PRIORITY);
             }
         }
 

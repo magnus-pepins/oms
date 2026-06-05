@@ -52,15 +52,46 @@ class OmsVenueEgressLagPublisherTest {
     }
 
     @Test
-    void computeLagBytes_caughtUp_returnsZero() {
+    void evaluateLagReading_caughtUp_returnsZeroExcess() {
         stubComparableCursors(5000L, 5000L, 1L, 1L);
+        OmsVenueEgressLagPublisher.VenueEgressLagReading reading = publisher.evaluateLagReading();
+        assertThat(reading.measurable()).isTrue();
+        assertThat(reading.rawLagBytes()).isZero();
+        assertThat(reading.excessLagBytes()).isZero();
+    }
+
+    @Test
+    void evaluateLagReading_serialEgressBehind_returnsRawAsExcess() {
+        config.getCluster().getVenueEgress().setVenueRouteMaxInFlight(1);
+        stubComparableCursors(9000L, 6000L, 2L, 2L);
+        OmsVenueEgressLagPublisher.VenueEgressLagReading reading = publisher.evaluateLagReading();
+        assertThat(reading.rawLagBytes()).isEqualTo(3000L);
+        assertThat(reading.excessLagBytes()).isEqualTo(3000L);
+        assertThat(publisher.computeLagBytes()).isEqualTo(3000L);
+    }
+
+    @Test
+    void evaluateLagReading_pipelinedHealthyWindow_rawHighExcessZero() {
+        config.getCluster().getVenueEgress().setVenueRouteMaxInFlight(512);
+        long floor = config.getVenue().getAdmissionGate().pipelinedFloorBytes(512);
+        stubComparableCursors(300_000L, 50_000L, 387L, 387L);
+
+        OmsVenueEgressLagPublisher.VenueEgressLagReading reading = publisher.evaluateLagReading();
+        assertThat(reading.rawLagBytes()).isEqualTo(250_000L);
+        assertThat(reading.pipelinedFloorBytes()).isEqualTo(floor);
+        assertThat(reading.excessLagBytes()).isZero();
         assertThat(publisher.computeLagBytes()).isZero();
     }
 
     @Test
-    void computeLagBytes_egressBehind_returnsDelta() {
-        stubComparableCursors(9000L, 6000L, 2L, 2L);
-        assertThat(publisher.computeLagBytes()).isEqualTo(3000L);
+    void evaluateLagReading_pipelinedStuckBeyondFloor_positiveExcess() {
+        config.getCluster().getVenueEgress().setVenueRouteMaxInFlight(512);
+        long floor = config.getVenue().getAdmissionGate().pipelinedFloorBytes(512);
+        stubComparableCursors(400_000L, 50_000L, 387L, 387L);
+
+        OmsVenueEgressLagPublisher.VenueEgressLagReading reading = publisher.evaluateLagReading();
+        assertThat(reading.rawLagBytes()).isEqualTo(350_000L);
+        assertThat(reading.excessLagBytes()).isEqualTo(350_000L - floor);
     }
 
     @Test
@@ -80,10 +111,12 @@ class OmsVenueEgressLagPublisherTest {
     }
 
     @Test
-    void pollCursors_updatesGaugeSupplier() {
+    void pollCursors_updatesGaugeSupplierWithExcessLag() {
+        config.getCluster().getVenueEgress().setVenueRouteMaxInFlight(1);
         stubComparableCursors(8000L, 7500L, 1L, 1L);
         publisher.pollCursors();
         assertThat(publisher.currentLagBytes()).isEqualTo(500L);
+        assertThat(publisher.currentRawLagBytes()).isEqualTo(500L);
     }
 
     @Test
@@ -137,20 +170,21 @@ class OmsVenueEgressLagPublisherTest {
     }
 
     @Test
-    void egressBehindBeyondMaxLag_blocks() {
+    void serialEgressBehindBeyondMaxExcess_blocks() {
+        config.getCluster().getVenueEgress().setVenueRouteMaxInFlight(1);
         stubPositions(20_000L, 6_432L);
         stubRecordings(387L, 387L);
         config.getVenue().getAdmissionGate().setMaxLagBytes(4096L);
-        config.getCluster().getVenueEgress().setVenueRouteMaxInFlight(1);
 
         OmsVenueEgressLagPublisher.VenueEgressHealthSnapshot snapshot =
                 publisher.computeHealthSnapshot();
         assertThat(snapshot.admissible()).isFalse();
-        assertThat(snapshot.blockDetail()).contains("exceeds max");
+        assertThat(snapshot.blockDetail()).contains("excess lag");
     }
 
     @Test
-    void withinMaxLag_allows() {
+    void withinMaxExcess_allows() {
+        config.getCluster().getVenueEgress().setVenueRouteMaxInFlight(1);
         stubPositions(9920L, 9900L);
         stubRecordings(387L, 387L);
         config.getVenue().getAdmissionGate().setMaxLagBytes(4096L);
@@ -165,7 +199,10 @@ class OmsVenueEgressLagPublisherTest {
         stubPositions(300_000L, 50_000L);
         stubRecordings(387L, 387L);
 
-        assertThat(publisher.computeHealthSnapshot().admissible()).isTrue();
+        OmsVenueEgressLagPublisher.VenueEgressHealthSnapshot snapshot =
+                publisher.computeHealthSnapshot();
+        assertThat(snapshot.admissible()).isTrue();
+        assertThat(snapshot.shouldThrottle()).isFalse();
     }
 
     @Test
@@ -176,6 +213,23 @@ class OmsVenueEgressLagPublisherTest {
         stubRecordings(387L, 387L);
 
         assertThat(publisher.computeHealthSnapshot().admissible()).isFalse();
+    }
+
+    @Test
+    void softThrottleBand_delaysWithoutBlocking() {
+        config.getCluster().getVenueEgress().setVenueRouteMaxInFlight(512);
+        config.getVenue().getAdmissionGate().setMaxLagBytes(4096L);
+        config.getVenue().getAdmissionGate().setThrottleExcessLagBytes(2048L);
+        long floor = config.getVenue().getAdmissionGate().pipelinedFloorBytes(512);
+        long raw = floor + 3000L;
+        stubPositions(raw + 50_000L, 50_000L);
+        stubRecordings(387L, 387L);
+
+        OmsVenueEgressLagPublisher.VenueEgressHealthSnapshot snapshot =
+                publisher.computeHealthSnapshot();
+        assertThat(snapshot.admissible()).isTrue();
+        assertThat(snapshot.shouldThrottle()).isTrue();
+        assertThat(snapshot.throttleDelayNanos()).isPositive();
     }
 
     @Test
@@ -199,14 +253,22 @@ class OmsVenueEgressLagPublisherTest {
 
     @Test
     void pollCursors_updatesHealthSnapshot() {
+        config.getCluster().getVenueEgress().setVenueRouteMaxInFlight(1);
         stubPositions(20_000L, 6_432L);
         stubRecordings(387L, 387L);
         config.getVenue().getAdmissionGate().setMaxLagBytes(4096L);
-        config.getCluster().getVenueEgress().setVenueRouteMaxInFlight(1);
 
         publisher.pollCursors();
 
         assertThat(publisher.currentHealthSnapshot().admissible()).isFalse();
+    }
+
+    @Test
+    void hardBlockRawLagBytes_isFloorPlusMaxExcess() {
+        OmsConfig.Venue.AdmissionGate gate = config.getVenue().getAdmissionGate();
+        gate.setMaxLagBytes(4096L);
+        assertThat(gate.hardBlockRawLagBytes(512))
+                .isEqualTo(gate.pipelinedFloorBytes(512) + 4096L);
     }
 
     private void stubPositions(long projectorPos, long egressPos) {

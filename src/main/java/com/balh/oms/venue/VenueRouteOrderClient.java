@@ -28,19 +28,23 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Profile;
 import org.springframework.stereotype.Component;
 
+import io.grpc.stub.ClientCallStreamObserver;
+import io.grpc.stub.ClientResponseObserver;
 import io.grpc.stub.StreamObserver;
 
 import java.util.List;
 import java.util.ArrayList;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.LockSupport;
 
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 
@@ -51,27 +55,43 @@ public class VenueRouteOrderClient {
 
     private static final Logger log = LoggerFactory.getLogger(VenueRouteOrderClient.class);
 
+    /** Bounded queue between callers and the ordered stream writer (venue gateway back-pressure). */
+    private static final int ROUTE_STREAM_WRITE_QUEUE_CAPACITY = 8192;
+    /** Max wait when the write queue is full before failing the route (fail closed → VENUE_REJECT). */
+    private static final long WRITE_QUEUE_OFFER_TIMEOUT_MS = 100L;
+    /** How often the ack-timeout sweeper scans {@link #pendingRoutes}. */
+    private static final long ACK_TIMEOUT_SWEEP_INTERVAL_MS = 50L;
+    /** Writer parks briefly when the gRPC stream is not ready (flow control). */
+    private static final long STREAM_NOT_READY_PARK_NANOS = MILLISECONDS.toNanos(1L);
+
     private final ManagedChannel channel;
     private final VenueOrderServiceGrpc.VenueOrderServiceBlockingStub blockingStub;
     private final VenueOrderServiceGrpc.VenueOrderServiceStub asyncStub;
     private final long grpcCallTimeoutMs;
+    private final long grpcStreamAckTimeoutMs;
     private final MeterRegistry meterRegistry;
 
     // ---- Pipelined RouteOrderStream state (used only when venue-route-max-in-flight > 1) ----
     /** In-flight async routes keyed by oms order id; completed by the response demuxer. */
     private final ConcurrentHashMap<String, PendingRoute> pendingRoutes = new ConcurrentHashMap<>();
-    /** Guards stream (re)open + ordered writes to {@link #requestObserver}. */
+    /** Ordered writes to {@link #requestObserver}; drained by the dedicated writer thread. */
+    private final BlockingQueue<QueuedWrite> writeQueue =
+            new LinkedBlockingQueue<>(ROUTE_STREAM_WRITE_QUEUE_CAPACITY);
+    /** Guards stream (re)open and {@link ClientCallStreamObserver#setOnReadyHandler} wiring. */
     private final ReentrantLock streamLock = new ReentrantLock();
     private volatile StreamObserver<RouteOrderRequest> requestObserver;
     private volatile boolean shuttingDown;
+    private final Thread writeThread;
     private ScheduledExecutorService routeTimeoutScheduler;
 
-    private record PendingRoute(
-            CompletableFuture<Optional<ExecutionReport>> future, ScheduledFuture<?> timeout) {}
+    private record QueuedWrite(RouteOrderRequest request, String orderId) {}
+
+    private record PendingRoute(CompletableFuture<Optional<ExecutionReport>> future, long deadlineNanos) {}
 
     public VenueRouteOrderClient(OmsConfig omsConfig, MeterRegistry meterRegistry) {
         this.meterRegistry = meterRegistry;
         this.grpcCallTimeoutMs = omsConfig.getVenue().getGrpcCallTimeoutMs();
+        this.grpcStreamAckTimeoutMs = omsConfig.getVenue().getGrpcStreamAckTimeoutMs();
         this.channel =
                 ManagedChannelBuilder.forAddress(
                                 omsConfig.getVenue().getGrpcHost(), omsConfig.getVenue().getGrpcPort())
@@ -79,6 +99,16 @@ public class VenueRouteOrderClient {
                         .build();
         this.blockingStub = VenueOrderServiceGrpc.newBlockingStub(channel);
         this.asyncStub = VenueOrderServiceGrpc.newStub(channel);
+        this.writeThread =
+                new Thread(this::writeLoop, "venue-route-stream-writer");
+        this.writeThread.setDaemon(true);
+        this.writeThread.start();
+        routeTimeoutScheduler()
+                .scheduleAtFixedRate(
+                        this::sweepAckTimeouts,
+                        ACK_TIMEOUT_SWEEP_INTERVAL_MS,
+                        ACK_TIMEOUT_SWEEP_INTERVAL_MS,
+                        MILLISECONDS);
     }
 
     private VenueOrderServiceGrpc.VenueOrderServiceBlockingStub stubWithDeadline() {
@@ -118,14 +148,13 @@ public class VenueRouteOrderClient {
     }
 
     /**
-     * Pipelined route over the ordered {@code RouteOrderStream}: writes the request in the caller's
-     * invocation order (the egress replay thread calls this in cluster-log order, so the venue sees
-     * offers in admission order and price-time priority is preserved) and returns a future the
+     * Pipelined route over the ordered {@code RouteOrderStream}: enqueues the request for the
+     * dedicated writer thread (preserving caller invocation order) and returns a future the
      * response demuxer completes when the venue acks. {@link Optional#empty()} means the venue
      * rejected / did not (fully) accept; a transport/stream failure completes the future
      * exceptionally with {@link VenueRouteTransportException} so the egress submits a VENUE_REJECT,
-     * exactly as the blocking path does. Not thread-safe across callers — the single egress replay
-     * thread is the only writer.
+     * exactly as the blocking path does. Not thread-safe across callers — the single egress
+     * route-offer thread is the only writer.
      */
     public CompletableFuture<Optional<ExecutionReport>> routeAdmittedOrderAsync(OrderAdmittedEvent ev) {
         String orderId = ev.orderId().toString();
@@ -139,46 +168,104 @@ public class VenueRouteOrderClient {
                         .setSide(ev.side())
                         .setCounterpartyId(ev.accountId())
                         .build();
-        streamLock.lock();
+        long deadlineNanos = System.nanoTime() + MILLISECONDS.toNanos(grpcStreamAckTimeoutMs);
+        PendingRoute prev = pendingRoutes.putIfAbsent(orderId, new PendingRoute(future, deadlineNanos));
+        if (prev != null) {
+            future.completeExceptionally(
+                    new VenueRouteTransportException(
+                            "duplicate in-flight venue route orderId=" + orderId, new IllegalStateException()));
+            return future;
+        }
         try {
-            ScheduledFuture<?> timeout =
-                    routeTimeoutScheduler().schedule(
-                            () -> {
-                                PendingRoute pr = pendingRoutes.remove(orderId);
-                                if (pr != null) {
-                                    pr.future().completeExceptionally(
-                                            new VenueRouteTransportException(
-                                                    "venue RouteOrderStream ack timeout orderId=" + orderId,
-                                                    new java.util.concurrent.TimeoutException("ack timeout")));
-                                }
-                            },
-                            grpcCallTimeoutMs,
-                            MILLISECONDS);
-            PendingRoute prev = pendingRoutes.putIfAbsent(orderId, new PendingRoute(future, timeout));
-            if (prev != null) {
-                timeout.cancel(false);
+            if (!writeQueue.offer(new QueuedWrite(request, orderId), WRITE_QUEUE_OFFER_TIMEOUT_MS, MILLISECONDS)) {
+                pendingRoutes.remove(orderId);
                 future.completeExceptionally(
                         new VenueRouteTransportException(
-                                "duplicate in-flight venue route orderId=" + orderId, new IllegalStateException()));
+                                "venue RouteOrderStream write queue full orderId=" + orderId,
+                                new IllegalStateException("write queue full")));
                 return future;
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            pendingRoutes.remove(orderId);
+            future.completeExceptionally(
+                    new VenueRouteTransportException(
+                            "venue RouteOrderStream enqueue interrupted orderId=" + orderId, e));
+            return future;
+        }
+        LockSupport.unpark(writeThread);
+        return future;
+    }
+
+    /**
+     * Drains {@link #writeQueue} in FIFO order, respecting gRPC client flow control so
+     * {@link #routeAdmittedOrderAsync} never blocks on {@code onNext} backpressure.
+     */
+    private void writeLoop() {
+        while (!shuttingDown) {
+            QueuedWrite item;
+            try {
+                item = writeQueue.poll(50L, MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            if (item == null) {
+                continue;
+            }
+            writeOne(item);
+        }
+    }
+
+    private void writeOne(QueuedWrite item) {
+        streamLock.lock();
+        try {
+            if (shuttingDown) {
+                failQueuedWriteLocked(item, new IllegalStateException("venue route client shutting down"));
+                return;
             }
             try {
                 ensureStreamOpenLocked();
-                requestObserver.onNext(request);
             } catch (RuntimeException e) {
-                PendingRoute pr = pendingRoutes.remove(orderId);
-                if (pr != null) {
-                    pr.timeout().cancel(false);
+                failQueuedWriteLocked(item, e);
+                return;
+            }
+            ClientCallStreamObserver<RouteOrderRequest> callObserver =
+                    (ClientCallStreamObserver<RouteOrderRequest>) requestObserver;
+            while (!callObserver.isReady() && !shuttingDown) {
+                streamLock.unlock();
+                LockSupport.parkNanos(STREAM_NOT_READY_PARK_NANOS);
+                streamLock.lock();
+                if (requestObserver == null) {
+                    failQueuedWriteLocked(item, new IllegalStateException("stream torn down"));
+                    return;
                 }
-                OmsVenueGrpcMetrics.recordEgressFailure(meterRegistry, OmsVenueGrpcMetrics.RPC_ROUTE_ORDER, asStatusRuntime(e));
-                future.completeExceptionally(
-                        new VenueRouteTransportException(
-                                "venue RouteOrderStream write failed orderId=" + orderId, e));
+                callObserver = (ClientCallStreamObserver<RouteOrderRequest>) requestObserver;
+            }
+            if (shuttingDown) {
+                failQueuedWriteLocked(item, new IllegalStateException("venue route client shutting down"));
+                return;
+            }
+            try {
+                callObserver.onNext(item.request());
+            } catch (RuntimeException e) {
+                failQueuedWriteLocked(item, e);
             }
         } finally {
             streamLock.unlock();
         }
-        return future;
+    }
+
+    private void failQueuedWriteLocked(QueuedWrite item, RuntimeException e) {
+        PendingRoute pr = pendingRoutes.remove(item.orderId());
+        if (pr != null) {
+            OmsVenueGrpcMetrics.recordEgressFailure(
+                    meterRegistry, OmsVenueGrpcMetrics.RPC_ROUTE_ORDER, asStatusRuntime(e));
+            pr.future()
+                    .completeExceptionally(
+                            new VenueRouteTransportException(
+                                    "venue RouteOrderStream write failed orderId=" + item.orderId(), e));
+        }
     }
 
     private ScheduledExecutorService routeTimeoutScheduler() {
@@ -194,6 +281,25 @@ public class VenueRouteOrderClient {
         return routeTimeoutScheduler;
     }
 
+    /** One periodic sweep replaces per-order {@code schedule()} at 400+ routes/s. */
+    private void sweepAckTimeouts() {
+        long now = System.nanoTime();
+        for (var entry : pendingRoutes.entrySet()) {
+            if (entry.getValue().deadlineNanos() > now) {
+                continue;
+            }
+            String orderId = entry.getKey();
+            PendingRoute pr = pendingRoutes.remove(orderId);
+            if (pr != null) {
+                pr.future()
+                        .completeExceptionally(
+                                new VenueRouteTransportException(
+                                        "venue RouteOrderStream ack timeout orderId=" + orderId,
+                                        new java.util.concurrent.TimeoutException("ack timeout")));
+            }
+        }
+    }
+
     /** Caller holds {@link #streamLock}. Opens (or reopens) the bidi stream if not currently live. */
     private void ensureStreamOpenLocked() {
         if (requestObserver != null) {
@@ -205,15 +311,25 @@ public class VenueRouteOrderClient {
         requestObserver = asyncStub.routeOrderStream(new RouteStreamResponseObserver());
     }
 
+    /** gRPC callback: unpark the writer when outbound flow-control window opens. */
+    private void onStreamReady() {
+        LockSupport.unpark(writeThread);
+    }
+
     /** Demuxes async venue responses to the matching in-flight future by oms order id. */
-    private final class RouteStreamResponseObserver implements StreamObserver<RouteOrderResponse> {
+    private final class RouteStreamResponseObserver
+            implements ClientResponseObserver<RouteOrderRequest, RouteOrderResponse> {
+        @Override
+        public void beforeStart(ClientCallStreamObserver<RouteOrderRequest> requestStream) {
+            requestStream.setOnReadyHandler(VenueRouteOrderClient.this::onStreamReady);
+        }
+
         @Override
         public void onNext(RouteOrderResponse response) {
             PendingRoute pr = pendingRoutes.remove(response.getOmsOrderId());
             if (pr == null) {
                 return; // late/duplicate (e.g. after a timeout already fired)
             }
-            pr.timeout().cancel(false);
             if (!response.getAccepted() || !response.hasExecutionReport()) {
                 pr.future().complete(Optional.empty());
             } else {
@@ -246,15 +362,26 @@ public class VenueRouteOrderClient {
         } finally {
             streamLock.unlock();
         }
+        QueuedWrite queued;
+        while ((queued = writeQueue.poll()) != null) {
+            PendingRoute pr = pendingRoutes.remove(queued.orderId());
+            if (pr != null) {
+                pr.future()
+                        .completeExceptionally(
+                                new VenueRouteTransportException(
+                                        message + " orderId=" + queued.orderId() + " (queued)", cause));
+            }
+        }
         List<String> ids = new ArrayList<>(pendingRoutes.keySet());
         for (String id : ids) {
             PendingRoute pr = pendingRoutes.remove(id);
             if (pr != null) {
-                pr.timeout().cancel(false);
-                pr.future().completeExceptionally(
-                        new VenueRouteTransportException(message + " orderId=" + id, cause));
+                pr.future()
+                        .completeExceptionally(
+                                new VenueRouteTransportException(message + " orderId=" + id, cause));
             }
         }
+        LockSupport.unpark(writeThread);
     }
 
     private static StatusRuntimeException asStatusRuntime(RuntimeException e) {
@@ -341,6 +468,12 @@ public class VenueRouteOrderClient {
     @PreDestroy
     void shutdown() {
         shuttingDown = true;
+        writeThread.interrupt();
+        try {
+            writeThread.join(2_000L);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
         streamLock.lock();
         try {
             if (requestObserver != null) {

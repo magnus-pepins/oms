@@ -315,6 +315,61 @@ class OmsVenueEgressPipelineTest {
     }
 
     @Test
+    void manyErCompletions_coalesceFlushToFewerExecutorTasks() throws Exception {
+        int admitCount = 32;
+        AtomicInteger erFlushSubmissions = new AtomicInteger();
+        CountDownLatch releaseEr = new CountDownLatch(1);
+        var erPool = Executors.newSingleThreadExecutor();
+        try {
+            java.util.concurrent.Executor coalescingErExecutor =
+                    task -> {
+                        erFlushSubmissions.incrementAndGet();
+                        erPool.execute(
+                                () -> {
+                                    try {
+                                        releaseEr.await();
+                                    } catch (InterruptedException e) {
+                                        Thread.currentThread().interrupt();
+                                        return;
+                                    }
+                                    task.run();
+                                });
+                    };
+            service.enablePipelineForTesting(32, coalescingErExecutor, Runnable::run, Runnable::run);
+
+            List<OrderAdmittedEvent> events = new ArrayList<>();
+            List<CompletableFuture<Optional<ExecutionReport>>> futures = new ArrayList<>();
+            for (int i = 0; i < admitCount; i++) {
+                OrderAdmittedEvent ev = admit("PREDMKT-TEST-1");
+                events.add(ev);
+                CompletableFuture<Optional<ExecutionReport>> f = new CompletableFuture<>();
+                futures.add(f);
+                when(routeClient.routeAdmittedOrderAsync(ev)).thenReturn(f);
+            }
+
+            for (int i = 0; i < admitCount; i++) {
+                service.pipelineDispatchAdmitForTesting(events.get(i), 10L * (i + 1));
+            }
+            for (int i = 0; i < admitCount; i++) {
+                futures.get(i).complete(Optional.of(er(events.get(i))));
+            }
+
+            releaseEr.countDown();
+            service.markRunningForTesting();
+            assertThat(service.pipelineQuiesceForTesting()).isTrue();
+
+            assertThat(erFlushSubmissions.get())
+                    .as("coalesced ER flush should not queue one executor task per completion")
+                    .isLessThan(admitCount);
+            verify(clusterIngressClient, times(admitCount)).submitApplyExecutionReport(any(), any());
+        } finally {
+            releaseEr.countDown();
+            erPool.shutdown();
+            erPool.awaitTermination(2, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
     void slowClusterErOffer_dispatchesFullPendingWindowWhileOffersPark() throws Exception {
         int maxInFlight = 4;
         int admitCount = maxInFlight * 2;

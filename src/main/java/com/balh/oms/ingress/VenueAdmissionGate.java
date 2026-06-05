@@ -11,6 +11,8 @@ import org.springframework.context.annotation.Profile;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Component;
 
+import java.util.concurrent.locks.LockSupport;
+
 /**
  * Pre-admission circuit breaker for venue-routed orders.
  *
@@ -25,10 +27,13 @@ import org.springframework.stereotype.Component;
  * <p><b>What it does.</b> On the accept path (HTTP {@code POST /…/orders} and the gRPC ingress, both via
  * {@link OrderIngressService#persistAccepted}), for symbols routed to the internal venue (prefix match,
  * default {@code PREDMKT}), it consults the cached venue-egress health snapshot from
- * {@link OmsVenueEgressLagPublisher} (refreshed on a scheduler thread, default every 5 s). If the
- * egress is on an older Aeron Archive recording than the projector, trails it by more than
- * {@code oms.venue.admission-gate.max-lag-bytes}, or has never run at all, the accept is refused with
- * HTTP 503 {@code venue_unavailable}. Equities / FIX-routed orders are never gated — they short-circuit
+ * {@link OmsVenueEgressLagPublisher} (refreshed on a scheduler thread, default every 5 s). Decisions
+ * use <em>excess</em> byte lag ({@code raw − pipelined_floor}) so a healthy pipelined in-flight window
+ * does not look like a wedge. When excess lag sits between {@code throttle-excess-lag-bytes} and
+ * {@code max-lag-bytes}, the gate applies a bounded accept-path delay (soft backpressure) before the
+ * cluster admit proceeds. When excess lag exceeds {@code max-lag-bytes}, or the egress is on an older
+ * Aeron Archive recording than the projector, or has never run at all, the accept is refused with HTTP
+ * 503 {@code venue_unavailable}. Equities / FIX-routed orders are never gated — they short-circuit
  * before any snapshot read.
  *
  * <p><b>Hot path.</b> Cluster admit is <em>not</em> blocked by per-request Postgres cursor queries; the
@@ -51,6 +56,7 @@ public class VenueAdmissionGate {
     static final String REJECT_CODE = "venue_unavailable";
 
     private static final String METRIC_BLOCKED = "oms_venue_admission_gate_blocked_total";
+    private static final String METRIC_THROTTLED = "oms_venue_admission_gate_throttled_total";
 
     private final OmsConfig config;
     private final OmsVenueEgressLagPublisher venueEgressLagPublisher;
@@ -80,6 +86,19 @@ public class VenueAdmissionGate {
 
         OmsVenueEgressLagPublisher.VenueEgressHealthSnapshot snapshot =
                 venueEgressLagPublisher.currentHealthSnapshot();
+        if (snapshot.shouldThrottle()) {
+            Counter.builder(METRIC_THROTTLED)
+                    .description(
+                            "Venue-routed accepts delayed by soft backpressure while egress excess lag"
+                                    + " is above the throttle floor but below hard 503 threshold")
+                    .tag("symbol", instrumentSymbol == null ? "" : instrumentSymbol)
+                    .register(meterRegistry)
+                    .increment();
+            LockSupport.parkNanos(snapshot.throttleDelayNanos());
+            if (Thread.interrupted()) {
+                Thread.currentThread().interrupt();
+            }
+        }
         if (!snapshot.admissible()) {
             trip(instrumentSymbol, snapshot.blockDetail());
         }

@@ -179,6 +179,15 @@ oms:
     grpc-host: ${OMS_VENUE_GRPC_HOST:127.0.0.1}
     grpc-port: ${OMS_VENUE_GRPC_PORT:50051}
     registry-sync-enabled: ${OMS_VENUE_REGISTRY_SYNC_ENABLED:true}
+    admission-gate:
+      enabled: ${OMS_VENUE_ADMISSION_GATE_ENABLED:true}
+      # Max *excess* lag (raw − pipelined floor) before HTTP 503 venue_unavailable.
+      max-lag-bytes: ${OMS_VENUE_ADMISSION_GATE_MAX_LAG_BYTES:4096}
+      throttle-excess-lag-bytes: ${OMS_VENUE_ADMISSION_GATE_THROTTLE_EXCESS_LAG_BYTES:2048}
+      throttle-base-delay-nanos: ${OMS_VENUE_ADMISSION_GATE_THROTTLE_BASE_DELAY_NANOS:500000}
+      max-throttle-delay-nanos: ${OMS_VENUE_ADMISSION_GATE_MAX_THROTTLE_DELAY_NANOS:25000000}
+    egress:
+      lag-poll-interval-ms: ${OMS_VENUE_EGRESS_LAG_POLL_INTERVAL_MS:5000}
   settlement:
     # Must match a row in custody_accounts (Flyway V11 seeds DEFAULT omnibus).
     default-custody-account-id: ${OMS_SETTLEMENT_DEFAULT_CUSTODY_ACCOUNT_ID:a0000001-0000-4000-8000-000000000001}

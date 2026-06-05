@@ -546,7 +546,11 @@ const apps = [
       OMS_VENUE_SYMBOL_PREFIX: 'PREDMKT',
       // Pipelined RouteOrderStream in-flight cap (see plans/oms-venue-egress-pipelining.md).
       OMS_CLUSTER_VENUE_EGRESS_VENUE_ROUTE_MAX_IN_FLIGHT: '512',
-      OMS_CLUSTER_VENUE_EGRESS_FRAGMENT_LIMIT: '256',
+      // Replay drain: tight idle park (10µs), 512 frags/poll, MAX-priority replay thread.
+      // Target ≥400 OrderAdmitted fragments/s under sustained HTTP admit (pop 321k resting book).
+      OMS_CLUSTER_VENUE_EGRESS_POLL_PARK_NANOS: '10000',
+      OMS_CLUSTER_VENUE_EGRESS_FRAGMENT_LIMIT: '512',
+      OMS_CLUSTER_VENUE_EGRESS_REPLAY_THREAD_PRIORITY: '10',
       // 8095/8092 are oms-fix-ingress on pop.
       OMS_VENUE_EGRESS_HTTP_PORT: '8097',
       OMS_VENUE_EGRESS_MANAGEMENT_SERVER_PORT: '8098',
@@ -581,8 +585,13 @@ const apps = [
       // Reads aeron_projector_cursor + oms_venue_egress_cursor from the shared oms projector DB.
       OMS_VENUE_SYMBOL_PREFIX: 'PREDMKT',
       OMS_VENUE_ADMISSION_GATE_ENABLED: 'true',
+      // max-lag-bytes = excess lag beyond pipelined floor (512×512 B) before hard 503.
       OMS_VENUE_ADMISSION_GATE_MAX_LAG_BYTES: '4096',
-      // Must match oms-venue-egress pipelining cap so VenueAdmissionGate effective budget scales.
+      // Soft backpressure band: park accepts when excess lag is between throttle floor and max.
+      OMS_VENUE_ADMISSION_GATE_THROTTLE_EXCESS_LAG_BYTES: '2048',
+      OMS_VENUE_ADMISSION_GATE_THROTTLE_BASE_DELAY_NANOS: '500000',
+      OMS_VENUE_ADMISSION_GATE_MAX_THROTTLE_DELAY_NANOS: '25000000',
+      // Must match oms-venue-egress pipelining cap (pipelined floor = inFlight × 512 B).
       OMS_CLUSTER_VENUE_EGRESS_VENUE_ROUTE_MAX_IN_FLIGHT: '512',
       // Sole HTTP order-accept JVM that needs live FX mids (FxQuoteService).
       OMS_FX_MID_SUBSCRIBER_ENABLED: 'true',

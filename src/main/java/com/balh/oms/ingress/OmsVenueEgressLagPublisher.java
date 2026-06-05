@@ -31,9 +31,13 @@ import java.util.concurrent.atomic.AtomicReference;
  * {@value #GAUGE_LAG_BYTES} on the order-accept JVM so operators can alert before
  * {@link VenueAdmissionGate} starts refusing {@code PREDMKT/*} accepts.
  *
- * <p>Lag is {@code projector_position - egress_position} on the shared OMS cluster events stream,
- * using the same recording-aware comparison as the gate. Returns {@link #NO_DATA_LAG_BYTES} until
- * both cursors exist and are comparable.
+ * <p><strong>Actionable lag.</strong> {@value #GAUGE_LAG_BYTES} is <em>excess</em> byte lag:
+ * {@code max(0, raw_lag − pipelined_floor)} where {@code raw_lag} is
+ * {@code projector_position − egress_position} on the shared events stream (recording-aware).
+ * Pipelined egress ({@code venue-route-max-in-flight > 1}) legitimately trails the projector by
+ * up to {@code in_flight × bytes_per_order}; subtracting that floor avoids treating a 250 KB
+ * healthy in-flight window as a 93 MB wedge. {@link #GAUGE_RAW_LAG_BYTES} keeps the unadjusted
+ * delta for soak scripts and deep dives.
  *
  * <p>{@link #currentHealthSnapshot()} is refreshed on the scheduler thread only; the accept hot path
  * reads the cached snapshot so cluster admit is not blocked by per-request Postgres cursor queries.
@@ -44,22 +48,52 @@ public class OmsVenueEgressLagPublisher {
 
     private static final Logger log = LoggerFactory.getLogger(OmsVenueEgressLagPublisher.class);
 
+    /** Excess byte lag beyond the pipelined in-flight floor — aligns with gate/throttle thresholds. */
     public static final String GAUGE_LAG_BYTES = "oms.venue.egress.lag_bytes";
+
+    /** Raw projector−egress byte delta before pipelined-floor subtraction. */
+    public static final String GAUGE_RAW_LAG_BYTES = "oms.venue.egress.raw_lag_bytes";
 
     /** Sentinel when egress or projector cursor is missing or on incomparable recordings. */
     public static final double NO_DATA_LAG_BYTES = -1.0;
 
     /**
+     * Recording-aware lag reading shared by the gauge and {@link VenueAdmissionGate}.
+     *
+     * @param rawLagBytes projector−egress byte delta (non-negative when comparable)
+     * @param pipelinedFloorBytes healthy in-flight window subtracted before gate decisions
+     * @param excessLagBytes {@code max(0, rawLagBytes − pipelinedFloorBytes)}
+     * @param measurable both cursors present and positions comparable
+     */
+    public record VenueEgressLagReading(
+            long rawLagBytes, long pipelinedFloorBytes, long excessLagBytes, boolean measurable) {
+
+        public static VenueEgressLagReading notMeasurable() {
+            return new VenueEgressLagReading(0L, 0L, 0L, false);
+        }
+    }
+
+    /**
      * Cached venue-egress health for {@link VenueAdmissionGate}. Updated by {@link #pollCursors()}
      * only — never on the HTTP accept hot path.
      */
-    public record VenueEgressHealthSnapshot(boolean admissible, String blockDetail) {
+    public record VenueEgressHealthSnapshot(
+            boolean admissible,
+            long throttleDelayNanos,
+            String blockDetail,
+            VenueEgressLagReading lagReading) {
+
         public static VenueEgressHealthSnapshot allow() {
-            return new VenueEgressHealthSnapshot(true, null);
+            return new VenueEgressHealthSnapshot(
+                    true, 0L, null, new VenueEgressLagReading(0L, 0L, 0L, true));
         }
 
-        public static VenueEgressHealthSnapshot block(String detail) {
-            return new VenueEgressHealthSnapshot(false, detail);
+        public static VenueEgressHealthSnapshot block(String detail, VenueEgressLagReading reading) {
+            return new VenueEgressHealthSnapshot(false, 0L, detail, reading);
+        }
+
+        public boolean shouldThrottle() {
+            return admissible && throttleDelayNanos > 0L;
         }
     }
 
@@ -70,7 +104,8 @@ public class OmsVenueEgressLagPublisher {
     private final String egressId;
     private final int streamId;
 
-    private final AtomicLong cachedLagBytes = new AtomicLong((long) NO_DATA_LAG_BYTES);
+    private final AtomicLong cachedExcessLagBytes = new AtomicLong((long) NO_DATA_LAG_BYTES);
+    private final AtomicLong cachedRawLagBytes = new AtomicLong((long) NO_DATA_LAG_BYTES);
     private final AtomicReference<VenueEgressHealthSnapshot> cachedHealthSnapshot =
             new AtomicReference<>(VenueEgressHealthSnapshot.allow());
 
@@ -106,21 +141,40 @@ public class OmsVenueEgressLagPublisher {
 
     @PostConstruct
     void registerGauge() {
+        Tags tags = Tags.of("egress_id", egressId, "stream_id", Integer.toString(streamId));
         Gauge.builder(GAUGE_LAG_BYTES, this, OmsVenueEgressLagPublisher::currentLagBytes)
                 .description(
-                        "OMS cluster events bytes the venue egress trails the postgres projector"
-                                + " (projector_pos - egress_pos). -1 when not measurable.")
-                .tags(Tags.of("egress_id", egressId, "stream_id", Integer.toString(streamId)))
+                        "Excess OMS cluster events bytes the venue egress trails the postgres projector"
+                                + " beyond the pipelined in-flight floor (max(0, raw − floor)). -1 when not measurable.")
+                .tags(tags)
                 .register(meterRegistry);
-        log.info("Registered {} gauge (egressId={}, streamId={})", GAUGE_LAG_BYTES, egressId, streamId);
+        Gauge.builder(GAUGE_RAW_LAG_BYTES, this, OmsVenueEgressLagPublisher::currentRawLagBytes)
+                .description(
+                        "Raw projector_pos − egress_pos byte delta before pipelined-floor subtraction."
+                                + " -1 when not measurable.")
+                .tags(tags)
+                .register(meterRegistry);
+        log.info(
+                "Registered {} and {} gauges (egressId={}, streamId={})",
+                GAUGE_LAG_BYTES,
+                GAUGE_RAW_LAG_BYTES,
+                egressId,
+                streamId);
         pollCursors();
     }
 
     @Scheduled(fixedDelayString = "${oms.venue.egress.lag-poll-interval-ms:5000}")
     public void pollCursors() {
         try {
-            cachedLagBytes.set(computeLagBytes());
-            cachedHealthSnapshot.set(computeHealthSnapshot());
+            VenueEgressLagReading reading = evaluateLagReading();
+            if (reading.measurable()) {
+                cachedExcessLagBytes.set(reading.excessLagBytes());
+                cachedRawLagBytes.set(reading.rawLagBytes());
+            } else {
+                cachedExcessLagBytes.set((long) NO_DATA_LAG_BYTES);
+                cachedRawLagBytes.set((long) NO_DATA_LAG_BYTES);
+            }
+            cachedHealthSnapshot.set(computeHealthSnapshot(reading));
         } catch (RuntimeException e) {
             log.warn(
                     "{} poll failed (egressId={}, streamId={}): {}; gauge and gate snapshot keep last value",
@@ -131,8 +185,14 @@ public class OmsVenueEgressLagPublisher {
         }
     }
 
+    /** Excess lag (actionable) — see class javadoc. */
     public double currentLagBytes() {
-        return cachedLagBytes.get();
+        return cachedExcessLagBytes.get();
+    }
+
+    /** Raw projector−egress delta before pipelined-floor subtraction. */
+    public double currentRawLagBytes() {
+        return cachedRawLagBytes.get();
     }
 
     /** Last polled health verdict; safe to read from the accept hot path (no I/O). */
@@ -140,12 +200,16 @@ public class OmsVenueEgressLagPublisher {
         return cachedHealthSnapshot.get();
     }
 
-    long computeLagBytes() {
+    VenueEgressLagReading evaluateLagReading() {
+        OmsConfig.Venue.AdmissionGate gate = config.getVenue().getAdmissionGate();
+        int venueRouteMaxInFlight = config.getCluster().getVenueEgress().getVenueRouteMaxInFlight();
+        long pipelinedFloor = gate.pipelinedFloorBytes(venueRouteMaxInFlight);
+
         OptionalLong egressPos = venueEgressCursor.findLastAppliedPosition(egressId, streamId);
         OptionalLong projectorPos =
                 projectorCursor.findLastAppliedPosition(OmsPostgresProjector.PROJECTOR_ID, streamId);
         if (egressPos.isEmpty() || projectorPos.isEmpty()) {
-            return (long) NO_DATA_LAG_BYTES;
+            return VenueEgressLagReading.notMeasurable();
         }
 
         Optional<AeronProjectorCursorRepository.RecordedCursor> projCursor =
@@ -158,16 +222,29 @@ public class OmsVenueEgressLagPublisher {
                 && egrCursor.get().hasRecordingId()
                 && egrCursor.get().recordingId() != projCursor.get().recordingId()) {
             if (egrCursor.get().recordingId() < projCursor.get().recordingId()) {
-                return Long.MAX_VALUE;
+                return new VenueEgressLagReading(Long.MAX_VALUE, pipelinedFloor, Long.MAX_VALUE, true);
             }
-            return 0L;
+            return new VenueEgressLagReading(0L, pipelinedFloor, 0L, true);
         }
 
-        long lag = projectorPos.getAsLong() - egressPos.getAsLong();
-        return lag < 0 ? 0L : lag;
+        long rawLag = projectorPos.getAsLong() - egressPos.getAsLong();
+        if (rawLag < 0L) {
+            rawLag = 0L;
+        }
+        long excess = Math.max(0L, rawLag - pipelinedFloor);
+        return new VenueEgressLagReading(rawLag, pipelinedFloor, excess, true);
+    }
+
+    long computeLagBytes() {
+        VenueEgressLagReading reading = evaluateLagReading();
+        return reading.measurable() ? reading.excessLagBytes() : (long) NO_DATA_LAG_BYTES;
     }
 
     VenueEgressHealthSnapshot computeHealthSnapshot() {
+        return computeHealthSnapshot(evaluateLagReading());
+    }
+
+    VenueEgressHealthSnapshot computeHealthSnapshot(VenueEgressLagReading reading) {
         OmsConfig.Venue.AdmissionGate gate = config.getVenue().getAdmissionGate();
         if (!gate.isEnabled()) {
             return VenueEgressHealthSnapshot.allow();
@@ -182,9 +259,14 @@ public class OmsVenueEgressLagPublisher {
         }
         if (egressPos.isEmpty()) {
             return VenueEgressHealthSnapshot.block(
-                    "venue egress cursor absent — oms-venue-egress has never applied an event");
+                    "venue egress cursor absent — oms-venue-egress has never applied an event",
+                    reading);
         }
         if (projectorPos.isEmpty()) {
+            return VenueEgressHealthSnapshot.allow();
+        }
+
+        if (!reading.measurable()) {
             return VenueEgressHealthSnapshot.allow();
         }
 
@@ -200,19 +282,37 @@ public class OmsVenueEgressLagPublisher {
             if (egrCursor.get().recordingId() < projCursor.get().recordingId()) {
                 return VenueEgressHealthSnapshot.block(
                         "venue egress on older recording " + egrCursor.get().recordingId()
-                                + " < projector recording " + projCursor.get().recordingId());
+                                + " < projector recording " + projCursor.get().recordingId(),
+                        reading);
             }
             return VenueEgressHealthSnapshot.allow();
         }
 
-        long lagBytes = projectorPos.getAsLong() - egressPos.getAsLong();
-        long maxLagBytes =
-                gate.effectiveMaxLagBytes(config.getCluster().getVenueEgress().getVenueRouteMaxInFlight());
-        if (lagBytes > maxLagBytes) {
+        long excessLag = reading.excessLagBytes();
+        long maxExcessLag = gate.getMaxLagBytes();
+        if (excessLag > maxExcessLag) {
             return VenueEgressHealthSnapshot.block(
-                    "venue egress lag " + lagBytes + " bytes exceeds max " + maxLagBytes
-                            + " (projector=" + projectorPos.getAsLong() + " egress=" + egressPos.getAsLong() + ")");
+                    "venue egress excess lag " + excessLag + " bytes exceeds max " + maxExcessLag
+                            + " (raw="
+                            + reading.rawLagBytes()
+                            + " floor="
+                            + reading.pipelinedFloorBytes()
+                            + " projector="
+                            + projectorPos.getAsLong()
+                            + " egress="
+                            + egressPos.getAsLong()
+                            + ")",
+                    reading);
         }
-        return VenueEgressHealthSnapshot.allow();
+
+        long throttleDelay = gate.throttleDelayNanos(excessLag);
+        if (throttleDelay > 0L) {
+            return new VenueEgressHealthSnapshot(
+                    true,
+                    throttleDelay,
+                    null,
+                    reading);
+        }
+        return new VenueEgressHealthSnapshot(true, 0L, null, reading);
     }
 }

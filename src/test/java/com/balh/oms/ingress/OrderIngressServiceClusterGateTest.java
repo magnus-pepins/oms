@@ -13,8 +13,10 @@ import com.balh.oms.fx.FxCustomerFlowNettingService;
 import com.balh.oms.fx.FxQuoteService;
 import com.balh.oms.ledger.LedgerBalanceClient;
 import com.balh.oms.ledger.LedgerInflightCoalescer;
+import com.balh.oms.ledger.LedgerInflightLifecycleClient;
 import com.balh.oms.ledger.LedgerInflightReservationClient;
 import com.balh.oms.observability.PiiHash;
+import com.balh.oms.persistence.LedgerInflightOutboxRepository;
 import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.tailer.OrderControlAdmission;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
@@ -82,6 +84,12 @@ class OrderIngressServiceClusterGateTest {
         ObjectProvider<LedgerInflightCoalescer> ledgerInflightCoalescer =
                 (ObjectProvider<LedgerInflightCoalescer>) mock(ObjectProvider.class);
         when(ledgerInflightCoalescer.getIfAvailable()).thenReturn(null);
+        ObjectProvider<LedgerInflightOutboxRepository> ledgerInflightOutbox =
+                (ObjectProvider<LedgerInflightOutboxRepository>) mock(ObjectProvider.class);
+        when(ledgerInflightOutbox.getIfAvailable()).thenReturn(null);
+        ObjectProvider<LedgerInflightLifecycleClient> ledgerInflightLifecycle =
+                (ObjectProvider<LedgerInflightLifecycleClient>) mock(ObjectProvider.class);
+        when(ledgerInflightLifecycle.getIfAvailable()).thenReturn(null);
         ObjectProvider<LedgerBalanceClient> ledgerBalance =
                 (ObjectProvider<LedgerBalanceClient>) mock(ObjectProvider.class);
         when(ledgerBalance.getIfAvailable()).thenReturn(null);
@@ -117,6 +125,8 @@ class OrderIngressServiceClusterGateTest {
                 piiHash,
                 ledgerInflight,
                 ledgerInflightCoalescer,
+                ledgerInflightOutbox,
+                ledgerInflightLifecycle,
                 ledgerBalance,
                 fxQuoteService,
                 customerFlowNetting,

@@ -14,12 +14,14 @@ import com.balh.oms.fx.FxCustomerFlowNettingService;
 import com.balh.oms.fx.FxQuoteService;
 import com.balh.oms.observability.PiiHash;
 import com.balh.oms.observability.metrics.OmsPipelineMetrics;
+import com.balh.oms.persistence.LedgerInflightOutboxRepository;
 import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.risk.BuyFundsRequirement;
 import com.balh.oms.tailer.OrderControlAdmission;
 import com.balh.oms.domain.Side;
 import com.balh.oms.ledger.LedgerBalanceClient;
 import com.balh.oms.ledger.LedgerInflightCoalescer;
+import com.balh.oms.ledger.LedgerInflightLifecycleClient;
 import com.balh.oms.ledger.LedgerInflightReservationClient;
 import com.balh.oms.ledger.LedgerInflightReservationFailures;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -99,12 +101,18 @@ public class OrderIngressService {
 
     /** Micrometer name for Ledger sync inflight hold latency (tag {@code result}). */
     private static final String METRIC_LEDGER_INFLIGHT_HOLD = "oms_ledger_inflight_hold";
+    private static final String HOLD_PATH_SYNC = "sync";
+    private static final String HOLD_PATH_PRE_ADMIT_ASYNC = "pre_admit_async";
+    private static final String HOLD_PATH_COALESCER = "coalescer";
+    private static final String HOLD_PATH_COALESCER_ASYNC = "coalescer_async";
 
     private final OrdersRepository orders;
     private final OmsConfig config;
     private final PiiHash piiHash;
     private final ObjectProvider<LedgerInflightReservationClient> ledgerInflightReservation;
     private final ObjectProvider<LedgerInflightCoalescer> ledgerInflightCoalescer;
+    private final ObjectProvider<LedgerInflightOutboxRepository> ledgerInflightOutbox;
+    private final ObjectProvider<LedgerInflightLifecycleClient> ledgerInflightLifecycleClient;
     private final ObjectProvider<LedgerBalanceClient> ledgerBalanceClient;
     /**
      * §8.4 quote-lock recall on the accept path. Optional: only present when
@@ -144,6 +152,8 @@ public class OrderIngressService {
             PiiHash piiHash,
             ObjectProvider<LedgerInflightReservationClient> ledgerInflightReservation,
             ObjectProvider<LedgerInflightCoalescer> ledgerInflightCoalescer,
+            ObjectProvider<LedgerInflightOutboxRepository> ledgerInflightOutbox,
+            ObjectProvider<LedgerInflightLifecycleClient> ledgerInflightLifecycleClient,
             ObjectProvider<LedgerBalanceClient> ledgerBalanceClient,
             ObjectProvider<FxQuoteService> fxQuoteService,
             ObjectProvider<FxCustomerFlowNettingService> customerFlowNetting,
@@ -157,6 +167,8 @@ public class OrderIngressService {
         this.piiHash = piiHash;
         this.ledgerInflightReservation = ledgerInflightReservation;
         this.ledgerInflightCoalescer = ledgerInflightCoalescer;
+        this.ledgerInflightOutbox = ledgerInflightOutbox;
+        this.ledgerInflightLifecycleClient = ledgerInflightLifecycleClient;
         this.ledgerBalanceClient = ledgerBalanceClient;
         this.fxQuoteService = fxQuoteService;
         this.customerFlowNetting = customerFlowNetting;
@@ -266,10 +278,11 @@ public class OrderIngressService {
             long quantityScaled = scaleQuantity(req.quantity());
             long limitPriceScaled = scaleLimitPrice(req.limitPrice());
             Order order = buildOrder(id, req, shardId, accountIdHash, ledgerBalanceId, now);
+            UUID submittedOrderId = order.id();
 
             // Buying-power hold is mandatory before cluster admit: a failed hold must reject at
             // ingress (HTTP 422 / RISK_BUYING_POWER) and must never reach the venue egress path.
-            ensureBuyLedgerInflightHoldBeforeClusterAdmit(order, req);
+            BuyLedgerHoldPlacement holdPlacement = ensureBuyLedgerInflightHoldBeforeClusterAdmit(order, req);
 
             // Slice E-1: route the admit to the cluster client owning this shard. At
             // shardCount=1 this is byte-identical to using the singleton client directly; at
@@ -289,6 +302,7 @@ public class OrderIngressService {
             }
 
             if (!created) {
+                maybeVoidDuplicateHold(holdPlacement, submittedOrderId, accepted.event().orderId());
                 // Duplicate at the cluster: the orders row + outbox rows were already produced by
                 // the original submission. Return without touching Postgres; the projector does NOT
                 // re-emit OrderAdmittedEvent on idempotent re-hits (see slice 2b-1), and re-inserting
@@ -297,8 +311,9 @@ public class OrderIngressService {
                 return new IngressResult(order, false);
             }
 
-            // Hold already placed pre-admit; BUY-async projector still writes the outbox row for
-            // lifecycle txn-id tracking and the reconciler idempotently confirms publish.
+            // Hold already placed pre-admit; persist lifecycle tracking when we have a direct
+            // /transactions txn id (coalescer path has no per-order txn id).
+            maybePersistLifecycleTrackingRow(order, holdPlacement);
             lockedQuote.ifPresent(cached -> maybeRecordCustomerFxFlow(req, cached));
 
             OmsPipelineMetrics.finishIngressAccept(meterRegistry, ingressSample, "created");
@@ -611,38 +626,41 @@ public class OrderIngressService {
         }
     }
 
-    private void ensureBuyLedgerInflightHoldBeforeClusterAdmit(Order order, CreateOrderRequest req) {
+    private BuyLedgerHoldPlacement ensureBuyLedgerInflightHoldBeforeClusterAdmit(Order order, CreateOrderRequest req) {
         if (!config.getLedger().isInflightReservationEnabled()) {
-            return;
+            return BuyLedgerHoldPlacement.none();
         }
         if (order.side() != Side.BUY) {
-            return;
+            return BuyLedgerHoldPlacement.none();
         }
         if (order.ledgerBalanceId() == null || order.ledgerBalanceId().isBlank()) {
-            return;
+            return BuyLedgerHoldPlacement.none();
         }
         if (!BuyFundsRequirement.hasBuyFundingPrice(order)) {
-            return;
+            return BuyLedgerHoldPlacement.none();
         }
         java.util.Optional<BigDecimal> holdAmount = (req.cashHoldAmount() != null)
                 ? java.util.Optional.of(req.cashHoldAmount())
                 : BuyFundsRequirement.requiredBuyFunds(order, config);
         if (holdAmount.isEmpty()) {
-            return;
+            return BuyLedgerHoldPlacement.none();
         }
         if (config.getLedger().isInflightCoalescerEnabled()) {
             LedgerInflightCoalescer coalescer = ledgerInflightCoalescer.getIfAvailable();
             if (coalescer != null) {
-                placeBuyLedgerInflightHoldThroughCoalescer(order, coalescer, holdAmount.get());
-                return;
+                // Async+coalescer mode keeps accept off the coalescer ACK future.
+                boolean waitForAck = !config.getLedger().isInflightAsyncEnabled();
+                placeBuyLedgerInflightHoldThroughCoalescer(order, coalescer, holdAmount.get(), waitForAck);
+                return BuyLedgerHoldPlacement.queued(holdAmount.get());
             }
             log.warn("inflight-coalescer-enabled=true but no LedgerInflightCoalescer bean; "
                     + "falling back to sync hold for orderId={}", order.id());
         }
-        placeBuyLedgerInflightHoldSync(order, holdAmount.get());
+        String ledgerTxnId = placeBuyLedgerInflightHoldSync(order, holdAmount.get());
+        return BuyLedgerHoldPlacement.placed(holdAmount.get(), ledgerTxnId);
     }
 
-    private void placeBuyLedgerInflightHoldSync(Order order, BigDecimal holdAmount) {
+    private String placeBuyLedgerInflightHoldSync(Order order, BigDecimal holdAmount) {
         LedgerInflightReservationClient client = ledgerInflightReservation.getIfAvailable();
         if (client == null) {
             throw new LedgerInflightHoldException(
@@ -651,15 +669,18 @@ public class OrderIngressService {
                     "ledger_unavailable",
                     "ledger inflight reservation client is not available");
         }
-        String holdPath = config.getLedger().isInflightAsyncEnabled() ? "pre_admit_async" : "sync";
+        String holdPath = config.getLedger().isInflightAsyncEnabled()
+                ? HOLD_PATH_PRE_ADMIT_ASYNC
+                : HOLD_PATH_SYNC;
         Timer.Sample sample = Timer.start(meterRegistry);
         try {
-            client.placeBuyFundsHold(order.id(), order.ledgerBalanceId(), holdAmount);
+            String ledgerTxnId = client.placeBuyFundsHold(order.id(), order.ledgerBalanceId(), holdAmount);
             sample.stop(Timer.builder(METRIC_LEDGER_INFLIGHT_HOLD)
                     .description("Ledger sync inflight hold HTTP call at order accept")
                     .tag("result", "success")
                     .tag("path", holdPath)
                     .register(meterRegistry));
+            return ledgerTxnId;
         } catch (LedgerInflightReservationClient.LedgerReservationException e) {
             sample.stop(Timer.builder(METRIC_LEDGER_INFLIGHT_HOLD)
                     .description("Ledger sync inflight hold HTTP call at order accept")
@@ -686,7 +707,7 @@ public class OrderIngressService {
     }
 
     private void placeBuyLedgerInflightHoldThroughCoalescer(
-            Order order, LedgerInflightCoalescer coalescer, BigDecimal holdAmount) {
+            Order order, LedgerInflightCoalescer coalescer, BigDecimal holdAmount, boolean waitForAck) {
         Timer.Sample sample = Timer.start(meterRegistry);
         long timeoutMs = config.getLedger().getInflightCoalescerSubmitTimeoutMs();
         CompletableFuture<Void> ack;
@@ -696,22 +717,30 @@ public class OrderIngressService {
             sample.stop(Timer.builder(METRIC_LEDGER_INFLIGHT_HOLD)
                     .description("Ledger inflight coalescer hold at order accept")
                     .tag("result", "failure")
-                    .tag("path", "coalescer")
+                    .tag("path", HOLD_PATH_COALESCER)
                     .register(meterRegistry));
             throw toLedgerInflightHoldException(e);
+        }
+        if (!waitForAck) {
+            sample.stop(Timer.builder(METRIC_LEDGER_INFLIGHT_HOLD)
+                    .description("Ledger inflight coalescer hold enqueue at order accept")
+                    .tag("result", "queued")
+                    .tag("path", HOLD_PATH_COALESCER_ASYNC)
+                    .register(meterRegistry));
+            return;
         }
         try {
             ack.get(timeoutMs, TimeUnit.MILLISECONDS);
             sample.stop(Timer.builder(METRIC_LEDGER_INFLIGHT_HOLD)
                     .description("Ledger inflight coalescer hold at order accept")
                     .tag("result", "success")
-                    .tag("path", "coalescer")
+                    .tag("path", HOLD_PATH_COALESCER)
                     .register(meterRegistry));
         } catch (TimeoutException e) {
             sample.stop(Timer.builder(METRIC_LEDGER_INFLIGHT_HOLD)
                     .description("Ledger inflight coalescer hold at order accept")
                     .tag("result", "timeout")
-                    .tag("path", "coalescer")
+                    .tag("path", HOLD_PATH_COALESCER)
                     .register(meterRegistry));
             // The future is still pending — coalescer may still flush + outbox-fallback after we
             // throw. The compensator path handles any orphaned admit since we roll back the
@@ -725,7 +754,7 @@ public class OrderIngressService {
             sample.stop(Timer.builder(METRIC_LEDGER_INFLIGHT_HOLD)
                     .description("Ledger inflight coalescer hold at order accept")
                     .tag("result", "failure")
-                    .tag("path", "coalescer")
+                    .tag("path", HOLD_PATH_COALESCER)
                     .register(meterRegistry));
             Throwable cause = e.getCause() != null ? e.getCause() : e;
             throw toLedgerInflightHoldException(cause);
@@ -734,9 +763,87 @@ public class OrderIngressService {
             sample.stop(Timer.builder(METRIC_LEDGER_INFLIGHT_HOLD)
                     .description("Ledger inflight coalescer hold at order accept")
                     .tag("result", "interrupted")
-                    .tag("path", "coalescer")
+                    .tag("path", HOLD_PATH_COALESCER)
                     .register(meterRegistry));
             throw new RuntimeException("ledger inflight coalescer ack interrupted", e);
+        }
+    }
+
+    private void maybeVoidDuplicateHold(
+            BuyLedgerHoldPlacement holdPlacement, UUID submittedOrderId, UUID clusterOrderId) {
+        if (holdPlacement.ledgerTxnId() == null || holdPlacement.ledgerTxnId().isBlank()) {
+            return;
+        }
+        LedgerInflightLifecycleClient lifecycleClient = ledgerInflightLifecycleClient.getIfAvailable();
+        if (lifecycleClient == null) {
+            throw new LedgerInflightHoldException(
+                    HttpStatus.SERVICE_UNAVAILABLE,
+                    RejectCode.INTERNAL_ERROR,
+                    "ledger_lifecycle_unavailable",
+                    "duplicate cluster admit after hold placement requires lifecycle client to void hold");
+        }
+        try {
+            lifecycleClient.voidHold(holdPlacement.ledgerTxnId());
+            log.info(
+                    "Voided pre-admit ledger hold for duplicate admit submittedOrderId={} clusterOrderId={} txnId={}",
+                    submittedOrderId,
+                    clusterOrderId,
+                    holdPlacement.ledgerTxnId());
+        } catch (LedgerInflightLifecycleClient.LedgerLifecycleException e) {
+            throw new LedgerInflightHoldException(
+                    HttpStatus.SERVICE_UNAVAILABLE,
+                    RejectCode.INTERNAL_ERROR,
+                    "ledger_duplicate_void_failed",
+                    "failed to void duplicate pre-admit hold txnId=" + holdPlacement.ledgerTxnId() + ": "
+                            + e.getMessage());
+        }
+    }
+
+    private void maybePersistLifecycleTrackingRow(Order order, BuyLedgerHoldPlacement holdPlacement) {
+        if (!config.getLedger().isInflightAsyncEnabled()) {
+            return;
+        }
+        if (holdPlacement.ledgerTxnId() == null || holdPlacement.ledgerTxnId().isBlank()) {
+            return;
+        }
+        LedgerInflightOutboxRepository outbox = ledgerInflightOutbox.getIfAvailable();
+        if (outbox == null) {
+            log.warn(
+                    "ledger inflight outbox repository missing; cannot persist lifecycle row for orderId={} txnId={}",
+                    order.id(),
+                    holdPlacement.ledgerTxnId());
+            return;
+        }
+        Instant now = Instant.now();
+        outbox.upsertPublishedWithTxnId(
+                order.id(),
+                ledgerOutboxPayload(order.ledgerBalanceId(), holdPlacement.holdAmount()),
+                holdPlacement.ledgerTxnId(),
+                now);
+    }
+
+    private static String ledgerOutboxPayload(String ledgerBalanceId, BigDecimal holdAmount) {
+        String escapedBalanceId = ledgerBalanceId == null
+                ? ""
+                : ledgerBalanceId.replace("\\", "\\\\").replace("\"", "\\\"");
+        return "{\"ledgerBalanceId\":\""
+                + escapedBalanceId
+                + "\",\"holdAmount\":\""
+                + holdAmount.toPlainString()
+                + "\"}";
+    }
+
+    private record BuyLedgerHoldPlacement(BigDecimal holdAmount, String ledgerTxnId) {
+        static BuyLedgerHoldPlacement none() {
+            return new BuyLedgerHoldPlacement(BigDecimal.ZERO, null);
+        }
+
+        static BuyLedgerHoldPlacement queued(BigDecimal holdAmount) {
+            return new BuyLedgerHoldPlacement(holdAmount, null);
+        }
+
+        static BuyLedgerHoldPlacement placed(BigDecimal holdAmount, String ledgerTxnId) {
+            return new BuyLedgerHoldPlacement(holdAmount, ledgerTxnId);
         }
     }
 

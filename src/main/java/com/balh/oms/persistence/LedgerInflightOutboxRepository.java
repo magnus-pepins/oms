@@ -61,6 +61,25 @@ public class LedgerInflightOutboxRepository {
             VALUES (:order_id, CAST(:payload AS jsonb), :created_at)
             ON CONFLICT (order_id) DO NOTHING
             """;
+    private static final String UPSERT_PUBLISHED_WITH_TXN_SQL = """
+            INSERT INTO ledger_inflight_outbox (
+                order_id,
+                payload_json,
+                created_at,
+                published_at,
+                ledger_txn_id
+            )
+            VALUES (
+                :order_id,
+                CAST(:payload AS jsonb),
+                :created_at,
+                :published_at,
+                :ledger_txn_id
+            )
+            ON CONFLICT (order_id) DO UPDATE
+               SET published_at = COALESCE(ledger_inflight_outbox.published_at, EXCLUDED.published_at),
+                   ledger_txn_id = COALESCE(ledger_inflight_outbox.ledger_txn_id, EXCLUDED.ledger_txn_id)
+            """;
 
     /**
      * {@code FOR UPDATE SKIP LOCKED} — callers must run inside a Spring transaction that spans fetch +
@@ -234,6 +253,27 @@ public class LedgerInflightOutboxRepository {
                 .addValue("payload", payloadJson)
                 .addValue("created_at", Timestamp.from(Instant.now()));
         return jdbc.update(INSERT_IF_ABSENT_SQL, params) == 1;
+    }
+
+    /**
+     * Persists or upgrades an outbox row to "already published" with a known Ledger txn id.
+     *
+     * <p>Used by pre-admit hold paths that already executed {@code POST /transactions} on the
+     * ingress thread: the reconciler must not place another hold, but the lifecycle reconciler
+     * still needs a durable row with {@code ledger_txn_id} for commit/void at terminal order
+     * status.
+     */
+    public void upsertPublishedWithTxnId(UUID orderId, String payloadJson, String ledgerTxnId, Instant now) {
+        if (ledgerTxnId == null || ledgerTxnId.isBlank()) {
+            return;
+        }
+        var params = new MapSqlParameterSource()
+                .addValue("order_id", orderId)
+                .addValue("payload", payloadJson)
+                .addValue("created_at", Timestamp.from(now))
+                .addValue("published_at", Timestamp.from(now))
+                .addValue("ledger_txn_id", ledgerTxnId);
+        jdbc.update(UPSERT_PUBLISHED_WITH_TXN_SQL, params);
     }
 
     public List<InflightRow> fetchPendingOlderThan(Instant olderThan, int batchSize) {

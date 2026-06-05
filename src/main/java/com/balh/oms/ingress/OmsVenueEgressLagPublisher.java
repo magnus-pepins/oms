@@ -23,7 +23,9 @@ import org.springframework.stereotype.Component;
 
 import java.util.Optional;
 import java.util.OptionalLong;
+import java.util.Objects;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -108,6 +110,8 @@ public class OmsVenueEgressLagPublisher {
     private final AtomicLong cachedRawLagBytes = new AtomicLong((long) NO_DATA_LAG_BYTES);
     private final AtomicReference<VenueEgressHealthSnapshot> cachedHealthSnapshot =
             new AtomicReference<>(VenueEgressHealthSnapshot.allow());
+    private final AtomicInteger missingEgressConsecutivePolls = new AtomicInteger(0);
+    private final AtomicLong missingEgressFirstSeenAtMs = new AtomicLong(0L);
 
     @Autowired
     public OmsVenueEgressLagPublisher(
@@ -167,6 +171,7 @@ public class OmsVenueEgressLagPublisher {
     public void pollCursors() {
         try {
             VenueEgressLagReading reading = evaluateLagReading();
+            VenueEgressHealthSnapshot previous = cachedHealthSnapshot.get();
             if (reading.measurable()) {
                 cachedExcessLagBytes.set(reading.excessLagBytes());
                 cachedRawLagBytes.set(reading.rawLagBytes());
@@ -174,7 +179,16 @@ public class OmsVenueEgressLagPublisher {
                 cachedExcessLagBytes.set((long) NO_DATA_LAG_BYTES);
                 cachedRawLagBytes.set((long) NO_DATA_LAG_BYTES);
             }
-            cachedHealthSnapshot.set(computeHealthSnapshot(reading));
+            VenueEgressHealthSnapshot next = computeHealthSnapshot(reading);
+            cachedHealthSnapshot.set(next);
+            if (!next.admissible()
+                    && (previous.admissible() || !Objects.equals(previous.blockDetail(), next.blockDetail()))) {
+                log.warn(
+                        "venue admission snapshot blocked (egressId={}, streamId={}, reason={})",
+                        egressId,
+                        streamId,
+                        next.blockDetail());
+            }
         } catch (RuntimeException e) {
             log.warn(
                     "{} poll failed (egressId={}, streamId={}): {}; gauge and gate snapshot keep last value",
@@ -247,6 +261,7 @@ public class OmsVenueEgressLagPublisher {
     VenueEgressHealthSnapshot computeHealthSnapshot(VenueEgressLagReading reading) {
         OmsConfig.Venue.AdmissionGate gate = config.getVenue().getAdmissionGate();
         if (!gate.isEnabled()) {
+            resetMissingEgressHysteresis();
             return VenueEgressHealthSnapshot.allow();
         }
 
@@ -255,16 +270,37 @@ public class OmsVenueEgressLagPublisher {
                 projectorCursor.findLastAppliedPosition(OmsPostgresProjector.PROJECTOR_ID, streamId);
 
         if (egressPos.isEmpty() && projectorPos.isEmpty()) {
+            resetMissingEgressHysteresis();
             return VenueEgressHealthSnapshot.allow();
         }
         if (egressPos.isEmpty()) {
+            long nowMs = System.currentTimeMillis();
+            long firstSeenAtMs = missingEgressFirstSeenAtMs.updateAndGet(prev -> prev == 0L ? nowMs : prev);
+            int consecutivePolls = missingEgressConsecutivePolls.incrementAndGet();
+            long elapsedMs = Math.max(0L, nowMs - firstSeenAtMs);
+            boolean blockByPolls = consecutivePolls >= gate.getMissingEgressBlockedPolls();
+            boolean blockByGrace = elapsedMs >= gate.getMissingEgressGraceMs();
+            if (!blockByPolls && !blockByGrace) {
+                return VenueEgressHealthSnapshot.allow();
+            }
             return VenueEgressHealthSnapshot.block(
-                    "venue egress cursor absent — oms-venue-egress has never applied an event",
+                    "venue egress cursor absent while projector is live"
+                            + " (consecutive_polls="
+                            + consecutivePolls
+                            + "/"
+                            + gate.getMissingEgressBlockedPolls()
+                            + ", elapsed_ms="
+                            + elapsedMs
+                            + "/"
+                            + gate.getMissingEgressGraceMs()
+                            + ")",
                     reading);
         }
         if (projectorPos.isEmpty()) {
+            resetMissingEgressHysteresis();
             return VenueEgressHealthSnapshot.allow();
         }
+        resetMissingEgressHysteresis();
 
         if (!reading.measurable()) {
             return VenueEgressHealthSnapshot.allow();
@@ -314,5 +350,10 @@ public class OmsVenueEgressLagPublisher {
                     reading);
         }
         return new VenueEgressHealthSnapshot(true, 0L, null, reading);
+    }
+
+    private void resetMissingEgressHysteresis() {
+        missingEgressConsecutivePolls.set(0);
+        missingEgressFirstSeenAtMs.set(0L);
     }
 }

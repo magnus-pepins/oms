@@ -140,6 +140,8 @@ class OmsVenueEgressLagPublisherTest {
 
     @Test
     void egressNeverApplied_projectorLive_blocks() {
+        config.getVenue().getAdmissionGate().setMissingEgressBlockedPolls(1);
+        config.getVenue().getAdmissionGate().setMissingEgressGraceMs(0L);
         when(venueEgressCursor.findLastAppliedPosition(OmsVenueEgressService.EGRESS_ID, STREAM))
                 .thenReturn(OptionalLong.empty());
         when(projectorCursor.findLastAppliedPosition(OmsPostgresProjector.PROJECTOR_ID, STREAM))
@@ -149,6 +151,20 @@ class OmsVenueEgressLagPublisherTest {
                 publisher.computeHealthSnapshot();
         assertThat(snapshot.admissible()).isFalse();
         assertThat(snapshot.blockDetail()).contains("venue egress cursor absent");
+    }
+
+    @Test
+    void egressMissingWithProjectorLive_hysteresisRequiresConsecutivePolls() {
+        config.getVenue().getAdmissionGate().setMissingEgressBlockedPolls(3);
+        config.getVenue().getAdmissionGate().setMissingEgressGraceMs(60_000L);
+        when(venueEgressCursor.findLastAppliedPosition(OmsVenueEgressService.EGRESS_ID, STREAM))
+                .thenReturn(OptionalLong.empty());
+        when(projectorCursor.findLastAppliedPosition(OmsPostgresProjector.PROJECTOR_ID, STREAM))
+                .thenReturn(OptionalLong.of(900L));
+
+        assertThat(publisher.computeHealthSnapshot().admissible()).isTrue();
+        assertThat(publisher.computeHealthSnapshot().admissible()).isTrue();
+        assertThat(publisher.computeHealthSnapshot().admissible()).isFalse();
     }
 
     @Test
@@ -254,6 +270,8 @@ class OmsVenueEgressLagPublisherTest {
     @Test
     void pollCursors_updatesHealthSnapshot() {
         config.getCluster().getVenueEgress().setVenueRouteMaxInFlight(1);
+        config.getVenue().getAdmissionGate().setMissingEgressBlockedPolls(1);
+        config.getVenue().getAdmissionGate().setMissingEgressGraceMs(0L);
         stubPositions(20_000L, 6_432L);
         stubRecordings(387L, 387L);
         config.getVenue().getAdmissionGate().setMaxLagBytes(4096L);

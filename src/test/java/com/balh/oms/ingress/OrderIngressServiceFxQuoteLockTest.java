@@ -12,8 +12,10 @@ import com.balh.oms.fx.FxCustomerFlowNettingService;
 import com.balh.oms.fx.FxQuoteService;
 import com.balh.oms.ledger.LedgerBalanceClient;
 import com.balh.oms.ledger.LedgerInflightCoalescer;
+import com.balh.oms.ledger.LedgerInflightLifecycleClient;
 import com.balh.oms.ledger.LedgerInflightReservationClient;
 import com.balh.oms.observability.PiiHash;
+import com.balh.oms.persistence.LedgerInflightOutboxRepository;
 import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.tailer.OrderControlAdmission;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
@@ -99,6 +101,12 @@ class OrderIngressServiceFxQuoteLockTest {
         ObjectProvider<LedgerInflightCoalescer> ledgerInflightCoalescer =
                 (ObjectProvider<LedgerInflightCoalescer>) mock(ObjectProvider.class);
         when(ledgerInflightCoalescer.getIfAvailable()).thenReturn(null);
+        ObjectProvider<LedgerInflightOutboxRepository> ledgerInflightOutbox =
+                (ObjectProvider<LedgerInflightOutboxRepository>) mock(ObjectProvider.class);
+        when(ledgerInflightOutbox.getIfAvailable()).thenReturn(null);
+        ObjectProvider<LedgerInflightLifecycleClient> ledgerInflightLifecycle =
+                (ObjectProvider<LedgerInflightLifecycleClient>) mock(ObjectProvider.class);
+        when(ledgerInflightLifecycle.getIfAvailable()).thenReturn(null);
         ObjectProvider<LedgerBalanceClient> ledgerBalance =
                 (ObjectProvider<LedgerBalanceClient>) mock(ObjectProvider.class);
         when(ledgerBalance.getIfAvailable()).thenReturn(null);
@@ -119,7 +127,8 @@ class OrderIngressServiceFxQuoteLockTest {
                 new SimpleMeterRegistry());
         service = new OrderIngressService(
                 orders, config, piiHash,
-                ledgerInflight, ledgerInflightCoalescer, ledgerBalance, fxProvider, nettingProvider,
+                ledgerInflight, ledgerInflightCoalescer, ledgerInflightOutbox, ledgerInflightLifecycle,
+                ledgerBalance, fxProvider, nettingProvider,
                 new SimpleMeterRegistry(), orderControlAdmission, router, venueAdmissionGate,
                 predictionMarketTickGate);
     }
@@ -278,13 +287,21 @@ class OrderIngressServiceFxQuoteLockTest {
                 (ObjectProvider<LedgerInflightCoalescer>) mock(ObjectProvider.class);
         when(coal.getIfAvailable()).thenReturn(null);
         @SuppressWarnings("unchecked")
+        ObjectProvider<LedgerInflightOutboxRepository> outbox =
+                (ObjectProvider<LedgerInflightOutboxRepository>) mock(ObjectProvider.class);
+        when(outbox.getIfAvailable()).thenReturn(null);
+        @SuppressWarnings("unchecked")
+        ObjectProvider<LedgerInflightLifecycleClient> lifecycle =
+                (ObjectProvider<LedgerInflightLifecycleClient>) mock(ObjectProvider.class);
+        when(lifecycle.getIfAvailable()).thenReturn(null);
+        @SuppressWarnings("unchecked")
         ObjectProvider<LedgerBalanceClient> bal =
                 (ObjectProvider<LedgerBalanceClient>) mock(ObjectProvider.class);
         when(bal.getIfAvailable()).thenReturn(null);
 
         OmsClusterShardRouter router = new OmsClusterShardRouter(1, Map.of(0, cluster));
         OrderIngressService noFxService = new OrderIngressService(
-                orders, config, piiHash, ledgerInflight, coal, bal, noFx, nettingProvider,
+                orders, config, piiHash, ledgerInflight, coal, outbox, lifecycle, bal, noFx, nettingProvider,
                 new SimpleMeterRegistry(), orderControlAdmission, router, venueAdmissionGate,
                 predictionMarketTickGate);
 

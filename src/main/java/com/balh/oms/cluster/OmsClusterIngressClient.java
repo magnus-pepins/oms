@@ -934,13 +934,18 @@ public class OmsClusterIngressClient {
                 long now = System.nanoTime();
                 int dstOffset = BatchAcceptOrderCommand.firstInnerOffset(0);
                 int kept = 0;
+                List<PendingBatchSubmit> keptSubmits = new ArrayList<>(drained.size());
                 for (PendingBatchSubmit s : drained) {
                     if (now > s.deadlineNanos()) {
+                        failBatchSubmit(s, new TimeoutException(
+                                "admit-batch submit expired before offer for correlationId="
+                                        + s.cmd().correlationId()));
                         continue;
                     }
                     int innerLen = s.cmd().encode(perCmdBuffer, 0);
                     dstOffset = BatchAcceptOrderCommand.writeInner(
                             batchBuffer, dstOffset, perCmdBuffer, 0, innerLen);
+                    keptSubmits.add(s);
                     kept++;
                 }
                 if (kept == 0) {
@@ -950,7 +955,7 @@ public class OmsClusterIngressClient {
                 int totalBytes = BatchAcceptOrderCommand.totalEncodedLength(dstOffset);
 
                 offerBatchWithBackpressure(
-                        batchBuffer, totalBytes, drained, offerBackpressureParkNanos);
+                        batchBuffer, totalBytes, keptSubmits, offerBackpressureParkNanos);
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
                 return;
@@ -1027,9 +1032,13 @@ public class OmsClusterIngressClient {
 
     private void failBatchWith(List<PendingBatchSubmit> batched, Throwable cause) {
         for (PendingBatchSubmit s : batched) {
-            if (pending.remove(s.cmd().correlationId(), s.future())) {
-                s.future().completeExceptionally(cause);
-            }
+            failBatchSubmit(s, cause);
+        }
+    }
+
+    private void failBatchSubmit(PendingBatchSubmit submit, Throwable cause) {
+        if (pending.remove(submit.cmd().correlationId(), submit.future())) {
+            submit.future().completeExceptionally(cause);
         }
     }
 

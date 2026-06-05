@@ -97,10 +97,7 @@ class OrderIngressServiceLedgerHoldTest {
 
         OmsClusterShardRouter router = new OmsClusterShardRouter(1, Map.of(0, cluster));
         VenueAdmissionGate venueAdmissionGate = new VenueAdmissionGate(
-                config,
-                mock(com.balh.oms.projector.AeronProjectorCursorRepository.class),
-                mock(com.balh.oms.venueegress.OmsVenueEgressCursorRepository.class),
-                new SimpleMeterRegistry());
+                config, mock(OmsVenueEgressLagPublisher.class), new SimpleMeterRegistry());
         PredictionMarketTickGate predictionMarketTickGate = new PredictionMarketTickGate(
                 config,
                 mock(com.balh.oms.predictionmarket.PredictionMarketContractRepository.class),

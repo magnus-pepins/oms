@@ -173,6 +173,14 @@ public class OmsPostgresProjector {
     static final String TIMER_ADMIT_TX = "oms.projector.admit_tx";
 
     /**
+     * Wall time from the end of an Aeron {@code replay.poll} pass to Postgres COMMIT for the whole
+     * batched fragment set (decode + apply + single commit). Pop! bench: compare
+     * {@code oms_projector_poll_batch_commit_seconds} mean against per-fragment commit overhead at
+     * 150+ fragments/s — expect batch size ≈ {@link OmsConfig.Cluster.Projector#getFragmentLimit()}.
+     */
+    static final String TIMER_POLL_BATCH_COMMIT = "oms.projector.poll_batch_commit";
+
+    /**
      * Bench-only env gate (Pop! PREDMKT soak). When {@code true}, venue-prefix symbols skip the
      * {@code control_decisions} PASS INSERT on the fresh-admit path; REJECT rows are unchanged.
      */
@@ -320,8 +328,9 @@ public class OmsPostgresProjector {
                 .register(meterRegistry);
         // Programmatic boundary: the replay loop is a non-Spring thread, so AOP-proxied
         // @Transactional on this bean's own methods would not be intercepted. A
-        // TransactionTemplate guarantees orders.insert + persistAdmission + cursor.advance
-        // commit (or roll back) as one unit per fragment.
+        // TransactionTemplate guarantees each poll batch (up to fragmentLimit fragments)
+        // commits (or rolls back) as one unit — amortising BEGIN/COMMIT overhead that
+        // otherwise caps drain rate at ~150 fragments/s on pop.
         this.transactionTemplate = new TransactionTemplate(transactionManager);
     }
 
@@ -560,7 +569,7 @@ public class OmsPostgresProjector {
      * to {@code (nextId, 0)} and re-opens replay against the new recording.
      */
     private void runReplayLoopWithRecordingWalk(AeronArchive archive, OmsConfig.Cluster.Projector projectorCfg) {
-        FragmentHandler handler = new ProjectingFragmentHandler();
+        ProjectingFragmentHandler handler = new ProjectingFragmentHandler();
         while (running.get()) {
             long recordingIdNow = currentRecordingId.get();
             if (recordingIdNow < 0L) {
@@ -678,6 +687,7 @@ public class OmsPostgresProjector {
                 while (running.get()) {
                     int polled = replay.poll(handler, projectorCfg.getFragmentLimit());
                     if (polled > 0) {
+                        handler.flushPollBatch();
                         continue;
                     }
                     // No fragments. Three cases:
@@ -911,73 +921,125 @@ public class OmsPostgresProjector {
     }
 
     /**
-     * Decodes one fragment and applies it to Postgres inside a single transaction:
-     *
-     * <ul>
-     *   <li>{@link OmsClusterWireFormat#TYPE_ID_ORDER_ADMITTED} → {@code orders} insert (idempotent
-     *       ON CONFLICT) + {@link OrderControlAdmission#persistAdmission} (CAS to WORKING /
-     *       REJECTED, {@code control_decisions} row, {@code domain_event_outbox} envelope) +
-     *       cursor advance (slice 2d).</li>
-     *   <li>{@link OmsClusterWireFormat#TYPE_ID_EXECUTION_APPLIED} → {@code executions} insert
-     *       (idempotent on {@code (account_id, venue_exec_ref)}) + {@code orders} CAS to
-     *       PARTIALLY_FILLED / FILLED / CANCELLED / REJECTED + {@code domain_event_outbox}
-     *       envelope (OrderPartiallyFilled / OrderFilled / OrderCancelled / OrderRejected) +
-     *       cursor advance (slice 3e).</li>
-     * </ul>
-     *
-     * <p>{@link io.aeron.logbuffer.Header#position()} is the cluster log position <em>after</em>
-     * this fragment.
-     *
-     * <p>Crash semantics: if the JVM dies after the transaction commits but before the in-memory
-     * {@link #lastAppliedPosition} updates, restart resumes from the persisted cursor — this is
-     * the same fragment, and every step in the transaction is idempotent. If the transaction
-     * itself fails (Postgres connectivity, schema drift), the exception bubbles up and stops the
-     * replay loop; operators must intervene rather than skip events silently.
+     * One decoded cluster fragment awaiting apply inside the current poll batch. Fragments are
+     * buffered during {@link ProjectingFragmentHandler#onFragment} and applied in log order inside
+     * a single {@link TransactionTemplate} boundary at {@link ProjectingFragmentHandler#flushPollBatch}.
      */
-    private final class ProjectingFragmentHandler implements FragmentHandler {
+    sealed interface PendingFragment permits PendingFragment.OrderAdmitted,
+            PendingFragment.ExecutionApplied,
+            PendingFragment.OrderCancelApplied,
+            PendingFragment.VenueResolutionApplied,
+            PendingFragment.CursorOnly {
+
+        long position();
+
+        record OrderAdmitted(OrderAdmittedEvent event, long position) implements PendingFragment {}
+
+        record ExecutionApplied(ExecutionAppliedEvent event, long position) implements PendingFragment {}
+
+        record OrderCancelApplied(OrderCancelAppliedEvent event, long position) implements PendingFragment {}
+
+        record VenueResolutionApplied(VenueResolutionAppliedEvent event, long position)
+                implements PendingFragment {}
+
+        /** Unknown type id — cursor advance only so the replay loop does not stall. */
+        record CursorOnly(long position) implements PendingFragment {}
+    }
+
+    /**
+     * Applies every fragment collected during one {@code replay.poll} pass inside a single Postgres
+     * transaction (log order preserved). Each fragment type still runs its existing apply body
+     * ({@link #applyAdmittedEvent}, {@link #applyExecutionAppliedEvent}, …) including per-fragment
+     * cursor advance — only the BEGIN/COMMIT envelope is shared.
+     *
+     * <p>Crash semantics: unchanged from the per-fragment model. A crash before commit replays the
+     * whole batch; every step is idempotent. A crash after commit but before
+     * {@link #lastAppliedPosition} update resumes from the persisted cursor.
+     */
+    private void applyPollBatch(List<PendingFragment> batch) {
+        if (batch.isEmpty()) {
+            return;
+        }
+        long pollBatchCommitStartNanos = System.nanoTime();
+        long lastPosition = batch.get(batch.size() - 1).position();
+        transactionTemplate.executeWithoutResult(status -> {
+            for (PendingFragment fragment : batch) {
+                applyPendingFragment(fragment);
+            }
+        });
+        lastAppliedPosition.set(lastPosition);
+        meterRegistry
+                .timer(TIMER_POLL_BATCH_COMMIT)
+                .record(System.nanoTime() - pollBatchCommitStartNanos, TimeUnit.NANOSECONDS);
+    }
+
+    private void applyPendingFragment(PendingFragment fragment) {
+        switch (fragment) {
+            case PendingFragment.OrderAdmitted(var ev, var pos) -> applyAdmittedEvent(ev, pos);
+            case PendingFragment.ExecutionApplied(var ev, var pos) -> applyExecutionAppliedEvent(ev, pos);
+            case PendingFragment.OrderCancelApplied(var ev, var pos) -> applyOrderCancelAppliedEvent(ev, pos);
+            case PendingFragment.VenueResolutionApplied(var ev, var pos) ->
+                    applyVenueResolutionAppliedEvent(ev, pos);
+            case PendingFragment.CursorOnly(var pos) ->
+                    cursorRepository.advanceWithRecording(
+                            PROJECTOR_ID,
+                            OmsClusterWireFormat.EVENTS_STREAM_ID,
+                            requireCurrentRecordingId(),
+                            pos);
+        }
+    }
+
+    /**
+     * Buffers fragments during {@code replay.poll}; {@link #flushPollBatch} commits the batch.
+     * Visible for unit tests that assert single-transaction poll boundaries without Aeron.
+     */
+    final class ProjectingFragmentHandler implements FragmentHandler {
+
+        private final List<PendingFragment> pollBatch = new ArrayList<>();
 
         @Override
         public void onFragment(org.agrona.DirectBuffer buffer, int offset, int length, io.aeron.logbuffer.Header header) {
             int typeId = buffer.getInt(offset + OmsClusterWireFormat.HEADER_TYPE_ID_OFFSET);
             long newPosition = header.position();
-            switch (typeId) {
-                case OmsClusterWireFormat.TYPE_ID_ORDER_ADMITTED -> {
-                    OrderAdmittedEvent ev = OrderAdmittedEvent.decode(buffer, offset, length);
-                    transactionTemplate.executeWithoutResult(status -> applyAdmittedEvent(ev, newPosition));
-                    lastAppliedPosition.set(newPosition);
-                }
-                case OmsClusterWireFormat.TYPE_ID_EXECUTION_APPLIED -> {
-                    ExecutionAppliedEvent ev = ExecutionAppliedEvent.decode(buffer, offset, length);
-                    transactionTemplate.executeWithoutResult(status -> applyExecutionAppliedEvent(ev, newPosition));
-                    lastAppliedPosition.set(newPosition);
-                }
-                case OmsClusterWireFormat.TYPE_ID_ORDER_CANCEL_APPLIED -> {
-                    OrderCancelAppliedEvent ev = OrderCancelAppliedEvent.decode(buffer, offset, length);
-                    transactionTemplate.executeWithoutResult(status -> applyOrderCancelAppliedEvent(ev, newPosition));
-                    lastAppliedPosition.set(newPosition);
-                }
-                case OmsClusterWireFormat.TYPE_ID_VENUE_RESOLUTION_APPLIED -> {
-                    VenueResolutionAppliedEvent ev = VenueResolutionAppliedEvent.decode(buffer, offset, length);
-                    transactionTemplate.executeWithoutResult(
-                            status -> applyVenueResolutionAppliedEvent(ev, newPosition));
-                    lastAppliedPosition.set(newPosition);
-                }
-                default -> {
-                    // Unknown event types must still advance the cursor so the projector does not stall
-                    // on a recording from a future schema. The cluster's snapshot bump procedure already
-                    // gates schema-incompatible deploys at the cluster service; the projector is a
-                    // downstream consumer that should drain unknown frames silently.
-                    long recordingIdNow = requireCurrentRecordingId();
-                    transactionTemplate.executeWithoutResult(status ->
-                            cursorRepository.advanceWithRecording(
-                                    PROJECTOR_ID,
-                                    OmsClusterWireFormat.EVENTS_STREAM_ID,
-                                    recordingIdNow,
-                                    newPosition));
-                    lastAppliedPosition.set(newPosition);
-                }
-            }
+            PendingFragment pending =
+                    switch (typeId) {
+                        case OmsClusterWireFormat.TYPE_ID_ORDER_ADMITTED ->
+                                new PendingFragment.OrderAdmitted(
+                                        OrderAdmittedEvent.decode(buffer, offset, length), newPosition);
+                        case OmsClusterWireFormat.TYPE_ID_EXECUTION_APPLIED ->
+                                new PendingFragment.ExecutionApplied(
+                                        ExecutionAppliedEvent.decode(buffer, offset, length), newPosition);
+                        case OmsClusterWireFormat.TYPE_ID_ORDER_CANCEL_APPLIED ->
+                                new PendingFragment.OrderCancelApplied(
+                                        OrderCancelAppliedEvent.decode(buffer, offset, length), newPosition);
+                        case OmsClusterWireFormat.TYPE_ID_VENUE_RESOLUTION_APPLIED ->
+                                new PendingFragment.VenueResolutionApplied(
+                                        VenueResolutionAppliedEvent.decode(buffer, offset, length), newPosition);
+                        default ->
+                                // Unknown event types must still advance the cursor so the projector
+                                // does not stall on a recording from a future schema.
+                                new PendingFragment.CursorOnly(newPosition);
+                    };
+            pollBatch.add(pending);
         }
+
+        void flushPollBatch() {
+            if (pollBatch.isEmpty()) {
+                return;
+            }
+            List<PendingFragment> batch = List.copyOf(pollBatch);
+            pollBatch.clear();
+            applyPollBatch(batch);
+        }
+    }
+
+    /** Package-private test hook — drives {@link #applyPollBatch} without Aeron replay. */
+    void applyPollBatchForTesting(List<PendingFragment> batch) {
+        applyPollBatch(batch);
+    }
+
+    ProjectingFragmentHandler createProjectingFragmentHandlerForTesting() {
+        return new ProjectingFragmentHandler();
     }
 
     /**

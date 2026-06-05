@@ -16,9 +16,7 @@ import com.balh.oms.ledger.LedgerInflightCoalescer;
 import com.balh.oms.ledger.LedgerInflightReservationClient;
 import com.balh.oms.observability.PiiHash;
 import com.balh.oms.persistence.OrdersRepository;
-import com.balh.oms.projector.AeronProjectorCursorRepository;
 import com.balh.oms.tailer.OrderControlAdmission;
-import com.balh.oms.venueegress.OmsVenueEgressCursorRepository;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -105,12 +103,9 @@ class OrderIngressServiceClusterGateTest {
         // wrapping the same mock client used by the rest of this test, so behaviour is unchanged.
         OmsClusterShardRouter router = new OmsClusterShardRouter(1, Map.of(0, cluster));
         // These tests trade AAPL (not a PREDMKT/* venue symbol), so the gate short-circuits before
-        // touching the cursor repos. Mocks keep it construction-safe regardless.
+        // reading the lag snapshot. Mock keeps construction safe regardless.
         VenueAdmissionGate venueAdmissionGate = new VenueAdmissionGate(
-                config,
-                mock(AeronProjectorCursorRepository.class),
-                mock(OmsVenueEgressCursorRepository.class),
-                new SimpleMeterRegistry());
+                config, mock(OmsVenueEgressLagPublisher.class), new SimpleMeterRegistry());
         // AAPL is not a PREDMKT/* venue symbol, so the tick gate short-circuits before the repo.
         PredictionMarketTickGate predictionMarketTickGate = new PredictionMarketTickGate(
                 config,

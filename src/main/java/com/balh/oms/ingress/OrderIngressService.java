@@ -247,8 +247,9 @@ public class OrderIngressService {
             //   2. FX quote-lock recall (§8.4; in-memory map lookup, opt-in).
             //   3. Aeron cluster admit (CompletableFuture wait; pulled out of tx in D-1).
             // All can fail and short-circuit before any Postgres conn is acquired.
-            // Venue-health circuit breaker first: refuse venue-routed orders the egress cannot
-            // currently deliver to balh-venue, before we admit anything into the OMS cluster.
+            // Venue-health circuit breaker (cached snapshot — no per-request DB): refuse
+            // venue-routed orders when the last poll shows egress cannot deliver to balh-venue,
+            // before we admit anything into the OMS cluster.
             venueAdmissionGate.assertVenueAdmissible(req.instrumentSymbol());
             // Per-contract tick/bounds reject at accept (mirrors the venue's authoritative reject) so an
             // off-tick venue-routed order is never admitted-then-venue-rejected.

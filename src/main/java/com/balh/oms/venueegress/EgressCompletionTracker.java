@@ -2,9 +2,9 @@ package com.balh.oms.venueegress;
 
 import java.util.ArrayDeque;
 import java.util.Deque;
-import java.util.HashSet;
 import java.util.OptionalLong;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Tracks the contiguous-completed prefix of an out-of-order-completing egress pipeline so the
@@ -27,9 +27,9 @@ import java.util.Set;
  * <h2>Threading</h2>
  *
  * {@link #register(long)}, {@link #registerCursorOnly(long)}, and {@link #pollContiguous()} are
- * called only by the replay thread; {@link #complete(long)} is called by venue-ack handler threads.
- * All four synchronise on {@code this}; per-fragment contention is negligible. {@link #inFlight()} /
- * {@link #isDrained()} support the quiesce-at-boundary protocol.
+ * called only by the replay / cursor-drain threads and serialise on {@link #replayLock}.
+ * {@link #complete(long)} is lock-free (concurrent set membership only) so ER-offer workers at
+ * 150+ admits/s do not queue behind {@link #pollContiguous()} or each other.
  *
  * <p>By construction {@link #register} for a position always precedes {@link #complete} for the
  * same position (a fragment is registered before it is written to the venue stream, and completed
@@ -38,37 +38,53 @@ import java.util.Set;
  */
 final class EgressCompletionTracker {
 
+    /** Serialises replay-thread-only deque mutation ({@link #register}, {@link #pollContiguous}). */
+    private final Object replayLock = new Object();
+
     /** Registered-but-not-yet-flushed admit positions, FIFO in strictly-increasing order. */
     private final Deque<Long> pending = new ArrayDeque<>();
 
-    /** Membership view of {@link #pending} for O(1) {@link #complete(long)} under load. */
-    private final Set<Long> pendingMembership = new HashSet<>();
+    /**
+     * Membership view of {@link #pending} for O(1) lock-free {@link #complete(long)} under burst
+     * load. {@link #pollContiguous()} removes entries when the contiguous prefix is flushed.
+     */
+    private final Set<Long> pendingMembership = ConcurrentHashMap.newKeySet();
 
     /** Cursor-only checkpoints (no venue route) waiting for prior admits to flush. */
     private final Deque<Long> cursorOnlyPending = new ArrayDeque<>();
 
-    /** Completed admit positions still waiting for their predecessors before they can be flushed. */
-    private final Set<Long> completed = new HashSet<>();
+    /**
+     * Completed admit positions still waiting for their predecessors before they can be flushed.
+     * Concurrent set so {@link #complete(long)} never acquires {@link #replayLock}.
+     */
+    private final Set<Long> completed = ConcurrentHashMap.newKeySet();
 
     private long lastRegistered = Long.MIN_VALUE;
 
-    synchronized void register(long position) {
-        requireIncreasing(position);
-        pending.addLast(position);
-        pendingMembership.add(position);
+    void register(long position) {
+        synchronized (replayLock) {
+            requireIncreasing(position);
+            pending.addLast(position);
+            pendingMembership.add(position);
+        }
     }
 
     /**
      * Records a cursor-only fragment (e.g. {@code ExecutionApplied}) in log order. The replay thread
      * may continue dispatching later admits without blocking here.
      */
-    synchronized void registerCursorOnly(long position) {
-        requireIncreasing(position);
-        cursorOnlyPending.addLast(position);
+    void registerCursorOnly(long position) {
+        synchronized (replayLock) {
+            requireIncreasing(position);
+            cursorOnlyPending.addLast(position);
+        }
     }
 
-    synchronized void complete(long position) {
-        // Ignore completions for positions we never registered (cannot happen by construction).
+    /**
+     * Marks a registered position complete. Lock-free: safe to call from many ER-offer workers
+     * without serialising on {@link #pollContiguous()}.
+     */
+    void complete(long position) {
         if (pendingMembership.remove(position)) {
             completed.add(position);
         }
@@ -79,48 +95,54 @@ final class EgressCompletionTracker {
      * unblocked) and returns the highest one popped, or empty if the head of the queue is still in
      * flight. The returned value is the position the caller should advance the persisted cursor to.
      */
-    synchronized OptionalLong pollContiguous() {
-        long highest = Long.MIN_VALUE;
-        boolean advanced = false;
-        while (true) {
-            boolean progress = false;
-            Long head = pending.peekFirst();
-            if (head != null && completed.remove(head)) {
-                pending.pollFirst();
-                pendingMembership.remove(head);
-                highest = head;
-                advanced = true;
-                progress = true;
-            }
-            while (!cursorOnlyPending.isEmpty()) {
-                long checkpoint = cursorOnlyPending.peekFirst();
-                Long nextAdmit = pending.peekFirst();
-                if (nextAdmit != null && nextAdmit < checkpoint) {
+    OptionalLong pollContiguous() {
+        synchronized (replayLock) {
+            long highest = Long.MIN_VALUE;
+            boolean advanced = false;
+            while (true) {
+                boolean progress = false;
+                Long head = pending.peekFirst();
+                if (head != null && completed.remove(head)) {
+                    pending.pollFirst();
+                    pendingMembership.remove(head);
+                    highest = head;
+                    advanced = true;
+                    progress = true;
+                }
+                while (!cursorOnlyPending.isEmpty()) {
+                    long checkpoint = cursorOnlyPending.peekFirst();
+                    Long nextAdmit = pending.peekFirst();
+                    if (nextAdmit != null && nextAdmit < checkpoint) {
+                        break;
+                    }
+                    cursorOnlyPending.pollFirst();
+                    highest = checkpoint;
+                    advanced = true;
+                    progress = true;
+                }
+                if (!progress) {
                     break;
                 }
-                cursorOnlyPending.pollFirst();
-                highest = checkpoint;
-                advanced = true;
-                progress = true;
             }
-            if (!progress) {
-                break;
-            }
+            return advanced ? OptionalLong.of(highest) : OptionalLong.empty();
         }
-        return advanced ? OptionalLong.of(highest) : OptionalLong.empty();
     }
 
     /** Registered admits not yet flushed via {@link #pollContiguous()} (in flight or complete-but-blocked). */
-    synchronized int inFlight() {
-        return pending.size();
+    int inFlight() {
+        synchronized (replayLock) {
+            return pending.size();
+        }
     }
 
     /**
      * {@code true} when nothing is registered-but-unflushed — used as the quiesce gate at
      * boundaries/shutdown.
      */
-    synchronized boolean isDrained() {
-        return pending.isEmpty() && cursorOnlyPending.isEmpty();
+    boolean isDrained() {
+        synchronized (replayLock) {
+            return pending.isEmpty() && cursorOnlyPending.isEmpty();
+        }
     }
 
     private void requireIncreasing(long position) {

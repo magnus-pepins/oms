@@ -586,6 +586,15 @@ const apps = [
       OMS_CLUSTER_VENUE_EGRESS_VENUE_ROUTE_MAX_IN_FLIGHT: '512',
       // Sole HTTP order-accept JVM that needs live FX mids (FxQuoteService).
       OMS_FX_MID_SUBSCRIBER_ENABLED: 'true',
+      // Phase D-6 admit-batcher: amortise cluster accept_order round-trips. Default off in
+      // application-oms-ingress-replica.yaml; enable on pop where 321k resting orders make
+      // per-admit cluster RTT the knee (150 RPS → ~377 ms accept_ms unbatched vs ~7 ms at 120).
+      // Pop! D-6 bench (57k rps): max=8 + flush=50 µs beat max=16; at ~150 RPS the 50 µs
+      // coalesce window fills ~8 admits before flush.
+      OMS_CLUSTER_CLIENT_ADMIT_BATCH_ENABLED: 'true',
+      OMS_CLUSTER_CLIENT_ADMIT_BATCH_MAX_SIZE: '8',
+      OMS_CLUSTER_CLIENT_ADMIT_BATCH_FLUSH_INTERVAL_NANOS: '50000',
+      OMS_CLUSTER_CLIENT_ADMIT_BATCH_QUEUE_CAPACITY: '8192',
     },
     ...COMMON_PM2,
   },

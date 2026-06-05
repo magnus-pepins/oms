@@ -312,6 +312,14 @@ public class OmsAdmissionClusteredService implements ClusteredService {
     private io.aeron.Counter openOrdersCountCounter;
 
     /**
+     * Cached count of non-terminal orders in {@link #orderIndex}. Updated incrementally on the
+     * admit / ER / cancel hot path so {@link #onSessionMessage} does not scan the full book on
+     * every cluster log entry (O(book) per message was the dominant cost at ~300k+ resting orders).
+     * Rebuilt from {@link #orderIndex} only at snapshot load and {@link #onStart} boot.
+     */
+    private long openOrdersCount;
+
+    /**
      * Phase 7 self-healing — Aeron counter published on the shared media driver so the smoke gate
      * and Prometheus scrape can read it without a code path into the service. Lifetime count of
      * self-healed snapshot-load failures on this JVM. See {@link #snapshotLoadFailedCount}.
@@ -506,7 +514,8 @@ public class OmsAdmissionClusteredService implements ClusteredService {
             }
             openOrdersCountCounter =
                     cluster.aeron().addCounter(OPEN_ORDERS_COUNT_COUNTER_TYPE_ID, OPEN_ORDERS_COUNT_COUNTER_LABEL);
-            syncOpenOrdersCountCounter();
+            recomputeOpenOrdersCountFromIndex();
+            publishOpenOrdersCountCounter();
 
             // Phase 7 self-healing — publish the load-failed counter on the shared media driver so
             // smoke / Prometheus can read it. Initial value = lifetime count this JVM (0 if no
@@ -574,20 +583,47 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                 // adding an UnknownCommandRejected event is a Phase 2 concern.
             }
         }
-        syncOpenOrdersCountCounter();
     }
 
-    private void syncOpenOrdersCountCounter() {
-        if (openOrdersCountCounter == null) {
-            return;
-        }
+    /** Rebuild {@link #openOrdersCount} from {@link #orderIndex} — snapshot load / boot only. */
+    private void recomputeOpenOrdersCountFromIndex() {
         long open = 0L;
         for (AdmittedOrder order : orderIndex.values()) {
             if (!isTerminal(order.statusCode())) {
                 open++;
             }
         }
-        openOrdersCountCounter.setOrdered(open);
+        openOrdersCount = open;
+    }
+
+    /** Publish cached {@link #openOrdersCount} to the Aeron counter (O(1)). */
+    private void publishOpenOrdersCountCounter() {
+        if (openOrdersCountCounter != null) {
+            openOrdersCountCounter.setOrdered(openOrdersCount);
+        }
+    }
+
+    /**
+     * Adjust {@link #openOrdersCount} when an order crosses the terminal boundary and publish if
+     * changed. No-op when status stays in the same open/terminal class (e.g. PENDING_NEW → WORKING).
+     */
+    private void onOrderStatusChanged(byte oldStatus, byte newStatus) {
+        boolean wasOpen = !isTerminal(oldStatus);
+        boolean nowOpen = !isTerminal(newStatus);
+        if (wasOpen == nowOpen) {
+            return;
+        }
+        if (wasOpen) {
+            openOrdersCount--;
+        } else {
+            openOrdersCount++;
+        }
+        publishOpenOrdersCountCounter();
+    }
+
+    /** Test hook — cached open-order count (independent of mocked Aeron counter). */
+    public long openOrdersCountForTest() {
+        return openOrdersCount;
     }
 
     /** Test hook — published open-order count counter value, or -1 if absent. */
@@ -874,6 +910,7 @@ public class OmsAdmissionClusteredService implements ClusteredService {
             idempotencyIndex.clear();
             executionRefIndex.clear();
             senderSeqIndex.clear();
+            openOrdersCount = 0L;
             log.error(
                     "{}: snapshot decode threw after {} bytes; cleared partial state"
                             + " (orders={}, idempotency={}, executionRefs={}, senderSeqs={})."
@@ -949,7 +986,7 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                 log.warn(
                         "readiness counter remains NOT_READY (empty replay, OMS_READINESS_ALLOW_EMPTY_REPLAY=false)");
             }
-            syncOpenOrdersCountCounter();
+            publishOpenOrdersCountCounter();
         }
     }
 
@@ -1012,6 +1049,8 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                 cmd.shardId());
         idempotencyIndex.put(key, admitted);
         orderIndex.put(admitted.orderId(), admitted);
+        openOrdersCount++;
+        publishOpenOrdersCountCounter();
 
         emitAdmitted(cmd, clusterTimestampMillis, admitted.version());
         emitAccepted(session, cmd.correlationId(), admitted, clusterTimestampMillis, false);
@@ -1206,6 +1245,7 @@ public class OmsAdmissionClusteredService implements ClusteredService {
         orderIndex.put(mutated.orderId(), mutated);
         idempotencyIndex.put(
                 new IdempotencyKey(mutated.accountId(), mutated.clientIdempotencyKey()), mutated);
+        onOrderStatusChanged(order.statusCode(), newStatus);
         if (seen == null) {
             seen = new HashSet<>(4);
             executionRefIndex.put(cmd.orderId(), seen);
@@ -1261,6 +1301,7 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                             order.shardId());
             orderIndex.put(order.orderId(), mutated);
             idempotencyIndex.put(new IdempotencyKey(mutated.accountId(), mutated.clientIdempotencyKey()), mutated);
+            onOrderStatusChanged(order.statusCode(), STATUS_RESOLVED);
             resolvedCount++;
         }
         resolvedContractKeys.add(cmd.idempotencyKey());
@@ -1356,6 +1397,7 @@ public class OmsAdmissionClusteredService implements ClusteredService {
         orderIndex.put(mutated.orderId(), mutated);
         idempotencyIndex.put(
                 new IdempotencyKey(mutated.accountId(), mutated.clientIdempotencyKey()), mutated);
+        onOrderStatusChanged(order.statusCode(), STATUS_CANCELLED);
 
         emitOrderCancelApplied(mutated, clusterTimestampMillis, cmd.reason());
     }
@@ -1819,6 +1861,7 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                 idempotencyIndex.put(new IdempotencyKey(o.accountId(), o.clientIdempotencyKey()), o);
                 orderIndex.put(o.orderId(), o);
             }
+            recomputeOpenOrdersCountFromIndex();
             int orderCountWithRefs = buffer.getInt(p);
             p += Integer.BYTES;
             for (int i = 0; i < orderCountWithRefs; i++) {

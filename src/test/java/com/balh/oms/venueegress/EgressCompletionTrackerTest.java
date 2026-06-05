@@ -139,4 +139,39 @@ class EgressCompletionTrackerTest {
         assertThatThrownBy(() -> t.registerCursorOnly(20L)).isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> t.register(15L)).isInstanceOf(IllegalArgumentException.class);
     }
+
+    @Test
+    void concurrentComplete_doesNotLoseCompletions() throws Exception {
+        EgressCompletionTracker t = new EgressCompletionTracker();
+        int n = 256;
+        for (long i = 1; i <= n; i++) {
+            t.register(i * 10L);
+        }
+        int threads = 32;
+        var pool = java.util.concurrent.Executors.newFixedThreadPool(threads);
+        try {
+            java.util.concurrent.CountDownLatch start = new java.util.concurrent.CountDownLatch(1);
+            java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(n);
+            for (long i = 1; i <= n; i++) {
+                long position = i * 10L;
+                pool.submit(
+                        () -> {
+                            try {
+                                start.await();
+                                t.complete(position);
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                            } finally {
+                                done.countDown();
+                            }
+                        });
+            }
+            start.countDown();
+            assertThat(done.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+        } finally {
+            pool.shutdownNow();
+        }
+        assertThat(t.pollContiguous()).isEqualTo(OptionalLong.of(n * 10L));
+        assertThat(t.isDrained()).isTrue();
+    }
 }

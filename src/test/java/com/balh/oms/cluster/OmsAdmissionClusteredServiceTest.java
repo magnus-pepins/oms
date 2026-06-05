@@ -1373,4 +1373,60 @@ class OmsAdmissionClusteredServiceTest {
         assertThat(service.replayValidationLoggedForTest()).isTrue();
     }
 
+    @Test
+    void openOrdersCount_incrementsOnAdmit_decrementsOnTerminalTransition() {
+        assertThat(service.openOrdersCountForTest()).isZero();
+
+        UUID orderA = UUID.fromString("00000000-0000-4000-8000-000000000101");
+        UUID orderB = UUID.fromString("00000000-0000-4000-8000-000000000102");
+        deliverCommand(sampleAccept(1L, "acct", "idem-a", orderA), ANY_TIMESTAMP_MS);
+        deliverCommand(sampleAccept(2L, "acct", "idem-b", orderB), ANY_TIMESTAMP_MS + 1);
+        assertThat(service.openOrdersCountForTest()).isEqualTo(2L);
+
+        deliverCommand(sampleCancel(orderA, "EXEC-CXL-A"), ANY_TIMESTAMP_MS + 2);
+        assertThat(service.openOrdersCountForTest()).isEqualTo(1L);
+
+        deliverCommand(
+                sampleTrade(orderB, 10_000_000_000L, 100_000_000L, "EXEC-FILL-B"),
+                ANY_TIMESTAMP_MS + 3);
+        assertThat(service.openOrdersCountForTest()).isZero();
+    }
+
+    @Test
+    void openOrdersCount_idempotentReHit_doesNotDoubleCount() {
+        UUID orderId = UUID.fromString("00000000-0000-4000-8000-000000000110");
+        deliverCommand(sampleAccept(1L, "acct", "idem", orderId), ANY_TIMESTAMP_MS);
+        deliverCommand(sampleAccept(2L, "acct", "idem", orderId), ANY_TIMESTAMP_MS + 1);
+        assertThat(service.openOrdersCountForTest()).isEqualTo(1L);
+    }
+
+    @Test
+    void openOrdersCount_venueNewPromotion_staysOpen() {
+        UUID orderId = UUID.fromString("00000000-0000-4000-8000-000000000120");
+        deliverCommand(sampleAccept(1L, "acct", "idem", orderId), ANY_TIMESTAMP_MS);
+        deliverCommand(
+                new ApplyExecutionReportCommand(
+                        0L, orderId, 0L, 0L, 0L, 1,
+                        ApplyExecutionReportCommand.EXEC_TYPE_VENUE_NEW, (byte) 0,
+                        "", "", "", ""),
+                ANY_TIMESTAMP_MS + 1);
+        assertThat(service.openOrdersCountForTest()).isEqualTo(1L);
+        assertThat(service.lookupByOrderId(orderId).statusCode())
+                .isEqualTo(OmsAdmissionClusteredService.STATUS_WORKING);
+    }
+
+    @Test
+    void openOrdersCount_snapshotRoundTrip_restoresCachedCount() {
+        UUID orderA = UUID.fromString("00000000-0000-4000-8000-000000000201");
+        UUID orderB = UUID.fromString("00000000-0000-4000-8000-000000000202");
+        deliverCommand(sampleAccept(1L, "acct", "idem-a", orderA), ANY_TIMESTAMP_MS);
+        deliverCommand(sampleAccept(2L, "acct", "idem-b", orderB), ANY_TIMESTAMP_MS + 1);
+        deliverCommand(sampleCancel(orderA, "EXEC-CXL"), ANY_TIMESTAMP_MS + 2);
+        assertThat(service.openOrdersCountForTest()).isEqualTo(1L);
+
+        OmsAdmissionClusteredService restored = newServiceFromSnapshot(takeSnapshotBytes(service));
+        assertThat(restored.openOrdersCountForTest()).isEqualTo(1L);
+        assertThat(restored.admittedOrderCount()).isEqualTo(2);
+    }
+
 }

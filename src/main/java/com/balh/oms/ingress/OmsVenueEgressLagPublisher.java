@@ -1,6 +1,7 @@
 package com.balh.oms.ingress;
 
 import com.balh.oms.cluster.OmsClusterWireFormat;
+import com.balh.oms.config.OmsConfig;
 import com.balh.oms.config.OmsProfiles;
 import com.balh.oms.projector.AeronProjectorCursorRepository;
 import com.balh.oms.projector.OmsPostgresProjector;
@@ -20,8 +21,10 @@ import org.springframework.context.annotation.Profile;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
+import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Hardening follow-up from {@code plans/oms-internal-venue-and-prediction-market.md}: publishes
@@ -31,6 +34,9 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>Lag is {@code projector_position - egress_position} on the shared OMS cluster events stream,
  * using the same recording-aware comparison as the gate. Returns {@link #NO_DATA_LAG_BYTES} until
  * both cursors exist and are comparable.
+ *
+ * <p>{@link #currentHealthSnapshot()} is refreshed on the scheduler thread only; the accept hot path
+ * reads the cached snapshot so cluster admit is not blocked by per-request Postgres cursor queries.
  */
 @Component
 @Profile(OmsProfiles.ORDER_ACCEPT_PROFILE)
@@ -43,6 +49,21 @@ public class OmsVenueEgressLagPublisher {
     /** Sentinel when egress or projector cursor is missing or on incomparable recordings. */
     public static final double NO_DATA_LAG_BYTES = -1.0;
 
+    /**
+     * Cached venue-egress health for {@link VenueAdmissionGate}. Updated by {@link #pollCursors()}
+     * only — never on the HTTP accept hot path.
+     */
+    public record VenueEgressHealthSnapshot(boolean admissible, String blockDetail) {
+        public static VenueEgressHealthSnapshot allow() {
+            return new VenueEgressHealthSnapshot(true, null);
+        }
+
+        public static VenueEgressHealthSnapshot block(String detail) {
+            return new VenueEgressHealthSnapshot(false, detail);
+        }
+    }
+
+    private final OmsConfig config;
     private final AeronProjectorCursorRepository projectorCursor;
     private final OmsVenueEgressCursorRepository venueEgressCursor;
     private final MeterRegistry meterRegistry;
@@ -50,13 +71,17 @@ public class OmsVenueEgressLagPublisher {
     private final int streamId;
 
     private final AtomicLong cachedLagBytes = new AtomicLong((long) NO_DATA_LAG_BYTES);
+    private final AtomicReference<VenueEgressHealthSnapshot> cachedHealthSnapshot =
+            new AtomicReference<>(VenueEgressHealthSnapshot.allow());
 
     @Autowired
     public OmsVenueEgressLagPublisher(
+            OmsConfig config,
             AeronProjectorCursorRepository projectorCursor,
             OmsVenueEgressCursorRepository venueEgressCursor,
             MeterRegistry meterRegistry) {
         this(
+                config,
                 projectorCursor,
                 venueEgressCursor,
                 meterRegistry,
@@ -65,11 +90,13 @@ public class OmsVenueEgressLagPublisher {
     }
 
     OmsVenueEgressLagPublisher(
+            OmsConfig config,
             AeronProjectorCursorRepository projectorCursor,
             OmsVenueEgressCursorRepository venueEgressCursor,
             MeterRegistry meterRegistry,
             String egressId,
             int streamId) {
+        this.config = config;
         this.projectorCursor = projectorCursor;
         this.venueEgressCursor = venueEgressCursor;
         this.meterRegistry = meterRegistry;
@@ -86,15 +113,17 @@ public class OmsVenueEgressLagPublisher {
                 .tags(Tags.of("egress_id", egressId, "stream_id", Integer.toString(streamId)))
                 .register(meterRegistry);
         log.info("Registered {} gauge (egressId={}, streamId={})", GAUGE_LAG_BYTES, egressId, streamId);
+        pollCursors();
     }
 
     @Scheduled(fixedDelayString = "${oms.venue.egress.lag-poll-interval-ms:5000}")
     public void pollCursors() {
         try {
             cachedLagBytes.set(computeLagBytes());
+            cachedHealthSnapshot.set(computeHealthSnapshot());
         } catch (RuntimeException e) {
             log.warn(
-                    "{} poll failed (egressId={}, streamId={}): {}; gauge keeps last value",
+                    "{} poll failed (egressId={}, streamId={}): {}; gauge and gate snapshot keep last value",
                     GAUGE_LAG_BYTES,
                     egressId,
                     streamId,
@@ -106,6 +135,11 @@ public class OmsVenueEgressLagPublisher {
         return cachedLagBytes.get();
     }
 
+    /** Last polled health verdict; safe to read from the accept hot path (no I/O). */
+    public VenueEgressHealthSnapshot currentHealthSnapshot() {
+        return cachedHealthSnapshot.get();
+    }
+
     long computeLagBytes() {
         OptionalLong egressPos = venueEgressCursor.findLastAppliedPosition(egressId, streamId);
         OptionalLong projectorPos =
@@ -114,9 +148,9 @@ public class OmsVenueEgressLagPublisher {
             return (long) NO_DATA_LAG_BYTES;
         }
 
-        java.util.Optional<AeronProjectorCursorRepository.RecordedCursor> projCursor =
+        Optional<AeronProjectorCursorRepository.RecordedCursor> projCursor =
                 projectorCursor.findLastAppliedCursor(OmsPostgresProjector.PROJECTOR_ID, streamId);
-        java.util.Optional<OmsVenueEgressCursorRepository.RecordedCursor> egrCursor =
+        Optional<OmsVenueEgressCursorRepository.RecordedCursor> egrCursor =
                 venueEgressCursor.findLastAppliedCursor(egressId, streamId);
         if (projCursor.isPresent()
                 && egrCursor.isPresent()
@@ -131,5 +165,54 @@ public class OmsVenueEgressLagPublisher {
 
         long lag = projectorPos.getAsLong() - egressPos.getAsLong();
         return lag < 0 ? 0L : lag;
+    }
+
+    VenueEgressHealthSnapshot computeHealthSnapshot() {
+        OmsConfig.Venue.AdmissionGate gate = config.getVenue().getAdmissionGate();
+        if (!gate.isEnabled()) {
+            return VenueEgressHealthSnapshot.allow();
+        }
+
+        OptionalLong egressPos = venueEgressCursor.findLastAppliedPosition(egressId, streamId);
+        OptionalLong projectorPos =
+                projectorCursor.findLastAppliedPosition(OmsPostgresProjector.PROJECTOR_ID, streamId);
+
+        if (egressPos.isEmpty() && projectorPos.isEmpty()) {
+            return VenueEgressHealthSnapshot.allow();
+        }
+        if (egressPos.isEmpty()) {
+            return VenueEgressHealthSnapshot.block(
+                    "venue egress cursor absent — oms-venue-egress has never applied an event");
+        }
+        if (projectorPos.isEmpty()) {
+            return VenueEgressHealthSnapshot.allow();
+        }
+
+        Optional<AeronProjectorCursorRepository.RecordedCursor> projCursor =
+                projectorCursor.findLastAppliedCursor(OmsPostgresProjector.PROJECTOR_ID, streamId);
+        Optional<OmsVenueEgressCursorRepository.RecordedCursor> egrCursor =
+                venueEgressCursor.findLastAppliedCursor(egressId, streamId);
+        if (projCursor.isPresent()
+                && egrCursor.isPresent()
+                && projCursor.get().hasRecordingId()
+                && egrCursor.get().hasRecordingId()
+                && egrCursor.get().recordingId() != projCursor.get().recordingId()) {
+            if (egrCursor.get().recordingId() < projCursor.get().recordingId()) {
+                return VenueEgressHealthSnapshot.block(
+                        "venue egress on older recording " + egrCursor.get().recordingId()
+                                + " < projector recording " + projCursor.get().recordingId());
+            }
+            return VenueEgressHealthSnapshot.allow();
+        }
+
+        long lagBytes = projectorPos.getAsLong() - egressPos.getAsLong();
+        long maxLagBytes =
+                gate.effectiveMaxLagBytes(config.getCluster().getVenueEgress().getVenueRouteMaxInFlight());
+        if (lagBytes > maxLagBytes) {
+            return VenueEgressHealthSnapshot.block(
+                    "venue egress lag " + lagBytes + " bytes exceeds max " + maxLagBytes
+                            + " (projector=" + projectorPos.getAsLong() + " egress=" + egressPos.getAsLong() + ")");
+        }
+        return VenueEgressHealthSnapshot.allow();
     }
 }

@@ -1387,6 +1387,14 @@ public class OmsVenueEgressService {
         /** Persists the contiguous cursor off the ER-offer pool so JDBC does not starve offers. */
         private final java.util.concurrent.Executor cursorDrainExecutor;
         private final ExecutorService ownedCursorDrainExecutor;
+        /**
+         * Serial ordered {@code RouteOrderStream} writer. The replay thread enqueues admits here after
+         * acquiring a venue-route permit so permit waits and gRPC {@code onNext} do not stall Aeron
+         * poll (observed knee ~120→150 RPS: egress wall lag tracked ingress while venue
+         * place_matched ~0.01 ms and ER offer ~0).
+         */
+        private final java.util.concurrent.Executor routeOfferExecutor;
+        private final ExecutorService ownedRouteOfferExecutor;
         /** Serialises cursor persistence between the replay thread and cursor-drain completions. */
         private final Object contiguousDrainLock = new Object();
         /**
@@ -1400,16 +1408,11 @@ public class OmsVenueEgressService {
             this.maxInFlight = maxInFlight;
             this.maxPendingFragments = maxInFlight * PENDING_FRAGMENT_CAP_MULTIPLIER;
             this.permits = new Semaphore(maxInFlight);
-            java.util.concurrent.atomic.AtomicLong seq = new java.util.concurrent.atomic.AtomicLong();
-            int erPoolSize = Math.max(maxInFlight, maxInFlight * 2);
-            ExecutorService pool =
-                    Executors.newFixedThreadPool(
-                            erPoolSize,
-                            r -> {
-                                Thread t = new Thread(r, "oms-venue-egress-er-submit-" + seq.getAndIncrement());
-                                t.setDaemon(true);
-                                return t;
-                            });
+            // Virtual-thread per ER completion: cluster offer back-pressure parks the carrier
+            // without exhausting a fixed platform pool (observed @ 150+ admits/s with
+            // maxInFlight=512 — platform pool threads blocked in offerWithBackpressure stalled
+            // tracker.complete and wedged awaitDispatchCapacity).
+            ExecutorService pool = Executors.newVirtualThreadPerTaskExecutor();
             this.erSubmitExecutor = pool;
             this.ownedErSubmitExecutor = pool;
             ExecutorService cursorPool =
@@ -1421,6 +1424,15 @@ public class OmsVenueEgressService {
                             });
             this.cursorDrainExecutor = cursorPool;
             this.ownedCursorDrainExecutor = cursorPool;
+            ExecutorService offerPool =
+                    Executors.newSingleThreadExecutor(
+                            r -> {
+                                Thread t = new Thread(r, "oms-venue-egress-route-offer");
+                                t.setDaemon(true);
+                                return t;
+                            });
+            this.routeOfferExecutor = offerPool;
+            this.ownedRouteOfferExecutor = offerPool;
         }
 
         /** Test seam: inject executors for deterministic ER completion and cursor-drain isolation. */
@@ -1428,6 +1440,15 @@ public class OmsVenueEgressService {
                 int maxInFlight,
                 java.util.concurrent.Executor erSubmitExecutor,
                 java.util.concurrent.Executor cursorDrainExecutor) {
+            this(maxInFlight, erSubmitExecutor, cursorDrainExecutor, erSubmitExecutor);
+        }
+
+        /** Test seam: optional dedicated route-offer executor (caller-runs keeps replay-thread dispatch). */
+        EgressRoutePipeline(
+                int maxInFlight,
+                java.util.concurrent.Executor erSubmitExecutor,
+                java.util.concurrent.Executor cursorDrainExecutor,
+                java.util.concurrent.Executor routeOfferExecutor) {
             this.maxInFlight = maxInFlight;
             this.maxPendingFragments = maxInFlight * PENDING_FRAGMENT_CAP_MULTIPLIER;
             this.permits = new Semaphore(maxInFlight);
@@ -1435,6 +1456,8 @@ public class OmsVenueEgressService {
             this.ownedErSubmitExecutor = null;
             this.cursorDrainExecutor = cursorDrainExecutor;
             this.ownedCursorDrainExecutor = null;
+            this.routeOfferExecutor = routeOfferExecutor;
+            this.ownedRouteOfferExecutor = null;
         }
 
         /** Bounds total pipeline depth when venue permits are released before ER submit completes. */
@@ -1491,6 +1514,15 @@ public class OmsVenueEgressService {
                 Thread.currentThread().interrupt();
                 return; // shutdown — fragment replays from the cursor on restart
             }
+            routeOfferExecutor.execute(() -> dispatchRoute(ev, newPosition));
+        }
+
+        /**
+         * Runs on {@link #routeOfferExecutor} — the sole {@code RouteOrderStream} writer. Registers the
+         * fragment, offers to the venue, and hands acks to the ER pool without blocking the replay poll
+         * loop on gRPC stream backpressure.
+         */
+        private void dispatchRoute(OrderAdmittedEvent ev, long newPosition) {
             tracker.register(newPosition);
             CompletableFuture<Optional<com.balh.venue.grpc.v1.ExecutionReport>> future;
             try {
@@ -1504,14 +1536,16 @@ public class OmsVenueEgressService {
             future.whenComplete(
                     (erOpt, err) -> {
                         permits.release();
+                        unparkReplayThread();
                         erSubmitExecutor.execute(
                                 () -> {
                                     try {
                                         completeRoute(ev, erOpt, err);
                                     } finally {
                                         tracker.complete(newPosition);
+                                        unparkReplayThread();
                                         // JDBC cursor persistence runs on a dedicated thread so ER-offer
-                                        // pool workers return immediately (observed on pop: pool threads
+                                        // workers return immediately (observed on pop: pool threads
                                         // blocked in advanceWithRecording inflated admit_to_fix_nos).
                                         scheduleDrainContiguous();
                                     }
@@ -1644,6 +1678,9 @@ public class OmsVenueEgressService {
         }
 
         void shutdown() {
+            if (ownedRouteOfferExecutor != null) {
+                ownedRouteOfferExecutor.shutdownNow();
+            }
             if (ownedErSubmitExecutor != null) {
                 ownedErSubmitExecutor.shutdownNow();
             }
@@ -1663,7 +1700,16 @@ public class OmsVenueEgressService {
             int maxInFlight,
             java.util.concurrent.Executor erSubmitExecutor,
             java.util.concurrent.Executor cursorDrainExecutor) {
-        this.pipeline = new EgressRoutePipeline(maxInFlight, erSubmitExecutor, cursorDrainExecutor);
+        enablePipelineForTesting(maxInFlight, erSubmitExecutor, cursorDrainExecutor, erSubmitExecutor);
+    }
+
+    void enablePipelineForTesting(
+            int maxInFlight,
+            java.util.concurrent.Executor erSubmitExecutor,
+            java.util.concurrent.Executor cursorDrainExecutor,
+            java.util.concurrent.Executor routeOfferExecutor) {
+        this.pipeline =
+                new EgressRoutePipeline(maxInFlight, erSubmitExecutor, cursorDrainExecutor, routeOfferExecutor);
     }
 
     void markRunningForTesting() {
@@ -1688,5 +1734,21 @@ public class OmsVenueEgressService {
 
     boolean pipelineIsDrainedForTesting() {
         return pipeline.tracker.isDrained();
+    }
+
+    int pipelineInFlightForTesting() {
+        return pipeline.tracker.inFlight();
+    }
+
+    /**
+     * Wakes the replay thread when ER completions drain {@link EgressCompletionTracker#inFlight()}
+     * so {@link EgressRoutePipeline#awaitDispatchCapacity()} does not sit a full park slice behind
+     * finished offers.
+     */
+    private void unparkReplayThread() {
+        Thread t = replayThread;
+        if (t != null) {
+            LockSupport.unpark(t);
+        }
     }
 }

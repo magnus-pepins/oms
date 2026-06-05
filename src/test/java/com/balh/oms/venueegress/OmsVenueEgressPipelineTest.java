@@ -23,15 +23,19 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.time.Duration;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
@@ -256,6 +260,101 @@ class OmsVenueEgressPipelineTest {
 
         assertThat(service.pipelineIsDrainedForTesting()).isTrue();
         verify(cursorRepository, times(1)).advanceWithRecording(any(), anyInt(), eq(3L), eq(10L));
+    }
+
+    @Test
+    void dispatchDecouplesReplayFromBlockingGrpcOffer() throws Exception {
+        int maxInFlight = 4;
+        CountDownLatch releaseOffer = new CountDownLatch(1);
+        AtomicInteger offersInFlight = new AtomicInteger();
+        AtomicInteger maxConcurrentOffers = new AtomicInteger();
+        var routeOfferPool = Executors.newSingleThreadExecutor();
+        var erPool = Executors.newSingleThreadExecutor();
+        try {
+            service.enablePipelineForTesting(4, erPool, Runnable::run, routeOfferPool);
+
+            when(routeClient.routeAdmittedOrderAsync(any()))
+                    .thenAnswer(
+                            inv -> {
+                                int concurrent = offersInFlight.incrementAndGet();
+                                maxConcurrentOffers.updateAndGet(prev -> Math.max(prev, concurrent));
+                                try {
+                                    releaseOffer.await();
+                                } catch (InterruptedException e) {
+                                    Thread.currentThread().interrupt();
+                                    return CompletableFuture.failedFuture(e);
+                                } finally {
+                                    offersInFlight.decrementAndGet();
+                                }
+                                OrderAdmittedEvent ev = inv.getArgument(0);
+                                return CompletableFuture.completedFuture(Optional.of(er(ev)));
+                            });
+
+            long t0 = System.nanoTime();
+            for (int i = 0; i < maxInFlight; i++) {
+                service.pipelineDispatchAdmitForTesting(admit("PREDMKT-TEST-1"), 10L * (i + 1));
+            }
+            long enqueueNanos = System.nanoTime() - t0;
+
+            assertThat(TimeUnit.NANOSECONDS.toMillis(enqueueNanos)).isLessThan(100L);
+            await().atMost(Duration.ofSeconds(1)).until(() -> maxConcurrentOffers.get() >= 1);
+
+            releaseOffer.countDown();
+            await().atMost(Duration.ofSeconds(5))
+                    .untilAsserted(
+                            () -> verify(routeClient, times(maxInFlight)).routeAdmittedOrderAsync(any()));
+            service.markRunningForTesting();
+            assertThat(service.pipelineQuiesceForTesting()).isTrue();
+        } finally {
+            releaseOffer.countDown();
+            routeOfferPool.shutdown();
+            erPool.shutdown();
+            routeOfferPool.awaitTermination(2, TimeUnit.SECONDS);
+            erPool.awaitTermination(2, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void slowClusterErOffer_dispatchesFullPendingWindowWhileOffersPark() throws Exception {
+        int maxInFlight = 4;
+        int admitCount = maxInFlight * 2;
+        CountDownLatch releaseEr = new CountDownLatch(1);
+
+        doAnswer(
+                        inv -> {
+                            assertThat(releaseEr.await(5, TimeUnit.SECONDS)).isTrue();
+                            return null;
+                        })
+                .when(clusterIngressClient)
+                .submitApplyExecutionReport(any(), any());
+
+        ExecutorService erPool = Executors.newVirtualThreadPerTaskExecutor();
+        try {
+            service.enablePipelineForTesting(maxInFlight, erPool, Runnable::run, Runnable::run);
+            service.markRunningForTesting();
+
+            List<OrderAdmittedEvent> events = new ArrayList<>();
+            for (int i = 0; i < admitCount; i++) {
+                OrderAdmittedEvent ev = admit("PREDMKT-TEST-1");
+                events.add(ev);
+                when(routeClient.routeAdmittedOrderAsync(ev))
+                        .thenReturn(CompletableFuture.completedFuture(Optional.of(er(ev))));
+            }
+
+            for (int i = 0; i < admitCount; i++) {
+                service.pipelineDispatchAdmitForTesting(events.get(i), 10L * (i + 1));
+            }
+
+            assertThat(service.pipelineInFlightForTesting()).isEqualTo(admitCount);
+
+            releaseEr.countDown();
+            assertThat(service.pipelineQuiesceForTesting()).isTrue();
+            verify(cursorRepository, times(1))
+                    .advanceWithRecording(any(), anyInt(), eq(3L), eq(10L * admitCount));
+        } finally {
+            erPool.shutdown();
+            erPool.awaitTermination(2, TimeUnit.SECONDS);
+        }
     }
 
     private static OrderAdmittedEvent admit(String symbol) {

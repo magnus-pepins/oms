@@ -110,12 +110,9 @@ class OrderIngressServiceFxQuoteLockTest {
         when(nettingProvider.getIfAvailable()).thenReturn(null);
 
         OmsClusterShardRouter router = new OmsClusterShardRouter(1, Map.of(0, cluster));
-        // AAPL orders only; gate short-circuits before the cursor repos (mocks keep it safe).
+        // AAPL orders only; gate short-circuits before the lag snapshot (mock keeps it safe).
         venueAdmissionGate = new VenueAdmissionGate(
-                config,
-                mock(com.balh.oms.projector.AeronProjectorCursorRepository.class),
-                mock(com.balh.oms.venueegress.OmsVenueEgressCursorRepository.class),
-                new SimpleMeterRegistry());
+                config, mock(OmsVenueEgressLagPublisher.class), new SimpleMeterRegistry());
         predictionMarketTickGate = new PredictionMarketTickGate(
                 config,
                 mock(com.balh.oms.predictionmarket.PredictionMarketContractRepository.class),

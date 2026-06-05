@@ -1,11 +1,17 @@
 package com.balh.oms.cluster;
 
 import com.balh.oms.config.OmsConfig;
+import io.aeron.cluster.client.AeronCluster;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import org.agrona.ExpandableArrayBuffer;
 import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
 
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
@@ -15,7 +21,9 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantLock;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -189,6 +197,196 @@ class OmsClusterIngressClientBatcherTest {
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("not connected");
         assertThat(client.pendingCountForTest()).isZero();
+    }
+
+    @Test
+    void admitBatcherLoop_packsMultipleSubmitsIntoOneBatchOffer() throws Exception {
+        OmsConfig cfg = newBatchConfig(256, 8);
+        cfg.getCluster().getClient().getAdmitBatch().setFlushIntervalNanos(10_000L);
+        OmsClusterIngressClient client = new OmsClusterIngressClient(cfg, new SimpleMeterRegistry());
+
+        AtomicInteger offerCount = new AtomicInteger();
+        List<Integer> batchCounts = new ArrayList<>();
+        AeronCluster cluster = Mockito.mock(AeronCluster.class);
+        Mockito.when(cluster.offer(Mockito.any(), Mockito.anyInt(), Mockito.anyInt()))
+                .thenAnswer(inv -> {
+                    ExpandableArrayBuffer buf = inv.getArgument(0);
+                    int offset = inv.getArgument(1);
+                    offerCount.incrementAndGet();
+                    int typeId = buf.getInt(offset + OmsClusterWireFormat.HEADER_TYPE_ID_OFFSET);
+                    if (typeId == OmsClusterWireFormat.TYPE_ID_BATCH_ACCEPT_ORDER) {
+                        synchronized (batchCounts) {
+                            batchCounts.add(BatchAcceptOrderCommand.readCount(buf, offset));
+                        }
+                    }
+                    return 1L;
+                });
+        Mockito.when(cluster.pollEgress()).thenReturn(0);
+
+        setField(client, "client", cluster);
+        setField(client, "closing", false);
+        startAdmitBatcherLocked(client);
+        startEgressPollerLocked(client);
+
+        int submitCount = 4;
+        ExecutorService pool = Executors.newFixedThreadPool(submitCount);
+        try {
+            for (int i = 0; i < submitCount; i++) {
+                pool.submit(() -> {
+                    try {
+                        long id = client.nextCorrelationId();
+                        client.submitAcceptOrder(newCmd(id), Duration.ofSeconds(5));
+                    } catch (Throwable t) {
+                        throw new AssertionError(t);
+                    }
+                });
+            }
+
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            boolean sawMultiBatch = false;
+            while (System.nanoTime() < deadline) {
+                synchronized (batchCounts) {
+                    sawMultiBatch = batchCounts.stream().anyMatch(c -> c >= 2);
+                }
+                if (sawMultiBatch) {
+                    break;
+                }
+                Thread.onSpinWait();
+            }
+            assertThat(sawMultiBatch)
+                    .as("batcher should coalesce multiple admits before first offer completes")
+                    .isTrue();
+
+            completeAllPendingAccepted(client);
+        } finally {
+            pool.shutdownNow();
+            client.close();
+        }
+
+        assertThat(offerCount.get())
+                .as("N admits should amortise to fewer cluster offers than submitCount")
+                .isLessThan(submitCount);
+        assertThat(batchCounts)
+                .as("at least one offer must be a multi-admit BatchAcceptOrderCommand")
+                .anyMatch(c -> c >= 2);
+    }
+
+    @Test
+    void admitBatcherLoop_expiredSubmitFailsWithoutBlockingBatch() throws Exception {
+        OmsClusterIngressClient client = new OmsClusterIngressClient(
+                newBatchConfig(64, 8), new SimpleMeterRegistry());
+
+        long correlationId = client.nextCorrelationId();
+        CompletableFuture<AdmissionResult> waiter = new CompletableFuture<>();
+        assertThat(injectPending(client, correlationId, waiter)).isNull();
+
+        Object expired = newPendingBatchSubmit(
+                client, newCmd(correlationId), System.nanoTime() - 1L, waiter);
+        admitBatchQueue(client).offer(expired);
+
+        AtomicReference<Throwable> batcherError = new AtomicReference<>();
+        Thread batcher = new Thread(() -> {
+            try {
+                invokeAdmitBatcherLoop(client);
+            } catch (Throwable t) {
+                batcherError.set(t);
+            }
+        });
+        batcher.start();
+        try {
+            assertThat(waiter)
+                    .failsWithin(Duration.ofSeconds(2))
+                    .withThrowableThat()
+                    .isInstanceOf(ExecutionException.class)
+                    .havingCause()
+                    .isInstanceOf(TimeoutException.class)
+                    .withMessageContaining("expired before offer");
+            assertThat(batcherError.get()).isNull();
+        } finally {
+            batcher.interrupt();
+            batcher.join(2_000L);
+        }
+    }
+
+    private static CompletableFuture<AdmissionResult> injectPending(
+            OmsClusterIngressClient client, long correlationId,
+            CompletableFuture<AdmissionResult> waiter) throws Exception {
+        Field f = OmsClusterIngressClient.class.getDeclaredField("pending");
+        f.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        java.util.concurrent.ConcurrentHashMap<Long, CompletableFuture<AdmissionResult>> pending =
+                (java.util.concurrent.ConcurrentHashMap<Long, CompletableFuture<AdmissionResult>>)
+                        f.get(client);
+        return pending.putIfAbsent(correlationId, waiter);
+    }
+
+    private static Object newPendingBatchSubmit(
+            OmsClusterIngressClient client,
+            AcceptOrderCommand cmd,
+            long deadlineNanos,
+            CompletableFuture<AdmissionResult> future) throws Exception {
+        Class<?> recordClass = Class.forName(
+                "com.balh.oms.cluster.OmsClusterIngressClient$PendingBatchSubmit");
+        var ctor = recordClass.getDeclaredConstructors()[0];
+        ctor.setAccessible(true);
+        return ctor.newInstance(cmd, deadlineNanos, future, null);
+    }
+
+    private static void invokeAdmitBatcherLoop(OmsClusterIngressClient client) throws Exception {
+        Method m = OmsClusterIngressClient.class.getDeclaredMethod("admitBatcherLoop");
+        m.setAccessible(true);
+        m.invoke(client);
+    }
+
+    private static void startAdmitBatcherLocked(OmsClusterIngressClient client) throws Exception {
+        Method m = OmsClusterIngressClient.class.getDeclaredMethod("startAdmitBatcherLocked");
+        m.setAccessible(true);
+        ReentrantLock lock = clientLock(client);
+        lock.lock();
+        try {
+            m.invoke(client);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private static void startEgressPollerLocked(OmsClusterIngressClient client) throws Exception {
+        Method m = OmsClusterIngressClient.class.getDeclaredMethod("startEgressPollerLocked");
+        m.setAccessible(true);
+        ReentrantLock lock = clientLock(client);
+        lock.lock();
+        try {
+            m.invoke(client);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private static ReentrantLock clientLock(OmsClusterIngressClient client) throws Exception {
+        Field f = OmsClusterIngressClient.class.getDeclaredField("clientLock");
+        f.setAccessible(true);
+        return (ReentrantLock) f.get(client);
+    }
+
+    private static void setField(Object target, String name, Object value) throws Exception {
+        Field f = target.getClass().getDeclaredField(name);
+        f.setAccessible(true);
+        f.set(target, value);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void completeAllPendingAccepted(OmsClusterIngressClient client) throws Exception {
+        Field f = OmsClusterIngressClient.class.getDeclaredField("pending");
+        f.setAccessible(true);
+        java.util.concurrent.ConcurrentHashMap<Long, CompletableFuture<AdmissionResult>> pending =
+                (java.util.concurrent.ConcurrentHashMap<Long, CompletableFuture<AdmissionResult>>)
+                        f.get(client);
+        for (Long correlationId : List.copyOf(pending.keySet())) {
+            client.completeWaiter(
+                    correlationId,
+                    new AdmissionResult.Accepted(
+                            new OrderAcceptedEvent(correlationId, UUID.randomUUID(), 1, false, 0L)));
+        }
     }
 
     private static AcceptOrderCommand newCmd(long correlationId) {

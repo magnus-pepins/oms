@@ -140,7 +140,8 @@ class OmsClusterSnapshotDecoderTest {
                 /* acceptedAtMillis = */ 1_700_000_000_000L,
                 statusCode,
                 cumQty,
-                shardId);
+                shardId,
+                -1L);
     }
 
     private static byte[] encodeSnapshot(List<OmsAdmissionClusteredService.AdmittedOrder> orders) {

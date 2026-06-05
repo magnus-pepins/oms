@@ -162,7 +162,8 @@ class OmsProjectorRebuildFromSnapshotToolTest {
                 /* acceptedAtMillis */ 1_700_000_000_000L,
                 /* statusCode */ (byte) 2,
                 /* cumQtyScaled */ 0L,
-                /* shardId */ 0);
+                /* shardId */ 0,
+                /* terminalAtMillis */ -1L);
 
         String json = OmsProjectorRebuildFromSnapshotTool.toJsonLine(order);
 
@@ -192,7 +193,7 @@ class OmsProjectorRebuildFromSnapshotToolTest {
                 100L, 0L,
                 com.balh.oms.cluster.AcceptOrderCommand.TIF_DAY,
                 /* ledgerBalanceIdOrNull */ null,
-                0, 0L, (byte) 1, 0L, 0);
+                0, 0L, (byte) 1, 0L, 0, -1L);
 
         String json = OmsProjectorRebuildFromSnapshotTool.toJsonLine(order);
 

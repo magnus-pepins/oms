@@ -1,12 +1,10 @@
 package com.balh.oms.projector;
 
-import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
-import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -22,13 +20,11 @@ import com.balh.oms.persistence.MarketContextRepository;
 import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.persistence.PositionsRepository;
 import com.balh.oms.tailer.OrderControlAdmission;
-import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
-import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.beans.factory.ObjectProvider;
@@ -40,22 +36,8 @@ import java.time.ZoneOffset;
 import java.util.UUID;
 
 /**
- * Phase 4 Tier 2.5 phase D-1 (introduced) / phase D-9 (promoted to primary) — covers
- * {@link OmsPostgresProjector}'s ledger inflight outbox projection: idempotently writes a
- * {@code ledger_inflight_outbox} row from the cluster's {@link OrderAdmittedEvent} so the
- * slice 4p reconciler/compensator pipeline drives the BUY hold (or compensating cancel).
- *
- * <p>D-1 added this as a crash-window backfill (ingress was the primary writer, projector
- * filled in if the ingress JVM crashed between cluster admit and its INSERT tx commit). D-9
- * removed the ingress-side INSERT entirely, so the projector is now the only writer on the
- * BUY-async path. The gating + payload contract this test pins down is unchanged across both
- * phases — the slice 4p reconciler keeps consuming the same row shape it always has, and
- * {@code insertIfAbsent} stays idempotent on cursor-rewind / recording-replay.
- *
- * <p>Scope: gating on {@code oms.ledger.inflight-reservation-enabled},
- * {@code oms.ledger.inflight-async-enabled}, {@code side=BUY}, non-null {@code ledgerBalanceId}
- * and non-zero limit price; plus the payload shape ({@code ledgerBalanceId} /
- * {@code quantity} / {@code limitPrice} as plain-string decimals) that the reconciler parses.
+ * Async BUY hold is now placed synchronously before cluster admit, so projector-side outbox
+ * projection must stay disabled to avoid a second Ledger POST.
  */
 @ExtendWith(MockitoExtension.class)
 class OmsPostgresProjectorD1BackfillTest {
@@ -183,7 +165,7 @@ class OmsPostgresProjectorD1BackfillTest {
     }
 
     @Test
-    void buyAsyncWithLedgerAndLimit_writesIdempotentRowWithExpectedPayload() throws Exception {
+    void buyAsyncWithLedgerAndLimit_skipsProjection() {
         config.getLedger().setInflightReservationEnabled(true);
         config.getLedger().setInflightAsyncEnabled(true);
 
@@ -195,34 +177,13 @@ class OmsPostgresProjectorD1BackfillTest {
                 limitPriceScaled,
                 "ledger-bal-d1");
 
-        when(ledgerInflightOutboxRepository.insertIfAbsent(eq(ev.orderId()), any())).thenReturn(true);
-
         projector.applyAdmittedEvent(ev, FRAGMENT_POSITION);
 
-        ArgumentCaptor<String> payloadCaptor = ArgumentCaptor.forClass(String.class);
-        verify(ledgerInflightOutboxRepository, times(1))
-                .insertIfAbsent(eq(ev.orderId()), payloadCaptor.capture());
-
-        JsonNode payload = objectMapper.readTree(payloadCaptor.getValue());
-        assertThat(payload.get("ledgerBalanceId").asText()).isEqualTo("ledger-bal-d1");
-        // BigDecimal value-equality is what matters to the reconciler; toPlainString round-trip
-        // gives us "12.3450000000" / "100.5000000000". The reconciler parses these back via
-        // new BigDecimal(...) and compareTo() the original — bit-exact representation isn't
-        // required, only numeric equivalence.
-        assertThat(new java.math.BigDecimal(payload.get("quantity").asText()))
-                .isEqualByComparingTo(new java.math.BigDecimal("12.345"));
-        assertThat(new java.math.BigDecimal(payload.get("limitPrice").asText()))
-                .isEqualByComparingTo(new java.math.BigDecimal("100.5"));
+        verify(ledgerInflightOutboxRepository, never()).insertIfAbsent(any(), any());
     }
 
     @Test
-    void replayPath_insertIfAbsentReturnsFalse_isStillTreatedAsSuccess() {
-        // Idempotency on cursor-rewind / recording-replay: insertIfAbsent returns false (the
-        // row from the original projection of this orderId still exists, ON CONFLICT DO NOTHING)
-        // and the projector advances the cursor without throwing. Pre-D-9 this also covered the
-        // "ingress already wrote the row" branch; D-9 removed that ingress-side INSERT, so this
-        // path now only fires on operator-driven cluster cursor rewinds. Mockito stub returns
-        // false by default.
+    void replayPath_stillAdvancesCursorWithoutProjection() {
         config.getLedger().setInflightReservationEnabled(true);
         config.getLedger().setInflightAsyncEnabled(true);
 
@@ -230,7 +191,7 @@ class OmsPostgresProjectorD1BackfillTest {
 
         projector.applyAdmittedEvent(ev, FRAGMENT_POSITION);
 
-        verify(ledgerInflightOutboxRepository).insertIfAbsent(eq(ev.orderId()), any());
+        verify(ledgerInflightOutboxRepository, never()).insertIfAbsent(any(), any());
         verify(cursorRepository).advanceWithRecording(anyString(), anyInt(), eq(13L), eq(FRAGMENT_POSITION));
     }
 

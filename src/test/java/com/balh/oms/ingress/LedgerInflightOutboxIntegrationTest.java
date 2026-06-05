@@ -36,17 +36,8 @@ import static com.github.tomakehurst.wiremock.client.WireMock.urlPathEqualTo;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * When {@code oms.ledger.inflight-async-enabled=true}, BUY inflight hold is written to
- * {@code ledger_inflight_outbox} and {@link LedgerInflightOutboxReconciler} POSTs to Ledger
- * shortly after.
- *
- * <p>Phase 4 Tier 2.5 phase D-9: the row is now written by the projector (asynchronously,
- * from the cluster's authoritative {@code OrderAdmittedEvent}) rather than inline by the
- * ingress accept tx — see {@code OmsPostgresProjector#recordLedgerInflightOutboxIfNeeded}.
- * The test daemon ({@code TestPostgresProjectorSingleton}) mirrors that path so this test
- * still runs without the production projector JVM, but the row appears after a small
- * (sub-ms typical, bounded by Awaitility timeout) projector lag instead of being visible
- * the instant the HTTP response returns.
+ * When {@code oms.ledger.inflight-async-enabled=true}, BUY inflight hold is still placed before
+ * cluster admit. The projector must not enqueue an outbox row that would trigger a second POST.
  */
 class LedgerInflightOutboxIntegrationTest extends AbstractPostgresIntegrationTest {
 
@@ -89,7 +80,7 @@ class LedgerInflightOutboxIntegrationTest extends AbstractPostgresIntegrationTes
     }
 
     @Test
-    void asyncInflightDefersLedgerPostUntilReconcilerRuns() {
+    void asyncInflightDoesNotCreateOutboxRowOrSecondLedgerPost() {
         // Verify path sends with_queued=false (Tier 2.5 phase C-3, see RestLedgerBalanceClient).
         ledgerWireMock.stubFor(get(urlPathEqualTo("/balances/cust_balance_async"))
                 .withQueryParam("with_queued", equalTo("false"))
@@ -113,11 +104,10 @@ class LedgerInflightOutboxIntegrationTest extends AbstractPostgresIntegrationTes
         assertThat(res.getStatusCode()).isEqualTo(HttpStatus.CREATED);
         UUID orderId = UUID.fromString((String) res.getBody().get("id"));
 
-        ledgerWireMock.verify(0, postRequestedFor(urlPathEqualTo("/transactions")));
-        ledgerWireMock.verify(1, getRequestedFor(urlPathEqualTo("/balances/cust_balance_async")));
+        ledgerWireMock.verify(1, postRequestedFor(urlPathEqualTo("/transactions")));
+        ledgerWireMock.verify(2, getRequestedFor(urlPathEqualTo("/balances/cust_balance_async")));
 
-        // D-9: the row is projected from OrderAdmittedEvent (async, sub-ms typical). Wait
-        // until the test projector daemon has caught up before we hand off to the reconciler.
+        // Projector path must not enqueue outbox rows when pre-admit hold already ran.
         Awaitility.await()
                 .atMost(Duration.ofSeconds(5))
                 .pollDelay(Duration.ZERO)
@@ -126,7 +116,7 @@ class LedgerInflightOutboxIntegrationTest extends AbstractPostgresIntegrationTes
                         "SELECT COUNT(*) FROM ledger_inflight_outbox WHERE order_id = ? AND published_at IS NULL",
                         Long.class,
                         orderId))
-                        .isEqualTo(1L));
+                        .isEqualTo(0L));
 
         ledgerInflightOutboxReconciler.runOnce();
 
@@ -135,7 +125,7 @@ class LedgerInflightOutboxIntegrationTest extends AbstractPostgresIntegrationTes
                 "SELECT COUNT(*) FROM ledger_inflight_outbox WHERE order_id = ? AND published_at IS NOT NULL",
                 Long.class,
                 orderId))
-                .isEqualTo(1L);
+                .isEqualTo(0L);
     }
 
     private static HttpHeaders authHeaders() {

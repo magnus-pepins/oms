@@ -1183,39 +1183,12 @@ public class OmsPostgresProjector {
     }
 
     /**
-     * Phase 4 Tier 2.5 phase D-9 — primary writer of {@code ledger_inflight_outbox} for the
-     * BUY-with-async-hold case, driven from {@link OrderAdmittedEvent} on the projector.
+     * BUY inflight hold is now always placed before cluster admit in ingress.
      *
-     * <p>Originally introduced as D-1's crash-window backfill (when ingress was the primary
-     * writer and the projector covered the gap if ingress crashed between cluster admit and
-     * its own outbox-INSERT tx commit). D-9 promoted the projector to the <strong>only</strong>
-     * writer, removing the last residual Postgres INSERT from the ingress hot path (Pop! D-8
-     * jstack showed 186/200 ingress exec threads parked in this exact INSERT waiting for a
-     * Hikari connection at c1600 / 20.8 k rps).
-     *
-     * <p>Gating mirrors {@link com.balh.oms.ingress.OrderIngressService#maybePlaceBuyLedgerInflightHold}
-     * for the async path: requires {@code oms.ledger.inflight-reservation-enabled=true},
-     * {@code oms.ledger.inflight-async-enabled=true} (the slice 4p outbox path), {@code side=BUY},
-     * a non-null {@code ledgerBalanceId}, and a non-zero limit price (the hold notional is
-     * {@code quantity * limitPrice}, so market orders are skipped here as well).
-     *
-     * <p>Payload shape: small JSON object with {@code ledgerBalanceId} / {@code quantity} /
-     * {@code limitPrice}, matching the slice 4p contract that {@code LedgerInflightOutboxReconciler}
-     * already consumes. Decode of {@code quantityScaled} / {@code limitPriceScaledOrZero} uses
-     * the same {@code BigDecimal.valueOf(scaled).divide(SCALE, 10, UNNECESSARY)} pattern as
-     * {@link OrdersRepository#insertFromAdmittedEvent(OrderAdmittedEvent)}, so the round-trip
-     * preserves exact value (no scientific-notation / trailing-zero drift).
-     *
-     * <p>Idempotent on replay (cursor rewind, recording rebuild) via
-     * {@code uq_ledger_inflight_outbox_order_id} + {@code ON CONFLICT DO NOTHING}: a row that
-     * was already projected stays as-is; reconciler/compensator state ({@code attempts},
-     * {@code published_at}, {@code compensated_at}) is preserved untouched.
-     *
-     * <p>Sync HTTP and {@code LedgerInflightCoalescer} (slice 4q) paths are <strong>not</strong>
-     * driven from here: those paths still call Ledger / the coalescer synchronously inside
-     * {@link com.balh.oms.ingress.OrderIngressService#maybePlaceBuyLedgerInflightHold} so the
-     * customer sees the hold result on the response. D-9 only changes the BUY-async branch
-     * (the production default).
+     * <p>When {@code oms.ledger.inflight-async-enabled=true}, writing a projector outbox row would
+     * make {@link com.balh.oms.reconciler.LedgerInflightOutboxReconciler} POST a second hold attempt
+     * for the same {@code oms:order:{id}} reference. Keep projector admission deterministic but skip
+     * outbox projection in this mode.
      */
     private void recordLedgerInflightOutboxIfNeeded(OrderAdmittedEvent ev) {
         if (!config.getLedger().isInflightReservationEnabled()) {
@@ -1224,64 +1197,7 @@ public class OmsPostgresProjector {
         if (!config.getLedger().isInflightAsyncEnabled()) {
             return;
         }
-        if (ev.side() != AcceptOrderCommand.SIDE_BUY) {
-            return;
-        }
-        if (ev.ledgerBalanceIdOrNull() == null || ev.ledgerBalanceIdOrNull().isBlank()) {
-            return;
-        }
-        if (ev.limitPriceScaledOrZero() == 0L) {
-            return;
-        }
-
-        BigDecimal quantity = BigDecimal.valueOf(ev.quantityScaled())
-                .divide(BigDecimal.valueOf(AcceptOrderCommand.QUANTITY_SCALE), 10, RoundingMode.UNNECESSARY);
-        BigDecimal limitPrice = BigDecimal.valueOf(ev.limitPriceScaledOrZero())
-                .divide(BigDecimal.valueOf(AcceptOrderCommand.PRICE_SCALE), 10, RoundingMode.UNNECESSARY);
-        Order holdSizing =
-                new Order(
-                        ev.orderId(),
-                        UUID.fromString(ev.accountId()),
-                        ev.clientIdempotencyKey(),
-                        ev.shardId(),
-                        ev.version(),
-                        OrderStatus.NEW,
-                        null,
-                        Side.BUY,
-                        ev.instrumentSymbol(),
-                        quantity,
-                        limitPrice,
-                        AcceptOrderCommand.timeInForceName(ev.timeInForceCode()),
-                        Instant.ofEpochSecond(0, ev.clientTimestampNanos()),
-                        Instant.ofEpochMilli(ev.acceptedAtMillis()),
-                        null,
-                        ev.accountIdHash(),
-                        ev.ledgerBalanceIdOrNull(),
-                        BigDecimal.ZERO,
-                        AcceptOrderCommand.ordTypeName(ev.ordTypeCode()));
-        Optional<BigDecimal> holdAmount = BuyFundsRequirement.requiredBuyFunds(holdSizing, config);
-        if (holdAmount.isEmpty()) {
-            return;
-        }
-        Optional<BigDecimal> feeAmount = BuyFundsRequirement.estimatedFee(holdSizing, config);
-
-        var node = objectMapper.createObjectNode();
-        node.put("ledgerBalanceId", ev.ledgerBalanceIdOrNull());
-        node.put("quantity", quantity.toPlainString());
-        node.put("limitPrice", limitPrice.toPlainString());
-        node.put("holdAmount", holdAmount.get().toPlainString());
-        feeAmount.ifPresent(f -> node.put("feeAmount", f.toPlainString()));
-        String payload;
-        try {
-            payload = objectMapper.writeValueAsString(node);
-        } catch (JsonProcessingException e) {
-            // Fail the projector tx loudly: a missing inflight outbox row is a financial
-            // correctness issue, and we cannot serialize a small fixed-shape JSON object means
-            // something is very wrong. Better to halt the projector than silently advance.
-            throw new IllegalStateException(
-                    "ledger inflight outbox payload serialisation failed for orderId=" + ev.orderId(), e);
-        }
-        ledgerInflightOutboxRepository.insertIfAbsent(ev.orderId(), payload);
+        return;
     }
 
     /**

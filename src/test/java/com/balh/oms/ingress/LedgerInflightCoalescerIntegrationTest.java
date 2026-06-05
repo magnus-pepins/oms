@@ -130,22 +130,19 @@ class LedgerInflightCoalescerIntegrationTest extends AbstractPostgresIntegration
                 ledgerWireMock.verify(1, postRequestedFor(urlPathEqualTo("/transactions/bulk"))));
         ledgerWireMock.verify(0, postRequestedFor(urlPathEqualTo("/transactions")));
 
-        // Phase 4 Tier 2.5 D-9: the test projector daemon always materialises
-        // ledger_inflight_outbox from OrderAdmittedEvent when inflight-async-enabled=true,
-        // even on the coalescer happy path (ingress/coalescer no longer write it). Slice 4q
-        // invariant narrows to: bulk hold succeeded and the slice-4p reconciler has not yet
-        // posted via /transactions (published_at still null).
+        // Coalescer happy-path should not enqueue outbox rows; fallback rows are only expected
+        // when the bulk endpoint fails.
         Awaitility.await().atMost(Duration.ofSeconds(2)).untilAsserted(() ->
                 assertThat(jdbc.queryForObject(
                         "SELECT COUNT(*) FROM ledger_inflight_outbox WHERE order_id = ?",
                         Long.class,
                         orderId))
-                        .isEqualTo(1L));
+                        .isEqualTo(0L));
         assertThat(jdbc.queryForObject(
                 "SELECT COUNT(*) FROM ledger_inflight_outbox WHERE order_id = ? AND published_at IS NULL",
                 Long.class,
                 orderId))
-                .isEqualTo(1L);
+                .isEqualTo(0L);
     }
 
     @Test

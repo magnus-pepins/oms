@@ -608,9 +608,6 @@ public abstract class AbstractPostgresIntegrationTest {
                             jdbc,
                             omsConfig,
                             resolutionObjectMapper);
-            ObjectMapper inflightObjectMapper = new ObjectMapper();
-            inflightObjectMapper.registerModule(new JavaTimeModule());
-
             Aeron aeron = Aeron.connect(new Aeron.Context().aeronDirectoryName(aeronDir));
             AeronArchive archive = AeronArchive.connect(new AeronArchive.Context()
                     .aeron(aeron)
@@ -633,10 +630,8 @@ public abstract class AbstractPostgresIntegrationTest {
                             orders,
                             domainEventOutbox,
                             domainEventCodec,
-                            ledgerInflightOutbox,
                             predictionMarketResolutionService,
                             tradeApplier,
-                            inflightObjectMapper,
                             running),
                     "oms-test-projector-daemon");
             thread.setDaemon(true);
@@ -703,10 +698,8 @@ public abstract class AbstractPostgresIntegrationTest {
                 OrdersRepository orders,
                 DomainEventOutboxRepository domainEventOutbox,
                 DomainEventEnvelopeCodec domainEventCodec,
-                LedgerInflightOutboxRepository ledgerInflightOutbox,
                 PredictionMarketResolutionService predictionMarketResolutionService,
                 TestPostgresProjectorTradeApplier tradeApplier,
-                ObjectMapper inflightObjectMapper,
                 AtomicBoolean running) {
             FragmentHandler handler = (buffer, offset, length, header) -> {
                 int typeId = buffer.getInt(offset + OmsClusterWireFormat.HEADER_TYPE_ID_OFFSET);
@@ -718,9 +711,7 @@ public abstract class AbstractPostgresIntegrationTest {
                                 length,
                                 orders,
                                 domainEventOutbox,
-                                domainEventCodec,
-                                ledgerInflightOutbox,
-                                inflightObjectMapper);
+                                domainEventCodec);
                     } else if (typeId == OmsClusterWireFormat.TYPE_ID_EXECUTION_APPLIED) {
                         ExecutionAppliedEvent ev = ExecutionAppliedEvent.decode(buffer, offset, length);
                         tradeApplier.applyExecutionAppliedEvent(ev);
@@ -749,9 +740,7 @@ public abstract class AbstractPostgresIntegrationTest {
                 int length,
                 OrdersRepository orders,
                 DomainEventOutboxRepository domainEventOutbox,
-                DomainEventEnvelopeCodec domainEventCodec,
-                LedgerInflightOutboxRepository ledgerInflightOutbox,
-                ObjectMapper inflightObjectMapper) {
+                DomainEventEnvelopeCodec domainEventCodec) {
             OrderAdmittedEvent ev = OrderAdmittedEvent.decode(buffer, offset, length);
             boolean fresh = orders.insertFromAdmittedEvent(ev);
             if (fresh) {
@@ -763,37 +752,6 @@ public abstract class AbstractPostgresIntegrationTest {
                 } catch (JsonProcessingException e) {
                     throw new IllegalStateException(
                             "OrderAccepted envelope serialisation failed for orderId=" + ev.orderId(), e);
-                }
-            }
-            // Mirror production OmsPostgresProjector D-9: project the BUY-async
-            // ledger_inflight_outbox row from the cluster's authoritative
-            // OrderAdmittedEvent. Gating mirrors the production gating: BUY only,
-            // non-null ledgerBalanceId, non-zero limit price. We don't gate on the
-            // OmsConfig.Ledger flags here because the integration test that exercises
-            // this path explicitly enables them via DynamicPropertySource; tests that
-            // disable inflight-async still POST orders without ledgerBalanceId, which
-            // short-circuits below.
-            if (ev.side() == AcceptOrderCommand.SIDE_BUY
-                    && ev.ledgerBalanceIdOrNull() != null
-                    && !ev.ledgerBalanceIdOrNull().isBlank()
-                    && ev.limitPriceScaledOrZero() != 0L) {
-                java.math.BigDecimal quantity = java.math.BigDecimal.valueOf(ev.quantityScaled())
-                        .divide(java.math.BigDecimal.valueOf(AcceptOrderCommand.QUANTITY_SCALE),
-                                10, java.math.RoundingMode.UNNECESSARY);
-                java.math.BigDecimal limitPrice = java.math.BigDecimal.valueOf(ev.limitPriceScaledOrZero())
-                        .divide(java.math.BigDecimal.valueOf(AcceptOrderCommand.PRICE_SCALE),
-                                10, java.math.RoundingMode.UNNECESSARY);
-                var node = inflightObjectMapper.createObjectNode();
-                node.put("ledgerBalanceId", ev.ledgerBalanceIdOrNull());
-                node.put("quantity", quantity.toPlainString());
-                node.put("limitPrice", limitPrice.toPlainString());
-                try {
-                    ledgerInflightOutbox.insertIfAbsent(
-                            ev.orderId(), inflightObjectMapper.writeValueAsString(node));
-                } catch (JsonProcessingException e) {
-                    throw new IllegalStateException(
-                            "ledger inflight outbox payload serialisation failed for orderId="
-                                    + ev.orderId(), e);
                 }
             }
         }

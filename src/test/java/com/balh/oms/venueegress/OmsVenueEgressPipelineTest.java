@@ -438,9 +438,9 @@ class OmsVenueEgressPipelineTest {
         service.enablePipelineForTesting(8, Runnable::run, Runnable::run, Runnable::run);
         service.markRunningForTesting();
 
-        AtomicInteger erQueueSamples = new AtomicInteger();
-        when(clusterIngressClient.erOfferQueueDepth())
-                .thenAnswer(inv -> erQueueSamples.getAndIncrement() < 8 ? 10 : 0);
+        // Keep ER backlog high for the whole pre-ack window so the throttle gate remains reduced
+        // until the first route completion actually drops in-flight below the throttled cap.
+        when(clusterIngressClient.erOfferQueueDepth()).thenReturn(10);
 
         OrderAdmittedEvent ev1 = admit("PREDMKT-TEST-1");
         OrderAdmittedEvent ev2 = admit("PREDMKT-TEST-1");

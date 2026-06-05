@@ -224,6 +224,42 @@ public class OrdersRepository {
         return jdbc.update(PROJECTOR_INSERT_SQL, projectorParams(ev)) == 1;
     }
 
+    /**
+     * In-memory {@link Order} view matching the row {@link #insertFromAdmittedEvent} just wrote
+     * (version 0, {@link OrderStatus#PENDING_NEW}). Lets the projector hot path skip a
+     * {@link #findById(java.util.UUID)} round-trip inside the same transaction.
+     */
+    public Order orderFromAdmittedEvent(OrderAdmittedEvent ev) {
+        BigDecimal quantity = BigDecimal.valueOf(ev.quantityScaled())
+                .divide(BigDecimal.valueOf(AcceptOrderCommand.QUANTITY_SCALE), 10, RoundingMode.UNNECESSARY);
+        BigDecimal limitPrice = ev.limitPriceScaledOrZero() == 0L
+                ? null
+                : BigDecimal.valueOf(ev.limitPriceScaledOrZero())
+                        .divide(BigDecimal.valueOf(AcceptOrderCommand.PRICE_SCALE), 10, RoundingMode.UNNECESSARY);
+        Instant receivedAt = nanosToInstant(ev.clientTimestampNanos());
+        Instant acceptedAt = Instant.ofEpochMilli(ev.acceptedAtMillis());
+        return new Order(
+                ev.orderId(),
+                UUID.fromString(ev.accountId()),
+                ev.clientIdempotencyKey(),
+                ev.shardId(),
+                0,
+                OrderStatus.PENDING_NEW,
+                null,
+                Side.valueOf(AcceptOrderCommand.sideName(ev.side())),
+                ev.instrumentSymbol(),
+                quantity,
+                limitPrice,
+                AcceptOrderCommand.timeInForceName(ev.timeInForceCode()),
+                receivedAt,
+                acceptedAt,
+                null,
+                ev.accountIdHash(),
+                ev.ledgerBalanceIdOrNull(),
+                BigDecimal.ZERO,
+                AcceptOrderCommand.ordTypeName(ev.ordTypeCode()));
+    }
+
     private static MapSqlParameterSource projectorParams(OrderAdmittedEvent ev) {
         BigDecimal quantity = BigDecimal.valueOf(ev.quantityScaled())
                 .divide(BigDecimal.valueOf(AcceptOrderCommand.QUANTITY_SCALE), 10, RoundingMode.UNNECESSARY);

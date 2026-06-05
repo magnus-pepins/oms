@@ -1,8 +1,10 @@
 package com.balh.oms.cluster;
 
 import com.balh.oms.config.OmsConfig;
+import io.aeron.cluster.client.AeronCluster;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
 
 import java.time.Duration;
 import java.util.UUID;
@@ -35,6 +37,33 @@ class OmsClusterIngressClientPipelineTest {
         cfg.getCluster().getClient().setEnabled(true);
         cfg.getCluster().getClient().setAeronDirectory("/tmp/oms-pipeline-test-not-real");
         return cfg;
+    }
+
+    @Test
+    void pollEgressDrain_stopsOnFirstIdlePoll() {
+        OmsClusterIngressClient client = new OmsClusterIngressClient(newConfig(), new SimpleMeterRegistry());
+        AeronCluster cluster = Mockito.mock(AeronCluster.class);
+        Mockito.when(cluster.pollEgress())
+                .thenReturn(2, 1, 0);
+
+        assertThat(client.pollEgressDrain(cluster)).isEqualTo(2);
+        Mockito.verify(cluster, Mockito.times(3)).pollEgress();
+    }
+
+    @Test
+    void pollEgressDrain_respectsCap() {
+        OmsClusterIngressClient client = new OmsClusterIngressClient(newConfig(), new SimpleMeterRegistry());
+        AeronCluster cluster = Mockito.mock(AeronCluster.class);
+        Mockito.when(cluster.pollEgress()).thenReturn(1);
+
+        assertThat(client.pollEgressDrain(cluster)).isEqualTo(256);
+        Mockito.verify(cluster, Mockito.times(256)).pollEgress();
+    }
+
+    @Test
+    void signalEgressPoller_whenPollerNotStarted_isNoOp() {
+        OmsClusterIngressClient client = new OmsClusterIngressClient(newConfig(), new SimpleMeterRegistry());
+        client.signalEgressPollerForTest();
     }
 
     @Test

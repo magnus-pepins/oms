@@ -111,12 +111,14 @@ class OmsPostgresProjectorD3OrderAcceptedTest {
                 new com.balh.oms.settlement.SettlementDateCalculator(
                         com.balh.oms.settlement.SettlementDateCalculator.DEFAULT_CYCLE_FALLBACK),
                 org.mockito.Mockito.mock(com.balh.oms.settlement.PredictionMarketResolutionService.class));
+        projector.setCurrentRecordingIdForTesting(13L);
     }
 
     @Test
     void freshAdmission_writesOrderAcceptedEnvelope_andCallsCodecWithSameEvent() throws Exception {
         OrderAdmittedEvent ev = sampleAdmitted(AcceptOrderCommand.SIDE_BUY, AcceptOrderCommand.TIF_DAY);
         when(ordersRepository.insertFromAdmittedEvent(ev)).thenReturn(true);
+        when(ordersRepository.orderFromAdmittedEvent(ev)).thenReturn(org.mockito.Mockito.mock(com.balh.oms.domain.Order.class));
         when(envelopeCodec.orderAcceptedFromAdmitted(ev)).thenReturn("{\"type\":\"OrderAccepted\"}");
 
         projector.applyAdmittedEvent(ev, FRAGMENT_POSITION);
@@ -135,6 +137,8 @@ class OmsPostgresProjectorD3OrderAcceptedTest {
 
         verify(envelopeCodec, never()).orderAcceptedFromAdmitted(any());
         verify(domainEventOutboxRepository, never()).insert(any(), any());
+        verify(controlAdmission, never()).persistAdmission(any());
+        verify(controlAdmission, never()).persistAdmission(any(), any());
     }
 
     @Test
@@ -169,6 +173,7 @@ class OmsPostgresProjectorD3OrderAcceptedTest {
                 new com.balh.oms.settlement.SettlementDateCalculator(
                         com.balh.oms.settlement.SettlementDateCalculator.DEFAULT_CYCLE_FALLBACK),
                 org.mockito.Mockito.mock(com.balh.oms.settlement.PredictionMarketResolutionService.class));
+        projectorWithRealCodec.setCurrentRecordingIdForTesting(13L);
 
         OrderAdmittedEvent ev = new OrderAdmittedEvent(
                 UUID.fromString("00000000-0000-4000-8000-0000000000d3"),
@@ -186,6 +191,8 @@ class OmsPostgresProjectorD3OrderAcceptedTest {
                 "AAPL",
                 "ledger-bal-d3");
         when(ordersRepository.insertFromAdmittedEvent(ev)).thenReturn(true);
+        when(ordersRepository.orderFromAdmittedEvent(ev))
+                .thenReturn(org.mockito.Mockito.mock(com.balh.oms.domain.Order.class));
 
         projectorWithRealCodec.applyAdmittedEvent(ev, FRAGMENT_POSITION);
 
@@ -233,6 +240,7 @@ class OmsPostgresProjectorD3OrderAcceptedTest {
                 new com.balh.oms.settlement.SettlementDateCalculator(
                         com.balh.oms.settlement.SettlementDateCalculator.DEFAULT_CYCLE_FALLBACK),
                 org.mockito.Mockito.mock(com.balh.oms.settlement.PredictionMarketResolutionService.class));
+        projectorWithRealCodec.setCurrentRecordingIdForTesting(13L);
 
         OrderAdmittedEvent ev = new OrderAdmittedEvent(
                 UUID.randomUUID(),
@@ -250,6 +258,8 @@ class OmsPostgresProjectorD3OrderAcceptedTest {
                 "AAPL",
                 /* ledgerBalanceIdOrNull = */ null);
         when(ordersRepository.insertFromAdmittedEvent(ev)).thenReturn(true);
+        when(ordersRepository.orderFromAdmittedEvent(ev))
+                .thenReturn(org.mockito.Mockito.mock(com.balh.oms.domain.Order.class));
 
         projectorWithRealCodec.applyAdmittedEvent(ev, FRAGMENT_POSITION);
 

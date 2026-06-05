@@ -1384,7 +1384,10 @@ public class OmsVenueEgressService {
         private final EgressCompletionTracker tracker = new EgressCompletionTracker();
         private final java.util.concurrent.Executor erSubmitExecutor;
         private final ExecutorService ownedErSubmitExecutor;
-        /** Serialises cursor persistence between the replay thread and ER-submit completions. */
+        /** Persists the contiguous cursor off the ER-offer pool so JDBC does not starve offers. */
+        private final java.util.concurrent.Executor cursorDrainExecutor;
+        private final ExecutorService ownedCursorDrainExecutor;
+        /** Serialises cursor persistence between the replay thread and cursor-drain completions. */
         private final Object contiguousDrainLock = new Object();
 
         EgressRoutePipeline(int maxInFlight) {
@@ -1403,6 +1406,15 @@ public class OmsVenueEgressService {
                             });
             this.erSubmitExecutor = pool;
             this.ownedErSubmitExecutor = pool;
+            ExecutorService cursorPool =
+                    Executors.newSingleThreadExecutor(
+                            r -> {
+                                Thread t = new Thread(r, "oms-venue-egress-cursor-drain");
+                                t.setDaemon(true);
+                                return t;
+                            });
+            this.cursorDrainExecutor = cursorPool;
+            this.ownedCursorDrainExecutor = cursorPool;
         }
 
         /** Test seam: inject a (typically caller-runs) executor for deterministic ER completion. */
@@ -1412,6 +1424,8 @@ public class OmsVenueEgressService {
             this.permits = new Semaphore(maxInFlight);
             this.erSubmitExecutor = erSubmitExecutor;
             this.ownedErSubmitExecutor = null;
+            this.cursorDrainExecutor = erSubmitExecutor;
+            this.ownedCursorDrainExecutor = null;
         }
 
         /** Bounds total pipeline depth when venue permits are released before ER submit completes. */
@@ -1487,12 +1501,18 @@ public class OmsVenueEgressService {
                                         completeRoute(ev, erOpt, err);
                                     } finally {
                                         tracker.complete(newPosition);
-                                        // Advance the persisted cursor promptly so VenueAdmissionGate
-                                        // does not confuse ER-submit backlog with a wedged egress.
-                                        drainContiguous();
+                                        // JDBC cursor persistence runs on a dedicated thread so ER-offer
+                                        // pool workers return immediately (observed on pop: pool threads
+                                        // blocked in advanceWithRecording inflated admit_to_fix_nos).
+                                        scheduleDrainContiguous();
                                     }
                                 });
                     });
+        }
+
+        /** Queues a contiguous-prefix cursor flush without blocking the ER-offer pool on Postgres. */
+        private void scheduleDrainContiguous() {
+            cursorDrainExecutor.execute(this::drainContiguous);
         }
 
         /** Runs on the completion executor — applies the venue ack to the OMS cluster. */
@@ -1593,6 +1613,9 @@ public class OmsVenueEgressService {
         void shutdown() {
             if (ownedErSubmitExecutor != null) {
                 ownedErSubmitExecutor.shutdownNow();
+            }
+            if (ownedCursorDrainExecutor != null) {
+                ownedCursorDrainExecutor.shutdownNow();
             }
         }
     }

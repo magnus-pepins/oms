@@ -2,6 +2,8 @@ package com.balh.oms.projector;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -9,6 +11,7 @@ import com.balh.oms.cluster.AcceptOrderCommand;
 import com.balh.oms.cluster.OmsClusterWireFormat;
 import com.balh.oms.cluster.OrderAdmittedEvent;
 import com.balh.oms.config.OmsConfig;
+import com.balh.oms.domain.Order;
 import com.balh.oms.events.DomainEventEnvelopeCodec;
 import com.balh.oms.marketdata.MarketdataPlatformHttpClient;
 import com.balh.oms.persistence.DomainEventOutboxRepository;
@@ -102,12 +105,15 @@ class OmsPostgresProjectorAdmitTimerTest {
     @Test
     void applyAdmittedEvent_recordsAdmitToProjectorTimer() {
         OrderAdmittedEvent ev = sampleAdmitted(AcceptOrderCommand.SIDE_BUY, AcceptOrderCommand.TIF_GTC);
+        Order projected = org.mockito.Mockito.mock(Order.class);
         when(ordersRepository.insertFromAdmittedEvent(ev)).thenReturn(true);
+        when(ordersRepository.orderFromAdmittedEvent(ev)).thenReturn(projected);
 
         projector.applyAdmittedEvent(ev, FRAGMENT_POSITION);
 
         verify(ordersRepository).insertFromAdmittedEvent(ev);
-        verify(controlAdmission).persistAdmission(any());
+        verify(ordersRepository).orderFromAdmittedEvent(ev);
+        verify(controlAdmission).persistAdmission(any(), eq(projected));
         verify(cursorRepository).advanceWithRecording(
                 OmsPostgresProjector.PROJECTOR_ID,
                 OmsClusterWireFormat.EVENTS_STREAM_ID,
@@ -147,6 +153,7 @@ class OmsPostgresProjectorAdmitTimerTest {
                 "AAPL",
                 /* ledgerBalanceIdOrNull = */ null);
         when(ordersRepository.insertFromAdmittedEvent(ev)).thenReturn(true);
+        when(ordersRepository.orderFromAdmittedEvent(ev)).thenReturn(org.mockito.Mockito.mock(Order.class));
 
         projector.applyAdmittedEvent(ev, FRAGMENT_POSITION);
 
@@ -161,6 +168,18 @@ class OmsPostgresProjectorAdmitTimerTest {
         assertThat(timer.totalTime(java.util.concurrent.TimeUnit.MILLISECONDS))
                 .as("Math.max(0, ...) clamp keeps NTP-slew samples at 0 ms")
                 .isEqualTo(0.0);
+    }
+
+    @Test
+    void replay_insertReturnsFalse_skipsControlAdmission() {
+        OrderAdmittedEvent ev = sampleAdmitted(AcceptOrderCommand.SIDE_BUY, AcceptOrderCommand.TIF_DAY);
+        when(ordersRepository.insertFromAdmittedEvent(ev)).thenReturn(false);
+
+        projector.applyAdmittedEvent(ev, FRAGMENT_POSITION);
+
+        verify(controlAdmission, never()).persistAdmission(any());
+        verify(controlAdmission, never()).persistAdmission(any(), any());
+        verify(ordersRepository, never()).orderFromAdmittedEvent(any());
     }
 
     @Test

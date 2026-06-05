@@ -41,6 +41,9 @@ final class EgressCompletionTracker {
     /** Registered-but-not-yet-flushed admit positions, FIFO in strictly-increasing order. */
     private final Deque<Long> pending = new ArrayDeque<>();
 
+    /** Membership view of {@link #pending} for O(1) {@link #complete(long)} under load. */
+    private final Set<Long> pendingMembership = new HashSet<>();
+
     /** Cursor-only checkpoints (no venue route) waiting for prior admits to flush. */
     private final Deque<Long> cursorOnlyPending = new ArrayDeque<>();
 
@@ -52,6 +55,7 @@ final class EgressCompletionTracker {
     synchronized void register(long position) {
         requireIncreasing(position);
         pending.addLast(position);
+        pendingMembership.add(position);
     }
 
     /**
@@ -65,7 +69,7 @@ final class EgressCompletionTracker {
 
     synchronized void complete(long position) {
         // Ignore completions for positions we never registered (cannot happen by construction).
-        if (pending.contains(position)) {
+        if (pendingMembership.remove(position)) {
             completed.add(position);
         }
     }
@@ -83,6 +87,7 @@ final class EgressCompletionTracker {
             Long head = pending.peekFirst();
             if (head != null && completed.remove(head)) {
                 pending.pollFirst();
+                pendingMembership.remove(head);
                 highest = head;
                 advanced = true;
                 progress = true;

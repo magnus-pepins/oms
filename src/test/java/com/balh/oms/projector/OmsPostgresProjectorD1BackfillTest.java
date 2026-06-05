@@ -107,6 +107,9 @@ class OmsPostgresProjectorD1BackfillTest {
         // drive applyAdmittedEvent directly. Seed the recording id so the apply path's cursor
         // write does not fail loud on -1.
         projector.setCurrentRecordingIdForTesting(13L);
+        // D-1 tests target ledger_inflight_outbox only; treat admits as replay so the fresh-insert
+        // branch (OrderAccepted envelope + control admission) stays out of scope.
+        when(ordersRepository.insertFromAdmittedEvent(any())).thenReturn(false);
     }
 
     @Test
@@ -241,7 +244,7 @@ class OmsPostgresProjectorD1BackfillTest {
                 /* version = */ 0,
                 side,
                 AcceptOrderCommand.TIF_DAY,
-                "acct",
+                "00000000-0000-4000-8000-00000000d1a1",
                 "idem-" + UUID.randomUUID(),
                 "hash",
                 "AAPL",

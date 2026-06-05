@@ -127,13 +127,20 @@ public class OmsClusterIngressClient {
     };
 
     /**
-     * Max time the egress poller thread spends trying to acquire {@link #clientLock} per pass
-     * before skipping that tick. Bounded so a back-pressured submit can't choke the poller
-     * indefinitely. Slice 4n: lock holds are now &lt;~10µs in steady state because no thread
-     * waits for an egress reply under the lock anymore, so this value is effectively only a
-     * safety upper bound.
+     * Safety cap on {@link #pollEgressDrain(AeronCluster)} rounds per lock hold so a pathological
+     * egress flood cannot spin forever under one {@link #clientLock} acquisition.
      */
-    private static final long POLLER_LOCK_TRY_NANOS = 1_000_000L;
+    private static final int EGRESS_DRAIN_CAP = 256;
+
+    /**
+     * Per submit-thread encode scratch for {@link #submitAcceptOrder}. {@link ExpandableArrayBuffer}
+     * is not thread-safe; one buffer per calling thread avoids a per-request allocation on the
+     * burst hot path (Pop! 200 RPS showed commit_round_trip tail mass above 10 ms buckets from
+     * combined poller skip + young-gen churn).
+     */
+    private static final ThreadLocal<ExpandableArrayBuffer> OFFER_BUFFER =
+            ThreadLocal.withInitial(
+                    () -> new ExpandableArrayBuffer(OmsClusterWireFormat.MAX_COMMAND_BYTES));
 
     /** {@link Thread#join(long)} budget when stopping the egress poller thread on close. */
     private static final long POLLER_JOIN_MS = 2_000L;
@@ -155,7 +162,8 @@ public class OmsClusterIngressClient {
     private final ConcurrentHashMap<Long, CompletableFuture<AdmissionResult>> pending =
             new ConcurrentHashMap<>();
 
-    private final ReentrantLock clientLock = new ReentrantLock();
+    /** Fair queue so the egress poller gets regular turns under burst offer contention. */
+    private final ReentrantLock clientLock = new ReentrantLock(true);
 
     private final EgressListener egressListener = new EgressListener() {
         @Override
@@ -524,7 +532,7 @@ public class OmsClusterIngressClient {
         Objects.requireNonNull(cmd, "cmd");
         Objects.requireNonNull(timeout, "timeout");
 
-        ExpandableArrayBuffer buffer = new ExpandableArrayBuffer(OmsClusterWireFormat.MAX_COMMAND_BYTES);
+        ExpandableArrayBuffer buffer = OFFER_BUFFER.get();
         int written = cmd.encode(buffer, 0);
 
         long deadlineNanos = System.nanoTime() + timeout.toNanos();
@@ -693,7 +701,7 @@ public class OmsClusterIngressClient {
             return submitAcceptOrderViaBatcher(cmd, timeout);
         }
 
-        ExpandableArrayBuffer buffer = new ExpandableArrayBuffer(OmsClusterWireFormat.MAX_COMMAND_BYTES);
+        ExpandableArrayBuffer buffer = OFFER_BUFFER.get();
         int written = cmd.encode(buffer, 0);
 
         long deadlineNanos = System.nanoTime() + timeout.toNanos();
@@ -991,6 +999,7 @@ public class OmsClusterIngressClient {
                 clientLock.unlock();
             }
             if (offerResult >= 0L) {
+                signalEgressPoller();
                 return;
             }
             if (System.nanoTime() > earliestDeadline) {
@@ -1031,6 +1040,7 @@ public class OmsClusterIngressClient {
                 clientLock.unlock();
             }
             if (offerResult >= 0L) {
+                signalEgressPoller();
                 return;
             }
             if (System.nanoTime() > deadlineNanos) {
@@ -1039,6 +1049,33 @@ public class OmsClusterIngressClient {
             }
             parkOrThrow(config.getOfferBackpressureParkNanos());
         }
+    }
+
+    /** Wake the egress poller so a freshly offered command gets demuxed without waiting a full park. */
+    void signalEgressPollerForTest() {
+        signalEgressPoller();
+    }
+
+    private void signalEgressPoller() {
+        Thread poller = egressPollerThread;
+        if (poller != null) {
+            LockSupport.unpark(poller);
+        }
+    }
+
+    /**
+     * Drain all currently queued egress fragments in one lock hold. Returns the number of
+     * {@link AeronCluster#pollEgress()} calls that returned a positive fragment count.
+     */
+    int pollEgressDrain(AeronCluster active) {
+        int rounds = 0;
+        while (rounds < EGRESS_DRAIN_CAP) {
+            if (active.pollEgress() <= 0) {
+                break;
+            }
+            rounds++;
+        }
+        return rounds;
     }
 
     /**
@@ -1073,13 +1110,14 @@ public class OmsClusterIngressClient {
 
     /**
      * Slice 4n daemon loop: every {@link OmsConfig.Cluster.Client#getEgressPollParkNanos()} ns we
-     * acquire {@link #clientLock} briefly and call {@link AeronCluster#pollEgress()} so cluster
-     * replies for in-flight submits ({@link #pending}) get demuxed and complete their futures
-     * with bounded latency. {@link AeronCluster#sendKeepAlive()} is called inside the same lock
-     * acquisition every {@link OmsConfig.Cluster.Client#getHeartbeatIntervalMs()} ms so the
-     * cluster session survives idle periods. {@link ReentrantLock#tryLock(long, TimeUnit) tryLock}
-     * keeps us non-blocking against bursty offer contention; on contention we skip a tick and
-     * retry on the next park.
+     * acquire {@link #clientLock} and {@linkplain #pollEgressDrain(AeronCluster) drain} all
+     * queued egress so cluster replies for in-flight submits ({@link #pending}) complete their
+     * futures promptly under burst offer contention. {@link AeronCluster#sendKeepAlive()} is
+     * called inside the same lock acquisition every
+     * {@link OmsConfig.Cluster.Client#getHeartbeatIntervalMs()} ms so the cluster session
+     * survives idle periods. Submit threads {@linkplain #signalEgressPoller() unpark} this
+     * thread after each successful offer so demux latency is not gated on
+     * {@link OmsConfig.Cluster.Client#getEgressPollParkNanos()} alone.
      */
     private void egressPollerLoop() {
         long parkNanos = config.getEgressPollParkNanos();
@@ -1087,24 +1125,23 @@ public class OmsClusterIngressClient {
         long nextHeartbeatDeadlineNanos = System.nanoTime() + heartbeatIntervalNanos;
         while (!closing) {
             try {
-                if (clientLock.tryLock(POLLER_LOCK_TRY_NANOS, TimeUnit.NANOSECONDS)) {
-                    try {
-                        AeronCluster active = client;
-                        if (active != null) {
-                            try {
-                                active.pollEgress();
-                                if (System.nanoTime() >= nextHeartbeatDeadlineNanos) {
-                                    active.sendKeepAlive();
-                                    nextHeartbeatDeadlineNanos =
-                                            System.nanoTime() + heartbeatIntervalNanos;
-                                }
-                            } catch (RuntimeException e) {
-                                log.warn("OMS cluster client egress poll/keep-alive failed", e);
+                clientLock.lockInterruptibly();
+                try {
+                    AeronCluster active = client;
+                    if (active != null) {
+                        try {
+                            pollEgressDrain(active);
+                            if (System.nanoTime() >= nextHeartbeatDeadlineNanos) {
+                                active.sendKeepAlive();
+                                nextHeartbeatDeadlineNanos =
+                                        System.nanoTime() + heartbeatIntervalNanos;
                             }
+                        } catch (RuntimeException e) {
+                            log.warn("OMS cluster client egress poll/keep-alive failed", e);
                         }
-                    } finally {
-                        clientLock.unlock();
                     }
+                } finally {
+                    clientLock.unlock();
                 }
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();

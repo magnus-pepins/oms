@@ -1038,9 +1038,12 @@ public class OmsPostgresProjector {
                 throw new IllegalStateException(
                         "OrderAccepted envelope serialisation failed for orderId=" + ev.orderId(), e);
             }
+            // Control admission (risk + control_decisions PASS) runs only on fresh insert.
+            // Replay idempotency mirrors the OrderAccepted envelope gate above: the original
+            // PASS row stands; skipping avoids a redundant findById + control_decisions INSERT.
+            controlAdmission.persistAdmission(
+                    toPendingControlEvent(ev), ordersRepository.orderFromAdmittedEvent(ev));
         }
-        PendingControlEvent pending = toPendingControlEvent(ev);
-        controlAdmission.persistAdmission(pending);
         // Phase 4 Tier 2.5 phase D-9: project the BUY-async ledger_inflight_outbox row from
         // the cluster's authoritative OrderAdmittedEvent. D-1 introduced this as a crash-window
         // backfill (ingress wrote the row in the happy path, projector filled the gap if the

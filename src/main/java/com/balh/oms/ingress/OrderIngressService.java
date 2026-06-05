@@ -258,9 +258,12 @@ public class OrderIngressService {
 
             UUID id = UUID.randomUUID();
             Instant now = Instant.now();
+            long clientTimestampNanos = toClientTimestampNanos(now);
             int shardId = ShardKey.shardFor(req.accountId(), config.getShard().getCount());
             String accountIdHash = piiHash.hash(req.accountId());
             String ledgerBalanceId = normalizeLedgerBalanceId(req.ledgerBalanceId());
+            long quantityScaled = scaleQuantity(req.quantity());
+            long limitPriceScaled = scaleLimitPrice(req.limitPrice());
             Order order = buildOrder(id, req, shardId, accountIdHash, ledgerBalanceId, now);
 
             // Buying-power hold is mandatory before cluster admit: a failed hold must reject at
@@ -273,7 +276,8 @@ public class OrderIngressService {
             // Passing the already-computed shardId (rather than re-deriving from accountId) keeps
             // the order's recorded shard and its admitting cluster identical by construction.
             OmsClusterIngressClient cluster = clusterShardRouter.forShard(shardId);
-            AdmissionResult ar = submitToClusterOrThrow(cluster, order, accountIdHash, now);
+            AdmissionResult ar = submitToClusterOrThrow(
+                    cluster, order, accountIdHash, clientTimestampNanos, quantityScaled, limitPriceScaled);
             AdmissionResult.Accepted accepted = (AdmissionResult.Accepted) ar;
             boolean created = !accepted.event().duplicate();
             if (accepted.event().duplicate() && !accepted.event().orderId().equals(id)) {
@@ -334,8 +338,14 @@ public class OrderIngressService {
     }
 
     private AdmissionResult submitToClusterOrThrow(
-            OmsClusterIngressClient cluster, Order order, String accountIdHash, Instant now) {
-        AcceptOrderCommand cmd = buildAcceptOrderCommand(cluster, order, accountIdHash, now);
+            OmsClusterIngressClient cluster,
+            Order order,
+            String accountIdHash,
+            long clientTimestampNanos,
+            long quantityScaled,
+            long limitPriceScaled) {
+        AcceptOrderCommand cmd = buildAcceptOrderCommand(
+                cluster, order, accountIdHash, clientTimestampNanos, quantityScaled, limitPriceScaled);
         Duration timeout = Duration.ofMillis(config.getCluster().getClient().getSubmitTimeoutMs());
         AdmissionResult result;
         try {
@@ -370,31 +380,12 @@ public class OrderIngressService {
     }
 
     private AcceptOrderCommand buildAcceptOrderCommand(
-            OmsClusterIngressClient cluster, Order order, String accountIdHash, Instant now) {
-        long quantityScaled;
-        try {
-            quantityScaled = order.quantity().movePointRight(9).longValueExact();
-        } catch (ArithmeticException e) {
-            throw new ClusterAdmissionException(
-                    HttpStatus.BAD_REQUEST,
-                    "quantity_unrepresentable",
-                    "quantity " + order.quantity()
-                            + " cannot be represented at AcceptOrderCommand quantity scale (1e9)",
-                    e);
-        }
-        long limitPriceScaled = 0L;
-        if (order.limitPrice() != null) {
-            try {
-                limitPriceScaled = order.limitPrice().movePointRight(6).longValueExact();
-            } catch (ArithmeticException e) {
-                throw new ClusterAdmissionException(
-                        HttpStatus.BAD_REQUEST,
-                        "limit_price_unrepresentable",
-                        "limitPrice " + order.limitPrice()
-                                + " cannot be represented at AcceptOrderCommand price scale (1e6)",
-                        e);
-            }
-        }
+            OmsClusterIngressClient cluster,
+            Order order,
+            String accountIdHash,
+            long clientTimestampNanos,
+            long quantityScaled,
+            long limitPriceScaled) {
         byte sideByte = order.side() == Side.BUY ? AcceptOrderCommand.SIDE_BUY : AcceptOrderCommand.SIDE_SELL;
         byte tifByte = tifByteFromString(order.timeInForce());
         byte ordTypeByte;
@@ -411,7 +402,7 @@ public class OrderIngressService {
         return new AcceptOrderCommand(
                 correlationId,
                 order.id(),
-                Math.multiplyExact(now.getEpochSecond(), 1_000_000_000L) + now.getNano(),
+                clientTimestampNanos,
                 quantityScaled,
                 limitPriceScaled,
                 order.shardId(),
@@ -423,6 +414,39 @@ public class OrderIngressService {
                 accountIdHash,
                 order.instrumentSymbol(),
                 order.ledgerBalanceId());
+    }
+
+    private static long toClientTimestampNanos(Instant now) {
+        return Math.multiplyExact(now.getEpochSecond(), 1_000_000_000L) + now.getNano();
+    }
+
+    private static long scaleQuantity(BigDecimal quantity) {
+        try {
+            return quantity.movePointRight(9).longValueExact();
+        } catch (ArithmeticException e) {
+            throw new ClusterAdmissionException(
+                    HttpStatus.BAD_REQUEST,
+                    "quantity_unrepresentable",
+                    "quantity " + quantity
+                            + " cannot be represented at AcceptOrderCommand quantity scale (1e9)",
+                    e);
+        }
+    }
+
+    private static long scaleLimitPrice(BigDecimal limitPrice) {
+        if (limitPrice == null) {
+            return 0L;
+        }
+        try {
+            return limitPrice.movePointRight(6).longValueExact();
+        } catch (ArithmeticException e) {
+            throw new ClusterAdmissionException(
+                    HttpStatus.BAD_REQUEST,
+                    "limit_price_unrepresentable",
+                    "limitPrice " + limitPrice
+                            + " cannot be represented at AcceptOrderCommand price scale (1e6)",
+                    e);
+        }
     }
 
     private static byte tifByteFromString(String tif) {

@@ -18,6 +18,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import java.time.Instant;
+import java.util.Objects;
 import java.util.UUID;
 
 /**
@@ -89,10 +90,19 @@ public class OrderControlAdmission {
      * tail path, without route dispatch).
      */
     public AdmissionResult persistAdmission(PendingControlEvent event) {
-        return persistAdmissionBody(event);
+        return persistAdmissionBody(event, null);
     }
 
-    private AdmissionResult persistAdmissionBody(PendingControlEvent event) {
+    /**
+     * Projector hot path: {@code admittedOrder} is the in-memory row just inserted by
+     * {@link OrdersRepository#insertFromAdmittedEvent} in the same transaction, avoiding a
+     * redundant {@link OrdersRepository#findById(java.util.UUID)} round-trip.
+     */
+    public AdmissionResult persistAdmission(PendingControlEvent event, Order admittedOrder) {
+        return persistAdmissionBody(event, Objects.requireNonNull(admittedOrder, "admittedOrder"));
+    }
+
+    private AdmissionResult persistAdmissionBody(PendingControlEvent event, Order preloadedOrder) {
         if (stale.isStale(event.orderTimestamp())) {
             boolean updated = orders.updateWithCas(
                     event.orderId(),
@@ -116,12 +126,13 @@ public class OrderControlAdmission {
             return updated ? AdmissionResult.STALE_REJECTED : AdmissionResult.SKIPPED_VERSION_MISMATCH;
         }
 
-        var row = orders.findById(event.orderId());
-        if (row.isEmpty()) {
+        Order order = preloadedOrder != null
+                ? preloadedOrder
+                : orders.findById(event.orderId()).orElse(null);
+        if (order == null) {
             log.warn("Control event references unknown orderId={}", event.orderId());
             return AdmissionResult.UNKNOWN_ORDER;
         }
-        Order order = row.get();
 
         var riskReject = controlRisk.evaluate(order);
         if (riskReject.isPresent()) {

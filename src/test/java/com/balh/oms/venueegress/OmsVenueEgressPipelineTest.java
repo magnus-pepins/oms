@@ -135,6 +135,30 @@ class OmsVenueEgressPipelineTest {
     }
 
     @Test
+    void cursorOnlyBetweenAdmits_doesNotBlockLaterDispatch() throws Exception {
+        OrderAdmittedEvent ev1 = admit("PREDMKT-TEST-1");
+        OrderAdmittedEvent ev2 = admit("PREDMKT-TEST-1");
+        CompletableFuture<Optional<ExecutionReport>> f1 = new CompletableFuture<>();
+        CompletableFuture<Optional<ExecutionReport>> f2 = new CompletableFuture<>();
+        when(routeClient.routeAdmittedOrderAsync(ev1)).thenReturn(f1);
+        when(routeClient.routeAdmittedOrderAsync(ev2)).thenReturn(f2);
+
+        service.pipelineDispatchAdmitForTesting(ev1, 10L);
+        service.pipelineRegisterCursorOnlyForTesting(15L);
+        service.pipelineDispatchAdmitForTesting(ev2, 20L);
+
+        verify(routeClient, times(2)).routeAdmittedOrderAsync(any());
+        assertThat(service.pipelineIsDrainedForTesting()).isFalse();
+
+        f1.complete(Optional.of(er(ev1)));
+        f2.complete(Optional.of(er(ev2)));
+        service.pipelineDrainContiguousForTesting();
+
+        verify(cursorRepository, times(1)).advanceWithRecording(any(), anyInt(), eq(3L), eq(20L));
+        assertThat(service.pipelineIsDrainedForTesting()).isTrue();
+    }
+
+    @Test
     void quiesce_blocksUntilInFlightCompletes_thenAdvances() throws Exception {
         service.markRunningForTesting();
         OrderAdmittedEvent ev1 = admit("PREDMKT-TEST-1");

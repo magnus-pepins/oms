@@ -19,12 +19,17 @@ import java.util.Set;
  * position it is safe to persist the cursor to (everything after {@code P} is replayed on crash;
  * the venue dedupes the redelivery, exactly as the existing {@code cursorFlushEvery} window does).
  *
+ * <p>Cursor-only fragments ({@link #registerCursorOnly(long)}, e.g. {@code ExecutionApplied}
+ * events the egress does not act on) are queued in log order and flushed once every in-flight admit
+ * <em>before</em> them has completed. Unlike the pre-2026-06-05 quiesce path, registering a
+ * cursor-only checkpoint does not block the replay thread on unrelated later admits.
+ *
  * <h2>Threading</h2>
  *
- * {@link #register(long)} and {@link #pollContiguous()} are called only by the replay thread;
- * {@link #complete(long)} is called by venue-ack handler threads. All three synchronise on
- * {@code this}; per-fragment contention is negligible. {@link #inFlight()} / {@link #isDrained()}
- * support the quiesce-at-boundary protocol.
+ * {@link #register(long)}, {@link #registerCursorOnly(long)}, and {@link #pollContiguous()} are
+ * called only by the replay thread; {@link #complete(long)} is called by venue-ack handler threads.
+ * All four synchronise on {@code this}; per-fragment contention is negligible. {@link #inFlight()} /
+ * {@link #isDrained()} support the quiesce-at-boundary protocol.
  *
  * <p>By construction {@link #register} for a position always precedes {@link #complete} for the
  * same position (a fragment is registered before it is written to the venue stream, and completed
@@ -33,22 +38,29 @@ import java.util.Set;
  */
 final class EgressCompletionTracker {
 
-    /** Registered-but-not-yet-flushed positions, FIFO in strictly-increasing order. */
+    /** Registered-but-not-yet-flushed admit positions, FIFO in strictly-increasing order. */
     private final Deque<Long> pending = new ArrayDeque<>();
 
-    /** Completed positions still waiting for their predecessors before they can be flushed. */
+    /** Cursor-only checkpoints (no venue route) waiting for prior admits to flush. */
+    private final Deque<Long> cursorOnlyPending = new ArrayDeque<>();
+
+    /** Completed admit positions still waiting for their predecessors before they can be flushed. */
     private final Set<Long> completed = new HashSet<>();
 
     private long lastRegistered = Long.MIN_VALUE;
 
     synchronized void register(long position) {
-        if (position <= lastRegistered) {
-            throw new IllegalArgumentException(
-                    "egress positions must be registered in strictly-increasing order; got "
-                            + position + " after " + lastRegistered);
-        }
-        lastRegistered = position;
+        requireIncreasing(position);
         pending.addLast(position);
+    }
+
+    /**
+     * Records a cursor-only fragment (e.g. {@code ExecutionApplied}) in log order. The replay thread
+     * may continue dispatching later admits without blocking here.
+     */
+    synchronized void registerCursorOnly(long position) {
+        requireIncreasing(position);
+        cursorOnlyPending.addLast(position);
     }
 
     synchronized void complete(long position) {
@@ -59,29 +71,59 @@ final class EgressCompletionTracker {
     }
 
     /**
-     * Pops every leading position whose ack has arrived and returns the highest one popped, or
-     * empty if the head of the queue is still in flight. The returned value is the position the
-     * caller should advance the persisted cursor to.
+     * Pops every leading position whose ack has arrived (and any cursor-only checkpoints that are
+     * unblocked) and returns the highest one popped, or empty if the head of the queue is still in
+     * flight. The returned value is the position the caller should advance the persisted cursor to.
      */
     synchronized OptionalLong pollContiguous() {
         long highest = Long.MIN_VALUE;
         boolean advanced = false;
-        Long head;
-        while ((head = pending.peekFirst()) != null && completed.remove(head)) {
-            pending.pollFirst();
-            highest = head;
-            advanced = true;
+        while (true) {
+            boolean progress = false;
+            Long head = pending.peekFirst();
+            if (head != null && completed.remove(head)) {
+                pending.pollFirst();
+                highest = head;
+                advanced = true;
+                progress = true;
+            }
+            while (!cursorOnlyPending.isEmpty()) {
+                long checkpoint = cursorOnlyPending.peekFirst();
+                Long nextAdmit = pending.peekFirst();
+                if (nextAdmit != null && nextAdmit < checkpoint) {
+                    break;
+                }
+                cursorOnlyPending.pollFirst();
+                highest = checkpoint;
+                advanced = true;
+                progress = true;
+            }
+            if (!progress) {
+                break;
+            }
         }
         return advanced ? OptionalLong.of(highest) : OptionalLong.empty();
     }
 
-    /** Registered fragments not yet flushed via {@link #pollContiguous()} (in flight or complete-but-blocked). */
+    /** Registered admits not yet flushed via {@link #pollContiguous()} (in flight or complete-but-blocked). */
     synchronized int inFlight() {
         return pending.size();
     }
 
-    /** {@code true} when nothing is registered-but-unflushed — used as the quiesce gate at boundaries/shutdown. */
+    /**
+     * {@code true} when nothing is registered-but-unflushed — used as the quiesce gate at
+     * boundaries/shutdown.
+     */
     synchronized boolean isDrained() {
-        return pending.isEmpty();
+        return pending.isEmpty() && cursorOnlyPending.isEmpty();
+    }
+
+    private void requireIncreasing(long position) {
+        if (position <= lastRegistered) {
+            throw new IllegalArgumentException(
+                    "egress positions must be registered in strictly-increasing order; got "
+                            + position + " after " + lastRegistered);
+        }
+        lastRegistered = position;
     }
 }

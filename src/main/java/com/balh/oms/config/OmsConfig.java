@@ -1088,8 +1088,15 @@ public class OmsConfig {
          * gated. See {@link com.balh.oms.ingress.VenueAdmissionGate}.
          */
         public static class AdmissionGate {
-            /** A handful of cluster events (~100-300 bytes each); steady-state egress lag is ~0. */
+            /** Steady-state / serial egress ({@code venue-route-max-in-flight=1}) lag budget. */
             private static final long DEFAULT_MAX_LAG_BYTES = 4_096L;
+
+            /**
+             * Per in-flight pipelined admit, the projector can lead the egress cursor by roughly one
+             * {@link com.balh.oms.cluster.OrderAdmittedEvent} plus the matching
+             * {@link com.balh.oms.cluster.ExecutionAppliedEvent} before the egress ER offer lands.
+             */
+            private static final int BYTES_PER_PIPELINED_IN_FLIGHT_ORDER = 512;
 
             private boolean enabled = true;
             private long maxLagBytes = DEFAULT_MAX_LAG_BYTES;
@@ -1100,6 +1107,26 @@ public class OmsConfig {
             public long getMaxLagBytes() { return maxLagBytes; }
             public void setMaxLagBytes(long maxLagBytes) {
                 this.maxLagBytes = maxLagBytes > 0 ? maxLagBytes : DEFAULT_MAX_LAG_BYTES;
+            }
+
+            public int getBytesPerPipelinedInFlightOrder() {
+                return BYTES_PER_PIPELINED_IN_FLIGHT_ORDER;
+            }
+
+            /**
+             * Lag budget for {@link com.balh.oms.ingress.VenueAdmissionGate}: serial path uses
+             * {@link #maxLagBytes}; pipelined egress raises the floor to
+             * {@code venue-route-max-in-flight × bytes-per-order} so healthy in-flight windows do not
+             * trip the gate while the egress cursor still waits for ER offers.
+             */
+            public long effectiveMaxLagBytes(int venueRouteMaxInFlight) {
+                long configured = getMaxLagBytes();
+                if (venueRouteMaxInFlight <= 1) {
+                    return configured;
+                }
+                long pipelinedFloor =
+                        (long) venueRouteMaxInFlight * BYTES_PER_PIPELINED_IN_FLIGHT_ORDER;
+                return Math.max(configured, pipelinedFloor);
             }
         }
     }
@@ -3307,11 +3334,11 @@ public class OmsConfig {
         public static class VenueEgress {
 
             private static final long DEFAULT_POLL_PARK_NANOS = 1_000_000L;
-            private static final int DEFAULT_FRAGMENT_LIMIT = 64;
+            private static final int DEFAULT_FRAGMENT_LIMIT = 256;
             private static final long DEFAULT_RECORDING_LOOKUP_PARK_MS = 100L;
             private static final int DEFAULT_REPLAY_STREAM_ID = 4324;
             private static final int DEFAULT_CURSOR_FLUSH_EVERY = 1;
-            private static final int DEFAULT_VENUE_ROUTE_MAX_IN_FLIGHT = 1;
+            private static final int DEFAULT_VENUE_ROUTE_MAX_IN_FLIGHT = 512;
 
             private boolean enabled = false;
             private String aeronDirectory = "";

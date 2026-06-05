@@ -94,4 +94,49 @@ class EgressCompletionTrackerTest {
         assertThat(new EgressCompletionTracker().isDrained()).isTrue();
         assertThat(new EgressCompletionTracker().pollContiguous()).isEmpty();
     }
+
+    @Test
+    void cursorOnlyCheckpoint_waitsForPriorAdmits_notLaterOnes() {
+        EgressCompletionTracker t = new EgressCompletionTracker();
+        t.register(10L);
+        t.register(20L);
+        t.registerCursorOnly(25L);
+        t.register(30L);
+
+        t.complete(10L);
+        t.complete(20L);
+        // One poll flushes the contiguous admits and the unblocked cursor-only checkpoint.
+        assertThat(t.pollContiguous()).isEqualTo(OptionalLong.of(25L));
+        assertThat(t.inFlight()).isEqualTo(1);
+        assertThat(t.isDrained()).isFalse();
+
+        t.complete(30L);
+        assertThat(t.pollContiguous()).isEqualTo(OptionalLong.of(30L));
+        assertThat(t.isDrained()).isTrue();
+    }
+
+    @Test
+    void cursorOnlyCheckpoint_interleavedWithAdmits_flushesInLogOrder() {
+        EgressCompletionTracker t = new EgressCompletionTracker();
+        t.register(10L);
+        t.register(20L);
+        t.registerCursorOnly(25L);
+        t.register(30L);
+
+        t.complete(10L);
+        t.complete(20L);
+        t.complete(30L);
+
+        assertThat(t.pollContiguous()).isEqualTo(OptionalLong.of(30L));
+        assertThat(t.isDrained()).isTrue();
+    }
+
+    @Test
+    void registerCursorOnly_mustBeStrictlyIncreasing() {
+        EgressCompletionTracker t = new EgressCompletionTracker();
+        t.register(10L);
+        t.registerCursorOnly(20L);
+        assertThatThrownBy(() -> t.registerCursorOnly(20L)).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> t.register(15L)).isInstanceOf(IllegalArgumentException.class);
+    }
 }

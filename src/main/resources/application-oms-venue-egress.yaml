@@ -20,6 +20,8 @@ oms:
       archive-control-response-channel: ${OMS_VENUE_EGRESS_ARCHIVE_CONTROL_RESPONSE_CHANNEL:aeron:ipc?term-length=64k}
       replay-channel: ${OMS_VENUE_EGRESS_REPLAY_CHANNEL:aeron:ipc?term-length=64k}
       replay-stream-id: ${OMS_VENUE_EGRESS_REPLAY_STREAM_ID:4324}
+      venue-route-max-in-flight: ${OMS_CLUSTER_VENUE_EGRESS_VENUE_ROUTE_MAX_IN_FLIGHT:512}
+      fragment-limit: ${OMS_CLUSTER_VENUE_EGRESS_FRAGMENT_LIMIT:256}
 server:
   # Default must not collide with oms-fix-ingress (8095/8092 on pop); ecosystem.config.cjs sets 8097/8098.
   port: ${OMS_VENUE_EGRESS_HTTP_PORT:8097}

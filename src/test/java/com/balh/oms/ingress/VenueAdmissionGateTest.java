@@ -108,6 +108,7 @@ class VenueAdmissionGateTest {
         stubPositions(/* projector = */ 20_000L, /* egress = */ 6_432L);
         stubRecordings(387L, 387L);
         config.getVenue().getAdmissionGate().setMaxLagBytes(4096L);
+        config.getCluster().getVenueEgress().setVenueRouteMaxInFlight(1);
 
         assertThatThrownBy(() -> gate.assertVenueAdmissible(VENUE_SYMBOL))
                 .isInstanceOfSatisfying(ClusterAdmissionException.class, e -> {
@@ -123,6 +124,29 @@ class VenueAdmissionGateTest {
         config.getVenue().getAdmissionGate().setMaxLagBytes(4096L);
 
         assertThatCode(() -> gate.assertVenueAdmissible(VENUE_SYMBOL)).doesNotThrowAnyException();
+    }
+
+    @Test
+    void pipelinedHealthyLag_withinInFlightBudget_allows() {
+        // With maxInFlight=512 the projector can legitimately lead by ~512 × 512 bytes while ER
+        // offers drain; the serial 4096-byte floor must not trip on that healthy window.
+        config.getCluster().getVenueEgress().setVenueRouteMaxInFlight(512);
+        config.getVenue().getAdmissionGate().setMaxLagBytes(4096L);
+        stubPositions(/* projector = */ 300_000L, /* egress = */ 50_000L);
+        stubRecordings(387L, 387L);
+
+        assertThatCode(() -> gate.assertVenueAdmissible(VENUE_SYMBOL)).doesNotThrowAnyException();
+    }
+
+    @Test
+    void pipelinedEgressStuckBeyondInFlightBudget_trips503() {
+        config.getCluster().getVenueEgress().setVenueRouteMaxInFlight(512);
+        config.getVenue().getAdmissionGate().setMaxLagBytes(4096L);
+        stubPositions(/* projector = */ 400_000L, /* egress = */ 50_000L);
+        stubRecordings(387L, 387L);
+
+        assertThatThrownBy(() -> gate.assertVenueAdmissible(VENUE_SYMBOL))
+                .isInstanceOf(ClusterAdmissionException.class);
     }
 
     @Test

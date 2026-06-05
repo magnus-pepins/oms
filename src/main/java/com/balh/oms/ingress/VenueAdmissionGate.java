@@ -129,7 +129,8 @@ public class VenueAdmissionGate {
         }
 
         long lagBytes = projectorPos.getAsLong() - egressPos.getAsLong();
-        long maxLagBytes = gate.getMaxLagBytes();
+        long maxLagBytes =
+                gate.effectiveMaxLagBytes(config.getCluster().getVenueEgress().getVenueRouteMaxInFlight());
         if (lagBytes > maxLagBytes) {
             trip(
                     instrumentSymbol,

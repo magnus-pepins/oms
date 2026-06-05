@@ -532,29 +532,13 @@ public class OmsClusterIngressClient {
         Timer.Sample sample = Timer.start(meterRegistry);
         Outcome outcome = Outcome.ERROR;
         try {
-            clientLock.lockInterruptibly();
-            try {
-                AeronCluster active = client;
-                if (active == null) {
-                    throw new IllegalStateException("OMS cluster client is not connected");
-                }
-                long offerResult;
-                do {
-                    offerResult = active.offer(buffer, 0, written);
-                    if (offerResult < 0L) {
-                        if (System.nanoTime() > deadlineNanos) {
-                            outcome = Outcome.TIMEOUT;
-                            throw new TimeoutException(
-                                    "cluster offer back-pressure timeout for ApplyExecutionReportCommand orderId="
-                                            + cmd.orderId() + " venueExecRef=" + cmd.venueExecRef());
-                        }
-                        parkOrThrow(config.getOfferBackpressureParkNanos());
-                    }
-                } while (offerResult < 0L);
-                outcome = Outcome.COMMIT;
-            } finally {
-                clientLock.unlock();
-            }
+            // Release the lock between back-pressure parks (same shape as submitAcceptOrder) so
+            // N pipelined venue-route completions do not serialize on one long lock hold.
+            offerWithBackpressure(buffer, written, deadlineNanos, cmd.correlationId());
+            outcome = Outcome.COMMIT;
+        } catch (TimeoutException e) {
+            outcome = Outcome.TIMEOUT;
+            throw e;
         } finally {
             sample.stop(applyExecutionReportTimers.get(outcome));
         }
@@ -569,28 +553,7 @@ public class OmsClusterIngressClient {
         ExpandableArrayBuffer buffer = new ExpandableArrayBuffer(OmsClusterWireFormat.MAX_COMMAND_BYTES);
         int written = cmd.encode(buffer, 0);
         long deadlineNanos = System.nanoTime() + timeout.toNanos();
-
-        clientLock.lockInterruptibly();
-        try {
-            AeronCluster active = client;
-            if (active == null) {
-                throw new IllegalStateException("OMS cluster client is not connected");
-            }
-            long offerResult;
-            do {
-                offerResult = active.offer(buffer, 0, written);
-                if (offerResult < 0L) {
-                    if (System.nanoTime() > deadlineNanos) {
-                        throw new TimeoutException(
-                                "cluster offer back-pressure timeout for ApplyVenueResolutionCommand symbol="
-                                        + cmd.instrumentSymbol());
-                    }
-                    parkOrThrow(config.getOfferBackpressureParkNanos());
-                }
-            } while (offerResult < 0L);
-        } finally {
-            clientLock.unlock();
-        }
+        offerWithBackpressure(buffer, written, deadlineNanos, cmd.correlationId());
     }
 
     /**
@@ -629,29 +592,11 @@ public class OmsClusterIngressClient {
         Timer.Sample sample = Timer.start(meterRegistry);
         Outcome outcome = Outcome.ERROR;
         try {
-            clientLock.lockInterruptibly();
-            try {
-                AeronCluster active = client;
-                if (active == null) {
-                    throw new IllegalStateException("OMS cluster client is not connected");
-                }
-                long offerResult;
-                do {
-                    offerResult = active.offer(buffer, 0, written);
-                    if (offerResult < 0L) {
-                        if (System.nanoTime() > deadlineNanos) {
-                            outcome = Outcome.TIMEOUT;
-                            throw new TimeoutException(
-                                    "cluster offer back-pressure timeout for CancelOrderCommand orderId="
-                                            + cmd.orderId() + " correlationId=" + cmd.correlationId());
-                        }
-                        parkOrThrow(config.getOfferBackpressureParkNanos());
-                    }
-                } while (offerResult < 0L);
-                outcome = Outcome.COMMIT;
-            } finally {
-                clientLock.unlock();
-            }
+            offerWithBackpressure(buffer, written, deadlineNanos, cmd.correlationId());
+            outcome = Outcome.COMMIT;
+        } catch (TimeoutException e) {
+            outcome = Outcome.TIMEOUT;
+            throw e;
         } finally {
             sample.stop(cancelOrderTimers.get(outcome));
         }
@@ -711,29 +656,11 @@ public class OmsClusterIngressClient {
         Timer.Sample sample = Timer.start(meterRegistry);
         Outcome outcome = Outcome.ERROR;
         try {
-            clientLock.lockInterruptibly();
-            try {
-                AeronCluster active = client;
-                if (active == null) {
-                    throw new IllegalStateException("OMS cluster client is not connected");
-                }
-                long offerResult;
-                do {
-                    offerResult = active.offer(buffer, 0, written);
-                    if (offerResult < 0L) {
-                        if (System.nanoTime() > deadlineNanos) {
-                            outcome = Outcome.TIMEOUT;
-                            throw new TimeoutException(
-                                    "cluster offer back-pressure timeout for " + diagnosticContext
-                                            + " correlationId=" + correlationId);
-                        }
-                        parkOrThrow(config.getOfferBackpressureParkNanos());
-                    }
-                } while (offerResult < 0L);
-                outcome = Outcome.COMMIT;
-            } finally {
-                clientLock.unlock();
-            }
+            offerWithBackpressure(buffer, written, deadlineNanos, correlationId);
+            outcome = Outcome.COMMIT;
+        } catch (TimeoutException e) {
+            outcome = Outcome.TIMEOUT;
+            throw e;
         } finally {
             sample.stop(timers.get(outcome));
         }

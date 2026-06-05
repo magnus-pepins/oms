@@ -1375,35 +1375,52 @@ public class OmsVenueEgressService {
         /** Park between non-progress passes while quiescing the in-flight window. */
         private static final long QUIESCE_PARK_NANOS = 50_000L;
 
+        /** Outstanding fragments (venue ack pending or ER submit pending) before we stop dispatching. */
+        private static final int PENDING_FRAGMENT_CAP_MULTIPLIER = 2;
+
+        private final int maxInFlight;
+        private final int maxPendingFragments;
         private final Semaphore permits;
         private final EgressCompletionTracker tracker = new EgressCompletionTracker();
-        private final java.util.concurrent.Executor completionExecutor;
-        private final ExecutorService ownedExecutor;
+        private final java.util.concurrent.Executor erSubmitExecutor;
+        private final ExecutorService ownedErSubmitExecutor;
 
         EgressRoutePipeline(int maxInFlight) {
-            // Sized to the in-flight window so the per-ack OMS-cluster ApplyExecutionReport submits run
-            // concurrently (the OmsClusterIngressClient is pipelined) instead of re-serialising on one
-            // thread. Concurrent completions are safe: submit* is thread-safe and the cursor is advanced
-            // only on the replay thread (drainContiguous / quiesce), never here.
+            this.maxInFlight = maxInFlight;
+            this.maxPendingFragments = maxInFlight * PENDING_FRAGMENT_CAP_MULTIPLIER;
             this.permits = new Semaphore(maxInFlight);
             java.util.concurrent.atomic.AtomicLong seq = new java.util.concurrent.atomic.AtomicLong();
+            int erPoolSize = Math.max(maxInFlight, maxInFlight * 2);
             ExecutorService pool =
                     Executors.newFixedThreadPool(
-                            maxInFlight,
+                            erPoolSize,
                             r -> {
-                                Thread t = new Thread(r, "oms-venue-egress-completion-" + seq.getAndIncrement());
+                                Thread t = new Thread(r, "oms-venue-egress-er-submit-" + seq.getAndIncrement());
                                 t.setDaemon(true);
                                 return t;
                             });
-            this.completionExecutor = pool;
-            this.ownedExecutor = pool;
+            this.erSubmitExecutor = pool;
+            this.ownedErSubmitExecutor = pool;
         }
 
-        /** Test seam: inject a (typically caller-runs) executor for deterministic completion. */
-        EgressRoutePipeline(int maxInFlight, java.util.concurrent.Executor completionExecutor) {
+        /** Test seam: inject a (typically caller-runs) executor for deterministic ER completion. */
+        EgressRoutePipeline(int maxInFlight, java.util.concurrent.Executor erSubmitExecutor) {
+            this.maxInFlight = maxInFlight;
+            this.maxPendingFragments = maxInFlight * PENDING_FRAGMENT_CAP_MULTIPLIER;
             this.permits = new Semaphore(maxInFlight);
-            this.completionExecutor = completionExecutor;
-            this.ownedExecutor = null;
+            this.erSubmitExecutor = erSubmitExecutor;
+            this.ownedErSubmitExecutor = null;
+        }
+
+        /** Bounds total pipeline depth when venue permits are released before ER submit completes. */
+        private void awaitDispatchCapacity() {
+            while (tracker.inFlight() >= maxPendingFragments) {
+                drainContiguous();
+                if (!running.get()) {
+                    return;
+                }
+                LockSupport.parkNanos(QUIESCE_PARK_NANOS);
+            }
         }
 
         /** Called on the replay thread for each polled fragment, in cluster-log order. */
@@ -1420,11 +1437,29 @@ public class OmsVenueEgressService {
                 applySyncAfterQuiesce(() -> applyAdmittedEvent(ev, newPosition), newPosition);
                 return;
             }
+            if (isCursorOnlyFragment(typeId)) {
+                // ExecutionApplied and other no-op events must not quiesce the replay thread — each
+                // ER would block dispatch of later admits while unrelated routes drain (observed on pop:
+                // meanRouteMs >> 1s on a loaded book at 200+ RPS). Checkpoints flush via
+                // drainContiguous once prior admits complete.
+                tracker.registerCursorOnly(newPosition);
+                drainContiguous();
+                return;
+            }
             applySyncAfterQuiesce(
                     () -> applyNonAdmitFragmentSync(typeId, buffer, offset, length, newPosition), newPosition);
         }
 
+        private boolean isCursorOnlyFragment(int typeId) {
+            return switch (typeId) {
+                case OmsClusterWireFormat.TYPE_ID_ORDER_CANCEL_REQUESTED,
+                        OmsClusterWireFormat.TYPE_ID_ORDER_REPLACE_REQUESTED -> false;
+                default -> true;
+            };
+        }
+
         private void dispatchAdmitAsync(OrderAdmittedEvent ev, long newPosition) {
+            awaitDispatchCapacity();
             try {
                 permits.acquire();
             } catch (InterruptedException e) {
@@ -1438,16 +1473,21 @@ public class OmsVenueEgressService {
             } catch (RuntimeException e) {
                 future = CompletableFuture.failedFuture(e);
             }
-            future.whenCompleteAsync(
+            // Release the venue-route permit as soon as the venue acks so the replay thread can keep
+            // dispatching RouteOrders. ER cluster offers run on a separate pool; the cursor still
+            // advances only after ER submit completes (tracker.complete below).
+            future.whenComplete(
                     (erOpt, err) -> {
-                        try {
-                            completeRoute(ev, erOpt, err);
-                        } finally {
-                            tracker.complete(newPosition);
-                            permits.release();
-                        }
-                    },
-                    completionExecutor);
+                        permits.release();
+                        erSubmitExecutor.execute(
+                                () -> {
+                                    try {
+                                        completeRoute(ev, erOpt, err);
+                                    } finally {
+                                        tracker.complete(newPosition);
+                                    }
+                                });
+                    });
         }
 
         /** Runs on the completion executor — applies the venue ack to the OMS cluster. */
@@ -1512,6 +1552,11 @@ public class OmsVenueEgressService {
             }
         }
 
+        void registerCursorOnlyCheckpoint(long newPosition) {
+            tracker.registerCursorOnly(newPosition);
+            drainContiguous();
+        }
+
         /** Non-blocking: advance the cursor over whatever contiguous prefix has completed since last call. */
         void drainContiguous() {
             OptionalLong contiguous = tracker.pollContiguous();
@@ -1539,8 +1584,8 @@ public class OmsVenueEgressService {
         }
 
         void shutdown() {
-            if (ownedExecutor != null) {
-                ownedExecutor.shutdownNow();
+            if (ownedErSubmitExecutor != null) {
+                ownedErSubmitExecutor.shutdownNow();
             }
         }
     }
@@ -1557,6 +1602,10 @@ public class OmsVenueEgressService {
 
     void pipelineDispatchAdmitForTesting(OrderAdmittedEvent ev, long newPosition) {
         pipeline.dispatchAdmitAsync(ev, newPosition);
+    }
+
+    void pipelineRegisterCursorOnlyForTesting(long newPosition) {
+        pipeline.registerCursorOnlyCheckpoint(newPosition);
     }
 
     void pipelineDrainContiguousForTesting() {

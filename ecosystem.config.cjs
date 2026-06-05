@@ -542,6 +542,9 @@ const apps = [
       OMS_VENUE_GRPC_CALL_TIMEOUT_MS: '15000',
       OMS_VENUE_SYMBOL_PREFIX_ROUTING_ENABLED: 'true',
       OMS_VENUE_SYMBOL_PREFIX: 'PREDMKT',
+      // Pipelined RouteOrderStream in-flight cap (see plans/oms-venue-egress-pipelining.md).
+      OMS_CLUSTER_VENUE_EGRESS_VENUE_ROUTE_MAX_IN_FLIGHT: '512',
+      OMS_CLUSTER_VENUE_EGRESS_FRAGMENT_LIMIT: '256',
       // 8095/8092 are oms-fix-ingress on pop.
       OMS_VENUE_EGRESS_HTTP_PORT: '8097',
       OMS_VENUE_EGRESS_MANAGEMENT_SERVER_PORT: '8098',
@@ -577,6 +580,8 @@ const apps = [
       OMS_VENUE_SYMBOL_PREFIX: 'PREDMKT',
       OMS_VENUE_ADMISSION_GATE_ENABLED: 'true',
       OMS_VENUE_ADMISSION_GATE_MAX_LAG_BYTES: '4096',
+      // Must match oms-venue-egress pipelining cap so VenueAdmissionGate effective budget scales.
+      OMS_CLUSTER_VENUE_EGRESS_VENUE_ROUTE_MAX_IN_FLIGHT: '512',
       // Sole HTTP order-accept JVM that needs live FX mids (FxQuoteService).
       OMS_FX_MID_SUBSCRIBER_ENABLED: 'true',
     },

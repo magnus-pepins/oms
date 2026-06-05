@@ -89,15 +89,19 @@ public class VenueAdmissionGate {
 
         OptionalLong egressPos =
                 venueEgressCursor.findLastAppliedPosition(OmsVenueEgressService.EGRESS_ID, streamId);
+        OptionalLong projectorPos =
+                projectorCursor.findLastAppliedPosition(OmsPostgresProjector.PROJECTOR_ID, streamId);
+
+        if (egressPos.isEmpty() && projectorPos.isEmpty()) {
+            // Fresh stack (e.g. post-wipe): neither consumer has persisted a cursor yet and no
+            // events have been admitted. There is no lag to measure — allow the first admits.
+            return;
+        }
         if (egressPos.isEmpty()) {
             trip(instrumentSymbol, "venue egress cursor absent — oms-venue-egress has never applied an event");
         }
-
-        OptionalLong projectorPos =
-                projectorCursor.findLastAppliedPosition(OmsPostgresProjector.PROJECTOR_ID, streamId);
         if (projectorPos.isEmpty()) {
-            // Fresh stack: nothing has been admitted yet, so there is nothing for the egress to be
-            // behind on. The projector is the liveness reference; without it we cannot measure lag.
+            // Egress is live but the projector has not applied yet — egress cannot be behind.
             return;
         }
 

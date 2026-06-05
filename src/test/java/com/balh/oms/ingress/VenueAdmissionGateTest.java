@@ -60,9 +60,21 @@ class VenueAdmissionGateTest {
     }
 
     @Test
-    void egressNeverApplied_trips503() {
+    void freshStack_bothCursorsAbsent_allows() {
         when(venueEgressCursor.findLastAppliedPosition(OmsVenueEgressService.EGRESS_ID, STREAM))
                 .thenReturn(OptionalLong.empty());
+        when(projectorCursor.findLastAppliedPosition(OmsPostgresProjector.PROJECTOR_ID, STREAM))
+                .thenReturn(OptionalLong.empty());
+
+        assertThatCode(() -> gate.assertVenueAdmissible(VENUE_SYMBOL)).doesNotThrowAnyException();
+    }
+
+    @Test
+    void egressNeverApplied_projectorLive_trips503() {
+        when(venueEgressCursor.findLastAppliedPosition(OmsVenueEgressService.EGRESS_ID, STREAM))
+                .thenReturn(OptionalLong.empty());
+        when(projectorCursor.findLastAppliedPosition(OmsPostgresProjector.PROJECTOR_ID, STREAM))
+                .thenReturn(OptionalLong.of(512L));
 
         assertThatThrownBy(() -> gate.assertVenueAdmissible(VENUE_SYMBOL))
                 .isInstanceOfSatisfying(ClusterAdmissionException.class, e -> {

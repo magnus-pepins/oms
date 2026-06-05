@@ -1,48 +1,76 @@
 ---
-description: AI agents must not mutate any deployed OMS cluster, ever, without explicit per-command operator approval
+description: OMS cluster mutations — strict on staging/production; pop is disposable by default
 alwaysApply: true
 ---
 
-# No OMS mutations by AI agents
+# OMS mutations by AI agents
 
-Works with [respect-operator-warnings.mdc](respect-operator-warnings.mdc), [no-bandaids.mdc](no-bandaids.mdc), [serious-debugging.mdc](serious-debugging.mdc), and [stay-in-role.mdc](stay-in-role.mdc).
+Works with [respect-operator-warnings.mdc](respect-operator-warnings.mdc), [no-bandaids.mdc](no-bandaids.mdc), [serious-debugging.mdc](serious-debugging.mdc), [stay-in-role.mdc](stay-in-role.mdc), and [no-ledger-mutations.mdc](no-ledger-mutations.mdc).
 
 ## Context
 
-OMS admission state lives in the Aeron cluster (`oms-cluster-node`). Postgres is a mirror. A bad restart can leave **WORKING** orders in Postgres while the cluster has **forgotten** them (`410 cluster_forgot_order`). Recovery is operator-led; see `system-documentation/plans/oms-cluster-recovery-and-hardening.md`.
+OMS admission state lives in the Aeron cluster (`oms-cluster-node`). Postgres is a mirror. A bad restart can leave **WORKING** orders in Postgres while the cluster has **forgotten** them (`410 cluster_forgot_order`). Recovery: `system-documentation/plans/oms-cluster-recovery-and-hardening.md`.
 
-## You MUST NOT, on any deployed OMS stack (pop, staging, production)
+**pop** is a disposable test/demo/CI host. Default: agents **may** deploy, restart, wipe Aeron state, repair Postgres cursors/projections, and run cluster-mutating load tests when the operator assigns that work. **Strict** OMS mutation blocks apply on staging/production, or on pop when the operator has **frozen** OMS for a prepared demo.
 
-- Run `pm2 start`, `pm2 restart`, `pm2 stop`, `pm2 reload`, `pm2 delete`, or anything that changes process state for `oms-cluster-node`, `oms-postgres-projector`, `oms-fix-egress`, or `oms-ingress`.
-- Run `ssh pop 'rm …'`, `ssh pop 'mv …'`, or any filesystem mutation under `~/oms/build/aeron-cluster/**`, `~/oms/logs/**`, or projector data dirs.
-- Run `psql -c "INSERT"`, `UPDATE`, `DELETE`, `TRUNCATE`, `ALTER`, or migration SQL against `oms` projector DBs on deployed hosts.
-- Run `./gradlew clusterSnapshot` on pop without explicit per-command approval naming that exact command.
-- Run `system-documentation/scripts/restart-pop-oms-cluster.sh` without explicit approval naming that script by filename.
-- Run deploy scripts that bounce `oms-cluster-node` or journal paths.
-- Submit cluster-mutating `POST` to deployed ingress without operator approval.
+## Demo freeze on pop (strict until released)
 
-## You MAY, with explicit single-task scope on each command
+When the operator says OMS on pop must not change for a demo ("demo is live", "don't touch OMS", "OMS frozen for demo"), treat **pop** like production for OMS until they explicitly release the freeze.
 
-- Read-only logs, `psql SELECT`, `curl` actuators, `pm2 list/logs`, `oms-end-to-end.sh`.
+While frozen on pop, you MUST NOT:
 
-Name each command before running it.
+- Change PM2 state for `oms-cluster-node`, `oms-postgres-projector`, `oms-fix-egress`, `oms-ingress`, or `oms-venue-egress`.
+- Mutate `~/oms/build/aeron-cluster/**`, OMS logs, or projector data dirs.
+- Run mutating SQL against the `oms` projector DB.
+- Run `restart-pop-oms-cluster.sh`, `wipe-and-restart-pop-oms-cluster.sh`, deploy/bounce scripts, or cluster-mutating ingress/load-test paths without the operator naming the exact action in the current task.
 
-## You MAY, on your local Mac
+Read-only probes remain allowed.
 
-- Edit code, `./gradlew test`, local boot.
+## You MUST NOT on staging or production (any time)
 
-## You MAY, only with explicit per-action operator approval
+Same as demo-freeze list above for any non-pop host that runs the OMS stack. No agent OMS mutations unless the operator pastes the exact command or names a specific runbook step in the current message.
 
-- Deploy, `restart-pop-oms-cluster.sh`, `clusterSnapshot` on pop.
+On staging/production, `./gradlew clusterSnapshot` and `wipe-and-restart-pop-oms-cluster.sh` are operator-only regardless of host naming.
 
-Per-action approval is one of:
+## On pop when there is no demo freeze (default)
 
-1. Operator pastes a command (or names a script by filename) and tells the agent to run it.
-2. Operator explicitly approves a runbook the agent sent in the most recent assistant message (e.g. "run the runbook", "do all the steps", "run all the sql commands and restarts you listed"). The agent then executes exactly those commands, in order, without inventing new mutating steps.
-3. Operator explicitly authorises a single named ongoing task ("deploy V55 + V56 now"). The agent enumerates the commands it will run BEFORE running them and stops the moment the scope is exhausted.
+You **MAY** perform OMS work the operator asked for, including:
 
-"Do whatever you think is best" with no reference to a specific runbook / script / command / named task is **not** approval.
+- `pm2 start` / `restart` / `stop` / `reload` for OMS roles (`oms-cluster-node`, `oms-postgres-projector`, `oms-fix-egress`, `oms-ingress`, `oms-venue-egress`).
+- `bash system-documentation/scripts/restart-pop-oms-cluster.sh` (use `SKIP_CONFIRM=1` / `EMPTY_WIPE_OK=1` when appropriate).
+- `bash system-documentation/scripts/wipe-and-restart-pop-oms-cluster.sh` when wipe is part of the task and the operator has directed disposable recovery (nothing of value on pop).
+- `bash system-documentation/scripts/deploy-pop-prediction-market-phase-a.sh` and similar pop deploy scripts.
+- Remove or reset `~/oms/build/aeron-cluster/**` when wiping disposable state is part of the task.
+- Mutating `oms` projector SQL when reconciling mirror drift after a cluster wipe (truncate order projections, cursor repair) if the operator directed that recovery.
+- `./gradlew clusterSnapshot` on pop when needed for the task.
+- Cluster-mutating load tests (`bootRunBurst`, `venue-ingest-soak.sh`, smoke scripts that place orders) for throughput/latency measurement.
+
+**Still required on pop (process, not a ban):**
+
+- List mutating commands in your reply **before** you run them so the operator can abort between steps.
+- For wipes and truncates, state what will be lost in the same turn.
+- Prefer `restart-pop-oms-cluster.sh` over ad-hoc `pm2 restart oms-cluster-node` alone.
+
+## Read-only (any host, including frozen pop)
+
+- `ssh pop 'tail …'`, `grep`, `ls -la` under `~/oms/`.
+- `psql … -c "SELECT …"` on `oms` projector DB.
+- `curl` readiness/reconcile actuators.
+- `pm2 list`, `pm2 logs --nostream`.
+- `bash system-documentation/scripts/smoke/oms-end-to-end.sh` when it does not contradict a demo freeze.
+
+## Local Mac (no `ssh pop`)
+
+- Edit code in `oms/` and sibling repos.
+- Run `./gradlew test`, `integrationTest`, `bootJar*` locally.
+- Boot local cluster roles for IT smoke.
+
+## If you find yourself reasoning toward a forbidden action on staging/production
+
+- Stop.
+- Write the proposed command in your reply.
+- Wait for the operator to paste it back or give a different instruction.
 
 ## Sibling parity
 
-Canonical: `system-documentation/.cursor/rules/no-oms-mutations.mdc`. This file must match when the canonical changes.
+Canonical: `system-documentation/.cursor/rules/no-oms-mutations.mdc`. Copy to `oms/.cursor/rules/no-oms-mutations.mdc` when changed.

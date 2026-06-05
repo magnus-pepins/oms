@@ -162,8 +162,22 @@ public class OmsClusterIngressClient {
     private final ConcurrentHashMap<Long, CompletableFuture<AdmissionResult>> pending =
             new ConcurrentHashMap<>();
 
-    /** Fair queue so the egress poller gets regular turns under burst offer contention. */
-    private final ReentrantLock clientLock = new ReentrantLock(true);
+    /**
+     * Unfair (default) {@link ReentrantLock}: {@link AeronCluster} is thread-confined so offer,
+     * {@link AeronCluster#pollEgress pollEgress}, and {@link AeronCluster#sendKeepAlive sendKeepAlive}
+     * share one lock. Under burst admit (Pop! 200 RPS, 100 concurrent {@link #submitAcceptOrder}
+     * threads) a <em>fair</em> lock queues the egress poller behind every waiting offer thread —
+     * measured {@code ingress_cluster_accept_ms} rose to ~287 ms because OrderAccepted demux waited
+     * for hundreds of fair-queue turns. Unfair barging plus {@link #signalEgressPoller()} after
+     * each successful offer lets the poller interleave sub-ms {@link #pollEgressDrain} passes.
+     * Blocking {@code lockInterruptibly()} (not slice-4n {@code tryLock} skip) is retained so egress
+     * is never dropped on contention.
+     *
+     * <p>Burst path uses per-message {@link #offerWithBackpressure} when
+     * {@link OmsConfig.Cluster.Client.AdmitBatch} is disabled (the default); the admit-batcher
+     * daemon is not started in that mode.
+     */
+    private final ReentrantLock clientLock = new ReentrantLock();
 
     private final EgressListener egressListener = new EgressListener() {
         @Override

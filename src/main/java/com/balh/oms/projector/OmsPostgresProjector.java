@@ -31,6 +31,7 @@ import com.balh.oms.persistence.SellFillPositionSplit;
 import com.balh.oms.risk.BuyFundsRequirement;
 import com.balh.oms.returnpath.ExecutionTradeCommand;
 import com.balh.oms.returnpath.MarketContextVenueEvidence;
+import com.balh.oms.routing.VenueRoutingSymbols;
 import com.balh.oms.settlement.PredictionMarketResolutionService;
 import com.balh.oms.settlement.SettlementDateCalculator;
 import com.balh.oms.tailer.OrderControlAdmission;
@@ -62,9 +63,11 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -160,6 +163,21 @@ public class OmsPostgresProjector {
      */
     static final String METRIC_SHARD_MISMATCH_DROPPED = "oms_projector_shard_mismatch_dropped_total";
 
+    /**
+     * Per-event projector service time inside {@link #applyAdmittedEvent} (nanos from first SQL to
+     * cursor advance). Distinct from {@link OmsPipelineMetrics#recordClusterAdmitToProjector} wall
+     * lag, which includes ingress/cluster backlog. Pop! bench: scrape mean of
+     * {@code oms_projector_admit_tx_seconds} on the projector actuator to compare before/after
+     * admit-path trims.
+     */
+    static final String TIMER_ADMIT_TX = "oms.projector.admit_tx";
+
+    /**
+     * Bench-only env gate (Pop! PREDMKT soak). When {@code true}, venue-prefix symbols skip the
+     * {@code control_decisions} PASS INSERT on the fresh-admit path; REJECT rows are unchanged.
+     */
+    static final String ENV_SKIP_VENUE_CONTROL_PASS_AUDIT = "OMS_PROJECTOR_SKIP_VENUE_CONTROL_PASS_AUDIT";
+
     private final OmsConfig config;
     private final AeronProjectorCursorRepository cursorRepository;
     private final OrdersRepository ordersRepository;
@@ -189,6 +207,12 @@ public class OmsPostgresProjector {
      * {@link #applyAdmittedEvent}. See {@link #METRIC_SHARD_MISMATCH_DROPPED} for the contract.
      */
     private final Counter shardMismatchCounter;
+
+    /**
+     * Unit tests pin bench skip without mutating process env. Production reads
+     * {@link #ENV_SKIP_VENUE_CONTROL_PASS_AUDIT} only when this stays {@code null}.
+     */
+    private Boolean skipVenueControlPassAuditOverride;
 
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicReference<Long> lastAppliedPosition = new AtomicReference<>(0L);
@@ -1025,8 +1049,9 @@ public class OmsPostgresProjector {
         if (isShardMisroute(ev.orderId(), ev.shardId(), newPosition)) {
             return;
         }
-        boolean freshAdmission = ordersRepository.insertFromAdmittedEvent(ev);
-        if (freshAdmission) {
+        long admitTxStartNanos = System.nanoTime();
+        OrdersRepository.ProjectorAdmitInsert admitInsert = ordersRepository.insertFromAdmittedEventWithOrder(ev);
+        if (admitInsert.fresh()) {
             // First time we project this admit: emit OrderAccepted into the fanout outbox so
             // downstream consumers see the same {received → working → ...} sequence they used
             // to see when ingress wrote it. On replay (recording recreation, cluster cursor
@@ -1042,7 +1067,9 @@ public class OmsPostgresProjector {
             // Replay idempotency mirrors the OrderAccepted envelope gate above: the original
             // PASS row stands; skipping avoids a redundant findById + control_decisions INSERT.
             controlAdmission.persistAdmission(
-                    toPendingControlEvent(ev), ordersRepository.orderFromAdmittedEvent(ev));
+                    toPendingControlEvent(ev),
+                    admitInsert.order(),
+                    skipVenueControlPassAudit(ev));
         }
         // Phase 4 Tier 2.5 phase D-9: project the BUY-async ledger_inflight_outbox row from
         // the cluster's authoritative OrderAdmittedEvent. D-1 introduced this as a crash-window
@@ -1065,9 +1092,32 @@ public class OmsPostgresProjector {
         // TransactionTemplate lambda returns (sub-ms after this point in the fast-path). If any of
         // the SQL above throws, the exception exits the lambda before this line and the Timer stays
         // silent for the failed event.
+        meterRegistry.timer(TIMER_ADMIT_TX).record(System.nanoTime() - admitTxStartNanos, TimeUnit.NANOSECONDS);
         long latencyMs = wallClock.millis() - ev.acceptedAtMillis();
         OmsPipelineMetrics.recordClusterAdmitToProjector(
                 meterRegistry, PROJECTOR_ID, ev.side(), ev.timeInForceCode(), latencyMs);
+    }
+
+    /**
+     * Pop! PREDMKT bench: one fewer INSERT ({@code control_decisions} PASS) per fresh admit when
+     * {@link #ENV_SKIP_VENUE_CONTROL_PASS_AUDIT} is {@code true} and the symbol matches the
+     * configured venue prefix. Does not skip risk evaluation or REJECT audit rows.
+     */
+    private boolean skipVenueControlPassAudit(OrderAdmittedEvent ev) {
+        boolean enabled = skipVenueControlPassAuditOverride != null
+                ? skipVenueControlPassAuditOverride
+                : Boolean.parseBoolean(
+                        Objects.requireNonNullElse(System.getenv(ENV_SKIP_VENUE_CONTROL_PASS_AUDIT), "false"));
+        if (!enabled) {
+            return false;
+        }
+        return VenueRoutingSymbols.matchesVenuePrefix(
+                VenueRoutingSymbols.venueSymbolPrefix(config), ev.instrumentSymbol());
+    }
+
+    /** Visible for unit tests that pin the bench skip gate without env mutation. */
+    void setSkipVenueControlPassAuditForTesting(boolean enabled) {
+        this.skipVenueControlPassAuditOverride = enabled;
     }
 
     /**

@@ -17,9 +17,15 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.time.Clock;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -156,6 +162,72 @@ class OmsVenueEgressPipelineTest {
 
         verify(cursorRepository, times(1)).advanceWithRecording(any(), anyInt(), eq(3L), eq(20L));
         assertThat(service.pipelineIsDrainedForTesting()).isTrue();
+    }
+
+    @Test
+    void manyCompletions_coalesceScheduledCursorDrainToSingleJdbcFlush() throws Exception {
+        int admitCount = 32;
+        List<OrderAdmittedEvent> events = new ArrayList<>();
+        List<CompletableFuture<Optional<ExecutionReport>>> futures = new ArrayList<>();
+        for (int i = 0; i < admitCount; i++) {
+            OrderAdmittedEvent ev = admit("PREDMKT-TEST-1");
+            events.add(ev);
+            CompletableFuture<Optional<ExecutionReport>> f = new CompletableFuture<>();
+            futures.add(f);
+            when(routeClient.routeAdmittedOrderAsync(ev)).thenReturn(f);
+        }
+
+        AtomicInteger jdbcCalls = new AtomicInteger();
+        when(cursorRepository.advanceWithRecording(any(), anyInt(), eq(3L), anyLong()))
+                .thenAnswer(
+                        inv -> {
+                            jdbcCalls.incrementAndGet();
+                            return true;
+                        });
+
+        AtomicInteger cursorDrainSubmissions = new AtomicInteger();
+        CountDownLatch releaseCursorDrain = new CountDownLatch(1);
+        var cursorDrainPool = Executors.newSingleThreadExecutor();
+        try {
+            java.util.concurrent.Executor cursorDrainExecutor =
+                    task -> {
+                        cursorDrainSubmissions.incrementAndGet();
+                        cursorDrainPool.execute(
+                                () -> {
+                                    try {
+                                        releaseCursorDrain.await();
+                                    } catch (InterruptedException e) {
+                                        Thread.currentThread().interrupt();
+                                        return;
+                                    }
+                                    task.run();
+                                });
+                    };
+            service.enablePipelineForTesting(32, Runnable::run, cursorDrainExecutor);
+
+            for (int i = 0; i < admitCount; i++) {
+                service.pipelineDispatchAdmitForTesting(events.get(i), 10L * (i + 1));
+            }
+
+            for (int i = 0; i < admitCount; i++) {
+                futures.get(i).complete(Optional.of(er(events.get(i))));
+            }
+
+            releaseCursorDrain.countDown();
+
+            service.markRunningForTesting();
+            assertThat(service.pipelineQuiesceForTesting()).isTrue();
+
+            // Coalesced: one queued drain task (not one per completion) and one JDBC flush.
+            assertThat(cursorDrainSubmissions.get()).isEqualTo(1);
+            assertThat(jdbcCalls.get()).isEqualTo(1);
+            verify(cursorRepository, times(1))
+                    .advanceWithRecording(any(), anyInt(), eq(3L), eq(10L * admitCount));
+        } finally {
+            releaseCursorDrain.countDown();
+            cursorDrainPool.shutdown();
+            cursorDrainPool.awaitTermination(2, TimeUnit.SECONDS);
+        }
     }
 
     @Test

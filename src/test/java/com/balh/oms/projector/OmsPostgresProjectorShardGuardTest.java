@@ -109,11 +109,13 @@ class OmsPostgresProjectorShardGuardTest {
         // unchanged by the E-2 guard.
         config.getShard().setId(0);
         OrderAdmittedEvent ev = sampleAdmitted(/* shardId = */ 0);
-        when(ordersRepository.insertFromAdmittedEvent(ev)).thenReturn(true);
+        when(ordersRepository.insertFromAdmittedEventWithOrder(ev))
+                .thenReturn(new OrdersRepository.ProjectorAdmitInsert(
+                        true, org.mockito.Mockito.mock(com.balh.oms.domain.Order.class)));
 
         projector.applyAdmittedEvent(ev, FRAGMENT_POSITION);
 
-        verify(ordersRepository).insertFromAdmittedEvent(ev);
+        verify(ordersRepository).insertFromAdmittedEventWithOrder(ev);
         verify(cursorRepository).advanceWithRecording(
                 OmsPostgresProjector.PROJECTOR_ID,
                 OmsClusterWireFormat.EVENTS_STREAM_ID,
@@ -134,7 +136,7 @@ class OmsPostgresProjectorShardGuardTest {
 
         projector.applyAdmittedEvent(ev, FRAGMENT_POSITION);
 
-        verify(ordersRepository, never()).insertFromAdmittedEvent(any());
+        verify(ordersRepository, never()).insertFromAdmittedEventWithOrder(any());
         verify(controlAdmission, never()).persistAdmission(any());
         verify(domainEventOutboxRepository, never()).insert(any(), any());
         verify(ledgerInflightOutboxRepository, never()).insertIfAbsent(any(), any());
@@ -158,7 +160,7 @@ class OmsPostgresProjectorShardGuardTest {
         projector.applyAdmittedEvent(second, FRAGMENT_POSITION + 1L);
         projector.applyAdmittedEvent(third, FRAGMENT_POSITION + 2L);
 
-        verify(ordersRepository, never()).insertFromAdmittedEvent(any());
+        verify(ordersRepository, never()).insertFromAdmittedEventWithOrder(any());
         assertThat(meterRegistry.counter(OmsPostgresProjector.METRIC_SHARD_MISMATCH_DROPPED)
                 .count()).isEqualTo(3.0);
     }

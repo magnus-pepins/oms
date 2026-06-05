@@ -6,6 +6,10 @@ import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 
+import org.agrona.ExpandableArrayBuffer;
+
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.time.Duration;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -14,6 +18,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReentrantLock;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -64,6 +69,87 @@ class OmsClusterIngressClientPipelineTest {
     void signalEgressPoller_whenPollerNotStarted_isNoOp() {
         OmsClusterIngressClient client = new OmsClusterIngressClient(newConfig(), new SimpleMeterRegistry());
         client.signalEgressPollerForTest();
+    }
+
+    @Test
+    void clientLock_isUnfair_soEgressPollerCanBargeUnderBurstOfferContention() throws Exception {
+        OmsClusterIngressClient client = new OmsClusterIngressClient(newConfig(), new SimpleMeterRegistry());
+        ReentrantLock lock = (ReentrantLock) declaredField(client, "clientLock").get(client);
+        assertThat(lock.isFair())
+                .as("fair lock queues poller behind every waiting offer thread (9829a8f regression)")
+                .isFalse();
+    }
+
+    @Test
+    void newConfig_admitBatchDisabledByDefault_burstUsesDirectOfferPath() {
+        assertThat(newConfig().getCluster().getClient().getAdmitBatch().isEnabled())
+                .as("burst profile path does not use admit-batcher unless explicitly enabled")
+                .isFalse();
+    }
+
+    /**
+     * Regression for 9829a8f: fair {@code clientLock} + blocking poller starved demux under
+     * concurrent offers. With unfair lock + {@link OmsClusterIngressClient#signalEgressPoller()},
+     * the poller must keep calling {@code pollEgress} while submit threads hammer offers.
+     */
+    @Test
+    void egressPoller_pollsDuringConcurrentOfferBurst() throws Exception {
+        OmsClusterIngressClient client = new OmsClusterIngressClient(newConfig(), new SimpleMeterRegistry());
+        AtomicInteger pollCount = new AtomicInteger();
+        AeronCluster cluster = Mockito.mock(AeronCluster.class);
+        Mockito.when(cluster.offer(Mockito.any(), Mockito.anyInt(), Mockito.anyInt())).thenReturn(1L);
+        Mockito.when(cluster.pollEgress()).thenAnswer(inv -> {
+            pollCount.incrementAndGet();
+            return 0;
+        });
+
+        setField(client, "client", cluster);
+        setField(client, "closing", false);
+        invokeStartEgressPollerLocked(client);
+
+        int threads = 64;
+        var pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch offersStarted = new CountDownLatch(threads);
+        CountDownLatch stopOffers = new CountDownLatch(1);
+        try {
+            for (int i = 0; i < threads; i++) {
+                pool.submit(() -> {
+                    offersStarted.countDown();
+                    try {
+                        offersStarted.await();
+                        Method offer = OmsClusterIngressClient.class.getDeclaredMethod(
+                                "offerWithBackpressure",
+                                ExpandableArrayBuffer.class,
+                                int.class,
+                                long.class,
+                                long.class);
+                        offer.setAccessible(true);
+                        ExpandableArrayBuffer buffer =
+                                new ExpandableArrayBuffer(OmsClusterWireFormat.MAX_COMMAND_BYTES);
+                        AcceptOrderCommand cmd = newAcceptOrderCommand(1L);
+                        int written = cmd.encode(buffer, 0);
+                        long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(500);
+                        while (stopOffers.getCount() > 0) {
+                            offer.invoke(client, buffer, written, deadlineNanos, cmd.correlationId());
+                        }
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                    } catch (ReflectiveOperationException e) {
+                        throw new AssertionError(e);
+                    }
+                });
+            }
+            assertThat(offersStarted.await(5, TimeUnit.SECONDS)).isTrue();
+            Thread.sleep(150);
+        } finally {
+            stopOffers.countDown();
+            pool.shutdownNow();
+            client.close();
+        }
+
+        assertThat(pollCount.get())
+                .as("egress poller must not sit behind a fair offer queue for the whole burst window")
+                .isGreaterThan(20);
     }
 
     @Test
@@ -222,5 +308,27 @@ class OmsClusterIngressClientPipelineTest {
     @SuppressWarnings("unchecked")
     private static CompletableFuture<AdmissionResult>[] newWaiterArray(int n) {
         return (CompletableFuture<AdmissionResult>[]) new CompletableFuture<?>[n];
+    }
+
+    private static Field declaredField(Object target, String name) throws NoSuchFieldException {
+        Field field = target.getClass().getDeclaredField(name);
+        field.setAccessible(true);
+        return field;
+    }
+
+    private static void setField(Object target, String name, Object value) throws Exception {
+        declaredField(target, name).set(target, value);
+    }
+
+    private static void invokeStartEgressPollerLocked(OmsClusterIngressClient client) throws Exception {
+        Method m = OmsClusterIngressClient.class.getDeclaredMethod("startEgressPollerLocked");
+        m.setAccessible(true);
+        ReentrantLock lock = (ReentrantLock) declaredField(client, "clientLock").get(client);
+        lock.lock();
+        try {
+            m.invoke(client);
+        } finally {
+            lock.unlock();
+        }
     }
 }

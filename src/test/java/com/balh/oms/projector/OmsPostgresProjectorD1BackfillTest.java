@@ -109,7 +109,9 @@ class OmsPostgresProjectorD1BackfillTest {
         projector.setCurrentRecordingIdForTesting(13L);
         // D-1 tests target ledger_inflight_outbox only; treat admits as replay so the fresh-insert
         // branch (OrderAccepted envelope + control admission) stays out of scope.
-        when(ordersRepository.insertFromAdmittedEvent(any())).thenReturn(false);
+        when(ordersRepository.insertFromAdmittedEventWithOrder(any()))
+                .thenReturn(new OrdersRepository.ProjectorAdmitInsert(
+                        false, org.mockito.Mockito.mock(com.balh.oms.domain.Order.class)));
     }
 
     @Test

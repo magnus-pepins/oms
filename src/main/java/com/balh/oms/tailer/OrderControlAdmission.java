@@ -99,10 +99,28 @@ public class OrderControlAdmission {
      * redundant {@link OrdersRepository#findById(java.util.UUID)} round-trip.
      */
     public AdmissionResult persistAdmission(PendingControlEvent event, Order admittedOrder) {
-        return persistAdmissionBody(event, Objects.requireNonNull(admittedOrder, "admittedOrder"));
+        return persistAdmission(event, admittedOrder, false);
+    }
+
+    /**
+     * Projector bench path: when {@code skipPassControlDecisionAudit} is {@code true} and control
+     * admission passes, the {@code control_decisions} PASS row is omitted. REJECT outcomes still
+     * record audit rows. Pop! PREDMKT soak enables this via
+     * {@code OMS_PROJECTOR_SKIP_VENUE_CONTROL_PASS_AUDIT=true} (see
+     * {@link com.balh.oms.projector.OmsPostgresProjector}).
+     */
+    public AdmissionResult persistAdmission(
+            PendingControlEvent event, Order admittedOrder, boolean skipPassControlDecisionAudit) {
+        return persistAdmissionBody(
+                event, Objects.requireNonNull(admittedOrder, "admittedOrder"), skipPassControlDecisionAudit);
     }
 
     private AdmissionResult persistAdmissionBody(PendingControlEvent event, Order preloadedOrder) {
+        return persistAdmissionBody(event, preloadedOrder, false);
+    }
+
+    private AdmissionResult persistAdmissionBody(
+            PendingControlEvent event, Order preloadedOrder, boolean skipPassControlDecisionAudit) {
         if (stale.isStale(event.orderTimestamp())) {
             boolean updated = orders.updateWithCas(
                     event.orderId(),
@@ -214,13 +232,15 @@ public class OrderControlAdmission {
         // venue gRPC and external FIX venues. We still record the control_decisions PASS audit row
         // so the risk decision is captured at admission time; the OrderWorking domain event now
         // fires from the venue-acceptance projection, not here.
-        controlDecisions.record(
-                event.orderId(),
-                event.orderVersion(),
-                "PASS",
-                null,
-                ControlRiskEvaluator.STAGE_CONTROL,
-                null);
+        if (!skipPassControlDecisionAudit) {
+            controlDecisions.record(
+                    event.orderId(),
+                    event.orderVersion(),
+                    "PASS",
+                    null,
+                    ControlRiskEvaluator.STAGE_CONTROL,
+                    null);
+        }
         return AdmissionResult.APPLIED;
     }
 

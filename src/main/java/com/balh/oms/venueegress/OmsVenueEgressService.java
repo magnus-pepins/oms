@@ -1389,6 +1389,12 @@ public class OmsVenueEgressService {
         private final ExecutorService ownedCursorDrainExecutor;
         /** Serialises cursor persistence between the replay thread and cursor-drain completions. */
         private final Object contiguousDrainLock = new Object();
+        /**
+         * Coalesces {@link #scheduleDrainContiguous()} so the single-thread {@link #cursorDrainExecutor}
+         * never queues one runnable per ER completion (observed on pop @ 200 RPS: thousands of
+         * redundant {@code advanceWithRecording} calls inflated {@code egress_wall_lag_ms}).
+         */
+        private final AtomicBoolean cursorDrainScheduled = new AtomicBoolean(false);
 
         EgressRoutePipeline(int maxInFlight) {
             this.maxInFlight = maxInFlight;
@@ -1417,14 +1423,17 @@ public class OmsVenueEgressService {
             this.ownedCursorDrainExecutor = cursorPool;
         }
 
-        /** Test seam: inject a (typically caller-runs) executor for deterministic ER completion. */
-        EgressRoutePipeline(int maxInFlight, java.util.concurrent.Executor erSubmitExecutor) {
+        /** Test seam: inject executors for deterministic ER completion and cursor-drain isolation. */
+        EgressRoutePipeline(
+                int maxInFlight,
+                java.util.concurrent.Executor erSubmitExecutor,
+                java.util.concurrent.Executor cursorDrainExecutor) {
             this.maxInFlight = maxInFlight;
             this.maxPendingFragments = maxInFlight * PENDING_FRAGMENT_CAP_MULTIPLIER;
             this.permits = new Semaphore(maxInFlight);
             this.erSubmitExecutor = erSubmitExecutor;
             this.ownedErSubmitExecutor = null;
-            this.cursorDrainExecutor = erSubmitExecutor;
+            this.cursorDrainExecutor = cursorDrainExecutor;
             this.ownedCursorDrainExecutor = null;
         }
 
@@ -1510,9 +1519,33 @@ public class OmsVenueEgressService {
                     });
         }
 
-        /** Queues a contiguous-prefix cursor flush without blocking the ER-offer pool on Postgres. */
+        /**
+         * Queues at most one contiguous-prefix cursor flush on {@link #cursorDrainExecutor}. Further
+         * ER completions while a drain is already scheduled coalesce into that single pass — each pass
+         * persists only the latest contiguous position ({@link #drainContiguous()}).
+         */
         private void scheduleDrainContiguous() {
-            cursorDrainExecutor.execute(this::drainContiguous);
+            if (!cursorDrainScheduled.compareAndSet(false, true)) {
+                return;
+            }
+            cursorDrainExecutor.execute(this::runScheduledCursorDrain);
+        }
+
+        /**
+         * Runs on {@link #cursorDrainExecutor}. Drains repeatedly until the contiguous prefix is
+         * fully persisted and no coalesced schedules remain — one queued task absorbs many ER
+         * completions instead of one JDBC per completion.
+         */
+        private void runScheduledCursorDrain() {
+            while (true) {
+                long before = lastAppliedPosition.get();
+                drainContiguous();
+                boolean progressed = lastAppliedPosition.get() > before;
+                boolean rescheduled = cursorDrainScheduled.getAndSet(false);
+                if (!rescheduled && !progressed) {
+                    return;
+                }
+            }
         }
 
         /** Runs on the completion executor — applies the venue ack to the OMS cluster. */
@@ -1623,7 +1656,14 @@ public class OmsVenueEgressService {
     // ---- Test seams for the pipeline (production drives it via init() + EgressFragmentHandler) ----
 
     void enablePipelineForTesting(int maxInFlight, java.util.concurrent.Executor completionExecutor) {
-        this.pipeline = new EgressRoutePipeline(maxInFlight, completionExecutor);
+        enablePipelineForTesting(maxInFlight, completionExecutor, completionExecutor);
+    }
+
+    void enablePipelineForTesting(
+            int maxInFlight,
+            java.util.concurrent.Executor erSubmitExecutor,
+            java.util.concurrent.Executor cursorDrainExecutor) {
+        this.pipeline = new EgressRoutePipeline(maxInFlight, erSubmitExecutor, cursorDrainExecutor);
     }
 
     void markRunningForTesting() {

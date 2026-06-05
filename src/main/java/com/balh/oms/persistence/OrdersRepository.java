@@ -220,8 +220,26 @@ public class OrdersRepository {
      *
      * <p>Returns {@code true} when the row was inserted, {@code false} when ON CONFLICT swallowed it.
      */
+    /**
+     * Projector hot-path result: one scaled-parameter pass for both the INSERT and the in-memory
+     * {@link Order} handed to {@link com.balh.oms.tailer.OrderControlAdmission}.
+     */
+    public record ProjectorAdmitInsert(boolean fresh, Order order) {}
+
     public boolean insertFromAdmittedEvent(OrderAdmittedEvent ev) {
-        return jdbc.update(PROJECTOR_INSERT_SQL, projectorParams(ev)) == 1;
+        return insertFromAdmittedEventWithOrder(ev).fresh();
+    }
+
+    /**
+     * Idempotent projector insert plus the matching in-memory {@link Order} (version 0,
+     * {@link OrderStatus#PENDING_NEW}). Computes scaled quantity/limit once so
+     * {@link #orderFromAdmittedEvent} does not repeat the same {@link BigDecimal} work on the hot
+     * path.
+     */
+    public ProjectorAdmitInsert insertFromAdmittedEventWithOrder(OrderAdmittedEvent ev) {
+        ProjectorAdmitFields fields = projectorAdmitFields(ev);
+        boolean fresh = jdbc.update(PROJECTOR_INSERT_SQL, fields.params()) == 1;
+        return new ProjectorAdmitInsert(fresh, fields.order());
     }
 
     /**
@@ -230,37 +248,12 @@ public class OrdersRepository {
      * {@link #findById(java.util.UUID)} round-trip inside the same transaction.
      */
     public Order orderFromAdmittedEvent(OrderAdmittedEvent ev) {
-        BigDecimal quantity = BigDecimal.valueOf(ev.quantityScaled())
-                .divide(BigDecimal.valueOf(AcceptOrderCommand.QUANTITY_SCALE), 10, RoundingMode.UNNECESSARY);
-        BigDecimal limitPrice = ev.limitPriceScaledOrZero() == 0L
-                ? null
-                : BigDecimal.valueOf(ev.limitPriceScaledOrZero())
-                        .divide(BigDecimal.valueOf(AcceptOrderCommand.PRICE_SCALE), 10, RoundingMode.UNNECESSARY);
-        Instant receivedAt = nanosToInstant(ev.clientTimestampNanos());
-        Instant acceptedAt = Instant.ofEpochMilli(ev.acceptedAtMillis());
-        return new Order(
-                ev.orderId(),
-                UUID.fromString(ev.accountId()),
-                ev.clientIdempotencyKey(),
-                ev.shardId(),
-                0,
-                OrderStatus.PENDING_NEW,
-                null,
-                Side.valueOf(AcceptOrderCommand.sideName(ev.side())),
-                ev.instrumentSymbol(),
-                quantity,
-                limitPrice,
-                AcceptOrderCommand.timeInForceName(ev.timeInForceCode()),
-                receivedAt,
-                acceptedAt,
-                null,
-                ev.accountIdHash(),
-                ev.ledgerBalanceIdOrNull(),
-                BigDecimal.ZERO,
-                AcceptOrderCommand.ordTypeName(ev.ordTypeCode()));
+        return projectorAdmitFields(ev).order();
     }
 
-    private static MapSqlParameterSource projectorParams(OrderAdmittedEvent ev) {
+    private record ProjectorAdmitFields(MapSqlParameterSource params, Order order) {}
+
+    private static ProjectorAdmitFields projectorAdmitFields(OrderAdmittedEvent ev) {
         BigDecimal quantity = BigDecimal.valueOf(ev.quantityScaled())
                 .divide(BigDecimal.valueOf(AcceptOrderCommand.QUANTITY_SCALE), 10, RoundingMode.UNNECESSARY);
         BigDecimal limitPrice = ev.limitPriceScaledOrZero() == 0L
@@ -275,7 +268,7 @@ public class OrdersRepository {
         // matching arithmetic fix in one diff.
         Instant acceptedAt = Instant.ofEpochMilli(ev.acceptedAtMillis());
         UUID accountId = UUID.fromString(ev.accountId());
-        return new MapSqlParameterSource()
+        MapSqlParameterSource params = new MapSqlParameterSource()
                 .addValue("id", ev.orderId())
                 .addValue("account_id", accountId)
                 .addValue("client_idempotency_key", ev.clientIdempotencyKey())
@@ -294,6 +287,27 @@ public class OrdersRepository {
                 .addValue("account_id_hash", ev.accountIdHash())
                 .addValue("ledger_balance_id", ev.ledgerBalanceIdOrNull())
                 .addValue("cum_filled_quantity", BigDecimal.ZERO);
+        Order order = new Order(
+                ev.orderId(),
+                accountId,
+                ev.clientIdempotencyKey(),
+                ev.shardId(),
+                0,
+                OrderStatus.PENDING_NEW,
+                null,
+                Side.valueOf(AcceptOrderCommand.sideName(ev.side())),
+                ev.instrumentSymbol(),
+                quantity,
+                limitPrice,
+                AcceptOrderCommand.timeInForceName(ev.timeInForceCode()),
+                receivedAt,
+                acceptedAt,
+                null,
+                ev.accountIdHash(),
+                ev.ledgerBalanceIdOrNull(),
+                BigDecimal.ZERO,
+                AcceptOrderCommand.ordTypeName(ev.ordTypeCode()));
+        return new ProjectorAdmitFields(params, order);
     }
 
     private static Instant nanosToInstant(long epochNanos) {

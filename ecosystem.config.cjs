@@ -497,6 +497,8 @@ const apps = [
       // Corporate-action processors + record-date snapshot job (Slice 17 / §5.9).
       OMS_CORPORATE_ACTION_PROCESSOR_ENABLED: 'true',
       OMS_CORPORATE_ACTION_RECORD_DATE_SNAPSHOT_JOB_ENABLED: 'true',
+      // Pop bench throughput: skip PASS control_decisions INSERT on PREDMKT/* admits.
+      OMS_PROJECTOR_SKIP_VENUE_CONTROL_PASS_AUDIT: 'true',
     },
     ...COMMON_PM2,
   },

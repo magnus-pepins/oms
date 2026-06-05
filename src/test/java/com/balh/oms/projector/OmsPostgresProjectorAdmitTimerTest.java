@@ -106,14 +106,14 @@ class OmsPostgresProjectorAdmitTimerTest {
     void applyAdmittedEvent_recordsAdmitToProjectorTimer() {
         OrderAdmittedEvent ev = sampleAdmitted(AcceptOrderCommand.SIDE_BUY, AcceptOrderCommand.TIF_GTC);
         Order projected = org.mockito.Mockito.mock(Order.class);
-        when(ordersRepository.insertFromAdmittedEvent(ev)).thenReturn(true);
-        when(ordersRepository.orderFromAdmittedEvent(ev)).thenReturn(projected);
+        when(ordersRepository.insertFromAdmittedEventWithOrder(ev))
+                .thenReturn(new OrdersRepository.ProjectorAdmitInsert(true, projected));
 
         projector.applyAdmittedEvent(ev, FRAGMENT_POSITION);
 
-        verify(ordersRepository).insertFromAdmittedEvent(ev);
-        verify(ordersRepository).orderFromAdmittedEvent(ev);
-        verify(controlAdmission).persistAdmission(any(), eq(projected));
+        verify(ordersRepository).insertFromAdmittedEventWithOrder(ev);
+        verify(ordersRepository, never()).orderFromAdmittedEvent(any());
+        verify(controlAdmission).persistAdmission(any(), eq(projected), eq(false));
         verify(cursorRepository).advanceWithRecording(
                 OmsPostgresProjector.PROJECTOR_ID,
                 OmsClusterWireFormat.EVENTS_STREAM_ID,
@@ -152,8 +152,9 @@ class OmsPostgresProjectorAdmitTimerTest {
                 "hash",
                 "AAPL",
                 /* ledgerBalanceIdOrNull = */ null);
-        when(ordersRepository.insertFromAdmittedEvent(ev)).thenReturn(true);
-        when(ordersRepository.orderFromAdmittedEvent(ev)).thenReturn(org.mockito.Mockito.mock(Order.class));
+        when(ordersRepository.insertFromAdmittedEventWithOrder(ev))
+                .thenReturn(new OrdersRepository.ProjectorAdmitInsert(
+                        true, org.mockito.Mockito.mock(Order.class)));
 
         projector.applyAdmittedEvent(ev, FRAGMENT_POSITION);
 
@@ -173,20 +174,22 @@ class OmsPostgresProjectorAdmitTimerTest {
     @Test
     void replay_insertReturnsFalse_skipsControlAdmission() {
         OrderAdmittedEvent ev = sampleAdmitted(AcceptOrderCommand.SIDE_BUY, AcceptOrderCommand.TIF_DAY);
-        when(ordersRepository.insertFromAdmittedEvent(ev)).thenReturn(false);
+        when(ordersRepository.insertFromAdmittedEventWithOrder(ev))
+                .thenReturn(new OrdersRepository.ProjectorAdmitInsert(
+                        false, org.mockito.Mockito.mock(Order.class)));
 
         projector.applyAdmittedEvent(ev, FRAGMENT_POSITION);
 
         verify(controlAdmission, never()).persistAdmission(any());
         verify(controlAdmission, never()).persistAdmission(any(), any());
-        verify(ordersRepository, never()).orderFromAdmittedEvent(any());
+        verify(controlAdmission, never()).persistAdmission(any(), any(), any(Boolean.class));
     }
 
     @Test
     void applyAdmittedEvent_failedInsert_doesNotRecordTimer() {
         OrderAdmittedEvent ev = sampleAdmitted(AcceptOrderCommand.SIDE_BUY, AcceptOrderCommand.TIF_DAY);
         Mockito.doThrow(new RuntimeException("simulated SQL failure"))
-                .when(ordersRepository).insertFromAdmittedEvent(ev);
+                .when(ordersRepository).insertFromAdmittedEventWithOrder(ev);
 
         try {
             projector.applyAdmittedEvent(ev, FRAGMENT_POSITION);

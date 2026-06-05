@@ -1,10 +1,13 @@
 package com.balh.oms.reconciler;
 
+import com.balh.oms.cluster.ApplyExecutionReportCommand;
 import com.balh.oms.cluster.CancelOrderCommand;
 import com.balh.oms.cluster.OmsClusterIngressClient;
 import com.balh.oms.cluster.OmsClusterShardRouter;
 import com.balh.oms.config.OmsConfig;
 import com.balh.oms.config.OmsProfiles;
+import com.balh.oms.domain.RejectCode;
+import com.balh.oms.ledger.LedgerInflightReservationFailures;
 import com.balh.oms.persistence.LedgerInflightOutboxRepository;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -29,7 +32,9 @@ import java.util.concurrent.TimeoutException;
  * hold has failed past
  * {@link OmsConfig.Ledger#getInflightCompensatorAttemptsThreshold() attempts-threshold}, this
  * reconciler treats the hold as un-acceptable (e.g. insufficient balance) and submits a
- * {@link CancelOrderCommand} to cancel the order in the cluster, then stamps
+ * {@link ApplyExecutionReportCommand} with {@link RejectCode#RISK_BUYING_POWER} for
+ * insufficient-funds holds (or a {@link CancelOrderCommand} for other hold failures on
+ * pre-fix admits), then stamps
  * {@code ledger_inflight_outbox.compensated_at} so the row is excluded from further retries.
  *
  * <h3>Race window (documented limitation)</h3>
@@ -70,6 +75,7 @@ public class LedgerInflightHoldFailureCompensator {
     private static final String METRIC_COMPENSATED = "oms_ledger_inflight_hold_compensated_total";
     private static final String METRIC_COMPENSATE_FAILED = "oms_ledger_inflight_hold_compensate_failed_total";
     private static final String TAG_OUTCOME = "outcome";
+    private static final String OUTCOME_REJECTED = "rejected";
     private static final String OUTCOME_CANCELLED = "cancelled";
     private static final String OUTCOME_SUBMIT_FAILED = "submit_failed";
 
@@ -161,21 +167,40 @@ public class LedgerInflightHoldFailureCompensator {
             try {
                 long correlationId = client.nextCorrelationId();
                 String reason = buildReason(row.lastError());
-                CancelOrderCommand cmd = new CancelOrderCommand(
-                        correlationId, row.orderId(), System.nanoTime(), reason);
-                client.submitCancelOrder(cmd, submitTimeout);
+                String outcome;
+                if (LedgerInflightReservationFailures.isInsufficientFundsMessage(row.lastError())) {
+                    ApplyExecutionReportCommand cmd = new ApplyExecutionReportCommand(
+                            correlationId,
+                            row.orderId(),
+                            0L,
+                            0L,
+                            System.nanoTime(),
+                            0,
+                            ApplyExecutionReportCommand.EXEC_TYPE_VENUE_REJECT,
+                            (byte) RejectCode.RISK_BUYING_POWER.ordinal(),
+                            config.getVenue().getVenueId(),
+                            "ledger-hold-compensate-" + row.orderId() + "-a" + row.attempts(),
+                            "",
+                            "{\"reason\":\"" + reason + "\",\"errorCode\":\"insufficient_funds\"}");
+                    client.submitApplyExecutionReport(cmd, submitTimeout);
+                    outcome = OUTCOME_REJECTED;
+                } else {
+                    CancelOrderCommand cmd = new CancelOrderCommand(
+                            correlationId, row.orderId(), System.nanoTime(), reason);
+                    client.submitCancelOrder(cmd, submitTimeout);
+                    outcome = OUTCOME_CANCELLED;
+                }
                 // Mark compensated only after cluster offer succeeds: the cluster log commit is
                 // the durability boundary. If we crash between this point and the next line the
-                // cluster will still apply the cancel on log replay (idempotent in the cluster
-                // service); the row stays uncompensated and the next compensator tick re-fires
-                // the cancel — also a no-op in the cluster, then this UPDATE catches up.
+                // cluster will still apply the reject/cancel on log replay (idempotent in the
+                // cluster service); the row stays uncompensated and the next compensator tick
+                // re-fires — also a no-op in the cluster, then this UPDATE catches up.
                 transactionTemplate.executeWithoutResult(s ->
                         outbox.markCompensated(row.id(), correlationId, Instant.now()));
-                meterRegistry.counter(METRIC_COMPENSATED,
-                        Tags.of(TAG_OUTCOME, OUTCOME_CANCELLED)).increment();
+                meterRegistry.counter(METRIC_COMPENSATED, Tags.of(TAG_OUTCOME, outcome)).increment();
                 log.info(
-                        "Compensated ledger_inflight_outbox id={} orderId={} shardId={} (attempts={}) -> CancelOrderCommand correlationId={}",
-                        row.id(), row.orderId(), row.shardId(), row.attempts(), correlationId);
+                        "Compensated ledger_inflight_outbox id={} orderId={} shardId={} (attempts={}) -> {} correlationId={}",
+                        row.id(), row.orderId(), row.shardId(), row.attempts(), outcome, correlationId);
             } catch (TimeoutException e) {
                 meterRegistry.counter(METRIC_COMPENSATE_FAILED,
                         Tags.of(TAG_OUTCOME, OUTCOME_SUBMIT_FAILED)).increment();

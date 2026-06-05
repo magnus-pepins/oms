@@ -32,6 +32,15 @@ public class OmsExceptionHandler {
      * BFF + Ops Console can branch on it directly; {@code errorCode} stays
      * a short slug ("fx_quote_expired") for logging / metrics tagging.
      */
+    @ExceptionHandler(LedgerInflightHoldException.class)
+    public ResponseEntity<ApiErrorResponse> handleLedgerInflightHold(LedgerInflightHoldException ex) {
+        var body = new ApiErrorResponse(
+                ex.getRejectCode().name(),
+                ex.getErrorCode(),
+                List.of(new ApiErrorResponse.FieldViolation("ledgerInflightHold", ex.getMessage())));
+        return ResponseEntity.status(ex.getHttpStatus()).body(body);
+    }
+
     @ExceptionHandler(FxQuoteLockException.class)
     public ResponseEntity<ApiErrorResponse> handleFxQuoteLock(FxQuoteLockException ex) {
         var body = new ApiErrorResponse(

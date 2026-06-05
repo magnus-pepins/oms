@@ -21,6 +21,7 @@ import com.balh.oms.domain.Side;
 import com.balh.oms.ledger.LedgerBalanceClient;
 import com.balh.oms.ledger.LedgerInflightCoalescer;
 import com.balh.oms.ledger.LedgerInflightReservationClient;
+import com.balh.oms.ledger.LedgerInflightReservationFailures;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
 import org.slf4j.Logger;
@@ -262,6 +263,10 @@ public class OrderIngressService {
             String ledgerBalanceId = normalizeLedgerBalanceId(req.ledgerBalanceId());
             Order order = buildOrder(id, req, shardId, accountIdHash, ledgerBalanceId, now);
 
+            // Buying-power hold is mandatory before cluster admit: a failed hold must reject at
+            // ingress (HTTP 422 / RISK_BUYING_POWER) and must never reach the venue egress path.
+            ensureBuyLedgerInflightHoldBeforeClusterAdmit(order, req);
+
             // Slice E-1: route the admit to the cluster client owning this shard. At
             // shardCount=1 this is byte-identical to using the singleton client directly; at
             // shardCount>1 (E-3+) the router fans out to N clients without touching this method.
@@ -287,12 +292,8 @@ public class OrderIngressService {
                 return new IngressResult(order, false);
             }
 
-            // D-9 post-cluster phase: only sync-HTTP and coalescer paths still have work
-            // here; BUY-async (the production default) returns immediately because the
-            // projector's recordLedgerInflightOutboxIfNeeded materialises the outbox row
-            // from the cluster's authoritative OrderAdmittedEvent. No Postgres I/O on the
-            // hot path for the BUY-async branch.
-            maybePlaceBuyLedgerInflightHold(order, req);
+            // Hold already placed pre-admit; BUY-async projector still writes the outbox row for
+            // lifecycle txn-id tracking and the reconciler idempotently confirms publish.
             lockedQuote.ifPresent(cached -> maybeRecordCustomerFxFlow(req, cached));
 
             OmsPipelineMetrics.finishIngressAccept(meterRegistry, ingressSample, "created");
@@ -585,7 +586,7 @@ public class OrderIngressService {
         }
     }
 
-    private void maybePlaceBuyLedgerInflightHold(Order order, CreateOrderRequest req) {
+    private void ensureBuyLedgerInflightHoldBeforeClusterAdmit(Order order, CreateOrderRequest req) {
         if (!config.getLedger().isInflightReservationEnabled()) {
             return;
         }
@@ -598,69 +599,65 @@ public class OrderIngressService {
         if (!BuyFundsRequirement.hasBuyFundingPrice(order)) {
             return;
         }
-        // §8.4 quote-lock — when the BFF computed the cross-currency hold in
-        // source-balance ccy off a locked quote, prefer that value over the
-        // single-ccy {@link BuyFundsRequirement} math (which treats limitPrice
-        // as same-ccy as the balance and would post the USD-magnitude to an
-        // EUR balance). Single-currency orders carry {@code cashHoldAmount=null}
-        // and fall through to the legacy sizer, byte-identical to pre-§8.
         java.util.Optional<BigDecimal> holdAmount = (req.cashHoldAmount() != null)
                 ? java.util.Optional.of(req.cashHoldAmount())
                 : BuyFundsRequirement.requiredBuyFunds(order, config);
         if (holdAmount.isEmpty()) {
             return;
         }
-        // Slice 4q: coalescer takes priority when enabled — both async-outbox (4p) and
-        // sync-HTTP paths remain available so operators can flip back. Coalescer reuses the
-        // outbox as its fallback path on flush failure, so {@code inflightCompensatorEnabled}
-        // still backstops correctness end-to-end.
         if (config.getLedger().isInflightCoalescerEnabled()) {
             LedgerInflightCoalescer coalescer = ledgerInflightCoalescer.getIfAvailable();
             if (coalescer != null) {
                 placeBuyLedgerInflightHoldThroughCoalescer(order, coalescer, holdAmount.get());
                 return;
             }
-            // Coalescer flag on but bean missing (mis-wiring): fall through to async/sync paths
-            // rather than silently dropping the hold.
             log.warn("inflight-coalescer-enabled=true but no LedgerInflightCoalescer bean; "
-                    + "falling back to async/sync path for orderId={}", order.id());
+                    + "falling back to sync hold for orderId={}", order.id());
         }
-        if (config.getLedger().isInflightAsyncEnabled()) {
-            // Phase 4 Tier 2.5 phase D-9: ingress no longer writes ledger_inflight_outbox.
-            // The projector's recordLedgerInflightOutboxIfNeeded(OrderAdmittedEvent) is the
-            // only writer; it idempotently inserts the row (ON CONFLICT DO NOTHING on
-            // uq_ledger_inflight_outbox_order_id) from the cluster's authoritative admit
-            // event, so the slice 4p reconciler/compensator pipeline picks the row up
-            // without any change. See class-level Javadoc for the consistency contract.
-            return;
-        }
+        placeBuyLedgerInflightHoldSync(order, holdAmount.get());
+    }
+
+    private void placeBuyLedgerInflightHoldSync(Order order, BigDecimal holdAmount) {
         LedgerInflightReservationClient client = ledgerInflightReservation.getIfAvailable();
         if (client == null) {
-            return;
+            throw new LedgerInflightHoldException(
+                    HttpStatus.SERVICE_UNAVAILABLE,
+                    RejectCode.INTERNAL_ERROR,
+                    "ledger_unavailable",
+                    "ledger inflight reservation client is not available");
         }
+        String holdPath = config.getLedger().isInflightAsyncEnabled() ? "pre_admit_async" : "sync";
         Timer.Sample sample = Timer.start(meterRegistry);
         try {
-            // Wed-demo (V32): the sync-mode hold path does NOT currently write a
-            // ledger_inflight_outbox row (that's the async path's projector). The returned
-            // txn id is therefore discarded here — the Ledger's expiry sweep is the safety
-            // net for sync-mode holds. The async path captures + persists txn id in
-            // LedgerInflightOutboxReconciler.runOnce(), where it does have an outbox row to
-            // update. If sync mode needs lifecycle reconciliation later, add a sync-side
-            // outbox INSERT here that stashes the returned txn id.
-            client.placeBuyFundsHold(order.id(), order.ledgerBalanceId(), holdAmount.get());
+            client.placeBuyFundsHold(order.id(), order.ledgerBalanceId(), holdAmount);
             sample.stop(Timer.builder(METRIC_LEDGER_INFLIGHT_HOLD)
                     .description("Ledger sync inflight hold HTTP call at order accept")
                     .tag("result", "success")
-                    .tag("path", "sync")
+                    .tag("path", holdPath)
                     .register(meterRegistry));
         } catch (LedgerInflightReservationClient.LedgerReservationException e) {
             sample.stop(Timer.builder(METRIC_LEDGER_INFLIGHT_HOLD)
                     .description("Ledger sync inflight hold HTTP call at order accept")
                     .tag("result", "failure")
-                    .tag("path", "sync")
+                    .tag("path", holdPath)
                     .register(meterRegistry));
-            throw new RuntimeException("ledger inflight reservation failed", e);
+            throw toLedgerInflightHoldException(e);
         }
+    }
+
+    private static LedgerInflightHoldException toLedgerInflightHoldException(Throwable t) {
+        if (LedgerInflightReservationFailures.isInsufficientFunds(t)) {
+            return new LedgerInflightHoldException(
+                    HttpStatus.UNPROCESSABLE_ENTITY,
+                    RejectCode.RISK_BUYING_POWER,
+                    "insufficient_funds",
+                    "insufficient buying power for this order");
+        }
+        return new LedgerInflightHoldException(
+                HttpStatus.SERVICE_UNAVAILABLE,
+                RejectCode.INTERNAL_ERROR,
+                "ledger_hold_failed",
+                t.getMessage() == null ? "ledger inflight hold failed" : t.getMessage());
     }
 
     private void placeBuyLedgerInflightHoldThroughCoalescer(
@@ -676,7 +673,7 @@ public class OrderIngressService {
                     .tag("result", "failure")
                     .tag("path", "coalescer")
                     .register(meterRegistry));
-            throw new RuntimeException("ledger inflight coalescer rejected submit: " + e.getMessage(), e);
+            throw toLedgerInflightHoldException(e);
         }
         try {
             ack.get(timeoutMs, TimeUnit.MILLISECONDS);
@@ -694,15 +691,19 @@ public class OrderIngressService {
             // The future is still pending — coalescer may still flush + outbox-fallback after we
             // throw. The compensator path handles any orphaned admit since we roll back the
             // ingress accept tx (no domain event emitted) and the cluster orderId stays admitted.
-            throw new RuntimeException(
-                    "ledger inflight coalescer ack timed out after " + timeoutMs + "ms", e);
+            throw new LedgerInflightHoldException(
+                    HttpStatus.SERVICE_UNAVAILABLE,
+                    RejectCode.INTERNAL_ERROR,
+                    "ledger_hold_timeout",
+                    "ledger inflight coalescer ack timed out after " + timeoutMs + "ms");
         } catch (ExecutionException e) {
             sample.stop(Timer.builder(METRIC_LEDGER_INFLIGHT_HOLD)
                     .description("Ledger inflight coalescer hold at order accept")
                     .tag("result", "failure")
                     .tag("path", "coalescer")
                     .register(meterRegistry));
-            throw new RuntimeException("ledger inflight coalescer ack failed", e.getCause());
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            throw toLedgerInflightHoldException(cause);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             sample.stop(Timer.builder(METRIC_LEDGER_INFLIGHT_HOLD)

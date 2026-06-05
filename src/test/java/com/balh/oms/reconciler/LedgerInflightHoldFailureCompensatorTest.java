@@ -1,9 +1,11 @@
 package com.balh.oms.reconciler;
 
+import com.balh.oms.cluster.ApplyExecutionReportCommand;
 import com.balh.oms.cluster.CancelOrderCommand;
 import com.balh.oms.cluster.OmsClusterIngressClient;
 import com.balh.oms.cluster.OmsClusterShardRouter;
 import com.balh.oms.config.OmsConfig;
+import com.balh.oms.domain.RejectCode;
 import com.balh.oms.persistence.LedgerInflightOutboxRepository;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
@@ -119,21 +121,44 @@ class LedgerInflightHoldFailureCompensatorTest {
     }
 
     @Test
-    void runOnce_successfulCancel_marksCompensatedWithSameCorrelationId() throws Exception {
+    void runOnce_insufficientFunds_rejectsWithBuyingPower() throws Exception {
         UUID orderId = UUID.fromString("00000000-0000-4000-8000-00000000A001");
         var row = new LedgerInflightOutboxRepository.FailedInflightRow(
-                42L, orderId, /* attempts = */ 3, "insufficient_balance", /* shardId = */ 0);
+                42L, orderId, /* attempts = */ 3, "INSUFFICIENT_FUNDS: balance too low", /* shardId = */ 0);
+        when(outbox.fetchFailedUncompensated(anyInt(), anyInt())).thenReturn(List.of(row));
+
+        compensator.runOnce();
+
+        ArgumentCaptor<ApplyExecutionReportCommand> cmdCaptor =
+                ArgumentCaptor.forClass(ApplyExecutionReportCommand.class);
+        verify(client).submitApplyExecutionReport(cmdCaptor.capture(), any(Duration.class));
+        long usedCorrelation = cmdCaptor.getValue().correlationId();
+        assertThat(cmdCaptor.getValue().orderId()).isEqualTo(orderId);
+        assertThat(cmdCaptor.getValue().execTypeCode())
+                .isEqualTo(ApplyExecutionReportCommand.EXEC_TYPE_VENUE_REJECT);
+        assertThat(cmdCaptor.getValue().rejectCodeOrZero())
+                .isEqualTo((byte) RejectCode.RISK_BUYING_POWER.ordinal());
+        assertThat(cmdCaptor.getValue().rawEnvelopeJson()).contains("insufficient_funds");
+
+        verify(outbox).markCompensated(eq(42L), eq(usedCorrelation), any());
+        verify(client, never()).submitCancelOrder(any(), any());
+        assertThat(meterRegistry.counter("oms_ledger_inflight_hold_compensated_total",
+                "outcome", "rejected").count()).isEqualTo(1.0);
+    }
+
+    @Test
+    void runOnce_nonFundsFailure_stillCancels() throws Exception {
+        UUID orderId = UUID.fromString("00000000-0000-4000-8000-00000000A001");
+        var row = new LedgerInflightOutboxRepository.FailedInflightRow(
+                42L, orderId, /* attempts = */ 3, "ledger timeout", /* shardId = */ 0);
         when(outbox.fetchFailedUncompensated(anyInt(), anyInt())).thenReturn(List.of(row));
 
         compensator.runOnce();
 
         ArgumentCaptor<CancelOrderCommand> cmdCaptor = ArgumentCaptor.forClass(CancelOrderCommand.class);
         verify(client).submitCancelOrder(cmdCaptor.capture(), any(Duration.class));
-        long usedCorrelation = cmdCaptor.getValue().correlationId();
         assertThat(cmdCaptor.getValue().orderId()).isEqualTo(orderId);
-        assertThat(cmdCaptor.getValue().reason()).contains("ledger_inflight_hold_failed:insufficient_balance");
-
-        verify(outbox).markCompensated(eq(42L), eq(usedCorrelation), any());
+        verify(client, never()).submitApplyExecutionReport(any(), any());
         assertThat(meterRegistry.counter("oms_ledger_inflight_hold_compensated_total",
                 "outcome", "cancelled").count()).isEqualTo(1.0);
     }

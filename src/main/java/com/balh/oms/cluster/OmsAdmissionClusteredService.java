@@ -27,6 +27,7 @@ import org.slf4j.LoggerFactory;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -103,14 +104,12 @@ public class OmsAdmissionClusteredService implements ClusteredService {
     /**
      * Phase 4 Tier 2.5 phase E-3b bumped this from {@code 3} to {@code 4} when {@link AdmittedOrder}
      * gained {@code shardId} so the cluster log carries the order's owning shard for every emitted
-     * {@link OrderCancelAppliedEvent} (and any future shard-aware emissions). Because {@link
-     * SnapshotLoader#onFragment} fails fast on a version mismatch, pre-E-3b snapshots are not
-     * load-compatible with this build &mdash; operators upgrading from E-2 must wipe
-     * {@code archive/} and {@code cluster/} (or the cluster-node's {@code aeron-cluster}) on each
-     * member <em>before</em> starting the E-3b binary; the cluster will rebuild state from the
-     * recorded log.
+     * {@link OrderCancelAppliedEvent} (and any future shard-aware emissions). Workstream 6 bumps to
+     * {@code 6} by adding {@link AdmittedOrder#terminalAtMillis()} for terminal tombstone retention.
+     * Because {@link SnapshotLoader#onFragment} fails fast on a version mismatch, older snapshots are
+     * not load-compatible with this build and must be rebuilt from archive replay.
      */
-    static final int SNAPSHOT_SCHEMA_VERSION = 5;
+    static final int SNAPSHOT_SCHEMA_VERSION = 6;
 
     /** Phase 2.1 readiness counter — see {@code plans/oms-cluster-recovery-and-hardening.md}. */
     public static final int READINESS_COUNTER_TYPE_ID = 2_000_002;
@@ -143,6 +142,17 @@ public class OmsAdmissionClusteredService implements ClusteredService {
     public static final String SNAPSHOT_LOAD_FAILED_LOG_MARKER = "SNAPSHOT_LOAD_FAILED";
 
     private static final String ENV_READINESS_ALLOW_EMPTY_REPLAY = "OMS_READINESS_ALLOW_EMPTY_REPLAY";
+    private static final String ENV_TERMINAL_TOMBSTONE_RETENTION_MILLIS =
+            "OMS_TERMINAL_TOMBSTONE_RETENTION_MILLIS";
+    private static final String ENV_SNAPSHOT_BUFFER_REUSE_MAX_BYTES =
+            "OMS_SNAPSHOT_BUFFER_REUSE_MAX_BYTES";
+
+    private static final long MILLIS_PER_SECOND = 1_000L;
+    private static final long SECONDS_PER_MINUTE = 60L;
+    private static final long MINUTES_PER_HOUR = 60L;
+    private static final long DEFAULT_TERMINAL_TOMBSTONE_RETENTION_MILLIS =
+            6L * MINUTES_PER_HOUR * SECONDS_PER_MINUTE * MILLIS_PER_SECOND;
+    private static final int DEFAULT_SNAPSHOT_BUFFER_REUSE_MAX_BYTES = 4 * 1024 * 1024;
 
     /** Initial buffer capacity for command processing. Grown on demand. */
     private static final int INITIAL_BUFFER_CAPACITY = 1024;
@@ -216,6 +226,9 @@ public class OmsAdmissionClusteredService implements ClusteredService {
      * cluster session offer.
      */
     private final ExpandableArrayBuffer eventsBuffer = new ExpandableArrayBuffer(INITIAL_BUFFER_CAPACITY);
+    private ExpandableArrayBuffer snapshotBuffer = new ExpandableArrayBuffer(INITIAL_BUFFER_CAPACITY);
+    private final long terminalTombstoneRetentionMillis;
+    private final int snapshotBufferReuseMaxBytes;
 
     // ---- Phase 4 slice 4b: snapshot observability ----
     // Cluster-resident code is plain Java + Agrona (no Spring magic in ClusteredService, per ADR 0001
@@ -363,7 +376,19 @@ public class OmsAdmissionClusteredService implements ClusteredService {
      * set up dashboards / alerts before the first snapshot fires).
      */
     public OmsAdmissionClusteredService(MeterRegistry meterRegistry) {
+        this(
+                meterRegistry,
+                parseTerminalTombstoneRetentionMillisFromEnv(),
+                parseSnapshotBufferReuseMaxBytesFromEnv());
+    }
+
+    OmsAdmissionClusteredService(
+            MeterRegistry meterRegistry,
+            long terminalTombstoneRetentionMillis,
+            int snapshotBufferReuseMaxBytes) {
         this.meterRegistry = Objects.requireNonNull(meterRegistry, "meterRegistry");
+        this.terminalTombstoneRetentionMillis = terminalTombstoneRetentionMillis;
+        this.snapshotBufferReuseMaxBytes = snapshotBufferReuseMaxBytes;
         Tags writeTags = Tags.of("outcome", "write");
         Tags loadTags = Tags.of("outcome", "load");
         this.snapshotWriteTimer = Timer.builder("oms.cluster.snapshot.duration")
@@ -558,6 +583,7 @@ public class OmsAdmissionClusteredService implements ClusteredService {
             int length,
             Header header) {
         sessionMessageCountSinceStart++;
+        pruneExpiredTerminalTombstones(timestamp);
         if (length < OmsClusterWireFormat.HEADER_LENGTH) {
             // Malformed; ignore. Logging here would break determinism on replay if log writes throw.
             return;
@@ -698,7 +724,7 @@ public class OmsAdmissionClusteredService implements ClusteredService {
     @Override
     public void onTakeSnapshot(ExclusivePublication snapshotPublication) {
         Timer.Sample sample = Timer.start(meterRegistry);
-        ExpandableArrayBuffer buffer = new ExpandableArrayBuffer(INITIAL_BUFFER_CAPACITY);
+        ExpandableArrayBuffer buffer = snapshotBuffer;
         int p = 0;
         buffer.putInt(p, SNAPSHOT_MAGIC);
         p += Integer.BYTES;
@@ -819,6 +845,7 @@ public class OmsAdmissionClusteredService implements ClusteredService {
         // returns success, so a back-pressured publish that throws does not advance freshness.
         lastSnapshotWriteEpochMs = System.currentTimeMillis();
         snapshotTakenCount++;
+        maybeShrinkSnapshotBufferAfterUse();
     }
 
     /**
@@ -995,6 +1022,35 @@ public class OmsAdmissionClusteredService implements ClusteredService {
         return raw != null && ("1".equals(raw.trim()) || "true".equalsIgnoreCase(raw.trim()));
     }
 
+    private static long parseTerminalTombstoneRetentionMillisFromEnv() {
+        return parseNonNegativeLongFromEnv(
+                ENV_TERMINAL_TOMBSTONE_RETENTION_MILLIS,
+                DEFAULT_TERMINAL_TOMBSTONE_RETENTION_MILLIS);
+    }
+
+    private static int parseSnapshotBufferReuseMaxBytesFromEnv() {
+        long parsed = parseNonNegativeLongFromEnv(
+                ENV_SNAPSHOT_BUFFER_REUSE_MAX_BYTES,
+                DEFAULT_SNAPSHOT_BUFFER_REUSE_MAX_BYTES);
+        if (parsed > Integer.MAX_VALUE) {
+            return Integer.MAX_VALUE;
+        }
+        return (int) parsed;
+    }
+
+    private static long parseNonNegativeLongFromEnv(String envName, long defaultValue) {
+        String raw = System.getenv(envName);
+        if (raw == null || raw.trim().isEmpty()) {
+            return defaultValue;
+        }
+        try {
+            long parsed = Long.parseLong(raw.trim());
+            return Math.max(0L, parsed);
+        } catch (NumberFormatException ignored) {
+            return defaultValue;
+        }
+    }
+
     @Override
     public void onTerminate(Cluster cluster) {
         log.info("OmsAdmissionClusteredService terminating; orders={}", orderIndex.size());
@@ -1046,7 +1102,8 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                 // venue gRPC and external FIX venues).
                 /* statusCode = */ STATUS_PENDING_NEW,
                 /* cumQtyScaled = */ 0L,
-                cmd.shardId());
+                cmd.shardId(),
+                AdmittedOrder.TERMINAL_AT_NOT_SET);
         idempotencyIndex.put(key, admitted);
         orderIndex.put(admitted.orderId(), admitted);
         openOrdersCount++;
@@ -1241,7 +1298,10 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                 order.acceptedAtMillis(),
                 newStatus,
                 newCumQty,
-                order.shardId());
+                order.shardId(),
+                isTerminal(newStatus) && !isTerminal(order.statusCode())
+                        ? clusterTimestampMillis
+                        : order.terminalAtMillis());
         orderIndex.put(mutated.orderId(), mutated);
         idempotencyIndex.put(
                 new IdempotencyKey(mutated.accountId(), mutated.clientIdempotencyKey()), mutated);
@@ -1264,6 +1324,7 @@ public class OmsAdmissionClusteredService implements ClusteredService {
         }
 
         emitExecutionApplied(cmd, mutated, clusterTimestampMillis);
+        maybeCompactOnTerminalTransition(order, mutated, clusterTimestampMillis);
     }
 
     private void applyVenueResolution(long clusterTimestampMillis, DirectBuffer buffer, int offset, int length) {
@@ -1298,10 +1359,12 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                             order.acceptedAtMillis(),
                             STATUS_RESOLVED,
                             order.cumQtyScaled(),
-                            order.shardId());
+                            order.shardId(),
+                            clusterTimestampMillis);
             orderIndex.put(order.orderId(), mutated);
             idempotencyIndex.put(new IdempotencyKey(mutated.accountId(), mutated.clientIdempotencyKey()), mutated);
             onOrderStatusChanged(order.statusCode(), STATUS_RESOLVED);
+            maybeCompactOnTerminalTransition(order, mutated, clusterTimestampMillis);
             resolvedCount++;
         }
         resolvedContractKeys.add(cmd.idempotencyKey());
@@ -1393,13 +1456,15 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                 order.acceptedAtMillis(),
                 STATUS_CANCELLED,
                 order.cumQtyScaled(),
-                order.shardId());
+                order.shardId(),
+                clusterTimestampMillis);
         orderIndex.put(mutated.orderId(), mutated);
         idempotencyIndex.put(
                 new IdempotencyKey(mutated.accountId(), mutated.clientIdempotencyKey()), mutated);
         onOrderStatusChanged(order.statusCode(), STATUS_CANCELLED);
 
         emitOrderCancelApplied(mutated, clusterTimestampMillis, cmd.reason());
+        maybeCompactOnTerminalTransition(order, mutated, clusterTimestampMillis);
     }
 
     private static String trimCancelReasonForLog(String reason) {
@@ -1680,6 +1745,10 @@ public class OmsAdmissionClusteredService implements ClusteredService {
         return orderIndex.size();
     }
 
+    public int requestedKeysBucketCountForTest() {
+        return requestedKeysIndex.size();
+    }
+
     /**
      * Visible for tests. Returns whether the cluster has already applied an
      * {@link ApplyExecutionReportCommand} for {@code (orderId, venueExecRef)}; mirrors the dedupe
@@ -1688,6 +1757,10 @@ public class OmsAdmissionClusteredService implements ClusteredService {
     public boolean hasAppliedExecutionRef(UUID orderId, String venueExecRef) {
         Set<String> refs = executionRefIndex.get(orderId);
         return refs != null && refs.contains(venueExecRef);
+    }
+
+    public int executionRefOrderCountForTest() {
+        return executionRefIndex.size();
     }
 
     /**
@@ -1792,6 +1865,45 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                 throw new IllegalStateException(
                         "decode cursor " + this.finalCursor + " exceeded encoded length " + length);
             }
+        }
+    }
+
+    private void maybeCompactOnTerminalTransition(
+            AdmittedOrder previous, AdmittedOrder current, long clusterTimestampMillis) {
+        if (isTerminal(previous.statusCode()) || !isTerminal(current.statusCode())) {
+            return;
+        }
+        executionRefIndex.remove(current.orderId());
+        requestedKeysIndex.remove(current.orderId());
+        AdmittedOrder tombstone = current.toTerminalTombstone(clusterTimestampMillis);
+        orderIndex.put(tombstone.orderId(), tombstone);
+        idempotencyIndex.put(new IdempotencyKey(tombstone.accountId(), tombstone.clientIdempotencyKey()), tombstone);
+    }
+
+    private void pruneExpiredTerminalTombstones(long clusterTimestampMillis) {
+        if (terminalTombstoneRetentionMillis <= 0L) {
+            return;
+        }
+        Iterator<Map.Entry<UUID, AdmittedOrder>> it = orderIndex.entrySet().iterator();
+        while (it.hasNext()) {
+            Map.Entry<UUID, AdmittedOrder> entry = it.next();
+            AdmittedOrder order = entry.getValue();
+            if (!order.isTerminalTombstone()) {
+                continue;
+            }
+            if ((clusterTimestampMillis - order.terminalAtMillis()) < terminalTombstoneRetentionMillis) {
+                continue;
+            }
+            it.remove();
+            idempotencyIndex.remove(new IdempotencyKey(order.accountId(), order.clientIdempotencyKey()));
+            executionRefIndex.remove(order.orderId());
+            requestedKeysIndex.remove(order.orderId());
+        }
+    }
+
+    private void maybeShrinkSnapshotBufferAfterUse() {
+        if (snapshotBuffer.capacity() > snapshotBufferReuseMaxBytes) {
+            snapshotBuffer = new ExpandableArrayBuffer(INITIAL_BUFFER_CAPACITY);
         }
     }
 
@@ -1974,7 +2086,10 @@ public class OmsAdmissionClusteredService implements ClusteredService {
             long acceptedAtMillis,
             byte statusCode,
             long cumQtyScaled,
-            int shardId) {
+            int shardId,
+            long terminalAtMillis) {
+
+        static final long TERMINAL_AT_NOT_SET = -1L;
 
         int encode(MutableDirectBuffer buffer, int offset) {
             int p = offset;
@@ -1991,6 +2106,8 @@ public class OmsAdmissionClusteredService implements ClusteredService {
             buffer.putLong(p, limitPriceScaledOrZero);
             p += Long.BYTES;
             buffer.putLong(p, cumQtyScaled);
+            p += Long.BYTES;
+            buffer.putLong(p, terminalAtMillis);
             p += Long.BYTES;
             // Phase 4 Tier 2.5 phase E-3b: shardId is preserved across replay/snapshot so the
             // cluster's emit paths (cancel today, future shard-aware emissions) carry the order's
@@ -2028,6 +2145,8 @@ public class OmsAdmissionClusteredService implements ClusteredService {
             p += Long.BYTES;
             long cumQtyScaled = buffer.getLong(p);
             p += Long.BYTES;
+            long terminalAtMillis = buffer.getLong(p);
+            p += Long.BYTES;
             int shardId = buffer.getInt(p);
             p += Integer.BYTES;
             byte side = buffer.getByte(p++);
@@ -2061,13 +2180,14 @@ public class OmsAdmissionClusteredService implements ClusteredService {
                     acceptedAtMillis,
                     statusCode,
                     cumQtyScaled,
-                    shardId);
+                    shardId,
+                    terminalAtMillis);
         }
 
         int encodedLength() {
             int p = 0;
-            // 6 longs (msb, lsb, acceptedAtMillis, quantityScaled, limitPriceScaledOrZero, cumQtyScaled).
-            p += Long.BYTES * 6;
+            // 7 longs (msb, lsb, acceptedAtMillis, quantityScaled, limitPriceScaledOrZero, cumQtyScaled, terminalAtMillis).
+            p += Long.BYTES * 7;
             // 2 ints (version, shardId).
             p += Integer.BYTES * 2;
             // 4 bytes (side, tif, statusCode, hasLedgerBalanceId).
@@ -2117,6 +2237,30 @@ public class OmsAdmissionClusteredService implements ClusteredService {
          */
         private static int stringByteLenAt(DirectBuffer buffer, int offset) {
             return Integer.BYTES + buffer.getInt(offset);
+        }
+
+        private boolean isTerminalTombstone() {
+            return isTerminal(statusCode) && terminalAtMillis != TERMINAL_AT_NOT_SET;
+        }
+
+        private AdmittedOrder toTerminalTombstone(long transitionTimestampMillis) {
+            return new AdmittedOrder(
+                    orderId,
+                    accountId,
+                    clientIdempotencyKey,
+                    "",
+                    "",
+                    (byte) 0,
+                    0L,
+                    0L,
+                    (byte) 0,
+                    null,
+                    version,
+                    acceptedAtMillis,
+                    statusCode,
+                    cumQtyScaled,
+                    0,
+                    transitionTimestampMillis);
         }
     }
 }

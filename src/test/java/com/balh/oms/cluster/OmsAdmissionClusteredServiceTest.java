@@ -819,6 +819,13 @@ class OmsAdmissionClusteredServiceTest {
         svc.onSessionMessage(session, clusterTimestampMillis, buffer, 0, written, /* header = */ null);
     }
 
+    private void deliverCommandTo(
+            OmsAdmissionClusteredService svc, CancelOrderCommand cmd, long clusterTimestampMillis) {
+        ExpandableArrayBuffer buffer = new ExpandableArrayBuffer(COMMAND_BUFFER_BYTES);
+        int written = cmd.encode(buffer, 0);
+        svc.onSessionMessage(session, clusterTimestampMillis, buffer, 0, written, /* header = */ null);
+    }
+
     private void deliverCommand(ApplyExecutionReportCommand cmd, long clusterTimestampMillis) {
         ExpandableArrayBuffer buffer = new ExpandableArrayBuffer(COMMAND_BUFFER_BYTES);
         int written = cmd.encode(buffer, 0);
@@ -872,6 +879,61 @@ class OmsAdmissionClusteredServiceTest {
         OmsAdmissionClusteredService.AdmittedOrder mutated = service.lookupByOrderId(orderId);
         assertThat(mutated.statusCode()).isEqualTo(OmsAdmissionClusteredService.STATUS_CANCELLED);
         assertThat(mutated.version()).isEqualTo(1);
+    }
+
+    @Test
+    void terminalTransition_compactsOrderAndPrunesTerminalOnlyIndexes() {
+        UUID orderId = UUID.fromString("00000000-0000-4000-8000-000000004003");
+        deliverCommand(sampleAccept(1L, "acct-comp", "idem-comp", orderId), ANY_TIMESTAMP_MS);
+        deliverCommand(
+                new RequestCancelOrderCommand(2L, orderId, 1L, "req-key", "ui-request"),
+                ANY_TIMESTAMP_MS + 1);
+        deliverCommand(
+                sampleTrade(orderId, 1_000_000_000L, 100_000_000L, "EXEC-COMP-1"),
+                ANY_TIMESTAMP_MS + 2);
+        assertThat(service.requestedKeysBucketCountForTest()).isEqualTo(1);
+        assertThat(service.executionRefOrderCountForTest()).isEqualTo(1);
+
+        deliverCommand(
+                new CancelOrderCommand(3L, orderId, 1L, "compensator"),
+                ANY_TIMESTAMP_MS + 3);
+
+        OmsAdmissionClusteredService.AdmittedOrder compacted = service.lookupByOrderId(orderId);
+        assertThat(compacted.statusCode()).isEqualTo(OmsAdmissionClusteredService.STATUS_CANCELLED);
+        assertThat(compacted.accountId()).isEqualTo("acct-comp");
+        assertThat(compacted.clientIdempotencyKey()).isEqualTo("idem-comp");
+        assertThat(compacted.instrumentSymbol()).isEmpty();
+        assertThat(compacted.quantityScaled()).isZero();
+        assertThat(service.requestedKeysBucketCountForTest()).isZero();
+        assertThat(service.executionRefOrderCountForTest()).isZero();
+    }
+
+    @Test
+    void terminalTombstone_expiresAfterRetentionWindow_andAllowsFreshAdmit() {
+        OmsAdmissionClusteredService svc = newStartedServiceWithRetentionMillis(2L);
+        UUID orderId = UUID.fromString("00000000-0000-4000-8000-000000004004");
+        deliverCommandTo(svc, sampleAccept(1L, "acct-expire", "idem-expire", orderId), ANY_TIMESTAMP_MS);
+        deliverCommandTo(
+                svc,
+                new CancelOrderCommand(2L, orderId, 1L, "compensator"),
+                ANY_TIMESTAMP_MS + 1);
+        assertThat(svc.lookupByIdempotency("acct-expire", "idem-expire")).isNotNull();
+
+        // Any later command runs the retention sweep before apply.
+        deliverCommandTo(
+                svc,
+                sampleAccept(3L, "acct-other", "idem-other",
+                        UUID.fromString("00000000-0000-4000-8000-000000004005")),
+                ANY_TIMESTAMP_MS + 10);
+        assertThat(svc.lookupByOrderId(orderId)).isNull();
+        assertThat(svc.lookupByIdempotency("acct-expire", "idem-expire")).isNull();
+
+        UUID reAdmitOrderId = UUID.fromString("00000000-0000-4000-8000-000000004006");
+        deliverCommandTo(
+                svc,
+                sampleAccept(4L, "acct-expire", "idem-expire", reAdmitOrderId),
+                ANY_TIMESTAMP_MS + 11);
+        assertThat(svc.lookupByOrderId(reAdmitOrderId)).isNotNull();
     }
 
     @Test
@@ -1023,6 +1085,22 @@ class OmsAdmissionClusteredServiceTest {
             int written = cmd.encode(buffer, 0);
             svc.onSessionMessage(sessionMock, clusterTimestampMillis, buffer, 0, written, /* header = */ null);
         }
+    }
+
+    private OmsAdmissionClusteredService newStartedServiceWithRetentionMillis(long retentionMillis) {
+        OmsAdmissionClusteredService svc = new OmsAdmissionClusteredService(
+                meterRegistry,
+                retentionMillis,
+                4 * 1024 * 1024);
+        Aeron aeronMock = mock(Aeron.class);
+        ExclusivePublication eventsPub = mock(ExclusivePublication.class);
+        when(eventsPub.offer(any(DirectBuffer.class), anyInt(), anyInt())).thenReturn(1L);
+        OmsAdmissionClusteredServiceTestFixtures.wireClusterAeronMocks(aeronMock, eventsPub);
+        Cluster newClusterMock = mock(Cluster.class);
+        when(newClusterMock.role()).thenReturn(Cluster.Role.LEADER);
+        when(newClusterMock.aeron()).thenReturn(aeronMock);
+        svc.onStart(newClusterMock, /* snapshotImage = */ null);
+        return svc;
     }
 
     // ------------------------------------------------------------------------

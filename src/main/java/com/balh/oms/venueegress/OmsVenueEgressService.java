@@ -368,13 +368,6 @@ public class OmsVenueEgressService {
         replayPollParkNanos = venueEgressCfg.getPollParkNanos();
         boolean venueWired = venueRouteOrderClient != null && clusterIngressClient != null;
         int maxInFlight = Math.max(1, config.getCluster().getVenueEgress().getVenueRouteMaxInFlight());
-        if (venueWired && maxInFlight > 1) {
-            pipeline = new EgressRoutePipeline(maxInFlight);
-            log.info(
-                    "oms-venue-egress pipelined RouteOrderStream active: venueRouteMaxInFlight={} (cursor advances over the contiguous-completed prefix; crash redelivery window <= {} RouteOrders, deduped by the venue)",
-                    maxInFlight,
-                    maxInFlight);
-        }
         if (savedCursor.isPresent()) {
             log.info(
                     "oms-venue-egress starting ({}); resuming from recording {} at log position {} (egressId={}, streamId={}); cursorFlushEvery={}",
@@ -397,6 +390,13 @@ public class OmsVenueEgressService {
                     cursorFlushEvery);
         }
         running.set(true);
+        if (venueWired && maxInFlight > 1) {
+            pipeline = new EgressRoutePipeline(maxInFlight);
+            log.info(
+                    "oms-venue-egress pipelined RouteOrderStream active: venueRouteMaxInFlight={} (cursor advances over the contiguous-completed prefix; crash redelivery window <= {} RouteOrders, deduped by the venue)",
+                    maxInFlight,
+                    maxInFlight);
+        }
         replayThread = new Thread(this::replayLoop, "oms-venue-egress-replay");
         replayThread.setDaemon(true);
         applyReplayThreadPriority(replayThread, venueEgressCfg.getReplayThreadPriority());
@@ -1566,7 +1566,18 @@ public class OmsVenueEgressService {
             while (true) {
                 PendingRouteOffer item = routeOfferQueue.poll();
                 if (item != null) {
-                    dispatchRoute(item.ev(), item.position());
+                    try {
+                        dispatchRoute(item.ev(), item.position());
+                    } catch (RuntimeException e) {
+                        log.error(
+                                "oms-venue-egress route-offer failed orderId={} position={}",
+                                item.ev().orderId(),
+                                item.position(),
+                                e);
+                        tracker.complete(item.position());
+                        permits.release();
+                        unparkReplayThread();
+                    }
                     continue;
                 }
                 if (!running.get() && routeOfferQueue.isEmpty()) {

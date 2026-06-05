@@ -276,6 +276,11 @@ public class OmsClusterIngressClient {
         return erOfferQueue.size();
     }
 
+    /** Runtime backlog signal for venue-egress throttle decisions. */
+    public int erOfferQueueDepth() {
+        return erOfferQueue.size();
+    }
+
     private volatile AeronCluster client;
     private volatile Thread egressPollerThread;
     private volatile boolean closing;

@@ -1309,34 +1309,57 @@ public class OmsVenueEgressService {
             byte side,
             byte timeInForceCode) {
         long venueTsNanos = TimeUnit.MILLISECONDS.toNanos(acceptedAtMillis);
-        ApplyExecutionReportCommand cmd =
-                new ApplyExecutionReportCommand(
-                        0L,
-                        orderId,
-                        0L,
-                        0L,
-                        venueTsNanos,
-                        0,
-                        ApplyExecutionReportCommand.EXEC_TYPE_VENUE_REJECT,
-                        (byte) RejectCode.VENUE_REJECT.ordinal(),
-                        config.getVenue().getVenueId(),
-                        "venue-route-failed-" + orderId,
-                        "",
-                        "{\"reason\":\"" + reason + "\"}");
+        String venueExecRef = "venue-route-failed-" + orderId;
+        String rawEnvelopeJson = "{\"reason\":\"" + reason + "\"}";
         Duration submitTimeout = Duration.ofMillis(config.getCluster().getClient().getSubmitTimeoutMs());
-        try {
-            clusterIngressClient.submitApplyExecutionReport(cmd, submitTimeout);
-            long latencyMs = wallClock.millis() - acceptedAtMillis;
-            OmsPipelineMetrics.recordClusterAdmitToFixNos(
-                    meterRegistry, EGRESS_ID, side, timeInForceCode, latencyMs);
-            return true;
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            return false;
-        } catch (Exception e) {
-            log.warn("oms-venue-egress: cluster VENUE_REJECT submit failed for orderId={}", orderId, e);
-            return false;
+        int maxAttempts = config.getCluster().getVenueEgress().getVenueRejectSubmitMaxAttempts();
+        long retryBackoffMs = config.getCluster().getVenueEgress().getVenueRejectSubmitRetryBackoffMs();
+
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            long correlationId = clusterIngressClient.nextCorrelationId();
+            ApplyExecutionReportCommand cmd =
+                    new ApplyExecutionReportCommand(
+                            correlationId,
+                            orderId,
+                            0L,
+                            0L,
+                            venueTsNanos,
+                            0,
+                            ApplyExecutionReportCommand.EXEC_TYPE_VENUE_REJECT,
+                            (byte) RejectCode.VENUE_REJECT.ordinal(),
+                            config.getVenue().getVenueId(),
+                            venueExecRef,
+                            "",
+                            rawEnvelopeJson);
+            try {
+                clusterIngressClient.submitApplyExecutionReport(cmd, submitTimeout);
+                long latencyMs = wallClock.millis() - acceptedAtMillis;
+                OmsPipelineMetrics.recordClusterAdmitToFixNos(
+                        meterRegistry, EGRESS_ID, side, timeInForceCode, latencyMs);
+                return true;
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            } catch (Exception e) {
+                if (attempt < maxAttempts) {
+                    log.warn(
+                            "oms-venue-egress: cluster VENUE_REJECT submit attempt {}/{} failed for orderId={}; retrying",
+                            attempt,
+                            maxAttempts,
+                            orderId,
+                            e);
+                    LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(retryBackoffMs));
+                } else {
+                    log.error(
+                            "oms-venue-egress: cluster VENUE_REJECT submit exhausted {} attempts for orderId={};"
+                                    + " cursor will not advance — fragment retries on replay",
+                            maxAttempts,
+                            orderId,
+                            e);
+                }
+            }
         }
+        return false;
     }
 
     private boolean submitVenueExecutionReport(
@@ -1463,6 +1486,10 @@ public class OmsVenueEgressService {
 
         private final int maxInFlight;
         private final int maxPendingFragments;
+        private final int backlogThrottlePendingRouteThreshold;
+        private final int backlogThrottleErOfferQueueDepthThreshold;
+        private final int backlogThrottleMaxInFlight;
+        private final long backlogThrottleParkNanos;
         private final Semaphore permits;
         private final EgressCompletionTracker tracker = new EgressCompletionTracker();
         private final java.util.concurrent.Executor erSubmitExecutor;
@@ -1506,6 +1533,14 @@ public class OmsVenueEgressService {
         EgressRoutePipeline(int maxInFlight) {
             this.maxInFlight = maxInFlight;
             this.maxPendingFragments = maxInFlight * PENDING_FRAGMENT_CAP_MULTIPLIER;
+            OmsConfig.Cluster.VenueEgress venueCfg = config.getCluster().getVenueEgress();
+            this.backlogThrottlePendingRouteThreshold =
+                    venueCfg.getBacklogThrottlePendingRouteThreshold();
+            this.backlogThrottleErOfferQueueDepthThreshold =
+                    venueCfg.getBacklogThrottleErOfferQueueDepthThreshold();
+            this.backlogThrottleMaxInFlight =
+                    Math.min(maxInFlight, venueCfg.getBacklogThrottleMaxInFlight());
+            this.backlogThrottleParkNanos = venueCfg.getBacklogThrottleParkNanos();
             this.permits = new Semaphore(maxInFlight);
             // Virtual-thread per ER completion: cluster offer back-pressure parks the carrier
             // without exhausting a fixed platform pool (observed @ 150+ admits/s with
@@ -1529,6 +1564,7 @@ public class OmsVenueEgressService {
             offerThread.setDaemon(true);
             offerThread.start();
             this.routeOfferThread = offerThread;
+            meterRegistry.gauge("oms.venue.egress.pipeline.pending.routes", tracker, EgressCompletionTracker::inFlight);
         }
 
         /** Test seam: inject executors for deterministic ER completion and cursor-drain isolation. */
@@ -1547,6 +1583,14 @@ public class OmsVenueEgressService {
                 java.util.concurrent.Executor routeOfferExecutor) {
             this.maxInFlight = maxInFlight;
             this.maxPendingFragments = maxInFlight * PENDING_FRAGMENT_CAP_MULTIPLIER;
+            OmsConfig.Cluster.VenueEgress venueCfg = config.getCluster().getVenueEgress();
+            this.backlogThrottlePendingRouteThreshold =
+                    venueCfg.getBacklogThrottlePendingRouteThreshold();
+            this.backlogThrottleErOfferQueueDepthThreshold =
+                    venueCfg.getBacklogThrottleErOfferQueueDepthThreshold();
+            this.backlogThrottleMaxInFlight =
+                    Math.min(maxInFlight, venueCfg.getBacklogThrottleMaxInFlight());
+            this.backlogThrottleParkNanos = venueCfg.getBacklogThrottleParkNanos();
             this.permits = new Semaphore(maxInFlight);
             this.erSubmitExecutor = erSubmitExecutor;
             this.ownedErSubmitExecutor = null;
@@ -1555,6 +1599,7 @@ public class OmsVenueEgressService {
             this.routeOfferExecutor = routeOfferExecutor;
             this.routeOfferQueue = null;
             this.routeOfferThread = null;
+            meterRegistry.gauge("oms.venue.egress.pipeline.pending.routes", tracker, EgressCompletionTracker::inFlight);
         }
 
         /**
@@ -1598,13 +1643,31 @@ public class OmsVenueEgressService {
 
         /** Bounds total pipeline depth when venue permits are released before ER submit completes. */
         private void awaitDispatchCapacity() {
-            while (tracker.inFlight() >= maxPendingFragments) {
+            while (true) {
+                int inFlight = tracker.inFlight();
+                int effectiveCap = effectiveDispatchCapacity(inFlight, currentErOfferQueueDepth());
+                if (inFlight < effectiveCap) {
+                    return;
+                }
                 drainContiguous();
                 if (!running.get()) {
                     return;
                 }
-                LockSupport.parkNanos(QUIESCE_PARK_NANOS);
+                LockSupport.parkNanos(backlogThrottleParkNanos);
             }
+        }
+
+        private int currentErOfferQueueDepth() {
+            return clusterIngressClient == null ? 0 : clusterIngressClient.erOfferQueueDepth();
+        }
+
+        private int effectiveDispatchCapacity(int inFlight, int erOfferQueueDepth) {
+            int effectiveMaxInFlight = maxInFlight;
+            if (inFlight >= backlogThrottlePendingRouteThreshold
+                    || erOfferQueueDepth >= backlogThrottleErOfferQueueDepthThreshold) {
+                effectiveMaxInFlight = backlogThrottleMaxInFlight;
+            }
+            return Math.min(maxPendingFragments, Math.max(1, effectiveMaxInFlight));
         }
 
         /** Called on the replay thread for each polled fragment, in cluster-log order. */

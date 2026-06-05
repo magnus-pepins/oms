@@ -1039,6 +1039,18 @@ public class OmsConfig {
         private String venueId = "balh-internal-venue";
         /** Phase C: push catalog creates/updates to balh-venue registry over gRPC. */
         private boolean registrySyncEnabled = true;
+        /**
+         * On {@code oms-ingress-replica} / {@code oms-venue-egress} ready, sync all OPEN catalog rows
+         * to the venue registry (retries until venue gRPC accepts or attempts exhaust).
+         */
+        private boolean registrySyncOnStartupEnabled = true;
+        private int registrySyncOnStartupMaxAttempts = DEFAULT_REGISTRY_SYNC_ON_STARTUP_MAX_ATTEMPTS;
+        private long registrySyncOnStartupRetryBackoffMs = DEFAULT_REGISTRY_SYNC_ON_STARTUP_RETRY_BACKOFF_MS;
+        private long registrySyncOnStartupInitialDelayMs = DEFAULT_REGISTRY_SYNC_ON_STARTUP_INITIAL_DELAY_MS;
+
+        private static final int DEFAULT_REGISTRY_SYNC_ON_STARTUP_MAX_ATTEMPTS = 12;
+        private static final long DEFAULT_REGISTRY_SYNC_ON_STARTUP_RETRY_BACKOFF_MS = 5_000L;
+        private static final long DEFAULT_REGISTRY_SYNC_ON_STARTUP_INITIAL_DELAY_MS = 2_000L;
         /** Phase B: hold Ledger posting until this window elapses (default 2h). */
         private long resolutionDisputeWindowMs = DEFAULT_RESOLUTION_DISPUTE_WINDOW_MS;
         /** Pre-admission circuit breaker: refuse venue-routed accepts when oms-venue-egress is behind. */
@@ -1080,6 +1092,26 @@ public class OmsConfig {
         public boolean isRegistrySyncEnabled() { return registrySyncEnabled; }
         public void setRegistrySyncEnabled(boolean registrySyncEnabled) {
             this.registrySyncEnabled = registrySyncEnabled;
+        }
+
+        public boolean isRegistrySyncOnStartupEnabled() { return registrySyncOnStartupEnabled; }
+        public void setRegistrySyncOnStartupEnabled(boolean registrySyncOnStartupEnabled) {
+            this.registrySyncOnStartupEnabled = registrySyncOnStartupEnabled;
+        }
+
+        public int getRegistrySyncOnStartupMaxAttempts() { return registrySyncOnStartupMaxAttempts; }
+        public void setRegistrySyncOnStartupMaxAttempts(int registrySyncOnStartupMaxAttempts) {
+            this.registrySyncOnStartupMaxAttempts = Math.max(1, registrySyncOnStartupMaxAttempts);
+        }
+
+        public long getRegistrySyncOnStartupRetryBackoffMs() { return registrySyncOnStartupRetryBackoffMs; }
+        public void setRegistrySyncOnStartupRetryBackoffMs(long registrySyncOnStartupRetryBackoffMs) {
+            this.registrySyncOnStartupRetryBackoffMs = Math.max(1L, registrySyncOnStartupRetryBackoffMs);
+        }
+
+        public long getRegistrySyncOnStartupInitialDelayMs() { return registrySyncOnStartupInitialDelayMs; }
+        public void setRegistrySyncOnStartupInitialDelayMs(long registrySyncOnStartupInitialDelayMs) {
+            this.registrySyncOnStartupInitialDelayMs = Math.max(0L, registrySyncOnStartupInitialDelayMs);
         }
 
         public long getResolutionDisputeWindowMs() {
@@ -1127,12 +1159,24 @@ public class OmsConfig {
              * {@link com.balh.oms.cluster.ExecutionAppliedEvent} before the egress ER offer lands.
              */
             private static final int BYTES_PER_PIPELINED_IN_FLIGHT_ORDER = 512;
+            /**
+             * Hysteresis for "projector present but egress cursor absent": require this many
+             * consecutive poll snapshots before hard-blocking venue admits.
+             */
+            private static final int DEFAULT_MISSING_EGRESS_BLOCKED_POLLS = 3;
+            /**
+             * Time-based hysteresis companion for missing egress cursor. The gate blocks once this
+             * grace window elapses even if poll cadence drifts and consecutive count is slower.
+             */
+            private static final long DEFAULT_MISSING_EGRESS_GRACE_MS = 15_000L;
 
             private boolean enabled = true;
             private long maxLagBytes = DEFAULT_MAX_LAG_BYTES;
             private long throttleExcessLagBytes = DEFAULT_THROTTLE_EXCESS_LAG_BYTES;
             private long throttleBaseDelayNanos = DEFAULT_THROTTLE_BASE_DELAY_NANOS;
             private long maxThrottleDelayNanos = DEFAULT_MAX_THROTTLE_DELAY_NANOS;
+            private int missingEgressBlockedPolls = DEFAULT_MISSING_EGRESS_BLOCKED_POLLS;
+            private long missingEgressGraceMs = DEFAULT_MISSING_EGRESS_GRACE_MS;
 
             public boolean isEnabled() { return enabled; }
             public void setEnabled(boolean enabled) { this.enabled = enabled; }
@@ -1164,6 +1208,22 @@ public class OmsConfig {
                         maxThrottleDelayNanos > 0
                                 ? maxThrottleDelayNanos
                                 : DEFAULT_MAX_THROTTLE_DELAY_NANOS;
+            }
+
+            public int getMissingEgressBlockedPolls() { return missingEgressBlockedPolls; }
+            public void setMissingEgressBlockedPolls(int missingEgressBlockedPolls) {
+                this.missingEgressBlockedPolls =
+                        missingEgressBlockedPolls > 0
+                                ? missingEgressBlockedPolls
+                                : DEFAULT_MISSING_EGRESS_BLOCKED_POLLS;
+            }
+
+            public long getMissingEgressGraceMs() { return missingEgressGraceMs; }
+            public void setMissingEgressGraceMs(long missingEgressGraceMs) {
+                this.missingEgressGraceMs =
+                        missingEgressGraceMs >= 0
+                                ? missingEgressGraceMs
+                                : DEFAULT_MISSING_EGRESS_GRACE_MS;
             }
 
             public int getBytesPerPipelinedInFlightOrder() {
@@ -3436,6 +3496,21 @@ public class OmsConfig {
             private static final int DEFAULT_REPLAY_STREAM_ID = 4324;
             private static final int DEFAULT_CURSOR_FLUSH_EVERY = 1;
             private static final int DEFAULT_VENUE_ROUTE_MAX_IN_FLIGHT = 512;
+            private static final int DEFAULT_BACKLOG_THROTTLE_PENDING_ROUTE_THRESHOLD = 384;
+            private static final int DEFAULT_BACKLOG_THROTTLE_ER_OFFER_QUEUE_DEPTH_THRESHOLD = 1024;
+            private static final int DEFAULT_BACKLOG_THROTTLE_MAX_IN_FLIGHT = 128;
+            private static final long DEFAULT_BACKLOG_THROTTLE_PARK_NANOS = 50_000L;
+
+            /**
+             * Bounded retries when {@code oms-venue-egress} submits a
+             * {@link com.balh.oms.cluster.ApplyExecutionReportCommand} with
+             * {@code EXEC_TYPE_VENUE_REJECT} after a venue {@code RouteOrder} failure. Without
+             * retries a transient cluster-offer blip orphans the order in {@code PENDING_NEW}.
+             */
+            private static final int DEFAULT_VENUE_REJECT_SUBMIT_MAX_ATTEMPTS = 3;
+
+            /** Park between VENUE_REJECT cluster-submit retries (milliseconds). */
+            private static final long DEFAULT_VENUE_REJECT_SUBMIT_RETRY_BACKOFF_MS = 50L;
 
             /**
              * {@link Thread#setPriority(int)} for {@code oms-venue-egress-replay}. Default
@@ -3455,7 +3530,15 @@ public class OmsConfig {
             private long recordingLookupParkMs = DEFAULT_RECORDING_LOOKUP_PARK_MS;
             private int cursorFlushEvery = DEFAULT_CURSOR_FLUSH_EVERY;
             private int venueRouteMaxInFlight = DEFAULT_VENUE_ROUTE_MAX_IN_FLIGHT;
+            private int backlogThrottlePendingRouteThreshold =
+                    DEFAULT_BACKLOG_THROTTLE_PENDING_ROUTE_THRESHOLD;
+            private int backlogThrottleErOfferQueueDepthThreshold =
+                    DEFAULT_BACKLOG_THROTTLE_ER_OFFER_QUEUE_DEPTH_THRESHOLD;
+            private int backlogThrottleMaxInFlight = DEFAULT_BACKLOG_THROTTLE_MAX_IN_FLIGHT;
+            private long backlogThrottleParkNanos = DEFAULT_BACKLOG_THROTTLE_PARK_NANOS;
             private int replayThreadPriority = DEFAULT_REPLAY_THREAD_PRIORITY;
+            private int venueRejectSubmitMaxAttempts = DEFAULT_VENUE_REJECT_SUBMIT_MAX_ATTEMPTS;
+            private long venueRejectSubmitRetryBackoffMs = DEFAULT_VENUE_REJECT_SUBMIT_RETRY_BACKOFF_MS;
 
             public boolean isEnabled() { return enabled; }
             public void setEnabled(boolean enabled) { this.enabled = enabled; }
@@ -3535,10 +3618,59 @@ public class OmsConfig {
                 this.venueRouteMaxInFlight = Math.max(1, venueRouteMaxInFlight);
             }
 
+            /**
+             * Pending-route watermark that enables backlog throttling in the pipelined egress.
+             * When {@link #getVenueRouteMaxInFlight()} is high, this watermark slows new dispatches
+             * before queueing pressure reaches replay lag spikes.
+             */
+            public int getBacklogThrottlePendingRouteThreshold() {
+                return backlogThrottlePendingRouteThreshold;
+            }
+            public void setBacklogThrottlePendingRouteThreshold(int threshold) {
+                this.backlogThrottlePendingRouteThreshold = Math.max(1, threshold);
+            }
+
+            /**
+             * ER-offer queue watermark (see {@link com.balh.oms.cluster.OmsClusterIngressClient}) that
+             * enables backlog throttling in the pipelined egress.
+             */
+            public int getBacklogThrottleErOfferQueueDepthThreshold() {
+                return backlogThrottleErOfferQueueDepthThreshold;
+            }
+            public void setBacklogThrottleErOfferQueueDepthThreshold(int threshold) {
+                this.backlogThrottleErOfferQueueDepthThreshold = Math.max(1, threshold);
+            }
+
+            /**
+             * Effective in-flight cap while backlog throttling is active. Must stay <=
+             * {@link #getVenueRouteMaxInFlight()}.
+             */
+            public int getBacklogThrottleMaxInFlight() {
+                return backlogThrottleMaxInFlight;
+            }
+            public void setBacklogThrottleMaxInFlight(int backlogThrottleMaxInFlight) {
+                this.backlogThrottleMaxInFlight = Math.max(1, backlogThrottleMaxInFlight);
+            }
+
+            public long getBacklogThrottleParkNanos() { return backlogThrottleParkNanos; }
+            public void setBacklogThrottleParkNanos(long backlogThrottleParkNanos) {
+                this.backlogThrottleParkNanos = Math.max(1_000L, backlogThrottleParkNanos);
+            }
+
             public int getReplayThreadPriority() { return replayThreadPriority; }
             public void setReplayThreadPriority(int replayThreadPriority) {
                 this.replayThreadPriority =
                         Math.clamp(replayThreadPriority, Thread.MIN_PRIORITY, Thread.MAX_PRIORITY);
+            }
+
+            public int getVenueRejectSubmitMaxAttempts() { return venueRejectSubmitMaxAttempts; }
+            public void setVenueRejectSubmitMaxAttempts(int venueRejectSubmitMaxAttempts) {
+                this.venueRejectSubmitMaxAttempts = Math.max(1, venueRejectSubmitMaxAttempts);
+            }
+
+            public long getVenueRejectSubmitRetryBackoffMs() { return venueRejectSubmitRetryBackoffMs; }
+            public void setVenueRejectSubmitRetryBackoffMs(long venueRejectSubmitRetryBackoffMs) {
+                this.venueRejectSubmitRetryBackoffMs = Math.max(1L, venueRejectSubmitRetryBackoffMs);
             }
         }
 

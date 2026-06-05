@@ -35,7 +35,9 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.atLeast;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
@@ -410,6 +412,80 @@ class OmsVenueEgressPipelineTest {
             erPool.shutdown();
             erPool.awaitTermination(2, TimeUnit.SECONDS);
         }
+    }
+
+    @Test
+    void backlogThrottle_reducesEffectiveInFlight_whenErQueueDepthIsHigh() throws Exception {
+        OmsConfig config = new OmsConfig();
+        config.getCluster().getVenueEgress().setVenueRouteMaxInFlight(8);
+        config.getCluster().getVenueEgress().setBacklogThrottleMaxInFlight(1);
+        config.getCluster().getVenueEgress().setBacklogThrottlePendingRouteThreshold(8);
+        config.getCluster().getVenueEgress().setBacklogThrottleErOfferQueueDepthThreshold(1);
+        config.getCluster().getVenueEgress().setBacklogThrottleParkNanos(10_000L);
+        service =
+                new OmsVenueEgressService(
+                        config,
+                        cursorRepository,
+                        new SimpleMeterRegistry(),
+                        new ObjectMapper(),
+                        Clock.systemUTC(),
+                        routeClient,
+                        clusterIngressClient);
+        service.setCurrentRecordingIdForTesting(3L);
+        lenient()
+                .when(cursorRepository.advanceWithRecording(any(), anyInt(), eq(3L), anyLong()))
+                .thenReturn(true);
+        service.enablePipelineForTesting(8, Runnable::run, Runnable::run, Runnable::run);
+        service.markRunningForTesting();
+
+        AtomicInteger erQueueSamples = new AtomicInteger();
+        when(clusterIngressClient.erOfferQueueDepth())
+                .thenAnswer(inv -> erQueueSamples.getAndIncrement() < 8 ? 10 : 0);
+
+        OrderAdmittedEvent ev1 = admit("PREDMKT-TEST-1");
+        OrderAdmittedEvent ev2 = admit("PREDMKT-TEST-1");
+        CompletableFuture<Optional<ExecutionReport>> f1 = new CompletableFuture<>();
+        CompletableFuture<Optional<ExecutionReport>> f2 = new CompletableFuture<>();
+        when(routeClient.routeAdmittedOrderAsync(ev1)).thenReturn(f1);
+        when(routeClient.routeAdmittedOrderAsync(ev2)).thenReturn(f2);
+
+        service.pipelineDispatchAdmitForTesting(ev1, 10L);
+
+        Thread throttledDispatch = new Thread(() -> service.pipelineDispatchAdmitForTesting(ev2, 20L));
+        throttledDispatch.start();
+        Thread.sleep(80L);
+        assertThat(throttledDispatch.isAlive()).isTrue();
+
+        f1.complete(Optional.of(er(ev1)));
+        throttledDispatch.join(2_000L);
+        assertThat(throttledDispatch.isAlive()).isFalse();
+
+        f2.complete(Optional.of(er(ev2)));
+        assertThat(service.pipelineQuiesceForTesting()).isTrue();
+        verify(routeClient, times(2)).routeAdmittedOrderAsync(any());
+    }
+
+    @Test
+    void failedErSubmit_keepsTrackerPending_andDoesNotAdvanceCursor() throws Exception {
+        service.markRunningForTesting();
+        OrderAdmittedEvent ev = admit("PREDMKT-TEST-1");
+        CompletableFuture<Optional<ExecutionReport>> f = new CompletableFuture<>();
+        when(routeClient.routeAdmittedOrderAsync(ev)).thenReturn(f);
+        doThrow(new java.util.concurrent.TimeoutException("cluster down"))
+                .when(clusterIngressClient)
+                .submitApplyExecutionReport(any(), any());
+
+        service.pipelineDispatchAdmitForTesting(ev, 10L);
+        f.complete(Optional.of(er(ev)));
+
+        await().atMost(Duration.ofSeconds(1))
+                .untilAsserted(
+                        () -> verify(clusterIngressClient, atLeast(1)).submitApplyExecutionReport(any(), any()));
+
+        service.pipelineDrainContiguousForTesting();
+        verify(cursorRepository, never()).advanceWithRecording(any(), anyInt(), anyLong(), anyLong());
+        assertThat(service.pipelineInFlightForTesting()).isEqualTo(1);
+        assertThat(service.pipelineIsDrainedForTesting()).isFalse();
     }
 
     private static OrderAdmittedEvent admit(String symbol) {

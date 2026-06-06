@@ -94,25 +94,32 @@ public final class OmsClusterReadinessFilter extends OncePerRequestFilter {
     private void rejectAsClusterNotReady(
             HttpServletRequest request, HttpServletResponse response, ReadinessSnapshot s)
             throws IOException {
+        boolean diskPressure = s.status() == ReadinessSnapshot.Status.DISK_PRESSURE;
         log.warn(
-                "rejecting {} {} — OMS cluster not ready: status={} counterValue={}",
+                "rejecting {} {} — OMS cluster not ready: status={} counterValue={} diskPressure={}",
                 request.getMethod(),
                 request.getRequestURI(),
                 s.status(),
-                s.counterValue());
+                s.counterValue(),
+                s.diskPressureLevel());
 
         response.setStatus(HttpStatus.SERVICE_UNAVAILABLE.value());
         response.setContentType(MediaType.APPLICATION_JSON_VALUE);
         response.setHeader(HttpHeaders.RETRY_AFTER, Integer.toString(retryAfterSeconds));
         Map<String, Object> body = new LinkedHashMap<>();
-        body.put("error", "OMS_CLUSTER_NOT_READY");
+        body.put("error", diskPressure ? "OMS_DISK_PRESSURE" : "OMS_CLUSTER_NOT_READY");
         body.put(
                 "message",
-                "OMS cluster is not ready to accept admission commands; retry after a few seconds."
-                        + " See oms/docs/runbooks/oms-cluster-recovery-incident.md.");
+                diskPressure
+                        ? "OMS cluster data directory is low on disk space; admission commands are"
+                                + " refused to prevent Aeron archive corruption. Free disk space and retry."
+                        : "OMS cluster is not ready to accept admission commands; retry after a few seconds."
+                                + " See oms/docs/runbooks/oms-cluster-recovery-incident.md.");
         body.put("retryAfterSeconds", retryAfterSeconds);
         body.put("readinessStatus", s.status().name());
         body.put("counterValue", s.counterValue());
+        body.put("diskPressureLevel", s.diskPressureLevel().name());
+        body.put("diskPressureCounterValue", s.diskPressureCounterValue());
         objectMapper.writeValue(response.getWriter(), body);
     }
 }

@@ -41,6 +41,9 @@ public class OmsClusterReadinessController {
         body.put("counterId", s.counterId());
         body.put("observedAtMillis", s.observedAtMillis());
         body.put("description", s.description());
+        body.put("diskPressureLevel", s.diskPressureLevel().name());
+        body.put("diskPressureCounterValue", s.diskPressureCounterValue());
+        body.put("diskPressureCounterId", s.diskPressureCounterId());
         return s.isReady() ? ResponseEntity.ok(body) : ResponseEntity.status(503).body(body);
     }
 }

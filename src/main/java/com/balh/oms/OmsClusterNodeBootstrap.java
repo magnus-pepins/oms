@@ -209,7 +209,8 @@ public final class OmsClusterNodeBootstrap {
             // cursor a stable monotonic position into a continuous recording.
             eventsRecording = startEventsRecording(paths);
 
-            clusteredService = new OmsAdmissionClusteredService(metricsExporter.meterRegistry());
+            clusteredService = new OmsAdmissionClusteredService(
+                    metricsExporter.meterRegistry(), paths.aeronDirBase(), shutdownLatch::countDown);
             container = ClusteredServiceContainer.launch(
                     buildServiceContainerContext(paths, clusteredService));
 

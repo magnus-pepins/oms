@@ -1,5 +1,7 @@
 package com.balh.oms.cluster;
 
+import com.balh.oms.cluster.disk.AeronDiskPressureMonitor;
+import com.balh.oms.cluster.disk.AeronDiskPressurePolicy;
 import io.aeron.CommonContext;
 import io.aeron.ExclusivePublication;
 import io.aeron.Image;
@@ -137,6 +139,11 @@ public class OmsAdmissionClusteredService implements ClusteredService {
     public static final int SNAPSHOT_LOAD_FAILED_COUNTER_TYPE_ID = 2_000_011;
 
     public static final String SNAPSHOT_LOAD_FAILED_COUNTER_LABEL = "oms-cluster-snapshot-load-failed";
+
+    /** Disk pressure counter — see {@code plans/aeron-disk-pressure-guard.md}. */
+    public static final int DISK_PRESSURE_COUNTER_TYPE_ID = 2_000_020;
+
+    public static final String DISK_PRESSURE_COUNTER_LABEL = "oms-cluster-disk-pressure";
 
     /** Greppable marker for the self-heal log line. Restart script + smoke pattern-match on this. */
     public static final String SNAPSHOT_LOAD_FAILED_LOG_MARKER = "SNAPSHOT_LOAD_FAILED";
@@ -330,6 +337,14 @@ public class OmsAdmissionClusteredService implements ClusteredService {
 
     private io.aeron.Counter readyCounter;
 
+    private io.aeron.Counter diskPressureCounter;
+
+    private AeronDiskPressureMonitor diskPressureMonitor;
+
+    private final String aeronDataDirBase;
+
+    private final Runnable onCriticalDiskShutdown;
+
     private io.aeron.Counter openOrdersCountCounter;
 
     /**
@@ -384,8 +399,18 @@ public class OmsAdmissionClusteredService implements ClusteredService {
      * set up dashboards / alerts before the first snapshot fires).
      */
     public OmsAdmissionClusteredService(MeterRegistry meterRegistry) {
+        this(meterRegistry, null, null);
+    }
+
+    /**
+     * Production cluster-node constructor — wires disk-pressure monitor against {@code aeronDataDirBase}.
+     */
+    public OmsAdmissionClusteredService(
+            MeterRegistry meterRegistry, String aeronDataDirBase, Runnable onCriticalDiskShutdown) {
         this(
                 meterRegistry,
+                aeronDataDirBase,
+                onCriticalDiskShutdown,
                 parseTerminalTombstoneRetentionMillisFromEnv(),
                 parseTerminalTombstonePruneEveryNMessagesFromEnv(),
                 parseSnapshotBufferReuseMaxBytesFromEnv());
@@ -397,6 +422,8 @@ public class OmsAdmissionClusteredService implements ClusteredService {
             int snapshotBufferReuseMaxBytes) {
         this(
                 meterRegistry,
+                null,
+                null,
                 terminalTombstoneRetentionMillis,
                 DEFAULT_TERMINAL_TOMBSTONE_PRUNE_EVERY_N_MESSAGES,
                 snapshotBufferReuseMaxBytes);
@@ -407,7 +434,25 @@ public class OmsAdmissionClusteredService implements ClusteredService {
             long terminalTombstoneRetentionMillis,
             int terminalTombstonePruneEveryNMessages,
             int snapshotBufferReuseMaxBytes) {
+        this(
+                meterRegistry,
+                null,
+                null,
+                terminalTombstoneRetentionMillis,
+                terminalTombstonePruneEveryNMessages,
+                snapshotBufferReuseMaxBytes);
+    }
+
+    OmsAdmissionClusteredService(
+            MeterRegistry meterRegistry,
+            String aeronDataDirBase,
+            Runnable onCriticalDiskShutdown,
+            long terminalTombstoneRetentionMillis,
+            int terminalTombstonePruneEveryNMessages,
+            int snapshotBufferReuseMaxBytes) {
         this.meterRegistry = Objects.requireNonNull(meterRegistry, "meterRegistry");
+        this.aeronDataDirBase = aeronDataDirBase;
+        this.onCriticalDiskShutdown = onCriticalDiskShutdown;
         this.terminalTombstoneRetentionMillis = terminalTombstoneRetentionMillis;
         this.terminalTombstonePruneEveryNMessages =
                 Math.max(1, terminalTombstonePruneEveryNMessages);
@@ -575,6 +620,27 @@ public class OmsAdmissionClusteredService implements ClusteredService {
             snapshotLoadFailedCounter = cluster.aeron().addCounter(
                     SNAPSHOT_LOAD_FAILED_COUNTER_TYPE_ID, SNAPSHOT_LOAD_FAILED_COUNTER_LABEL);
             snapshotLoadFailedCounter.setOrdered(snapshotLoadFailedCount);
+
+            if (diskPressureCounter != null) {
+                diskPressureCounter.close();
+                diskPressureCounter = null;
+            }
+            diskPressureCounter =
+                    cluster.aeron().addCounter(DISK_PRESSURE_COUNTER_TYPE_ID, DISK_PRESSURE_COUNTER_LABEL);
+            diskPressureCounter.setOrdered(0L);
+            if (aeronDataDirBase != null && !aeronDataDirBase.isBlank()) {
+                if (diskPressureMonitor != null) {
+                    diskPressureMonitor.close();
+                }
+                AeronDiskPressurePolicy policy =
+                        AeronDiskPressurePolicy.fromEnv(aeronDataDirBase);
+                diskPressureMonitor = new AeronDiskPressureMonitor(
+                        policy,
+                        diskPressureCounter,
+                        onCriticalDiskShutdown,
+                        meterRegistry);
+                diskPressureMonitor.start();
+            }
         }
 
         log.info(
@@ -1093,11 +1159,19 @@ public class OmsAdmissionClusteredService implements ClusteredService {
     @Override
     public void onTerminate(Cluster cluster) {
         log.info("OmsAdmissionClusteredService terminating; orders={}", orderIndex.size());
+        if (diskPressureMonitor != null) {
+            diskPressureMonitor.close();
+            diskPressureMonitor = null;
+        }
         CloseHelper.quietClose(eventsPublication);
         eventsPublication = null;
         if (readyCounter != null) {
             readyCounter.close();
             readyCounter = null;
+        }
+        if (diskPressureCounter != null) {
+            diskPressureCounter.close();
+            diskPressureCounter = null;
         }
         if (openOrdersCountCounter != null) {
             openOrdersCountCounter.close();

@@ -1,6 +1,7 @@
 package com.balh.oms.ingress.readiness;
 
 import com.balh.oms.cluster.OmsAdmissionClusteredService;
+import com.balh.oms.cluster.disk.AeronDiskPressureLevel;
 import io.aeron.Aeron;
 import io.aeron.driver.exceptions.ActiveDriverException;
 import org.agrona.CloseHelper;
@@ -100,11 +101,17 @@ public final class OmsClusterReadinessReader implements AutoCloseable {
                 return;
             }
             long value = reader.getCounterValue(counterId);
-            latest.set(ReadinessSnapshot.observed(
+            int diskCounterId = findDiskPressureCounterId(reader);
+            long diskValue = diskCounterId < 0 ? 0L : reader.getCounterValue(diskCounterId);
+            AeronDiskPressureLevel diskLevel = AeronDiskPressureLevel.fromCounterValue(diskValue);
+            latest.set(ReadinessSnapshot.observedWithDiskPressure(
                     value,
                     counterId,
                     System.currentTimeMillis(),
-                    OmsAdmissionClusteredService.READINESS_VALUE_READY));
+                    OmsAdmissionClusteredService.READINESS_VALUE_READY,
+                    diskLevel,
+                    diskValue,
+                    diskCounterId));
         } catch (RuntimeException ex) {
             log.warn("OMS cluster readiness poll threw: {}", ex.getMessage());
             CloseHelper.quietClose(aeron);
@@ -134,6 +141,17 @@ public final class OmsClusterReadinessReader implements AutoCloseable {
         reader.forEach((counterId, typeId, keyBuffer, label) -> {
             if (typeId == OmsAdmissionClusteredService.READINESS_COUNTER_TYPE_ID
                     && OmsAdmissionClusteredService.READINESS_COUNTER_LABEL.equals(label)) {
+                found[0] = counterId;
+            }
+        });
+        return found[0];
+    }
+
+    private static int findDiskPressureCounterId(CountersReader reader) {
+        final int[] found = {-1};
+        reader.forEach((counterId, typeId, keyBuffer, label) -> {
+            if (typeId == OmsAdmissionClusteredService.DISK_PRESSURE_COUNTER_TYPE_ID
+                    && OmsAdmissionClusteredService.DISK_PRESSURE_COUNTER_LABEL.equals(label)) {
                 found[0] = counterId;
             }
         });

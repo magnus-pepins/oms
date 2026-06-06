@@ -443,12 +443,10 @@ class OmsVenueEgressPipelineTest {
                                 OrderAdmittedEvent ev = inv.getArgument(0);
                                 return CompletableFuture.completedFuture(Optional.of(er(ev)));
                             });
+            // Return a pending future immediately so enqueue does not block the route-offer thread;
+            // completions stay in-flight until erBlock is completed after releaseEr.
             when(clusterIngressClient.submitApplyExecutionReportAsync(any(), any()))
-                    .thenAnswer(
-                            inv -> {
-                                assertThat(releaseEr.await(5, TimeUnit.SECONDS)).isTrue();
-                                return erBlock;
-                            });
+                    .thenReturn(erBlock);
 
             for (int i = 0; i < maxPending; i++) {
                 service.pipelineDispatchAdmitForTesting(admit("PREDMKT-TEST-1"), 10L * (i + 1));
@@ -538,11 +536,7 @@ class OmsVenueEgressPipelineTest {
         service.pipelineDispatchAdmitForTesting(ev, 10L);
         f.complete(Optional.of(er(ev)));
 
-        await().atMost(Duration.ofSeconds(1))
-                .untilAsserted(
-                        () ->
-                                verify(clusterIngressClient, atLeast(1))
-                                        .submitApplyExecutionReportAsync(any(), any()));
+        verify(clusterIngressClient, atLeast(1)).submitApplyExecutionReportAsync(any(), any());
 
         service.pipelineDrainContiguousForTesting();
         verify(cursorRepository, never()).advanceWithRecording(any(), anyInt(), anyLong(), anyLong());

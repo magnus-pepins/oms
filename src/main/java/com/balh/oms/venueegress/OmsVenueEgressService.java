@@ -1799,69 +1799,91 @@ public class OmsVenueEgressService {
          * each ER via {@link OmsClusterIngressClient#submitApplyExecutionReportAsync} without blocking
          * this thread on cluster offer back-pressure — the coalesced flush can fill
          * {@code erOfferQueue} in one pass so the ingress ER daemon amortises {@code clientLock} trips.
-         * {@link #onErSubmitFinished} advances the tracker when each async offer completes.
+         * {@link #onErSubmitSucceeded} advances the tracker when each async offer completes.
          */
         private void runScheduledErCompletionFlush() {
             try {
                 ErCompletion item;
                 while ((item = erCompletionQueue.poll()) != null) {
-                    dispatchErCompletionAsync(item);
+                    if (!dispatchErCompletionAsync(item)) {
+                        // Mirror serial replay semantics: stop this flush pass so a synchronously
+                        // failed offer is not immediately re-polled in the same loop.
+                        erCompletionQueue.add(item);
+                        break;
+                    }
                 }
             } finally {
                 erCompletionFlushScheduled.set(false);
-                if (!erCompletionQueue.isEmpty()) {
-                    scheduleErCompletionFlush();
-                }
             }
         }
 
         /**
          * Non-blocking ER hand-off for the pipelined path. VENUE_REJECT retries still run on
          * {@link #erSubmitExecutor} because they need a bounded multi-attempt loop.
+         *
+         * @return {@code false} when the cluster offer failed synchronously (caller re-queues and
+         *         stops the flush pass); {@code true} when the offer was enqueued or completed inline
          */
-        private void dispatchErCompletionAsync(ErCompletion item) {
+        private boolean dispatchErCompletionAsync(ErCompletion item) {
             if (item.err() != null || item.erOpt().isEmpty()) {
                 erSubmitExecutor.execute(
                         () -> {
                             boolean applied = completeRoute(item.ev(), item.erOpt(), item.err());
-                            onErSubmitFinished(item, applied);
+                            if (applied) {
+                                onErSubmitSucceeded(item);
+                            } else {
+                                erCompletionQueue.add(item);
+                            }
                         });
-                return;
+                return true;
             }
             ApplyExecutionReportCommand cmd =
                     VenueGrpcExecutionReportMapper.toApplyCommand(
                             item.erOpt().get(), config.getVenue().getVenueId(), objectMapper);
             Duration submitTimeout =
                     Duration.ofMillis(config.getCluster().getClient().getSubmitTimeoutMs());
-            clusterIngressClient
-                    .submitApplyExecutionReportAsync(cmd, submitTimeout)
-                    .whenComplete(
-                            (v, err) -> {
-                                if (err != null) {
-                                    log.warn(
-                                            "oms-venue-egress (pipelined): cluster ER submit failed for orderId={}",
-                                            item.ev().orderId(),
-                                            err);
-                                    onErSubmitFinished(item, false);
-                                    return;
-                                }
-                                long latencyMs = wallClock.millis() - item.ev().acceptedAtMillis();
-                                OmsPipelineMetrics.recordClusterAdmitToFixNos(
-                                        meterRegistry,
-                                        EGRESS_ID,
-                                        item.ev().side(),
-                                        item.ev().timeInForceCode(),
-                                        latencyMs);
-                                onErSubmitFinished(item, true);
-                            });
+            CompletableFuture<Void> submitFuture =
+                    clusterIngressClient.submitApplyExecutionReportAsync(cmd, submitTimeout);
+            if (!submitFuture.isDone()) {
+                submitFuture.whenComplete(
+                        (v, err) -> {
+                            if (err != null) {
+                                log.warn(
+                                        "oms-venue-egress (pipelined): cluster ER submit failed for orderId={}",
+                                        item.ev().orderId(),
+                                        err);
+                                erCompletionQueue.add(item);
+                                scheduleErCompletionFlush();
+                                return;
+                            }
+                            recordErSubmitMetrics(item);
+                            onErSubmitSucceeded(item);
+                        });
+                return true;
+            }
+            if (submitFuture.isCompletedExceptionally()) {
+                log.warn(
+                        "oms-venue-egress (pipelined): cluster ER submit failed for orderId={}",
+                        item.ev().orderId(),
+                        submitFuture.exceptionNow());
+                return false;
+            }
+            recordErSubmitMetrics(item);
+            onErSubmitSucceeded(item);
+            return true;
         }
 
-        private void onErSubmitFinished(ErCompletion item, boolean applied) {
-            if (!applied) {
-                erCompletionQueue.add(item);
-                scheduleErCompletionFlush();
-                return;
-            }
+        private void recordErSubmitMetrics(ErCompletion item) {
+            long latencyMs = wallClock.millis() - item.ev().acceptedAtMillis();
+            OmsPipelineMetrics.recordClusterAdmitToFixNos(
+                    meterRegistry,
+                    EGRESS_ID,
+                    item.ev().side(),
+                    item.ev().timeInForceCode(),
+                    latencyMs);
+        }
+
+        private void onErSubmitSucceeded(ErCompletion item) {
             tracker.complete(item.position());
             unparkReplayThread();
             scheduleDrainContiguous();

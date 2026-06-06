@@ -67,9 +67,10 @@ class OmsVenueEgressReplayPollLoopTest {
     }
 
     @Test
-    void effectiveReplayFragmentLimit_floorsAt1024ForHighAdmitDrain() {
-        assertThat(OmsVenueEgressService.effectiveReplayFragmentLimit(512)).isEqualTo(1024);
-        assertThat(OmsVenueEgressService.effectiveReplayFragmentLimit(2048)).isEqualTo(2048);
+    void effectiveReplayFragmentLimit_floorsAt2048ForHighAdmitDrain() {
+        assertThat(OmsVenueEgressService.effectiveReplayFragmentLimit(512)).isEqualTo(2048);
+        assertThat(OmsVenueEgressService.effectiveReplayFragmentLimit(1024)).isEqualTo(2048);
+        assertThat(OmsVenueEgressService.effectiveReplayFragmentLimit(4096)).isEqualTo(4096);
     }
 
     @Test

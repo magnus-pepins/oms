@@ -862,7 +862,8 @@ public class OmsVenueEgressService {
      * in the gap between the burst terminal zero and {@link #findRecordingById}; skipping this
      * slice forces an Archive control round-trip plus park on every momentary race.
      */
-    private static final int REPLAY_IDLE_TAIL_POLLS = 4;
+    /** Live-tail spins before park/recording-walk; raised for pop @ 10k admit/s knee vs 5k. */
+    private static final int REPLAY_IDLE_TAIL_POLLS = 8;
 
     /**
      * Tight-spin drain: call {@link Subscription#poll} repeatedly while Aeron delivers fragments,
@@ -925,10 +926,10 @@ public class OmsVenueEgressService {
 
     /**
      * Amortizes {@code replay.poll} syscall overhead at 5k–10k admits/s. Operators may set a lower
-     * configured limit; production floors at 1024 frags/poll.
+     * configured limit; production floors at 2048 frags/poll for sustained 10k/s drain.
      */
     static int effectiveReplayFragmentLimit(int configuredLimit) {
-        return Math.max(configuredLimit, 1024);
+        return Math.max(configuredLimit, 2048);
     }
 
     /**
@@ -1532,10 +1533,20 @@ public class OmsVenueEgressService {
         private static final long QUIESCE_PARK_NANOS = 50_000L;
 
         /** Idle park for the dedicated route-offer consumer when the transfer queue is empty. */
-        private static final long ROUTE_OFFER_IDLE_PARK_NANOS = 50_000L;
+        private static final long ROUTE_OFFER_IDLE_PARK_NANOS = 1_000L;
 
-        /** Outstanding fragments (venue ack pending or ER submit pending) before we stop dispatching. */
-        private static final int PENDING_FRAGMENT_CAP_MULTIPLIER = 2;
+        /**
+         * Spin-yield passes in {@link #awaitDispatchCapacity()} before paying a configured park
+         * slice — completions {@link #unparkReplayThread()} frequently under 10k admit/s.
+         */
+        private static final int DISPATCH_CAPACITY_SPIN_LIMIT = 64;
+
+        /**
+         * Outstanding fragments (venue ack pending or ER submit pending) before we stop dispatching.
+         * 4× venue permits keeps replay registering while ER submit trails venue acks (observed pop
+         * @ 10k RPS clean book: 2× capped {@code egress_wall_lag_ms} ~300 ms with route ~0.01 ms).
+         */
+        private static final int PENDING_FRAGMENT_CAP_MULTIPLIER = 4;
 
         private final int maxInFlight;
         private final int maxPendingFragments;
@@ -1615,6 +1626,7 @@ public class OmsVenueEgressService {
             this.routeOfferExecutor = null;
             Thread offerThread = new Thread(this::routeOfferLoop, "oms-venue-egress-route-offer");
             offerThread.setDaemon(true);
+            applyReplayThreadPriority(offerThread, venueCfg.getReplayThreadPriority());
             offerThread.start();
             this.routeOfferThread = offerThread;
             meterRegistry.gauge("oms.venue.egress.pipeline.pending.routes", tracker, EgressCompletionTracker::inFlight);
@@ -1696,6 +1708,7 @@ public class OmsVenueEgressService {
 
         /** Bounds total pipeline depth when venue permits are released before ER submit completes. */
         private void awaitDispatchCapacity() {
+            int idleSpins = 0;
             while (true) {
                 int inFlight = tracker.inFlight();
                 int effectiveCap = effectiveDispatchCapacity(inFlight, currentErOfferQueueDepth());
@@ -1706,6 +1719,12 @@ public class OmsVenueEgressService {
                 if (!running.get()) {
                     return;
                 }
+                if (idleSpins < DISPATCH_CAPACITY_SPIN_LIMIT) {
+                    idleSpins++;
+                    Thread.onSpinWait();
+                    continue;
+                }
+                idleSpins = 0;
                 LockSupport.parkNanos(backlogThrottleParkNanos);
             }
         }
@@ -1716,10 +1735,11 @@ public class OmsVenueEgressService {
 
         /**
          * Max registered fragments the replay thread may dispatch before {@link #awaitDispatchCapacity()}
-         * parks. Normally {@link #maxPendingFragments} (2× venue permits) so replay keeps registering
+         * parks. Normally {@link #maxPendingFragments} (4× venue permits) so replay keeps registering
          * admits while venue acks recycle permits faster than ER submit completes — capping at
-         * {@link #maxInFlight} alone wedged replay at ~512 deep with free permits (observed pop @ 5–10k
-         * RPS: {@code egress_wall_lag_ms} 65–152 ms, {@code egress_route_service_ms} ~0.01 ms).
+         * {@link #maxInFlight} alone wedged replay at ~512 deep with free permits (observed pop @ 5k
+         * RPS: {@code egress_wall_lag_ms} ~27 ms; @ 10k with 2× cap: ~306 ms,
+         * {@code egress_route_service_ms} ~0.01 ms).
          * Backlog throttle applies only when the venue permit pool is exhausted or the ER offer queue
          * is deep.
          */
@@ -1845,6 +1865,9 @@ public class OmsVenueEgressService {
                 }
             } finally {
                 erCompletionFlushScheduled.set(false);
+                if (!erCompletionQueue.isEmpty()) {
+                    scheduleErCompletionFlush();
+                }
             }
         }
 
@@ -2025,6 +2048,9 @@ public class OmsVenueEgressService {
          */
         boolean replayPollHasBacklog() {
             if (!tracker.isDrained()) {
+                return true;
+            }
+            if (!erCompletionQueue.isEmpty()) {
                 return true;
             }
             return routeOfferQueue != null && !routeOfferQueue.isEmpty();

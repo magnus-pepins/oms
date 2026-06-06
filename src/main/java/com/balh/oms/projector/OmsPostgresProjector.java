@@ -250,6 +250,12 @@ public class OmsPostgresProjector {
      */
     private final AtomicLong currentRecordingId = new AtomicLong(-1L);
     /**
+     * {@link OrderAdmittedEvent#acceptedAtMillis()} of the most recently applied admit fragment.
+     * Compared to {@link #wallClock} in the replay idle path to detect catch-up backlog
+     * ({@code projector_wall_lag_ms} on the bench scrape).
+     */
+    private final AtomicLong lastAppliedAcceptedAtMillis = new AtomicLong(0L);
+    /**
      * 2026-05-23 hardening. When non-empty, {@link #init} stashes the resume cursor here and the
      * replay loop honors it as the start position; on a fresh first-ever start it stays empty and
      * the replay loop bootstraps from the oldest available recording at position 0.
@@ -455,6 +461,11 @@ public class OmsPostgresProjector {
     /** Visible for unit tests that drive {@link #pollReplayBurst} without starting the replay thread. */
     void setRunningForTesting(boolean value) {
         running.set(value);
+    }
+
+    /** Visible for unit tests that assert catch-up fast-path gating without Aeron replay. */
+    void setLastAppliedAcceptedAtMillisForTesting(long acceptedAtMillis) {
+        lastAppliedAcceptedAtMillis.set(acceptedAtMillis);
     }
 
     /**
@@ -721,9 +732,11 @@ public class OmsPostgresProjector {
                     if (polledBurst > 0) {
                         continue;
                     }
-                    int idleTailBurst = pollReplayIdleTail(replay, handler, projectorCfg);
-                    if (idleTailBurst > 0) {
-                        continue;
+                    if (!replayPollHasCatchUpBacklog(projectorCfg)) {
+                        int idleTailBurst = pollReplayIdleTail(replay, handler, projectorCfg);
+                        if (idleTailBurst > 0) {
+                            continue;
+                        }
                     }
                     if (handler.pendingFragmentCount() > 0) {
                         handler.flushPollBatch();
@@ -773,7 +786,7 @@ public class OmsPostgresProjector {
                         lastAppliedPosition.set(successor.startPosition());
                         break; // exit inner poll loop -> outer loop reopens against successor
                     }
-                    LockSupport.parkNanos(projectorCfg.getPollParkNanos());
+                    parkReplayIdleAfterPoll(projectorCfg);
                 }
             } finally {
                 CloseHelper.quietClose(replay);
@@ -1025,18 +1038,19 @@ public class OmsPostgresProjector {
      * lands fragments in the gap between the burst terminal zero and archive refresh; flushing on
      * the first zero forces ~100-fragment COMMITs and caps drain near 500/s.
      */
-    private static final int REPLAY_IDLE_TAIL_POLLS = 4;
+    /** Live-tail spins before park/recording-walk; raised for pop @ 10k admit/s knee vs 5k. */
+    private static final int REPLAY_IDLE_TAIL_POLLS = 8;
 
     /**
      * Tight-spin drain: call {@link Subscription#poll} repeatedly while Aeron delivers fragments.
-     * Flushes only when {@link OmsConfig.Cluster.Projector#getMaxFragmentsPerCommit()} is reached
-     * during productive polling — partial batches defer to {@link #pollReplayIdleTail} and the
-     * outer replay loop. Mirrors {@code OmsVenueEgressService#pollReplayBurst}.
+     * Flushes only when {@link #effectiveMaxFragmentsPerCommit} is reached during productive
+     * polling — partial batches defer to {@link #pollReplayIdleTail} and the outer replay loop.
+     * Mirrors {@code OmsVenueEgressService#pollReplayBurst}.
      */
     int pollReplayBurst(
             Subscription replay, ProjectingFragmentHandler handler, OmsConfig.Cluster.Projector projectorCfg) {
         int fragmentLimit = effectiveFragmentLimit(projectorCfg.getFragmentLimit());
-        int maxFragmentsPerCommit = projectorCfg.getMaxFragmentsPerCommit();
+        int maxFragmentsPerCommit = effectiveMaxFragmentsPerCommit(projectorCfg);
         int totalPolled = 0;
         int polled;
         do {
@@ -1071,11 +1085,59 @@ public class OmsPostgresProjector {
 
     /**
      * Amortizes {@code replay.poll} syscall overhead at 5k–10k admits/s. Operators may set a lower
-     * configured limit; production floors at 1024 frags/poll — mirrors
+     * configured limit; production floors at 2048 frags/poll — mirrors
      * {@code OmsVenueEgressService#effectiveReplayFragmentLimit}.
      */
     static int effectiveFragmentLimit(int configuredLimit) {
-        return Math.max(configuredLimit, 1024);
+        return Math.max(configuredLimit, 2048);
+    }
+
+    /**
+     * Raises the poll-batch COMMIT cap when {@link #replayPollHasCatchUpBacklog} so fewer
+     * {@code oms_projector_poll_batch_commit_seconds} samples fire per thousand fragments.
+     */
+    int effectiveMaxFragmentsPerCommit(OmsConfig.Cluster.Projector projectorCfg) {
+        if (replayPollHasCatchUpBacklog(projectorCfg)) {
+            return projectorCfg.getCatchUpMaxFragmentsPerCommit();
+        }
+        return projectorCfg.getMaxFragmentsPerCommit();
+    }
+
+    /**
+     * True when the last applied admit is older than {@link OmsConfig.Cluster.Projector#getCatchUpLagThresholdMs()}
+     * — the bench {@code projector_wall_lag_ms} scrape uses the same admit→applied clock.
+     */
+    boolean replayPollHasCatchUpBacklog(OmsConfig.Cluster.Projector projectorCfg) {
+        return replayPollHasCatchUpBacklog(
+                projectorCfg.getCatchUpLagThresholdMs(),
+                lastAppliedAcceptedAtMillis.get(),
+                wallClock.millis());
+    }
+
+    static boolean replayPollHasCatchUpBacklog(
+            long catchUpLagThresholdMs, long lastAppliedAcceptedAtMillis, long nowMillis) {
+        if (lastAppliedAcceptedAtMillis <= 0L) {
+            return false;
+        }
+        return nowMillis - lastAppliedAcceptedAtMillis >= catchUpLagThresholdMs;
+    }
+
+    /**
+     * Idle wait between replay polls when Aeron returned zero fragments. Spin-yield instead of park
+     * while catch-up backlog is present so the replay thread re-polls without a configured idle
+     * slice behind in-flight admits. Mirrors {@code OmsVenueEgressService#parkReplayIdleAfterPoll}.
+     */
+    void parkReplayIdleAfterPoll(OmsConfig.Cluster.Projector projectorCfg) {
+        if (replayPollHasCatchUpBacklog(projectorCfg)) {
+            Thread.onSpinWait();
+            return;
+        }
+        parkReplayIdle(projectorCfg.getPollParkNanos());
+    }
+
+    /** Idle park between replay polls when no fragments were available. */
+    static void parkReplayIdle(long pollParkNanos) {
+        LockSupport.parkNanos(pollParkNanos);
     }
 
     private void advanceCursorAtPosition(long newPosition) {
@@ -1285,6 +1347,7 @@ public class OmsPostgresProjector {
         // the SQL above throws, the exception exits the lambda before this line and the Timer stays
         // silent for the failed event.
         meterRegistry.timer(TIMER_ADMIT_TX).record(System.nanoTime() - admitTxStartNanos, TimeUnit.NANOSECONDS);
+        lastAppliedAcceptedAtMillis.set(ev.acceptedAtMillis());
         long latencyMs = wallClock.millis() - ev.acceptedAtMillis();
         OmsPipelineMetrics.recordClusterAdmitToProjector(
                 meterRegistry, PROJECTOR_ID, ev.side(), ev.timeInForceCode(), latencyMs);

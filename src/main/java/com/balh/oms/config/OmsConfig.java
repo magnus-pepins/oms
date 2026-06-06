@@ -3834,21 +3834,35 @@ public class OmsConfig {
          */
         public static class Projector {
 
-            /** Default poll cadence inside the projector replay loop. */
-            private static final long DEFAULT_POLL_PARK_NANOS = 1_000_000L;
+            /** Default poll cadence inside the projector replay loop (live tail). */
+            private static final long DEFAULT_POLL_PARK_NANOS = 1_000L;
 
             /**
-             * Default fragments per {@code replay.poll} pass. Matches venue-egress (1024): at 5k admits/s
-             * a limit of 64 caps drain at ~78 Postgres COMMITs/s and {@code projector_wall_lag_ms}
-             * climbs even when {@code ingress_cluster_accept} stays sub-ms.
+             * Default fragments per {@code replay.poll} pass. Matches venue-egress (2048): at 5k–10k
+             * admits/s a limit of 64 caps drain at ~78 Postgres COMMITs/s and
+             * {@code projector_wall_lag_ms} climbs even when {@code ingress_cluster_accept} stays
+             * sub-ms.
              */
-            private static final int DEFAULT_FRAGMENT_LIMIT = 1024;
+            private static final int DEFAULT_FRAGMENT_LIMIT = 2048;
 
             /**
-             * Safety cap on fragments per poll-batch COMMIT during catch-up bursts. Prevents a single
-             * multi-thousand-row transaction when the projector replays a deep Aeron backlog.
+             * Safety cap on fragments per poll-batch COMMIT at live tail. Larger batches amortise
+             * {@code oms_projector_poll_batch_commit_seconds} overhead that otherwise caps drain
+             * when ingress outruns replay.
              */
-            private static final int DEFAULT_MAX_FRAGMENTS_PER_COMMIT = 4096;
+            private static final int DEFAULT_MAX_FRAGMENTS_PER_COMMIT = 8192;
+
+            /**
+             * When {@link #catchUpLagThresholdMs} is exceeded, the replay loop uses this larger
+             * commit cap and spin-yields instead of idle tail / park.
+             */
+            private static final int DEFAULT_CATCH_UP_MAX_FRAGMENTS_PER_COMMIT = 16_384;
+
+            /**
+             * Wall-lag ms (cluster admit → projector applied) above which the replay loop enters
+             * catch-up fast path: larger commit batches, skip idle tail, spin instead of park.
+             */
+            private static final long DEFAULT_CATCH_UP_LAG_THRESHOLD_MS = 1_000L;
 
             /** Default backoff between {@code listRecordings} retries while waiting for the recording to appear. */
             private static final long DEFAULT_RECORDING_LOOKUP_PARK_MS = 100L;
@@ -3862,6 +3876,8 @@ public class OmsConfig {
             private long pollParkNanos = DEFAULT_POLL_PARK_NANOS;
             private int fragmentLimit = DEFAULT_FRAGMENT_LIMIT;
             private int maxFragmentsPerCommit = DEFAULT_MAX_FRAGMENTS_PER_COMMIT;
+            private int catchUpMaxFragmentsPerCommit = DEFAULT_CATCH_UP_MAX_FRAGMENTS_PER_COMMIT;
+            private long catchUpLagThresholdMs = DEFAULT_CATCH_UP_LAG_THRESHOLD_MS;
             private long recordingLookupParkMs = DEFAULT_RECORDING_LOOKUP_PARK_MS;
 
             public boolean isEnabled() { return enabled; }
@@ -3919,6 +3935,16 @@ public class OmsConfig {
             public int getMaxFragmentsPerCommit() { return maxFragmentsPerCommit; }
             public void setMaxFragmentsPerCommit(int maxFragmentsPerCommit) {
                 this.maxFragmentsPerCommit = Math.max(1, maxFragmentsPerCommit);
+            }
+
+            public int getCatchUpMaxFragmentsPerCommit() { return catchUpMaxFragmentsPerCommit; }
+            public void setCatchUpMaxFragmentsPerCommit(int catchUpMaxFragmentsPerCommit) {
+                this.catchUpMaxFragmentsPerCommit = Math.max(1, catchUpMaxFragmentsPerCommit);
+            }
+
+            public long getCatchUpLagThresholdMs() { return catchUpLagThresholdMs; }
+            public void setCatchUpLagThresholdMs(long catchUpLagThresholdMs) {
+                this.catchUpLagThresholdMs = Math.max(1L, catchUpLagThresholdMs);
             }
 
             public long getRecordingLookupParkMs() { return recordingLookupParkMs; }

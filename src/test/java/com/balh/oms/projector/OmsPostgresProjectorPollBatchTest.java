@@ -164,14 +164,14 @@ class OmsPostgresProjectorPollBatchTest {
                 projector.createProjectingFragmentHandlerForTesting();
         Subscription replay = org.mockito.Mockito.mock(io.aeron.Subscription.class);
         AtomicInteger pollCalls = new AtomicInteger();
-        when(replay.poll(any(), eq(1024)))
+        when(replay.poll(any(), eq(2048)))
                 .thenAnswer(
                         inv -> {
                             int n = pollCalls.getAndIncrement();
                             return switch (n) {
                                 case 0 -> {
                                     deliverCursorOnlyFragment(handler, 64L);
-                                    yield 1024;
+                                    yield 2048;
                                 }
                                 case 1 -> {
                                     deliverCursorOnlyFragment(handler, 128L);
@@ -184,7 +184,7 @@ class OmsPostgresProjectorPollBatchTest {
         int total =
                 projector.pollReplayBurst(replay, handler, config.getCluster().getProjector());
 
-        assertThat(total).isEqualTo(1041);
+        assertThat(total).isEqualTo(2065);
         assertThat(pollCalls.get()).isEqualTo(3);
         assertThat(txManager.beginCount.get())
                 .as("partial batch defers flush until outer loop idle tail")
@@ -202,7 +202,7 @@ class OmsPostgresProjectorPollBatchTest {
                 projector.createProjectingFragmentHandlerForTesting();
         Subscription replay = org.mockito.Mockito.mock(io.aeron.Subscription.class);
         AtomicInteger pollCalls = new AtomicInteger();
-        when(replay.poll(any(), eq(1024)))
+        when(replay.poll(any(), eq(2048)))
                 .thenAnswer(
                         inv -> {
                             return switch (pollCalls.getAndIncrement()) {
@@ -231,9 +231,33 @@ class OmsPostgresProjectorPollBatchTest {
     }
 
     @Test
-    void effectiveFragmentLimit_floorsAt1024ForHighAdmitDrain() {
-        assertThat(OmsPostgresProjector.effectiveFragmentLimit(512)).isEqualTo(1024);
-        assertThat(OmsPostgresProjector.effectiveFragmentLimit(2048)).isEqualTo(2048);
+    void effectiveFragmentLimit_floorsAt2048ForHighAdmitDrain() {
+        assertThat(OmsPostgresProjector.effectiveFragmentLimit(512)).isEqualTo(2048);
+        assertThat(OmsPostgresProjector.effectiveFragmentLimit(4096)).isEqualTo(4096);
+    }
+
+    @Test
+    void effectiveMaxFragmentsPerCommit_usesCatchUpCapWhenWallLagHigh() {
+        OmsConfig.Cluster.Projector projectorCfg = config.getCluster().getProjector();
+        projectorCfg.setMaxFragmentsPerCommit(8192);
+        projectorCfg.setCatchUpMaxFragmentsPerCommit(16_384);
+        projectorCfg.setCatchUpLagThresholdMs(500L);
+
+        assertThat(
+                        OmsPostgresProjector.replayPollHasCatchUpBacklog(
+                                500L, ACCEPTED_AT_MS, ACCEPTED_AT_MS + 400L))
+                .isFalse();
+        assertThat(
+                        OmsPostgresProjector.replayPollHasCatchUpBacklog(
+                                500L, ACCEPTED_AT_MS, ACCEPTED_AT_MS + 600L))
+                .isTrue();
+
+        // pinned wall clock is ACCEPTED_AT_MS + 5 — below threshold
+        projector.setLastAppliedAcceptedAtMillisForTesting(ACCEPTED_AT_MS);
+        assertThat(projector.effectiveMaxFragmentsPerCommit(projectorCfg)).isEqualTo(8192);
+
+        projector.setLastAppliedAcceptedAtMillisForTesting(ACCEPTED_AT_MS - 2_000L);
+        assertThat(projector.effectiveMaxFragmentsPerCommit(projectorCfg)).isEqualTo(16_384);
     }
 
     @Test
@@ -246,7 +270,7 @@ class OmsPostgresProjectorPollBatchTest {
         deliverCursorOnlyFragment(handler, 64L);
         Subscription replay = org.mockito.Mockito.mock(io.aeron.Subscription.class);
         AtomicInteger pollCalls = new AtomicInteger();
-        when(replay.poll(any(), eq(1024)))
+        when(replay.poll(any(), eq(2048)))
                 .thenAnswer(
                         inv -> {
                             if (pollCalls.getAndIncrement() == 2) {

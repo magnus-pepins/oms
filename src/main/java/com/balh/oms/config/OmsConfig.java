@@ -3864,15 +3864,31 @@ public class OmsConfig {
 
             /**
              * When {@link #catchUpLagThresholdMs} is exceeded, the replay loop uses this larger
-             * commit cap and spin-yields instead of idle tail / park.
+             * commit cap, spin-yields instead of park, and skips recording-walk metadata until lag
+             * falls below threshold.
              */
             private static final int DEFAULT_CATCH_UP_MAX_FRAGMENTS_PER_COMMIT = 16_384;
 
             /**
              * Wall-lag ms (cluster admit → projector applied) above which the replay loop enters
-             * catch-up fast path: larger commit batches, skip idle tail, spin instead of park.
+             * catch-up fast path: larger commit batches, spin instead of park, skip Archive
+             * {@code listRecordings} on idle polls.
              */
             private static final long DEFAULT_CATCH_UP_LAG_THRESHOLD_MS = 1_000L;
+
+            /**
+             * Bounded queue of poll batches awaiting the apply thread. Lets the replay thread keep
+             * {@code replay.poll}ing while Postgres COMMIT runs — overlap removes poll time from the
+             * per-batch critical path at 10k admits/s.
+             */
+            private static final int DEFAULT_APPLY_QUEUE_BATCH_CAPACITY = 4;
+
+            /**
+             * {@link Thread#setPriority(int)} for {@code oms-postgres-projector-replay} and
+             * {@code oms-postgres-projector-apply}. Default {@link Thread#MAX_PRIORITY} keeps the
+             * Aeron drain ahead of generic worker pools on pop bench hosts.
+             */
+            private static final int DEFAULT_REPLAY_THREAD_PRIORITY = Thread.MAX_PRIORITY;
 
             /** Default backoff between {@code listRecordings} retries while waiting for the recording to appear. */
             private static final long DEFAULT_RECORDING_LOOKUP_PARK_MS = 100L;
@@ -3888,6 +3904,8 @@ public class OmsConfig {
             private int maxFragmentsPerCommit = DEFAULT_MAX_FRAGMENTS_PER_COMMIT;
             private int catchUpMaxFragmentsPerCommit = DEFAULT_CATCH_UP_MAX_FRAGMENTS_PER_COMMIT;
             private long catchUpLagThresholdMs = DEFAULT_CATCH_UP_LAG_THRESHOLD_MS;
+            private int applyQueueBatchCapacity = DEFAULT_APPLY_QUEUE_BATCH_CAPACITY;
+            private int replayThreadPriority = DEFAULT_REPLAY_THREAD_PRIORITY;
             private long recordingLookupParkMs = DEFAULT_RECORDING_LOOKUP_PARK_MS;
 
             public boolean isEnabled() { return enabled; }
@@ -3955,6 +3973,17 @@ public class OmsConfig {
             public long getCatchUpLagThresholdMs() { return catchUpLagThresholdMs; }
             public void setCatchUpLagThresholdMs(long catchUpLagThresholdMs) {
                 this.catchUpLagThresholdMs = Math.max(1L, catchUpLagThresholdMs);
+            }
+
+            public int getApplyQueueBatchCapacity() { return applyQueueBatchCapacity; }
+            public void setApplyQueueBatchCapacity(int applyQueueBatchCapacity) {
+                this.applyQueueBatchCapacity = Math.max(1, applyQueueBatchCapacity);
+            }
+
+            public int getReplayThreadPriority() { return replayThreadPriority; }
+            public void setReplayThreadPriority(int replayThreadPriority) {
+                this.replayThreadPriority =
+                        Math.clamp(replayThreadPriority, Thread.MIN_PRIORITY, Thread.MAX_PRIORITY);
             }
 
             public long getRecordingLookupParkMs() { return recordingLookupParkMs; }

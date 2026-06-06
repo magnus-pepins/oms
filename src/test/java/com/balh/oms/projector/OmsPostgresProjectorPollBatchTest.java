@@ -290,6 +290,47 @@ class OmsPostgresProjectorPollBatchTest {
     }
 
     @Test
+    void pollReplayIdleTail_runsDuringCatchUpBacklog() {
+        projector.setRunningForTesting(true);
+        projector.setLastAppliedAcceptedAtMillisForTesting(ACCEPTED_AT_MS - 5_000L);
+        config.getCluster().getProjector().setFragmentLimit(512);
+
+        OmsPostgresProjector.ProjectingFragmentHandler handler =
+                projector.createProjectingFragmentHandlerForTesting();
+        deliverCursorOnlyFragment(handler, 64L);
+        Subscription replay = org.mockito.Mockito.mock(io.aeron.Subscription.class);
+        AtomicInteger pollCalls = new AtomicInteger();
+        when(replay.poll(any(), eq(2048)))
+                .thenAnswer(
+                        inv -> {
+                            if (pollCalls.getAndIncrement() == 1) {
+                                deliverCursorOnlyFragment(handler, 128L);
+                                return 1;
+                            }
+                            return 0;
+                        });
+
+        int idleTail =
+                projector.pollReplayIdleTail(replay, handler, config.getCluster().getProjector());
+
+        assertThat(idleTail).isEqualTo(1);
+        assertThat(pollCalls.get()).isGreaterThanOrEqualTo(2);
+        assertThat(txManager.beginCount.get())
+                .as("idle tail must accumulate before partial flush even when catch-up")
+                .isZero();
+        assertThat(handler.pendingFragmentCount()).isEqualTo(2);
+    }
+
+    @Test
+    void replayThreadPriority_clampedToThreadRange() {
+        OmsConfig.Cluster.Projector projectorCfg = config.getCluster().getProjector();
+        projectorCfg.setReplayThreadPriority(Thread.MAX_PRIORITY + 10);
+        assertThat(projectorCfg.getReplayThreadPriority()).isEqualTo(Thread.MAX_PRIORITY);
+        projectorCfg.setReplayThreadPriority(Thread.MIN_PRIORITY - 10);
+        assertThat(projectorCfg.getReplayThreadPriority()).isEqualTo(Thread.MIN_PRIORITY);
+    }
+
+    @Test
     void fragmentHandler_buffersUntilFlushThenCommitsOnce() throws Exception {
         OrderAdmittedEvent ev1 = admitted("PREDMKT-A");
         OrderAdmittedEvent ev2 = admitted("PREDMKT-B");

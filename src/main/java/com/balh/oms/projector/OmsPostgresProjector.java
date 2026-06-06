@@ -68,6 +68,8 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.UUID;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -264,6 +266,13 @@ public class OmsPostgresProjector {
             new AtomicReference<>(null);
     private Thread replayThread;
     /**
+     * Async Postgres apply queue — null in unit tests that drive {@link #applyPollBatch} directly
+     * without {@link #init()}.
+     */
+    private BlockingQueue<List<PendingFragment>> applyQueue;
+    private Thread applyThread;
+    private final AtomicReference<RuntimeException> applyFailure = new AtomicReference<>();
+    /**
      * When true (only on the replay thread inside {@link #applyPollBatch}), per-fragment cursor
      * UPSERTs coalesce to a single {@link AeronProjectorCursorRepository#advanceWithRecording} at
      * the max fragment position before COMMIT — the prior per-fragment updates were redundant
@@ -420,8 +429,15 @@ public class OmsPostgresProjector {
                     OmsClusterWireFormat.EVENTS_STREAM_ID);
         }
         running.set(true);
+        OmsConfig.Cluster.Projector projectorCfg = config.getCluster().getProjector();
+        applyQueue = new ArrayBlockingQueue<>(Math.max(1, projectorCfg.getApplyQueueBatchCapacity()));
+        applyThread = new Thread(this::applyLoop, "oms-postgres-projector-apply");
+        applyThread.setDaemon(true);
+        applyThread.setPriority(projectorCfg.getReplayThreadPriority());
+        applyThread.start();
         replayThread = new Thread(this::replayLoop, "oms-postgres-projector-replay");
         replayThread.setDaemon(true);
+        replayThread.setPriority(projectorCfg.getReplayThreadPriority());
         replayThread.start();
     }
 
@@ -437,6 +453,77 @@ public class OmsPostgresProjector {
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
+        }
+        if (applyThread != null) {
+            applyThread.interrupt();
+            try {
+                applyThread.join(10_000L);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    private void applyLoop() {
+        while (true) {
+            List<PendingFragment> batch;
+            try {
+                batch = applyQueue.poll(100L, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+            if (batch == null) {
+                if (!running.get() && applyQueue.isEmpty()) {
+                    break;
+                }
+                continue;
+            }
+            try {
+                applyPollBatch(batch);
+            } catch (RuntimeException e) {
+                applyFailure.set(e);
+                running.set(false);
+                log.error("oms-postgres-projector apply loop terminating", e);
+                break;
+            }
+        }
+        List<PendingFragment> remaining;
+        while ((remaining = applyQueue.poll()) != null) {
+            try {
+                applyPollBatch(remaining);
+            } catch (RuntimeException e) {
+                log.error("oms-postgres-projector apply drain on shutdown failed", e);
+            }
+        }
+    }
+
+    private void enqueuePollBatch(List<PendingFragment> batch) {
+        if (batch.isEmpty()) {
+            return;
+        }
+        BlockingQueue<List<PendingFragment>> queue = applyQueue;
+        if (queue == null) {
+            applyPollBatch(batch);
+            return;
+        }
+        try {
+            while (running.get()) {
+                if (queue.offer(batch, 10L, TimeUnit.MILLISECONDS)) {
+                    return;
+                }
+                rethrowApplyFailureIfAny();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            applyPollBatch(batch);
+        }
+    }
+
+    private void rethrowApplyFailureIfAny() {
+        RuntimeException failure = applyFailure.get();
+        if (failure != null) {
+            throw failure;
         }
     }
 
@@ -728,18 +815,21 @@ public class OmsPostgresProjector {
                         projectorCfg.getReplayStreamId());
 
                 while (running.get()) {
+                    rethrowApplyFailureIfAny();
                     int polledBurst = pollReplayBurst(replay, handler, projectorCfg);
                     if (polledBurst > 0) {
                         continue;
                     }
-                    if (!replayPollHasCatchUpBacklog(projectorCfg)) {
-                        int idleTailBurst = pollReplayIdleTail(replay, handler, projectorCfg);
-                        if (idleTailBurst > 0) {
-                            continue;
-                        }
+                    int idleTailBurst = pollReplayIdleTail(replay, handler, projectorCfg);
+                    if (idleTailBurst > 0) {
+                        continue;
                     }
                     if (handler.pendingFragmentCount() > 0) {
                         handler.flushPollBatch();
+                    }
+                    if (replayPollHasCatchUpBacklog(projectorCfg)) {
+                        parkReplayIdleAfterPoll(projectorCfg);
+                        continue;
                     }
                     // No fragments. Three cases:
                     //   (a) live-tail wait on the cluster's currently-active recording — park,
@@ -1039,7 +1129,7 @@ public class OmsPostgresProjector {
      * the first zero forces ~100-fragment COMMITs and caps drain near 500/s.
      */
     /** Live-tail spins before park/recording-walk; raised for pop @ 10k admit/s knee vs 5k. */
-    private static final int REPLAY_IDLE_TAIL_POLLS = 8;
+    private static final int REPLAY_IDLE_TAIL_POLLS = 16;
 
     /**
      * Tight-spin drain: call {@link Subscription#poll} repeatedly while Aeron delivers fragments.
@@ -1215,7 +1305,7 @@ public class OmsPostgresProjector {
             }
             List<PendingFragment> batch = List.copyOf(pollBatch);
             pollBatch.clear();
-            applyPollBatch(batch);
+            enqueuePollBatch(batch);
         }
 
         int pendingFragmentCount() {

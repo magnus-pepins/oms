@@ -33,6 +33,7 @@ class OmsClusterIngressClientErOfferTest {
         OmsConfig cfg = new OmsConfig();
         cfg.getCluster().getClient().setEnabled(true);
         cfg.getCluster().getClient().setAeronDirectory("/tmp/oms-er-offer-test-not-real");
+        cfg.getCluster().getClient().getErOffer().setMaxPerLockPass(256);
         return cfg;
     }
 
@@ -140,6 +141,106 @@ class OmsClusterIngressClientErOfferTest {
         releaseOffer.countDown();
         future.get(5, TimeUnit.SECONDS);
         client.close();
+    }
+
+    @Test
+    void submitApplyExecutionReportAsync_whenQueueFull_failsFastWithoutBlocking() throws Exception {
+        OmsConfig cfg = newConfig();
+        int queueCap = cfg.getCluster().getClient().getErOffer().getQueueCapacity();
+        OmsClusterIngressClient client = new OmsClusterIngressClient(cfg, new SimpleMeterRegistry());
+        setField(client, "client", Mockito.mock(AeronCluster.class));
+        setField(client, "closing", false);
+
+        for (int i = 0; i < queueCap; i++) {
+            CompletableFuture<Void> enqueued =
+                    client.submitApplyExecutionReportAsync(
+                            sampleEr(client.nextCorrelationId()), Duration.ofSeconds(5));
+            assertThat(enqueued.isDone()).isFalse();
+        }
+        assertThat(client.erOfferQueueDepthForTest()).isEqualTo(queueCap);
+
+        long blockedStart = System.nanoTime();
+        CompletableFuture<Void> rejected =
+                client.submitApplyExecutionReportAsync(
+                        sampleEr(client.nextCorrelationId()), Duration.ofSeconds(5));
+        long blockedNanos = System.nanoTime() - blockedStart;
+
+        assertThat(rejected.isCompletedExceptionally()).isTrue();
+        assertThat(blockedNanos)
+                .as("full queue should fail fast instead of parking the caller")
+                .isLessThan(TimeUnit.MILLISECONDS.toNanos(50));
+        assertThat(client.erOfferQueueDepthForTest()).isEqualTo(queueCap);
+        client.close();
+    }
+
+    @Test
+    void erOfferDaemon_greedyExtensionAmortisesLockAcrossQueueDrain() throws Exception {
+        OmsConfig cfg = newConfig();
+        cfg.getCluster().getClient().getErOffer().setMaxPerLockPass(64);
+        OmsClusterIngressClient client = new OmsClusterIngressClient(cfg, new SimpleMeterRegistry());
+        AtomicInteger lockAcquisitions = new AtomicInteger();
+        AtomicInteger offers = new AtomicInteger();
+        AeronCluster cluster = Mockito.mock(AeronCluster.class);
+        Mockito.when(cluster.offer(Mockito.any(), Mockito.anyInt(), Mockito.anyInt()))
+                .thenAnswer(
+                        inv -> {
+                            offers.incrementAndGet();
+                            return 1L;
+                        });
+
+        setField(client, "client", cluster);
+        setField(client, "closing", false);
+        ReentrantLock lock = (ReentrantLock) declaredField(client, "clientLock").get(client);
+        ReentrantLock countingLock =
+                new ReentrantLock() {
+                    @Override
+                    public void lock() {
+                        lockAcquisitions.incrementAndGet();
+                        lock.lock();
+                    }
+
+                    @Override
+                    public void lockInterruptibly() throws InterruptedException {
+                        lockAcquisitions.incrementAndGet();
+                        lock.lockInterruptibly();
+                    }
+
+                    @Override
+                    public void unlock() {
+                        lock.unlock();
+                    }
+                };
+        setField(client, "clientLock", countingLock);
+        invokeStartErOfferDaemonLocked(client);
+
+        int n = 200;
+        var pool = Executors.newVirtualThreadPerTaskExecutor();
+        try {
+            CountDownLatch done = new CountDownLatch(n);
+            for (int i = 0; i < n; i++) {
+                long cid = client.nextCorrelationId();
+                pool.submit(
+                        () -> {
+                            try {
+                                client.submitApplyExecutionReportAsync(sampleEr(cid), Duration.ofSeconds(5))
+                                        .get(10, TimeUnit.SECONDS);
+                            } catch (Exception e) {
+                                throw new AssertionError(e);
+                            } finally {
+                                done.countDown();
+                            }
+                        });
+            }
+            assertThat(done.await(15, TimeUnit.SECONDS)).isTrue();
+        } finally {
+            pool.shutdownNow();
+            client.close();
+        }
+
+        assertThat(offers.get()).isEqualTo(n);
+        assertThat(lockAcquisitions.get())
+                .as("greedy extension should offer many frames per lock acquisition")
+                .isLessThan(n / 4);
     }
 
     @Test

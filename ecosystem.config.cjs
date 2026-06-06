@@ -551,10 +551,14 @@ const apps = [
       // Pipelined RouteOrderStream in-flight cap (see plans/oms-venue-egress-pipelining.md).
       OMS_CLUSTER_VENUE_EGRESS_VENUE_ROUTE_MAX_IN_FLIGHT: '512',
       // Replay drain: 1µs idle park, 2048 frags/poll, MAX-priority replay + route-offer threads.
-      // pollReplayIdleTail spins 8× before park; 4× pending cap vs venue permits for 10k/s ER tail.
+      // pollReplayIdleTail spins 8× before park; 6× pending cap; ER-queue throttle floor 6144.
       OMS_CLUSTER_VENUE_EGRESS_POLL_PARK_NANOS: '1000',
       OMS_CLUSTER_VENUE_EGRESS_FRAGMENT_LIMIT: '2048',
       OMS_CLUSTER_VENUE_EGRESS_REPLAY_THREAD_PRIORITY: '10',
+      OMS_CLUSTER_VENUE_EGRESS_BACKLOG_THROTTLE_PENDING_ROUTE_THRESHOLD: '1536',
+      OMS_CLUSTER_VENUE_EGRESS_BACKLOG_THROTTLE_ER_OFFER_QUEUE_DEPTH_THRESHOLD: '6144',
+      OMS_CLUSTER_VENUE_EGRESS_BACKLOG_THROTTLE_MAX_IN_FLIGHT: '512',
+      OMS_CLUSTER_VENUE_EGRESS_BACKLOG_THROTTLE_PARK_NANOS: '10000',
       // 8095/8092 are oms-fix-ingress on pop.
       OMS_VENUE_EGRESS_HTTP_PORT: '8097',
       OMS_VENUE_EGRESS_MANAGEMENT_SERVER_PORT: '8098',

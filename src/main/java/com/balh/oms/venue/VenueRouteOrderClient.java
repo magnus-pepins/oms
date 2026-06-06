@@ -63,6 +63,15 @@ public class VenueRouteOrderClient {
     private static final long ACK_TIMEOUT_SWEEP_INTERVAL_MS = 50L;
     /** Writer parks briefly when the gRPC stream is not ready (flow control). */
     private static final long STREAM_NOT_READY_PARK_NANOS = MILLISECONDS.toNanos(1L);
+    /**
+     * Idle park when the write queue is empty. Must use {@link LockSupport#parkNanos(long)} — not
+     * {@link BlockingQueue#poll(long, TimeUnit)} — so {@link #routeAdmittedOrderAsync} can wake the
+     * writer via {@link LockSupport#unpark(Thread)} without a missed signal (observed @ 10k/s:
+     * {@code poll(50ms)} ignored unpark and inflated {@code oms.pipeline.cluster_admit_to_fix_nos}).
+     */
+    private static final long WRITE_LOOP_IDLE_PARK_NANOS = MILLISECONDS.toNanos(1L);
+    /** Max ordered {@code onNext} calls per ready window before re-checking flow control. */
+    private static final int MAX_WRITES_PER_READY_WINDOW = 64;
 
     private final ManagedChannel channel;
     private final VenueOrderServiceGrpc.VenueOrderServiceBlockingStub blockingStub;
@@ -203,14 +212,9 @@ public class VenueRouteOrderClient {
      */
     private void writeLoop() {
         while (!shuttingDown) {
-            QueuedWrite item;
-            try {
-                item = writeQueue.poll(50L, MILLISECONDS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return;
-            }
+            QueuedWrite item = writeQueue.poll();
             if (item == null) {
+                LockSupport.parkNanos(WRITE_LOOP_IDLE_PARK_NANOS);
                 continue;
             }
             writeOne(item);
@@ -248,11 +252,34 @@ public class VenueRouteOrderClient {
             }
             try {
                 callObserver.onNext(item.request());
+                drainReadyWritesLocked(callObserver);
             } catch (RuntimeException e) {
                 failQueuedWriteLocked(item, e);
             }
         } finally {
             streamLock.unlock();
+        }
+    }
+
+    /**
+     * Caller holds {@link #streamLock} and has just written {@code item}. While outbound flow
+     * control allows, drain additional queued writes without releasing the lock — amortises
+     * {@code isReady} spins and lock trips at 10k admits/s.
+     */
+    private void drainReadyWritesLocked(ClientCallStreamObserver<RouteOrderRequest> callObserver) {
+        int written = 0;
+        while (written < MAX_WRITES_PER_READY_WINDOW && callObserver.isReady() && !shuttingDown) {
+            QueuedWrite next = writeQueue.poll();
+            if (next == null) {
+                return;
+            }
+            try {
+                callObserver.onNext(next.request());
+                written++;
+            } catch (RuntimeException e) {
+                failQueuedWriteLocked(next, e);
+                return;
+            }
         }
     }
 

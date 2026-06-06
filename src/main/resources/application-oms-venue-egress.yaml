@@ -22,10 +22,12 @@ oms:
       replay-channel: ${OMS_VENUE_EGRESS_REPLAY_CHANNEL:aeron:ipc?term-length=64k}
       replay-stream-id: ${OMS_VENUE_EGRESS_REPLAY_STREAM_ID:4324}
       venue-route-max-in-flight: ${OMS_CLUSTER_VENUE_EGRESS_VENUE_ROUTE_MAX_IN_FLIGHT:512}
-      backlog-throttle-pending-route-threshold: ${OMS_CLUSTER_VENUE_EGRESS_BACKLOG_THROTTLE_PENDING_ROUTE_THRESHOLD:384}
-      backlog-throttle-er-offer-queue-depth-threshold: ${OMS_CLUSTER_VENUE_EGRESS_BACKLOG_THROTTLE_ER_OFFER_QUEUE_DEPTH_THRESHOLD:1024}
-      backlog-throttle-max-in-flight: ${OMS_CLUSTER_VENUE_EGRESS_BACKLOG_THROTTLE_MAX_IN_FLIGHT:128}
-      backlog-throttle-park-nanos: ${OMS_CLUSTER_VENUE_EGRESS_BACKLOG_THROTTLE_PARK_NANOS:50000}
+      # Throttle only when ER queue is genuinely saturated (8192 cap on ingress client) — 1024 fired
+      # too early @ 10k/s coalesced flush and clamped dispatch to 128 (~188 ms meanRouteMs).
+      backlog-throttle-pending-route-threshold: ${OMS_CLUSTER_VENUE_EGRESS_BACKLOG_THROTTLE_PENDING_ROUTE_THRESHOLD:1536}
+      backlog-throttle-er-offer-queue-depth-threshold: ${OMS_CLUSTER_VENUE_EGRESS_BACKLOG_THROTTLE_ER_OFFER_QUEUE_DEPTH_THRESHOLD:6144}
+      backlog-throttle-max-in-flight: ${OMS_CLUSTER_VENUE_EGRESS_BACKLOG_THROTTLE_MAX_IN_FLIGHT:512}
+      backlog-throttle-park-nanos: ${OMS_CLUSTER_VENUE_EGRESS_BACKLOG_THROTTLE_PARK_NANOS:10000}
       # Replay drain tuning (pop @ 5–10k RPS admit): 1µs idle park + 2048 frags/poll + MAX priority threads.
       # pollReplayIdleTail spins 8× before park/recording-walk; keep poll-park short so true-idle wake is cheap.
       poll-park-nanos: ${OMS_CLUSTER_VENUE_EGRESS_POLL_PARK_NANOS:1000}

@@ -1539,14 +1539,15 @@ public class OmsVenueEgressService {
          * Spin-yield passes in {@link #awaitDispatchCapacity()} before paying a configured park
          * slice — completions {@link #unparkReplayThread()} frequently under 10k admit/s.
          */
-        private static final int DISPATCH_CAPACITY_SPIN_LIMIT = 64;
+        private static final int DISPATCH_CAPACITY_SPIN_LIMIT = 128;
 
         /**
          * Outstanding fragments (venue ack pending or ER submit pending) before we stop dispatching.
-         * 4× venue permits keeps replay registering while ER submit trails venue acks (observed pop
-         * @ 10k RPS clean book: 2× capped {@code egress_wall_lag_ms} ~300 ms with route ~0.01 ms).
+         * 6× venue permits keeps replay registering while ER submit trails venue acks (observed pop
+         * @ 10k RPS clean book: 4× cap cut {@code egress_wall_lag_ms} 306→154 ms; 6× targets &lt;100 ms
+         * meanRouteMs with raised ER-queue throttle floor).
          */
-        private static final int PENDING_FRAGMENT_CAP_MULTIPLIER = 4;
+        private static final int PENDING_FRAGMENT_CAP_MULTIPLIER = 6;
 
         private final int maxInFlight;
         private final int maxPendingFragments;
@@ -1735,7 +1736,7 @@ public class OmsVenueEgressService {
 
         /**
          * Max registered fragments the replay thread may dispatch before {@link #awaitDispatchCapacity()}
-         * parks. Normally {@link #maxPendingFragments} (4× venue permits) so replay keeps registering
+         * parks. Normally {@link #maxPendingFragments} (6× venue permits) so replay keeps registering
          * admits while venue acks recycle permits faster than ER submit completes — capping at
          * {@link #maxInFlight} alone wedged replay at ~512 deep with free permits (observed pop @ 5k
          * RPS: {@code egress_wall_lag_ms} ~27 ms; @ 10k with 2× cap: ~306 ms,

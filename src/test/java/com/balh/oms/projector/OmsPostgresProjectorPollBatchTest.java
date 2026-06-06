@@ -107,9 +107,7 @@ class OmsPostgresProjectorPollBatchTest {
         OrderAdmittedEvent ev1 = admitted("PREDMKT-1");
         OrderAdmittedEvent ev2 = admitted("PREDMKT-2");
         OrderAdmittedEvent ev3 = admitted("PREDMKT-3");
-        stubFreshAdmit(ev1);
-        stubFreshAdmit(ev2);
-        stubFreshAdmit(ev3);
+        when(ordersRepository.batchInsertFromAdmittedEvents(List.of(ev1, ev2, ev3))).thenReturn(new int[] {1, 1, 1});
 
         projector.applyPollBatchForTesting(List.of(
                 new OmsPostgresProjector.PendingFragment.OrderAdmitted(ev1, 100L),
@@ -119,7 +117,8 @@ class OmsPostgresProjectorPollBatchTest {
         assertThat(txManager.beginCount.get())
                 .as("one BEGIN/COMMIT envelope for the whole poll batch")
                 .isEqualTo(1);
-        verify(ordersRepository, times(3))
+        verify(ordersRepository).batchInsertFromAdmittedEvents(List.of(ev1, ev2, ev3));
+        verify(ordersRepository, never())
                 .insertFromAdmittedEventWithOrder(any(), nullable(OrdersRepository.PinnedFeeAtAdmit.class));
         verify(cursorRepository, times(1))
                 .advanceWithRecording(
@@ -131,9 +130,25 @@ class OmsPostgresProjectorPollBatchTest {
     }
 
     @Test
+    void isAdmitOnlyPollBatch_trueForAdmits_falseForMixed() {
+        OrderAdmittedEvent ev = admitted("PREDMKT-1");
+        assertThat(
+                        OmsPostgresProjector.isAdmitOnlyPollBatch(
+                                List.of(new OmsPostgresProjector.PendingFragment.OrderAdmitted(ev, 1L))))
+                .isTrue();
+        assertThat(
+                        OmsPostgresProjector.isAdmitOnlyPollBatch(
+                                List.of(
+                                        new OmsPostgresProjector.PendingFragment.OrderAdmitted(ev, 1L),
+                                        new OmsPostgresProjector.PendingFragment.CursorOnly(2L))))
+                .isFalse();
+        assertThat(OmsPostgresProjector.isAdmitOnlyPollBatch(List.of())).isFalse();
+    }
+
+    @Test
     void applyPollBatch_recordsPollBatchCommitTimer() throws Exception {
         OrderAdmittedEvent ev = admitted("PREDMKT-1");
-        stubFreshAdmit(ev);
+        stubFreshAdmitBatch(List.of(ev));
 
         projector.applyPollBatchForTesting(
                 List.of(new OmsPostgresProjector.PendingFragment.OrderAdmitted(ev, 512L)));
@@ -334,8 +349,7 @@ class OmsPostgresProjectorPollBatchTest {
     void fragmentHandler_buffersUntilFlushThenCommitsOnce() throws Exception {
         OrderAdmittedEvent ev1 = admitted("PREDMKT-A");
         OrderAdmittedEvent ev2 = admitted("PREDMKT-B");
-        stubFreshAdmit(ev1);
-        stubFreshAdmit(ev2);
+        stubFreshAdmitBatch(List.of(ev1, ev2));
 
         OmsPostgresProjector.ProjectingFragmentHandler handler =
                 projector.createProjectingFragmentHandlerForTesting();
@@ -370,12 +384,15 @@ class OmsPostgresProjectorPollBatchTest {
         handler.onFragment(buf, 0, 32, header);
     }
 
-    private void stubFreshAdmit(OrderAdmittedEvent ev) throws Exception {
+    private void stubFreshAdmitBatch(List<OrderAdmittedEvent> events) throws Exception {
+        int[] counts = new int[events.size()];
+        java.util.Arrays.fill(counts, 1);
+        when(ordersRepository.batchInsertFromAdmittedEvents(events)).thenReturn(counts);
         Order projected = org.mockito.Mockito.mock(Order.class);
-        when(ordersRepository.insertFromAdmittedEventWithOrder(
-                        eq(ev), nullable(OrdersRepository.PinnedFeeAtAdmit.class)))
-                .thenReturn(new OrdersRepository.ProjectorAdmitInsert(true, projected));
-        when(envelopeCodec.orderAcceptedFromAdmitted(ev)).thenReturn("{\"type\":\"OrderAccepted\"}");
+        for (OrderAdmittedEvent ev : events) {
+            when(ordersRepository.orderFromAdmittedEvent(ev)).thenReturn(projected);
+            when(envelopeCodec.orderAcceptedFromAdmitted(ev)).thenReturn("{\"type\":\"OrderAccepted\"}");
+        }
     }
 
     private static OrderAdmittedEvent admitted(String symbol) {

@@ -1101,6 +1101,10 @@ public class OmsPostgresProjector {
         if (batch.isEmpty()) {
             return;
         }
+        if (isAdmitOnlyPollBatch(batch)) {
+            applyAdmitOnlyPollBatch(batch);
+            return;
+        }
         long pollBatchCommitStartNanos = System.nanoTime();
         long lastPosition = batch.get(batch.size() - 1).position();
         deferPollBatchCursorAdvance = true;
@@ -1120,6 +1124,80 @@ public class OmsPostgresProjector {
         meterRegistry
                 .timer(TIMER_POLL_BATCH_COMMIT)
                 .record(System.nanoTime() - pollBatchCommitStartNanos, TimeUnit.NANOSECONDS);
+    }
+
+    /**
+     * Pop! bench bursts are admit-only fragments. One {@link OrdersRepository#batchInsertFromAdmittedEvents}
+     * per poll batch replaces thousands of round-trip {@code jdbc.update} calls inside the same COMMIT.
+     */
+    private void applyAdmitOnlyPollBatch(List<PendingFragment> batch) {
+        long pollBatchCommitStartNanos = System.nanoTime();
+        long lastPosition = batch.get(batch.size() - 1).position();
+        deferPollBatchCursorAdvance = true;
+        deferredPollBatchMaxPosition = -1L;
+        try {
+            transactionTemplate.executeWithoutResult(status -> {
+                long admitTxStartNanos = System.nanoTime();
+                List<OrderAdmittedEvent> events = new ArrayList<>(batch.size());
+                for (PendingFragment fragment : batch) {
+                    PendingFragment.OrderAdmitted admitted = (PendingFragment.OrderAdmitted) fragment;
+                    if (isShardMisroute(admitted.event().orderId(), admitted.event().shardId(), admitted.position())) {
+                        continue;
+                    }
+                    events.add(admitted.event());
+                    advanceCursorAtPosition(admitted.position());
+                }
+                int[] insertCounts = ordersRepository.batchInsertFromAdmittedEvents(events);
+                long admitBatchSqlNanos = System.nanoTime() - admitTxStartNanos;
+                long perEventAdmitTxNanos =
+                        events.isEmpty() ? 0L : admitBatchSqlNanos / events.size();
+                for (int i = 0; i < events.size(); i++) {
+                    OrderAdmittedEvent ev = events.get(i);
+                    boolean fresh = insertCounts[i] == 1;
+                    if (fresh && !skipVenueOrderAcceptedOutbox(ev)) {
+                        try {
+                            domainEventOutboxRepository.insert(ev.orderId(), envelopeCodec.orderAcceptedFromAdmitted(ev));
+                        } catch (JsonProcessingException e) {
+                            throw new IllegalStateException(
+                                    "OrderAccepted envelope serialisation failed for orderId=" + ev.orderId(), e);
+                        }
+                    }
+                    if (fresh) {
+                        OrdersRepository.ProjectorAdmitInsert admitInsert =
+                                new OrdersRepository.ProjectorAdmitInsert(
+                                        true, ordersRepository.orderFromAdmittedEvent(ev));
+                        boolean skipPassAudit = skipVenueControlPassAudit(ev);
+                        if (!skipsVenueBenchControlAdmission(skipPassAudit, admitInsert.order())) {
+                            controlAdmission.persistAdmission(
+                                    toPendingControlEvent(ev), admitInsert.order(), skipPassAudit);
+                        }
+                    }
+                    recordLedgerInflightOutboxIfNeeded(ev);
+                    meterRegistry.timer(TIMER_ADMIT_TX).record(perEventAdmitTxNanos, TimeUnit.NANOSECONDS);
+                    recordClusterAdmitToProjectorWallLag(ev);
+                }
+                flushDeferredPollBatchCursorAdvance();
+            });
+        } finally {
+            deferPollBatchCursorAdvance = false;
+            deferredPollBatchMaxPosition = -1L;
+        }
+        lastAppliedPosition.set(lastPosition);
+        meterRegistry
+                .timer(TIMER_POLL_BATCH_COMMIT)
+                .record(System.nanoTime() - pollBatchCommitStartNanos, TimeUnit.NANOSECONDS);
+    }
+
+    static boolean isAdmitOnlyPollBatch(List<PendingFragment> batch) {
+        if (batch.isEmpty()) {
+            return false;
+        }
+        for (PendingFragment fragment : batch) {
+            if (!(fragment instanceof PendingFragment.OrderAdmitted)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
@@ -1431,12 +1509,20 @@ public class OmsPostgresProjector {
         // index + ON CONFLICT DO NOTHING make this a safe no-op when the row already exists.
         recordLedgerInflightOutboxIfNeeded(ev);
         advanceCursorAtPosition(newPosition);
-        // Phase 4j per-event histogram: cluster-admit -> projector-applied. Recorded after the last
-        // SQL operation in this fragment's transaction; the actual COMMIT happens when the wrapping
-        // TransactionTemplate lambda returns (sub-ms after this point in the fast-path). If any of
-        // the SQL above throws, the exception exits the lambda before this line and the Timer stays
-        // silent for the failed event.
+        finishAdmitProjectionMetrics(ev, admitTxStartNanos);
+    }
+
+    /**
+     * Phase 4j per-event histogram: cluster-admit -> projector-applied. Recorded after the last SQL
+     * operation in this fragment's transaction; the actual COMMIT happens when the wrapping
+     * TransactionTemplate lambda returns (sub-ms after this point in the fast-path).
+     */
+    private void finishAdmitProjectionMetrics(OrderAdmittedEvent ev, long admitTxStartNanos) {
         meterRegistry.timer(TIMER_ADMIT_TX).record(System.nanoTime() - admitTxStartNanos, TimeUnit.NANOSECONDS);
+        recordClusterAdmitToProjectorWallLag(ev);
+    }
+
+    private void recordClusterAdmitToProjectorWallLag(OrderAdmittedEvent ev) {
         lastAppliedAcceptedAtMillis.set(ev.acceptedAtMillis());
         long latencyMs = wallClock.millis() - ev.acceptedAtMillis();
         OmsPipelineMetrics.recordClusterAdmitToProjector(

@@ -3881,7 +3881,8 @@ public class OmsConfig {
              * {@code replay.poll}ing while Postgres COMMIT runs — overlap removes poll time from the
              * per-batch critical path at 10k admits/s.
              */
-            private static final int DEFAULT_APPLY_QUEUE_BATCH_CAPACITY = 4;
+            /** Depth for async apply queue — must cover soak burst (30s @ 10k/s) while COMMIT runs. */
+            private static final int DEFAULT_APPLY_QUEUE_BATCH_CAPACITY = 48;
 
             /**
              * {@link Thread#setPriority(int)} for {@code oms-postgres-projector-replay} and

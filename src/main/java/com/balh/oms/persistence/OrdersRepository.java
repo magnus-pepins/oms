@@ -257,6 +257,22 @@ public class OrdersRepository {
         return new ProjectorAdmitInsert(fresh, fields.order());
     }
 
+    /**
+     * Batched projector admit for poll-batch fast path. Each array element is the JDBC update count
+     * ({@code 1} fresh insert, {@code 0} idempotent replay) matching
+     * {@link #insertFromAdmittedEventWithOrder}.
+     */
+    public int[] batchInsertFromAdmittedEvents(List<OrderAdmittedEvent> events) {
+        if (events.isEmpty()) {
+            return new int[0];
+        }
+        MapSqlParameterSource[] batch = new MapSqlParameterSource[events.size()];
+        for (int i = 0; i < events.size(); i++) {
+            batch[i] = projectorAdmitFields(events.get(i), null).params();
+        }
+        return jdbc.batchUpdate(PROJECTOR_INSERT_SQL, batch);
+    }
+
     /** Phase E: pin fee model + estimated taker fee quoted at cluster admit (PREDMKT orders). */
     public void pinPredictionMarketFeeAtAdmit(
             UUID orderId,

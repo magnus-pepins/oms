@@ -42,7 +42,7 @@ oms:
       max-fragments-per-commit: ${OMS_POSTGRES_PROJECTOR_MAX_FRAGMENTS_PER_COMMIT:8192}
       catch-up-lag-threshold-ms: ${OMS_POSTGRES_PROJECTOR_CATCH_UP_LAG_THRESHOLD_MS:1000}
       catch-up-max-fragments-per-commit: ${OMS_POSTGRES_PROJECTOR_CATCH_UP_MAX_FRAGMENTS_PER_COMMIT:16384}
-      apply-queue-batch-capacity: ${OMS_POSTGRES_PROJECTOR_APPLY_QUEUE_BATCH_CAPACITY:4}
+      apply-queue-batch-capacity: ${OMS_POSTGRES_PROJECTOR_APPLY_QUEUE_BATCH_CAPACITY:48}
       replay-thread-priority: ${OMS_POSTGRES_PROJECTOR_REPLAY_THREAD_PRIORITY:10}
 
 # Main HTTP port: the projector role does not serve order-accept HTTP, but Spring Boot's auto-config

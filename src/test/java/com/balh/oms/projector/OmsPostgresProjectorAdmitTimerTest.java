@@ -3,6 +3,7 @@ package com.balh.oms.projector;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.nullable;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -20,6 +21,7 @@ import com.balh.oms.persistence.LedgerInflightOutboxRepository;
 import com.balh.oms.persistence.MarketContextRepository;
 import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.persistence.PositionsRepository;
+import com.balh.oms.risk.ControlRiskEvaluator;
 import com.balh.oms.tailer.OrderControlAdmission;
 import com.balh.oms.observability.metrics.OmsPipelineMeterNames;
 import com.balh.oms.observability.metrics.OmsPipelineMetrics;
@@ -28,6 +30,7 @@ import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Tags;
 import io.micrometer.core.instrument.Timer;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -75,6 +78,11 @@ class OmsPostgresProjectorAdmitTimerTest {
     private MeterRegistry meterRegistry;
     private OmsPostgresProjector projector;
 
+    @AfterEach
+    void tearDown() {
+        ControlRiskEvaluator.setSkipVenueControlRiskEvalForTesting(null);
+    }
+
     @BeforeEach
     void setUp() {
         meterRegistry = new SimpleMeterRegistry();
@@ -107,12 +115,12 @@ class OmsPostgresProjectorAdmitTimerTest {
     void applyAdmittedEvent_recordsAdmitToProjectorTimer() {
         OrderAdmittedEvent ev = sampleAdmitted(AcceptOrderCommand.SIDE_BUY, AcceptOrderCommand.TIF_GTC);
         Order projected = org.mockito.Mockito.mock(Order.class);
-        when(ordersRepository.insertFromAdmittedEventWithOrder(ev))
+        when(ordersRepository.insertFromAdmittedEventWithOrder(eq(ev), nullable(OrdersRepository.PinnedFeeAtAdmit.class)))
                 .thenReturn(new OrdersRepository.ProjectorAdmitInsert(true, projected));
 
         projector.applyAdmittedEvent(ev, FRAGMENT_POSITION);
 
-        verify(ordersRepository).insertFromAdmittedEventWithOrder(ev);
+        verify(ordersRepository).insertFromAdmittedEventWithOrder(eq(ev), nullable(OrdersRepository.PinnedFeeAtAdmit.class));
         verify(ordersRepository, never()).orderFromAdmittedEvent(any());
         verify(controlAdmission).persistAdmission(any(), eq(projected), eq(false));
         verify(cursorRepository).advanceWithRecording(
@@ -153,7 +161,7 @@ class OmsPostgresProjectorAdmitTimerTest {
                 "hash",
                 "AAPL",
                 /* ledgerBalanceIdOrNull = */ null);
-        when(ordersRepository.insertFromAdmittedEventWithOrder(ev))
+        when(ordersRepository.insertFromAdmittedEventWithOrder(eq(ev), nullable(OrdersRepository.PinnedFeeAtAdmit.class)))
                 .thenReturn(new OrdersRepository.ProjectorAdmitInsert(
                         true, org.mockito.Mockito.mock(Order.class)));
 
@@ -173,9 +181,41 @@ class OmsPostgresProjectorAdmitTimerTest {
     }
 
     @Test
+    void benchSkip_predmktWithLedgerBalance_skipsControlAdmission() {
+        config.getRouting().setVenueSymbolPrefixRoutingEnabled(true);
+        projector.setSkipVenueControlPassAuditForTesting(true);
+        ControlRiskEvaluator.setSkipVenueControlRiskEvalForTesting(true);
+        OrderAdmittedEvent ev = new OrderAdmittedEvent(
+                UUID.randomUUID(),
+                0L,
+                ACCEPTED_AT_MS,
+                1L,
+                100_000L,
+                0,
+                0,
+                AcceptOrderCommand.SIDE_BUY,
+                AcceptOrderCommand.TIF_DAY,
+                "acct",
+                "idem",
+                "hash",
+                "PREDMKT-BENCH",
+                "bal-bench");
+        Order projected = org.mockito.Mockito.mock(Order.class);
+        when(projected.ledgerBalanceId()).thenReturn("bal-bench");
+        when(ordersRepository.insertFromAdmittedEventWithOrder(eq(ev), nullable(OrdersRepository.PinnedFeeAtAdmit.class)))
+                .thenReturn(new OrdersRepository.ProjectorAdmitInsert(true, projected));
+
+        projector.applyAdmittedEvent(ev, FRAGMENT_POSITION);
+
+        verify(controlAdmission, never()).persistAdmission(any());
+        verify(controlAdmission, never()).persistAdmission(any(), any());
+        verify(controlAdmission, never()).persistAdmission(any(), any(), any(Boolean.class));
+    }
+
+    @Test
     void replay_insertReturnsFalse_skipsControlAdmission() {
         OrderAdmittedEvent ev = sampleAdmitted(AcceptOrderCommand.SIDE_BUY, AcceptOrderCommand.TIF_DAY);
-        when(ordersRepository.insertFromAdmittedEventWithOrder(ev))
+        when(ordersRepository.insertFromAdmittedEventWithOrder(eq(ev), nullable(OrdersRepository.PinnedFeeAtAdmit.class)))
                 .thenReturn(new OrdersRepository.ProjectorAdmitInsert(
                         false, org.mockito.Mockito.mock(Order.class)));
 
@@ -190,7 +230,7 @@ class OmsPostgresProjectorAdmitTimerTest {
     void applyAdmittedEvent_failedInsert_doesNotRecordTimer() {
         OrderAdmittedEvent ev = sampleAdmitted(AcceptOrderCommand.SIDE_BUY, AcceptOrderCommand.TIF_DAY);
         Mockito.doThrow(new RuntimeException("simulated SQL failure"))
-                .when(ordersRepository).insertFromAdmittedEventWithOrder(ev);
+                .when(ordersRepository).insertFromAdmittedEventWithOrder(eq(ev), nullable(OrdersRepository.PinnedFeeAtAdmit.class));
 
         try {
             projector.applyAdmittedEvent(ev, FRAGMENT_POSITION);

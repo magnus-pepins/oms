@@ -80,14 +80,16 @@ public class OrdersRepository {
                 status, terminal_reason, side, instrument_symbol,
                 quantity, limit_price, time_in_force, ord_type,
                 received_at, accepted_at, terminal_at, account_id_hash, ledger_balance_id,
-                cum_filled_quantity
+                cum_filled_quantity,
+                pinned_fee_model_id, pinned_fee_schedule_version, pinned_estimated_fee, pinned_fee_currency
             ) VALUES (
                 :id, :account_id, :client_idempotency_key, :shard_id, 0,
                 CAST(:status AS order_status), CAST(:terminal_reason AS reject_code),
                 CAST(:side AS order_side), :instrument_symbol,
                 :quantity, :limit_price, :time_in_force, :ord_type,
                 :received_at, :accepted_at, :terminal_at, :account_id_hash, :ledger_balance_id,
-                :cum_filled_quantity
+                :cum_filled_quantity,
+                :pinned_fee_model_id, :pinned_fee_schedule_version, :pinned_estimated_fee, :pinned_fee_currency
             )
             ON CONFLICT DO NOTHING
             """;
@@ -226,6 +228,10 @@ public class OrdersRepository {
      */
     public record ProjectorAdmitInsert(boolean fresh, Order order) {}
 
+    /** Optional Phase-E fee columns coalesced into {@link #PROJECTOR_INSERT_SQL} on fresh admit. */
+    public record PinnedFeeAtAdmit(
+            String feeModelId, int feeScheduleVersion, BigDecimal estimatedFee, String feeCurrency) {}
+
     public boolean insertFromAdmittedEvent(OrderAdmittedEvent ev) {
         return insertFromAdmittedEventWithOrder(ev).fresh();
     }
@@ -237,7 +243,16 @@ public class OrdersRepository {
      * path.
      */
     public ProjectorAdmitInsert insertFromAdmittedEventWithOrder(OrderAdmittedEvent ev) {
-        ProjectorAdmitFields fields = projectorAdmitFields(ev);
+        return insertFromAdmittedEventWithOrder(ev, null);
+    }
+
+    /**
+     * Hot-path insert with optional pinned fee columns (avoids a follow-up
+     * {@link #pinPredictionMarketFeeAtAdmit} UPDATE on PREDMKT admits).
+     */
+    public ProjectorAdmitInsert insertFromAdmittedEventWithOrder(
+            OrderAdmittedEvent ev, PinnedFeeAtAdmit pinnedFeeOrNull) {
+        ProjectorAdmitFields fields = projectorAdmitFields(ev, pinnedFeeOrNull);
         boolean fresh = jdbc.update(PROJECTOR_INSERT_SQL, fields.params()) == 1;
         return new ProjectorAdmitInsert(fresh, fields.order());
     }
@@ -272,12 +287,13 @@ public class OrdersRepository {
      * {@link #findById(java.util.UUID)} round-trip inside the same transaction.
      */
     public Order orderFromAdmittedEvent(OrderAdmittedEvent ev) {
-        return projectorAdmitFields(ev).order();
+        return projectorAdmitFields(ev, null).order();
     }
 
     private record ProjectorAdmitFields(MapSqlParameterSource params, Order order) {}
 
-    private static ProjectorAdmitFields projectorAdmitFields(OrderAdmittedEvent ev) {
+    private static ProjectorAdmitFields projectorAdmitFields(
+            OrderAdmittedEvent ev, PinnedFeeAtAdmit pinnedFeeOrNull) {
         BigDecimal quantity = BigDecimal.valueOf(ev.quantityScaled())
                 .divide(BigDecimal.valueOf(AcceptOrderCommand.QUANTITY_SCALE), 10, RoundingMode.UNNECESSARY);
         BigDecimal limitPrice = ev.limitPriceScaledOrZero() == 0L
@@ -310,7 +326,15 @@ public class OrdersRepository {
                 .addValue("terminal_at", null)
                 .addValue("account_id_hash", ev.accountIdHash())
                 .addValue("ledger_balance_id", ev.ledgerBalanceIdOrNull())
-                .addValue("cum_filled_quantity", BigDecimal.ZERO);
+                .addValue("cum_filled_quantity", BigDecimal.ZERO)
+                .addValue("pinned_fee_model_id", pinnedFeeOrNull == null ? null : pinnedFeeOrNull.feeModelId())
+                .addValue(
+                        "pinned_fee_schedule_version",
+                        pinnedFeeOrNull == null ? null : pinnedFeeOrNull.feeScheduleVersion())
+                .addValue(
+                        "pinned_estimated_fee",
+                        pinnedFeeOrNull == null ? null : pinnedFeeOrNull.estimatedFee())
+                .addValue("pinned_fee_currency", pinnedFeeOrNull == null ? null : pinnedFeeOrNull.feeCurrency());
         Order order = new Order(
                 ev.orderId(),
                 accountId,

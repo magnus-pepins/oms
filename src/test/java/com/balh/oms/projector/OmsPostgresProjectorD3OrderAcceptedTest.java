@@ -3,6 +3,7 @@ package com.balh.oms.projector;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.nullable;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -118,7 +119,7 @@ class OmsPostgresProjectorD3OrderAcceptedTest {
     @Test
     void freshAdmission_writesOrderAcceptedEnvelope_andCallsCodecWithSameEvent() throws Exception {
         OrderAdmittedEvent ev = sampleAdmitted(AcceptOrderCommand.SIDE_BUY, AcceptOrderCommand.TIF_DAY);
-        when(ordersRepository.insertFromAdmittedEventWithOrder(ev))
+        when(ordersRepository.insertFromAdmittedEventWithOrder(eq(ev), nullable(OrdersRepository.PinnedFeeAtAdmit.class)))
                 .thenReturn(new OrdersRepository.ProjectorAdmitInsert(
                         true, org.mockito.Mockito.mock(com.balh.oms.domain.Order.class)));
         when(envelopeCodec.orderAcceptedFromAdmitted(ev)).thenReturn("{\"type\":\"OrderAccepted\"}");
@@ -133,7 +134,7 @@ class OmsPostgresProjectorD3OrderAcceptedTest {
     @Test
     void replay_insertReturnsFalse_doesNotEmitOrderAcceptedEnvelope() throws Exception {
         OrderAdmittedEvent ev = sampleAdmitted(AcceptOrderCommand.SIDE_SELL, AcceptOrderCommand.TIF_GTC);
-        when(ordersRepository.insertFromAdmittedEventWithOrder(ev))
+        when(ordersRepository.insertFromAdmittedEventWithOrder(eq(ev), nullable(OrdersRepository.PinnedFeeAtAdmit.class)))
                 .thenReturn(new OrdersRepository.ProjectorAdmitInsert(
                         false, org.mockito.Mockito.mock(com.balh.oms.domain.Order.class)));
 
@@ -196,7 +197,7 @@ class OmsPostgresProjectorD3OrderAcceptedTest {
                 "hash-d3",
                 "AAPL",
                 "ledger-bal-d3");
-        when(ordersRepository.insertFromAdmittedEventWithOrder(ev))
+        when(ordersRepository.insertFromAdmittedEventWithOrder(eq(ev), nullable(OrdersRepository.PinnedFeeAtAdmit.class)))
                 .thenReturn(new OrdersRepository.ProjectorAdmitInsert(
                         true, org.mockito.Mockito.mock(com.balh.oms.domain.Order.class)));
 
@@ -264,7 +265,7 @@ class OmsPostgresProjectorD3OrderAcceptedTest {
                 "hash",
                 "AAPL",
                 /* ledgerBalanceIdOrNull = */ null);
-        when(ordersRepository.insertFromAdmittedEventWithOrder(ev))
+        when(ordersRepository.insertFromAdmittedEventWithOrder(eq(ev), nullable(OrdersRepository.PinnedFeeAtAdmit.class)))
                 .thenReturn(new OrdersRepository.ProjectorAdmitInsert(
                         true, org.mockito.Mockito.mock(com.balh.oms.domain.Order.class)));
 

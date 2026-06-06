@@ -29,6 +29,7 @@ import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.persistence.PositionsRepository;
 import com.balh.oms.persistence.SellFillPositionSplit;
 import com.balh.oms.risk.BuyFundsRequirement;
+import com.balh.oms.risk.ControlRiskEvaluator;
 import com.balh.oms.returnpath.ExecutionTradeCommand;
 import com.balh.oms.returnpath.MarketContextVenueEvidence;
 import com.balh.oms.routing.VenueRoutingSymbols;
@@ -1235,7 +1236,12 @@ public class OmsPostgresProjector {
             return;
         }
         long admitTxStartNanos = System.nanoTime();
-        OrdersRepository.ProjectorAdmitInsert admitInsert = ordersRepository.insertFromAdmittedEventWithOrder(ev);
+        OrdersRepository.PinnedFeeAtAdmit pinnedFee = null;
+        if (venueTradeFeeProjectionService != null) {
+            pinnedFee = venueTradeFeeProjectionService.optionalPinnedFeeAtAdmit(ev).orElse(null);
+        }
+        OrdersRepository.ProjectorAdmitInsert admitInsert =
+                ordersRepository.insertFromAdmittedEventWithOrder(ev, pinnedFee);
         if (admitInsert.fresh()) {
             // First time we project this admit: emit OrderAccepted into the fanout outbox so
             // downstream consumers see the same {received → working → ...} sequence they used
@@ -1253,12 +1259,12 @@ public class OmsPostgresProjector {
             // Control admission (risk + control_decisions PASS) runs only on fresh insert.
             // Replay idempotency mirrors the OrderAccepted envelope gate above: the original
             // PASS row stands; skipping avoids a redundant findById + control_decisions INSERT.
-            controlAdmission.persistAdmission(
-                    toPendingControlEvent(ev),
-                    admitInsert.order(),
-                    skipVenueControlPassAudit(ev));
-            if (venueTradeFeeProjectionService != null) {
-                venueTradeFeeProjectionService.pinFeeAtAdmit(ev);
+            // Pop! PREDMKT bench: when pass-audit + risk-eval skips both apply (pre-admit hold
+            // path), omit the whole call — no SQL and no redundant control-plane work.
+            boolean skipPassAudit = skipVenueControlPassAudit(ev);
+            if (!skipsVenueBenchControlAdmission(skipPassAudit, admitInsert.order())) {
+                controlAdmission.persistAdmission(
+                        toPendingControlEvent(ev), admitInsert.order(), skipPassAudit);
             }
         }
         // Phase 4 Tier 2.5 phase D-9: project the BUY-async ledger_inflight_outbox row from
@@ -1282,6 +1288,15 @@ public class OmsPostgresProjector {
         long latencyMs = wallClock.millis() - ev.acceptedAtMillis();
         OmsPipelineMetrics.recordClusterAdmitToProjector(
                 meterRegistry, PROJECTOR_ID, ev.side(), ev.timeInForceCode(), latencyMs);
+    }
+
+    /**
+     * Bench soak: projector control admission is a no-op when pass-audit skip is on and ingress
+     * already ran risk + buying power (see {@link ControlRiskEvaluator#shouldSkipVenueBenchRiskEval}).
+     */
+    private static boolean skipsVenueBenchControlAdmission(boolean skipPassAudit, Order admittedOrder) {
+        return skipPassAudit
+                && ControlRiskEvaluator.shouldSkipVenueBenchRiskEval(skipPassAudit, admittedOrder);
     }
 
     /**
@@ -2002,9 +2017,30 @@ public class OmsPostgresProjector {
         }
         meterRegistry.counter(METRIC_EXECUTIONS_APPLIED, TAG_OUTCOME, OUTCOME_INSERTED).increment();
         int newSeq = pgExpectedVersion + 1;
-        Order refreshed = ordersRepository.findById(order.id()).orElse(order);
+        Instant appliedAt = appliedAtInstant(ev);
+        Order working =
+                new Order(
+                        order.id(),
+                        order.accountId(),
+                        order.clientIdempotencyKey(),
+                        order.shardId(),
+                        newSeq,
+                        OrderStatus.WORKING,
+                        null,
+                        order.side(),
+                        order.instrumentSymbol(),
+                        order.quantity(),
+                        order.limitPrice(),
+                        order.timeInForce(),
+                        order.receivedAt(),
+                        appliedAt,
+                        null,
+                        order.accountIdHash(),
+                        order.ledgerBalanceId(),
+                        order.cumFilledQuantity(),
+                        order.ordType());
         try {
-            domainEventOutboxRepository.insert(order.id(), envelopeCodec.orderWorking(refreshed, newSeq));
+            domainEventOutboxRepository.insert(order.id(), envelopeCodec.orderWorking(working, newSeq));
         } catch (JsonProcessingException e) {
             throw new IllegalStateException("domain event serialisation failed for VENUE_NEW of order " + order.id(), e);
         }

@@ -1,6 +1,7 @@
 package com.balh.oms.projector;
 
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.nullable;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -92,7 +93,8 @@ class OmsPostgresProjectorD1BackfillTest {
         projector.setCurrentRecordingIdForTesting(13L);
         // D-1 tests target ledger_inflight_outbox only; treat admits as replay so the fresh-insert
         // branch (OrderAccepted envelope + control admission) stays out of scope.
-        when(ordersRepository.insertFromAdmittedEventWithOrder(any()))
+        when(ordersRepository.insertFromAdmittedEventWithOrder(
+                        any(), nullable(OrdersRepository.PinnedFeeAtAdmit.class)))
                 .thenReturn(new OrdersRepository.ProjectorAdmitInsert(
                         false, org.mockito.Mockito.mock(com.balh.oms.domain.Order.class)));
     }

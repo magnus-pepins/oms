@@ -3,6 +3,7 @@ package com.balh.oms.projector;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.nullable;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -118,7 +119,8 @@ class OmsPostgresProjectorPollBatchTest {
         assertThat(txManager.beginCount.get())
                 .as("one BEGIN/COMMIT envelope for the whole poll batch")
                 .isEqualTo(1);
-        verify(ordersRepository, times(3)).insertFromAdmittedEventWithOrder(any());
+        verify(ordersRepository, times(3))
+                .insertFromAdmittedEventWithOrder(any(), nullable(OrdersRepository.PinnedFeeAtAdmit.class));
         verify(cursorRepository, times(1))
                 .advanceWithRecording(
                         eq(OmsPostgresProjector.PROJECTOR_ID),
@@ -147,7 +149,8 @@ class OmsPostgresProjectorPollBatchTest {
         projector.applyPollBatchForTesting(List.of());
 
         assertThat(txManager.beginCount.get()).isZero();
-        verify(ordersRepository, never()).insertFromAdmittedEventWithOrder(any());
+        verify(ordersRepository, never())
+                .insertFromAdmittedEventWithOrder(any(), nullable(OrdersRepository.PinnedFeeAtAdmit.class));
         Timer timer = meterRegistry.find(OmsPostgresProjector.TIMER_POLL_BATCH_COMMIT).timer();
         assertThat(timer).isNull();
     }
@@ -304,7 +307,8 @@ class OmsPostgresProjectorPollBatchTest {
 
     private void stubFreshAdmit(OrderAdmittedEvent ev) throws Exception {
         Order projected = org.mockito.Mockito.mock(Order.class);
-        when(ordersRepository.insertFromAdmittedEventWithOrder(ev))
+        when(ordersRepository.insertFromAdmittedEventWithOrder(
+                        eq(ev), nullable(OrdersRepository.PinnedFeeAtAdmit.class)))
                 .thenReturn(new OrdersRepository.ProjectorAdmitInsert(true, projected));
         when(envelopeCodec.orderAcceptedFromAdmitted(ev)).thenReturn("{\"type\":\"OrderAccepted\"}");
     }

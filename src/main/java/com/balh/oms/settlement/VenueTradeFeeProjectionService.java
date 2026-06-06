@@ -6,6 +6,7 @@ import com.balh.oms.domain.Order;
 import com.balh.oms.persistence.ExecutionsRepository;
 import com.balh.oms.persistence.OrdersRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import java.util.Optional;
 import org.springframework.stereotype.Service;
 
 /** Applies venue trade fees on TRADE projection (Phase E). */
@@ -32,15 +33,15 @@ public class VenueTradeFeeProjectionService {
     }
 
     /**
-     * Pins contract fee model + conservative taker-fee estimate on fresh admit. Resting fills may
-     * accrue a lower maker fee at execution time.
+     * Fee quote for coalescing into the projector's single {@code orders} INSERT (no follow-up
+     * UPDATE). Resting fills may accrue a lower maker fee at execution time.
      */
-    public void pinFeeAtAdmit(OrderAdmittedEvent ev) {
+    public Optional<OrdersRepository.PinnedFeeAtAdmit> optionalPinnedFeeAtAdmit(OrderAdmittedEvent ev) {
         if (ev.instrumentSymbol() == null || !ev.instrumentSymbol().startsWith("PREDMKT")) {
-            return;
+            return Optional.empty();
         }
         boolean retail = !counterpartyLookup.isFixAccount(java.util.UUID.fromString(ev.accountId()));
-        feeCalculator
+        return feeCalculator
                 .quoteForFill(
                         ev.instrumentSymbol(),
                         java.util.UUID.fromString(ev.accountId()),
@@ -49,14 +50,30 @@ public class VenueTradeFeeProjectionService {
                         ev.quantityScaled(),
                         ev.limitPriceScaledOrZero(),
                         null)
-                .ifPresent(
+                .map(
                         quote ->
-                                ordersRepository.pinPredictionMarketFeeAtAdmit(
-                                        ev.orderId(),
+                                new OrdersRepository.PinnedFeeAtAdmit(
                                         quote.modelId().name(),
                                         quote.scheduleVersion(),
                                         quote.feeAmount(),
                                         quote.feeCurrency()));
+    }
+
+    /**
+     * Pins contract fee model + conservative taker-fee estimate on fresh admit. Prefer
+     * {@link #optionalPinnedFeeAtAdmit} on the projector hot path so fee columns land in the
+     * initial INSERT.
+     */
+    public void pinFeeAtAdmit(OrderAdmittedEvent ev) {
+        optionalPinnedFeeAtAdmit(ev)
+                .ifPresent(
+                        fee ->
+                                ordersRepository.pinPredictionMarketFeeAtAdmit(
+                                        ev.orderId(),
+                                        fee.feeModelId(),
+                                        fee.feeScheduleVersion(),
+                                        fee.estimatedFee(),
+                                        fee.feeCurrency()));
     }
 
     public void applyTradeFee(long executionId, ExecutionAppliedEvent ev, Order order) {

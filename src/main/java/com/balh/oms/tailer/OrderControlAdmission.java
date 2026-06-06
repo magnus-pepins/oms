@@ -115,6 +115,11 @@ public class OrderControlAdmission {
      * {@link ControlRiskEvaluator#ENV_SKIP_VENUE_CONTROL_RISK_EVAL} or
      * {@link ControlRiskEvaluator#ENV_SKIP_VENUE_CONTROL_PASS_AUDIT} is enabled,
      * {@link ControlRiskEvaluator#evaluate} is skipped — risk gates already ran at ingress.
+     *
+     * <p>When the same pre-admit hold conditions hold and
+     * {@link BuyingPowerAdmission#ENV_SKIP_VENUE_CONTROL_BUYING_POWER_EVAL} or
+     * {@link ControlRiskEvaluator#ENV_SKIP_VENUE_CONTROL_PASS_AUDIT} is enabled,
+     * {@link BuyingPowerAdmission#evaluate} is skipped — ingress hold already reserved funds.
      */
     public AdmissionResult persistAdmission(
             PendingControlEvent event, Order admittedOrder, boolean skipPassControlDecisionAudit) {
@@ -186,7 +191,9 @@ public class OrderControlAdmission {
             return updated ? AdmissionResult.RISK_PIPELINE_REJECTED : AdmissionResult.SKIPPED_VERSION_MISMATCH;
         }
 
-        if (config.getLedger().isEnabled()) {
+        if (config.getLedger().isEnabled()
+                && !BuyingPowerAdmission.shouldSkipVenueBenchBuyingPowerEval(
+                        skipPassControlDecisionAudit, order)) {
             switch (buyingPower.evaluate(order)) {
                 case REJECT_INSUFFICIENT -> {
                     boolean updated = orders.updateWithCas(

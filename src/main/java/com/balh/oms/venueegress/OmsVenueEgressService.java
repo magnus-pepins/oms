@@ -793,6 +793,10 @@ public class OmsVenueEgressService {
                         // recording roll-forward (below).
                         pipeline.drainContiguous();
                     }
+                    int idleTailBurst = pollReplayIdleTail(replay, handler);
+                    if (idleTailBurst > 0) {
+                        continue;
+                    }
                     // No fragments. Three cases — mirrors OmsPostgresProjector.runReplayLoopWithRecordingWalk:
                     //   (a) live-tail wait on the cluster's currently-active recording — park.
                     //   (b) end of a completed recording (stopPosition set) with a successor
@@ -853,6 +857,14 @@ public class OmsVenueEgressService {
     }
 
     /**
+     * Spin-yield re-polls after a zero-return {@link #pollReplayBurst} before archive metadata
+     * refresh or configured idle park. At 5k–10k admits/s the cluster writer often lands fragments
+     * in the gap between the burst terminal zero and {@link #findRecordingById}; skipping this
+     * slice forces an Archive control round-trip plus park on every momentary race.
+     */
+    private static final int REPLAY_IDLE_TAIL_POLLS = 4;
+
+    /**
      * Tight-spin drain: call {@link Subscription#poll} repeatedly while Aeron delivers fragments,
      * without idle park or recording-walk work between passes. Returns the fragment count for
      * this burst (zero ⇒ caller should run idle / quiesce / walk-forward logic).
@@ -869,6 +881,25 @@ public class OmsVenueEgressService {
             Thread.onSpinWait();
         }
         return total;
+    }
+
+    /**
+     * Live-tail idle burst: yield and re-run {@link #pollReplayBurst} a few times before the
+     * replay loop pays for recording-walk metadata or a configured park. Package-private for
+     * unit tests that assert the spin count without Aeron Archive.
+     */
+    int pollReplayIdleTail(Subscription replay, FragmentHandler handler) {
+        for (int attempt = 0; attempt < REPLAY_IDLE_TAIL_POLLS && running.get(); attempt++) {
+            Thread.onSpinWait();
+            int polled = pollReplayBurst(replay, handler);
+            if (polled > 0) {
+                return polled;
+            }
+            if (pipeline != null && pipeline.replayPollHasBacklog()) {
+                continue;
+            }
+        }
+        return 0;
     }
 
     /**

@@ -656,8 +656,10 @@ public class OrderIngressService {
         if (config.getLedger().isInflightCoalescerEnabled()) {
             LedgerInflightCoalescer coalescer = ledgerInflightCoalescer.getIfAvailable();
             if (coalescer != null) {
-                // Async+coalescer mode keeps accept off the coalescer ACK future.
-                boolean waitForAck = !config.getLedger().isInflightAsyncEnabled();
+                // Pre-admit rejects insufficient funds before cluster admit — must wait for the
+                // coalescer ACK. Async+coalescer without pre-admit stays fire-and-forget (slice 4p).
+                boolean waitForAck = config.getLedger().isInflightPreAdmitHoldEnabled()
+                        || !config.getLedger().isInflightAsyncEnabled();
                 placeBuyLedgerInflightHoldThroughCoalescer(order, coalescer, holdAmount.get(), waitForAck);
                 return BuyLedgerHoldPlacement.queued(holdAmount.get());
             }

@@ -19,6 +19,7 @@ import org.springframework.stereotype.Component;
 
 import java.time.Instant;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.UUID;
 
 /**
@@ -108,6 +109,12 @@ public class OrderControlAdmission {
      * record audit rows. Pop! PREDMKT soak enables this via
      * {@code OMS_PROJECTOR_SKIP_VENUE_CONTROL_PASS_AUDIT=true} (see
      * {@link com.balh.oms.projector.OmsPostgresProjector}).
+     *
+     * <p>When {@code skipPassControlDecisionAudit} is {@code true}, the order carries a
+     * {@code ledgerBalanceId} (ingress pre-admit hold path), and
+     * {@link ControlRiskEvaluator#ENV_SKIP_VENUE_CONTROL_RISK_EVAL} or
+     * {@link ControlRiskEvaluator#ENV_SKIP_VENUE_CONTROL_PASS_AUDIT} is enabled,
+     * {@link ControlRiskEvaluator#evaluate} is skipped — risk gates already ran at ingress.
      */
     public AdmissionResult persistAdmission(
             PendingControlEvent event, Order admittedOrder, boolean skipPassControlDecisionAudit) {
@@ -152,7 +159,10 @@ public class OrderControlAdmission {
             return AdmissionResult.UNKNOWN_ORDER;
         }
 
-        var riskReject = controlRisk.evaluate(order);
+        Optional<RejectCode> riskReject = ControlRiskEvaluator.shouldSkipVenueBenchRiskEval(
+                        skipPassControlDecisionAudit, order)
+                ? Optional.empty()
+                : controlRisk.evaluate(order);
         if (riskReject.isPresent()) {
             RejectCode code = riskReject.get();
             boolean updated = orders.updateWithCas(

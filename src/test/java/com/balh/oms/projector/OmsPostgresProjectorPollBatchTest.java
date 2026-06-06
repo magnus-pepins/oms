@@ -23,6 +23,7 @@ import com.balh.oms.persistence.OrdersRepository;
 import com.balh.oms.persistence.PositionsRepository;
 import com.balh.oms.tailer.OrderControlAdmission;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.aeron.Subscription;
 import io.aeron.logbuffer.Header;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.agrona.ExpandableArrayBuffer;
@@ -48,8 +49,8 @@ import org.springframework.transaction.support.AbstractPlatformTransactionManage
 import org.springframework.transaction.support.DefaultTransactionStatus;
 
 /**
- * Poll-batch transaction boundary: one Postgres COMMIT per {@code replay.poll} pass (up to
- * {@code fragmentLimit} fragments), not per fragment.
+ * Poll-batch transaction boundary: one Postgres COMMIT per accumulated poll burst (up to
+ * {@code maxFragmentsPerCommit} fragments), not per fragment or per single {@code replay.poll}.
  */
 @ExtendWith(MockitoExtension.class)
 class OmsPostgresProjectorPollBatchTest {
@@ -152,6 +153,42 @@ class OmsPostgresProjectorPollBatchTest {
     }
 
     @Test
+    void pollReplayBurst_spinsPastFirstZeroPollBeforeFlushingPartialBatch() {
+        projector.setRunningForTesting(true);
+        config.getCluster().getProjector().setMaxFragmentsPerCommit(2048);
+        config.getCluster().getProjector().setFragmentLimit(512);
+
+        OmsPostgresProjector.ProjectingFragmentHandler handler =
+                projector.createProjectingFragmentHandlerForTesting();
+        Subscription replay = org.mockito.Mockito.mock(io.aeron.Subscription.class);
+        AtomicInteger pollCalls = new AtomicInteger();
+        when(replay.poll(any(), eq(512)))
+                .thenAnswer(
+                        inv -> {
+                            if (pollCalls.getAndIncrement() == 0) {
+                                deliverCursorOnlyFragment(handler, 64L);
+                                return 1;
+                            }
+                            return 0;
+                        });
+
+        int total =
+                projector.pollReplayBurst(replay, handler, config.getCluster().getProjector());
+
+        assertThat(total).isEqualTo(1);
+        assertThat(pollCalls.get())
+                .as("must spin through idle polls before flushing a sub-cap partial batch")
+                .isGreaterThan(2);
+        assertThat(txManager.beginCount.get()).isEqualTo(1);
+    }
+
+    @Test
+    void accumulateIdlePollPasses_scalesWithCommitCap() {
+        assertThat(OmsPostgresProjector.accumulateIdlePollPasses(2048, 512)).isEqualTo(16);
+        assertThat(OmsPostgresProjector.accumulateIdlePollPasses(512, 512)).isEqualTo(8);
+    }
+
+    @Test
     void fragmentHandler_buffersUntilFlushThenCommitsOnce() throws Exception {
         OrderAdmittedEvent ev1 = admitted("PREDMKT-A");
         OrderAdmittedEvent ev2 = admitted("PREDMKT-B");
@@ -180,6 +217,15 @@ class OmsPostgresProjectorPollBatchTest {
         Header header = Mockito.mock(Header.class);
         Mockito.when(header.position()).thenReturn(position);
         handler.onFragment(buf, 0, length, header);
+    }
+
+    private static void deliverCursorOnlyFragment(
+            OmsPostgresProjector.ProjectingFragmentHandler handler, long position) {
+        ExpandableArrayBuffer buf = new ExpandableArrayBuffer(32);
+        buf.putInt(OmsClusterWireFormat.HEADER_TYPE_ID_OFFSET, 99_999);
+        Header header = Mockito.mock(Header.class);
+        Mockito.when(header.position()).thenReturn(position);
+        handler.onFragment(buf, 0, 32, header);
     }
 
     private void stubFreshAdmit(OrderAdmittedEvent ev) throws Exception {

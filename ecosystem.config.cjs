@@ -499,6 +499,8 @@ const apps = [
       OMS_CORPORATE_ACTION_RECORD_DATE_SNAPSHOT_JOB_ENABLED: 'true',
       // Pop bench throughput: skip PASS control_decisions INSERT on PREDMKT/* admits.
       OMS_PROJECTOR_SKIP_VENUE_CONTROL_PASS_AUDIT: 'true',
+      // Pop bench throughput: skip domain_event_outbox OrderAccepted INSERT on PREDMKT/* fresh admits.
+      OMS_PROJECTOR_SKIP_VENUE_ORDER_ACCEPTED_OUTBOX: 'true',
     },
     ...COMMON_PM2,
   },

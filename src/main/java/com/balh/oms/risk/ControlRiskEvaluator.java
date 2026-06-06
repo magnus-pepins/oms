@@ -22,17 +22,41 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Pre-trade checks that run in {@link com.balh.oms.tailer.ControlTailer}
- * before Ledger buying-power admission (when enabled) and before WORKING CAS.
+ * Pre-trade checks that run in {@link com.balh.oms.tailer.OrderControlAdmission}
+ * before Ledger buying-power admission (when enabled) and before venue acceptance.
  *
  * <p>All thresholds are bound from {@link OmsConfig#getRisk()} — no bare numeric
  * literals in business logic (ecosystem config rule). Tradable-instrument CSV is
  * parsed into a set only when the configured string changes (slice 5 cache placeholder).
+ *
+ * <p>Pop! PREDMKT bench: when ingress already ran the pre-admit ledger hold path
+ * ({@code order.ledgerBalanceId()} set) and the projector passes
+ * {@code skipPassControlDecisionAudit=true} (see {@link #ENV_SKIP_VENUE_CONTROL_PASS_AUDIT}),
+ * {@link #shouldSkipVenueBenchRiskEval} may skip a redundant projector-tier
+ * {@link #evaluate(Order)} — ingress gates (venue health, tick, hold) already ran.
  */
 @Component
 public class ControlRiskEvaluator {
 
     public static final String STAGE_CONTROL = "CONTROL";
+
+    /**
+     * Bench-only env gate (Pop! PREDMKT soak). When {@code true}, together with
+     * {@link #ENV_SKIP_VENUE_CONTROL_PASS_AUDIT} venue-prefix admits that carry a
+     * {@code ledgerBalanceId}, the projector skips {@link #evaluate(Order)}.
+     * When this env is unset, {@link #ENV_SKIP_VENUE_CONTROL_PASS_AUDIT} is consulted
+     * so a single flag on pop covers both PASS-audit omission and risk-eval skip.
+     */
+    public static final String ENV_SKIP_VENUE_CONTROL_RISK_EVAL = "OMS_PROJECTOR_SKIP_VENUE_CONTROL_RISK_EVAL";
+
+    /**
+     * Companion to {@link com.balh.oms.projector.OmsPostgresProjector}'s
+     * {@code OMS_PROJECTOR_SKIP_VENUE_CONTROL_PASS_AUDIT} — referenced here for the
+     * fallback gate documented on {@link #ENV_SKIP_VENUE_CONTROL_RISK_EVAL}.
+     */
+    public static final String ENV_SKIP_VENUE_CONTROL_PASS_AUDIT = "OMS_PROJECTOR_SKIP_VENUE_CONTROL_PASS_AUDIT";
+
+    private static volatile Boolean skipVenueControlRiskEvalOverride;
 
     private final OmsConfig omsConfig;
     private final ControlRuntimeFlagsRepository runtimeFlags;
@@ -64,6 +88,42 @@ public class ControlRiskEvaluator {
         this.fixRouteStateRepository = fixRouteStateRepository;
         this.iskInstrumentEligibilityGate = iskInstrumentEligibilityGate;
         this.iskFundingGate = iskFundingGate;
+    }
+
+    /**
+     * Pop! PREDMKT bench: skip redundant projector risk when ingress pre-admit hold already ran.
+     *
+     * @param skipPassControlDecisionAudit {@code true} when
+     *     {@link #ENV_SKIP_VENUE_CONTROL_PASS_AUDIT} is enabled and the symbol matches the
+     *     configured venue prefix (see {@link com.balh.oms.projector.OmsPostgresProjector})
+     * @param order admitted order row handed to {@link com.balh.oms.tailer.OrderControlAdmission}
+     */
+    public static boolean shouldSkipVenueBenchRiskEval(boolean skipPassControlDecisionAudit, Order order) {
+        if (!skipPassControlDecisionAudit || order == null) {
+            return false;
+        }
+        String balanceId = order.ledgerBalanceId();
+        if (balanceId == null || balanceId.isBlank()) {
+            return false;
+        }
+        return isVenueControlRiskEvalSkipEnabled();
+    }
+
+    static boolean isVenueControlRiskEvalSkipEnabled() {
+        if (skipVenueControlRiskEvalOverride != null) {
+            return skipVenueControlRiskEvalOverride;
+        }
+        String dedicated = System.getenv(ENV_SKIP_VENUE_CONTROL_RISK_EVAL);
+        if (dedicated != null) {
+            return Boolean.parseBoolean(dedicated);
+        }
+        return Boolean.parseBoolean(
+                java.util.Objects.requireNonNullElse(System.getenv(ENV_SKIP_VENUE_CONTROL_PASS_AUDIT), "false"));
+    }
+
+    /** Visible for unit tests that pin the bench skip gate without env mutation. */
+    public static void setSkipVenueControlRiskEvalForTesting(Boolean enabled) {
+        skipVenueControlRiskEvalOverride = enabled;
     }
 
     /**

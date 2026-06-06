@@ -186,6 +186,13 @@ public class OmsPostgresProjector {
      */
     static final String ENV_SKIP_VENUE_CONTROL_PASS_AUDIT = "OMS_PROJECTOR_SKIP_VENUE_CONTROL_PASS_AUDIT";
 
+    /**
+     * Bench-only env gate (Pop! PREDMKT soak). When {@code true}, venue-prefix symbols skip the
+     * {@code domain_event_outbox} {@code OrderAccepted} INSERT on the fresh-admit path only;
+     * replay idempotency ({@code freshAdmission == false}) is unchanged.
+     */
+    static final String ENV_SKIP_VENUE_ORDER_ACCEPTED_OUTBOX = "OMS_PROJECTOR_SKIP_VENUE_ORDER_ACCEPTED_OUTBOX";
+
     private final OmsConfig config;
     private final AeronProjectorCursorRepository cursorRepository;
     private final OrdersRepository ordersRepository;
@@ -222,6 +229,12 @@ public class OmsPostgresProjector {
      * {@link #ENV_SKIP_VENUE_CONTROL_PASS_AUDIT} only when this stays {@code null}.
      */
     private Boolean skipVenueControlPassAuditOverride;
+
+    /**
+     * Unit tests pin bench outbox skip without mutating process env. Production reads
+     * {@link #ENV_SKIP_VENUE_ORDER_ACCEPTED_OUTBOX} only when this stays {@code null}.
+     */
+    private Boolean skipVenueOrderAcceptedOutboxOverride;
 
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicReference<Long> lastAppliedPosition = new AtomicReference<>(0L);
@@ -436,6 +449,11 @@ public class OmsPostgresProjector {
      */
     void setCurrentRecordingIdForTesting(long recordingId) {
         currentRecordingId.set(recordingId);
+    }
+
+    /** Visible for unit tests that drive {@link #pollReplayBurst} without starting the replay thread. */
+    void setRunningForTesting(boolean value) {
+        running.set(value);
     }
 
     /**
@@ -994,23 +1012,40 @@ public class OmsPostgresProjector {
     }
 
     /**
-     * Tight-spin drain: poll Aeron repeatedly while fragments are available, flushing one or more
-     * Postgres batches (each bounded by {@link OmsConfig.Cluster.Projector#getMaxFragmentsPerCommit()})
-     * before idle park or recording-walk logic runs. Mirrors {@code OmsVenueEgressService#pollReplayBurst}.
+     * Tight-spin drain: poll Aeron repeatedly, accumulating fragments across multiple
+     * {@code replay.poll} passes before flushing Postgres. Each flush is bounded by
+     * {@link OmsConfig.Cluster.Projector#getMaxFragmentsPerCommit()}; a productive poll that only
+     * yields ~100 fragments (common at live replay tail) no longer forces an immediate COMMIT on
+     * the first zero-return poll. Mirrors {@code OmsVenueEgressService#pollReplayBurst} with
+     * projector-specific batch amortisation.
      */
     int pollReplayBurst(
             Subscription replay, ProjectingFragmentHandler handler, OmsConfig.Cluster.Projector projectorCfg) {
         int fragmentLimit = projectorCfg.getFragmentLimit();
         int maxFragmentsPerCommit = projectorCfg.getMaxFragmentsPerCommit();
+        int maxIdlePollPasses = accumulateIdlePollPasses(maxFragmentsPerCommit, fragmentLimit);
         int totalPolled = 0;
-        int polled;
-        do {
-            polled = replay.poll(handler, fragmentLimit);
+        int idlePollPasses = 0;
+        while (running.get()) {
+            int polled = replay.poll(handler, fragmentLimit);
             totalPolled += polled;
+            if (polled > 0) {
+                idlePollPasses = 0;
+            } else {
+                idlePollPasses++;
+                if (handler.pendingFragmentCount() == 0) {
+                    break;
+                }
+            }
             if (handler.pendingFragmentCount() >= maxFragmentsPerCommit) {
                 handler.flushPollBatch();
+            } else if (idlePollPasses >= maxIdlePollPasses) {
+                handler.flushPollBatch();
+                break;
+            } else if (polled == 0) {
+                Thread.onSpinWait();
             }
-        } while (polled > 0 && running.get());
+        }
         if (handler.pendingFragmentCount() > 0) {
             handler.flushPollBatch();
         }
@@ -1018,6 +1053,16 @@ public class OmsPostgresProjector {
             Thread.onSpinWait();
         }
         return totalPolled;
+    }
+
+    /**
+     * Zero-return polls tolerated while filling a commit batch. Derived from
+     * {@code maxFragmentsPerCommit / fragmentLimit} so bench defaults (2048 / 512) spin ~16 idle
+     * passes (~100 frags/poll observed on pop) before flushing a partial tail.
+     */
+    static int accumulateIdlePollPasses(int maxFragmentsPerCommit, int fragmentLimit) {
+        int pollsToFillBatch = (maxFragmentsPerCommit + fragmentLimit - 1) / fragmentLimit;
+        return Math.max(8, pollsToFillBatch * 4);
     }
 
     private void advanceCursorAtPosition(long newPosition) {
@@ -1185,11 +1230,13 @@ public class OmsPostgresProjector {
             // to see when ingress wrote it. On replay (recording recreation, cluster cursor
             // rewind) freshAdmission == false and the envelope is not re-written; the
             // domain_event_outbox row from the original projection stands.
-            try {
-                domainEventOutboxRepository.insert(ev.orderId(), envelopeCodec.orderAcceptedFromAdmitted(ev));
-            } catch (JsonProcessingException e) {
-                throw new IllegalStateException(
-                        "OrderAccepted envelope serialisation failed for orderId=" + ev.orderId(), e);
+            if (!skipVenueOrderAcceptedOutbox(ev)) {
+                try {
+                    domainEventOutboxRepository.insert(ev.orderId(), envelopeCodec.orderAcceptedFromAdmitted(ev));
+                } catch (JsonProcessingException e) {
+                    throw new IllegalStateException(
+                            "OrderAccepted envelope serialisation failed for orderId=" + ev.orderId(), e);
+                }
             }
             // Control admission (risk + control_decisions PASS) runs only on fresh insert.
             // Replay idempotency mirrors the OrderAccepted envelope gate above: the original
@@ -1242,9 +1289,32 @@ public class OmsPostgresProjector {
                 VenueRoutingSymbols.venueSymbolPrefix(config), ev.instrumentSymbol());
     }
 
+    /**
+     * Pop! PREDMKT bench: one fewer INSERT ({@code domain_event_outbox} OrderAccepted) per fresh
+     * admit when {@link #ENV_SKIP_VENUE_ORDER_ACCEPTED_OUTBOX} is {@code true} and the symbol
+     * matches the configured venue prefix. Replay idempotency is unchanged — the gate only runs
+     * inside the {@code freshAdmission} branch.
+     */
+    private boolean skipVenueOrderAcceptedOutbox(OrderAdmittedEvent ev) {
+        boolean enabled = skipVenueOrderAcceptedOutboxOverride != null
+                ? skipVenueOrderAcceptedOutboxOverride
+                : Boolean.parseBoolean(
+                        Objects.requireNonNullElse(System.getenv(ENV_SKIP_VENUE_ORDER_ACCEPTED_OUTBOX), "false"));
+        if (!enabled) {
+            return false;
+        }
+        return VenueRoutingSymbols.matchesVenuePrefix(
+                VenueRoutingSymbols.venueSymbolPrefix(config), ev.instrumentSymbol());
+    }
+
     /** Visible for unit tests that pin the bench skip gate without env mutation. */
     void setSkipVenueControlPassAuditForTesting(boolean enabled) {
         this.skipVenueControlPassAuditOverride = enabled;
+    }
+
+    /** Visible for unit tests that pin the bench outbox skip gate without env mutation. */
+    void setSkipVenueOrderAcceptedOutboxForTesting(boolean enabled) {
+        this.skipVenueOrderAcceptedOutboxOverride = enabled;
     }
 
     /**

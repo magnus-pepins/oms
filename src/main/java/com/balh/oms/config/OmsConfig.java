@@ -4023,8 +4023,11 @@ public class OmsConfig {
             }
 
             private final AdmitBatch admitBatch = new AdmitBatch();
+            private final ErOffer erOffer = new ErOffer();
 
             public AdmitBatch getAdmitBatch() { return admitBatch; }
+
+            public ErOffer getErOffer() { return erOffer; }
 
             /**
              * Phase 4 Tier 2.5 phase E-3b — per-shard overrides for the few cluster-client values
@@ -4113,12 +4116,13 @@ public class OmsConfig {
                 /** Default off — slice 4n single-message path is the safe fallback. */
                 private static final boolean DEFAULT_ENABLED = false;
                 /**
-                 * Default 16 admits per batch. Picks roughly the knee of the
-                 * "amortise framing overhead vs grow per-batch decode cost" trade-off based on
-                 * Pop! single-host bench shape (~360-byte AcceptOrderCommand bodies, 2.81 ms
-                 * cluster RTT). Tunable via env without code changes.
+                 * Default 32 admits per batch. Pop! bench with admit-batch enabled and
+                 * {@code ingress_cluster_accept_ms} sub-2 ms showed cluster accept is no longer the
+                 * dominant drain; larger batches amortise ingress offer / lock trips without growing
+                 * per-batch decode cost materially (~360-byte AcceptOrderCommand bodies).
+                 * Tunable via {@code OMS_CLUSTER_CLIENT_ADMIT_BATCH_MAX_SIZE}.
                  */
-                private static final int DEFAULT_MAX_BATCH_SIZE = 16;
+                private static final int DEFAULT_MAX_BATCH_SIZE = 32;
                 /**
                  * Default 50 µs flush interval. Below the 17.5 µs per-admit cluster CPU cost
                  * observed at 57 k rps (so the daemon's tick is fast enough to keep up with peak
@@ -4161,6 +4165,52 @@ public class OmsConfig {
                 public int getQueueCapacity() { return queueCapacity; }
                 public void setQueueCapacity(int queueCapacity) {
                     this.queueCapacity = Math.max(64, queueCapacity);
+                }
+
+                public long getEnqueueParkNanos() { return enqueueParkNanos; }
+                public void setEnqueueParkNanos(long enqueueParkNanos) {
+                    this.enqueueParkNanos = Math.max(100L, enqueueParkNanos);
+                }
+            }
+
+            /**
+             * Configuration for the {@link com.balh.oms.cluster.OmsClusterIngressClient} ER-offer
+             * daemon: bounded queue, burst drain per {@code clientLock} hold, and park intervals.
+             * Wire format has no batch ER frame — this is transport coalescing only.
+             *
+             * <p>Tunable via {@code oms.cluster.client.er-offer.*} /
+             * {@code OMS_CLUSTER_CLIENT_ER_OFFER_*} env vars on ingress-replica JVMs.
+             */
+            public static class ErOffer {
+
+                private static final int DEFAULT_QUEUE_CAPACITY = 8_192;
+                /**
+                 * Default frames offered per lock acquisition. Raised from 64 for bench throughput
+                 * when venue-egress virtual-thread completions flood the ingress client at 400+
+                 * routes/s.
+                 */
+                private static final int DEFAULT_MAX_PER_LOCK_PASS = 128;
+                private static final long DEFAULT_DRAIN_INTERVAL_NANOS = 50_000L;
+                private static final long DEFAULT_ENQUEUE_PARK_NANOS = 1_000L;
+
+                private int queueCapacity = DEFAULT_QUEUE_CAPACITY;
+                private int maxPerLockPass = DEFAULT_MAX_PER_LOCK_PASS;
+                private long drainIntervalNanos = DEFAULT_DRAIN_INTERVAL_NANOS;
+                private long enqueueParkNanos = DEFAULT_ENQUEUE_PARK_NANOS;
+
+                public int getQueueCapacity() { return queueCapacity; }
+                public void setQueueCapacity(int queueCapacity) {
+                    this.queueCapacity = Math.max(64, queueCapacity);
+                }
+
+                public int getMaxPerLockPass() { return maxPerLockPass; }
+                public void setMaxPerLockPass(int maxPerLockPass) {
+                    this.maxPerLockPass = Math.max(1, maxPerLockPass);
+                }
+
+                public long getDrainIntervalNanos() { return drainIntervalNanos; }
+                public void setDrainIntervalNanos(long drainIntervalNanos) {
+                    this.drainIntervalNanos = Math.max(1_000L, drainIntervalNanos);
                 }
 
                 public long getEnqueueParkNanos() { return enqueueParkNanos; }

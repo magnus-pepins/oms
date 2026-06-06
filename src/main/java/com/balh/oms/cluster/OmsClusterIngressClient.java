@@ -83,7 +83,8 @@ import java.util.concurrent.locks.ReentrantLock;
  * <p>{@link #submitApplyExecutionReport(ApplyExecutionReportCommand, Duration)} is a
  * fire-and-forget offer (no session egress reply). A dedicated ER-offer daemon serializes
  * {@link AeronCluster#offer} under {@link #clientLock} and drains bursts of up to
- * {@link #ER_OFFER_MAX_PER_LOCK_PASS} frames per lock acquisition so venue-egress virtual-thread
+ * {@link OmsConfig.Cluster.Client.ErOffer#getMaxPerLockPass()} frames per lock acquisition so
+ * venue-egress virtual-thread
  * completions do not contend on the lock at 400+ routes/s (wire format has no batch ER frame).
  *
  * <h2>Determinism (per ADR 0001 §Discipline)</h2>
@@ -146,18 +147,6 @@ public class OmsClusterIngressClient {
 
     /** {@link Thread#join(long)} budget when stopping the egress poller thread on close. */
     private static final long POLLER_JOIN_MS = 2_000L;
-
-    /**
-     * ER-offer daemon bounds (venue-egress @ 400 routes/s). One daemon serializes
-     * {@link #submitApplyExecutionReport} cluster offers so N virtual-thread completions do not
-     * fight for {@link #clientLock}; {@link #ER_OFFER_MAX_PER_LOCK_PASS} amortises lock trips per
-     * drain pass. Wire format has no batch ER frame — this is transport coalescing only.
-     */
-    private static final int ER_OFFER_QUEUE_CAPACITY = 8_192;
-
-    private static final int ER_OFFER_MAX_PER_LOCK_PASS = 64;
-    private static final long ER_OFFER_DRAIN_INTERVAL_NANOS = 50_000L;
-    private static final long ER_OFFER_ENQUEUE_PARK_NANOS = 1_000L;
 
     private final OmsConfig.Cluster.Client config;
     private final AtomicLong correlationIds = new AtomicLong(1);
@@ -314,8 +303,7 @@ public class OmsClusterIngressClient {
      * Bounded queue for {@link #submitApplyExecutionReport}. Always active — unlike admit-batching
      * this does not change wire shape; it only serializes offers and drains bursts per lock hold.
      */
-    private final BlockingQueue<PendingErSubmit> erOfferQueue =
-            new ArrayBlockingQueue<>(ER_OFFER_QUEUE_CAPACITY);
+    private final BlockingQueue<PendingErSubmit> erOfferQueue;
     private volatile Thread erOfferDaemonThread;
 
     // ---- Phase 4 slice 4c: commit-round-trip timer ----
@@ -404,6 +392,8 @@ public class OmsClusterIngressClient {
                 this.config.getAdmitBatch().isEnabled()
                         ? new ArrayBlockingQueue<>(this.config.getAdmitBatch().getQueueCapacity())
                         : null;
+        this.erOfferQueue =
+                new ArrayBlockingQueue<>(this.config.getErOffer().getQueueCapacity());
     }
 
     private static EnumMap<Outcome, Timer> registerTimers(MeterRegistry registry, String command) {
@@ -477,15 +467,19 @@ public class OmsClusterIngressClient {
             while (System.nanoTime() < deadline) {
                 try {
                     this.client = AeronCluster.connect(ctx.clone());
+                    OmsConfig.Cluster.Client.ErOffer erCfg = config.getErOffer();
                     log.info(
-                            "OMS cluster client connected: aeronDir={} ingressEndpoints={} admitBatch={}",
+                            "OMS cluster client connected: aeronDir={} ingressEndpoints={} admitBatch={} erOffer={}",
                             aeronDirectory,
                             config.getIngressEndpoints(),
                             config.getAdmitBatch().isEnabled()
                                     ? "enabled(maxBatchSize=" + config.getAdmitBatch().getMaxBatchSize()
                                             + ", flushNanos=" + config.getAdmitBatch().getFlushIntervalNanos()
                                             + ", queueCap=" + config.getAdmitBatch().getQueueCapacity() + ")"
-                                    : "disabled");
+                                    : "disabled",
+                            "maxPerLockPass=" + erCfg.getMaxPerLockPass()
+                                    + ", queueCap=" + erCfg.getQueueCapacity()
+                                    + ", drainNanos=" + erCfg.getDrainIntervalNanos());
                     startEgressPollerLocked();
                     startAdmitBatcherLocked();
                     startErOfferDaemonLocked();
@@ -638,7 +632,7 @@ public class OmsClusterIngressClient {
                     erOfferQueue.remove(submit);
                     return CompletableFuture.failedFuture(new InterruptedException());
                 }
-                LockSupport.parkNanos(ER_OFFER_ENQUEUE_PARK_NANOS);
+                LockSupport.parkNanos(config.getErOffer().getEnqueueParkNanos());
                 if (Thread.interrupted()) {
                     erOfferQueue.remove(submit);
                     return CompletableFuture.failedFuture(new InterruptedException());
@@ -1274,13 +1268,16 @@ public class OmsClusterIngressClient {
     }
 
     /**
-     * Daemon loop: drain up to {@link #ER_OFFER_MAX_PER_LOCK_PASS} pre-encoded ER frames per pass
-     * and offer as many as possible per {@link #clientLock} acquisition. Callers park on per-submit
-     * futures — no direct lock contention from venue-egress virtual-thread completions.
+     * Daemon loop: drain up to {@link OmsConfig.Cluster.Client.ErOffer#getMaxPerLockPass()} pre-encoded
+     * ER frames per pass and offer as many as possible per {@link #clientLock} acquisition. Callers
+     * park on per-submit futures — no direct lock contention from venue-egress virtual-thread
+     * completions.
      */
     private void erOfferDaemonLoop() {
+        OmsConfig.Cluster.Client.ErOffer erCfg = config.getErOffer();
+        int maxPerLockPass = erCfg.getMaxPerLockPass();
         long parkNanos = config.getOfferBackpressureParkNanos();
-        List<PendingErSubmit> drained = new ArrayList<>(ER_OFFER_MAX_PER_LOCK_PASS);
+        List<PendingErSubmit> drained = new ArrayList<>(maxPerLockPass);
         org.agrona.concurrent.UnsafeBuffer offerScratch =
                 new org.agrona.concurrent.UnsafeBuffer(
                         new byte[OmsClusterWireFormat.MAX_COMMAND_BYTES]);
@@ -1289,13 +1286,13 @@ public class OmsClusterIngressClient {
             try {
                 PendingErSubmit head = erOfferQueue.poll();
                 if (head == null) {
-                    LockSupport.parkNanos(ER_OFFER_DRAIN_INTERVAL_NANOS);
+                    LockSupport.parkNanos(erCfg.getDrainIntervalNanos());
                     continue;
                 }
                 do {
                     drained.clear();
                     drained.add(head);
-                    erOfferQueue.drainTo(drained, ER_OFFER_MAX_PER_LOCK_PASS - 1);
+                    erOfferQueue.drainTo(drained, maxPerLockPass - 1);
                     offerErBurstWithBackpressure(drained, offerScratch, parkNanos);
                     head = erOfferQueue.poll();
                 } while (head != null && !closing);

@@ -19,6 +19,9 @@ import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -91,6 +94,13 @@ public final class LedgerInflightCoalescer {
 
     private static final Logger log = LoggerFactory.getLogger(LedgerInflightCoalescer.class);
 
+    /**
+     * Concurrent bulk POSTs in flight. Slice 4q used a single flush thread so accept threads
+     * blocked serially on one bulk HTTP per JVM; pipelining lifts the ceiling toward Ledger's
+     * bulk throughput without changing pre-admit semantics on the ingress side.
+     */
+    private static final int MAX_IN_FLIGHT_FLUSHES = 8;
+
     /** Bench-evidence-driven (slice 4q): coalescer flush latency, by outcome tag. */
     private static final String METRIC_FLUSH_SECONDS = "oms_ledger_inflight_coalescer_flush_seconds";
     /** Bench-evidence-driven (slice 4q): per-submit latency to first acknowledgement (success or fallback). */
@@ -108,6 +118,8 @@ public final class LedgerInflightCoalescer {
     private final TransactionTemplate transactionTemplate;
 
     private final BlockingQueue<PendingHold> queue;
+    private final ExecutorService flushExecutor;
+    private final Semaphore inFlightFlushes;
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicLong drainedOnShutdown = new AtomicLong(0);
     private volatile Thread flushThread;
@@ -126,6 +138,12 @@ public final class LedgerInflightCoalescer {
         this.meterRegistry = meterRegistry;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
         this.queue = new ArrayBlockingQueue<>(config.getLedger().getInflightCoalescerQueueCapacity());
+        this.flushExecutor = Executors.newFixedThreadPool(MAX_IN_FLIGHT_FLUSHES, r -> {
+            Thread t = new Thread(r, "oms-ledger-inflight-coalescer-flush");
+            t.setDaemon(true);
+            return t;
+        });
+        this.inFlightFlushes = new Semaphore(MAX_IN_FLIGHT_FLUSHES);
     }
 
     /**
@@ -188,6 +206,15 @@ public final class LedgerInflightCoalescer {
                 Thread.currentThread().interrupt();
             }
         }
+        flushExecutor.shutdown();
+        try {
+            if (!flushExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+                flushExecutor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            flushExecutor.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
         // Final drain in case the flush thread exited before clearing the queue (e.g. due to
         // the interrupt hitting between poll() and flush()).
         List<PendingHold> residual = new ArrayList<>();
@@ -224,11 +251,11 @@ public final class LedgerInflightCoalescer {
                 }
                 batch.add(first);
                 queue.drainTo(batch, maxBatchSize - 1);
-                flushBatch(batch);
+                submitFlushAsync(List.copyOf(batch));
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
                 if (!batch.isEmpty()) {
-                    flushBatch(batch);
+                    submitFlushAsync(List.copyOf(batch));
                 }
                 break;
             } catch (RuntimeException ex) {
@@ -247,6 +274,26 @@ public final class LedgerInflightCoalescer {
             fallbackToOutbox(tail, "loop_exit_drain");
             drainedOnShutdown.addAndGet(tail.size());
         }
+    }
+
+    private void submitFlushAsync(List<PendingHold> batch) {
+        if (batch.isEmpty()) {
+            return;
+        }
+        try {
+            inFlightFlushes.acquire();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            fallbackToOutbox(batch, "loop_exit_drain");
+            return;
+        }
+        flushExecutor.submit(() -> {
+            try {
+                flushBatch(batch);
+            } finally {
+                inFlightFlushes.release();
+            }
+        });
     }
 
     private void flushBatch(List<PendingHold> batch) {

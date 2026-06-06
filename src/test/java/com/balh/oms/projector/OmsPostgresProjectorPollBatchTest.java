@@ -145,6 +145,28 @@ class OmsPostgresProjectorPollBatchTest {
     }
 
     @Test
+    void applyPollBatch_batchesLedgerInflightOutboxInserts() throws Exception {
+        config.getLedger().setInflightReservationEnabled(true);
+        config.getLedger().setInflightAsyncEnabled(true);
+        config.getLedger().setInflightPreAdmitHoldEnabled(false);
+
+        OrderAdmittedEvent ev1 = admittedWithLedgerBalance("PREDMKT-L1", "bal-1");
+        OrderAdmittedEvent ev2 = admittedWithLedgerBalance("PREDMKT-L2", "bal-2");
+        OrderAdmittedEvent ev3 = admittedWithLedgerBalance("PREDMKT-L3", "bal-3");
+        when(ordersRepository.batchInsertFromAdmittedEvents(List.of(ev1, ev2, ev3)))
+                .thenReturn(new int[] {1, 1, 1});
+
+        projector.applyPollBatchForTesting(List.of(
+                new OmsPostgresProjector.PendingFragment.OrderAdmitted(ev1, 100L),
+                new OmsPostgresProjector.PendingFragment.OrderAdmitted(ev2, 200L),
+                new OmsPostgresProjector.PendingFragment.OrderAdmitted(ev3, 300L)));
+
+        verify(ledgerInflightOutboxRepository, never()).insertIfAbsent(any(), any());
+        verify(ledgerInflightOutboxRepository, times(1))
+                .batchInsertIfAbsent(any(), any());
+    }
+
+    @Test
     void isAdmitOnlyPollBatch_trueForAdmits_falseForMixed() {
         OrderAdmittedEvent ev = admitted("PREDMKT-1");
         assertThat(
@@ -426,6 +448,24 @@ class OmsPostgresProjectorPollBatchTest {
                 "hash",
                 symbol,
                 null);
+    }
+
+    private static OrderAdmittedEvent admittedWithLedgerBalance(String symbol, String balanceId) {
+        return new OrderAdmittedEvent(
+                UUID.randomUUID(),
+                0L,
+                ACCEPTED_AT_MS,
+                10_000_000_000L,
+                30_000L,
+                0,
+                0,
+                AcceptOrderCommand.SIDE_BUY,
+                AcceptOrderCommand.TIF_DAY,
+                UUID.randomUUID().toString(),
+                "idem-" + symbol,
+                "hash",
+                symbol,
+                balanceId);
     }
 
     private static final class CountingTransactionManager extends AbstractPlatformTransactionManager {

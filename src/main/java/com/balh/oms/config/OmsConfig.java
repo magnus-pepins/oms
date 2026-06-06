@@ -3838,17 +3838,17 @@ public class OmsConfig {
             private static final long DEFAULT_POLL_PARK_NANOS = 1_000_000L;
 
             /**
-             * Default fragments per {@code replay.poll} pass. Matches venue-egress (512): at 5k admits/s
+             * Default fragments per {@code replay.poll} pass. Matches venue-egress (1024): at 5k admits/s
              * a limit of 64 caps drain at ~78 Postgres COMMITs/s and {@code projector_wall_lag_ms}
              * climbs even when {@code ingress_cluster_accept} stays sub-ms.
              */
-            private static final int DEFAULT_FRAGMENT_LIMIT = 512;
+            private static final int DEFAULT_FRAGMENT_LIMIT = 1024;
 
             /**
              * Safety cap on fragments per poll-batch COMMIT during catch-up bursts. Prevents a single
              * multi-thousand-row transaction when the projector replays a deep Aeron backlog.
              */
-            private static final int DEFAULT_MAX_FRAGMENTS_PER_COMMIT = 2048;
+            private static final int DEFAULT_MAX_FRAGMENTS_PER_COMMIT = 4096;
 
             /** Default backoff between {@code listRecordings} retries while waiting for the recording to appear. */
             private static final long DEFAULT_RECORDING_LOOKUP_PARK_MS = 100L;

@@ -153,39 +153,113 @@ class OmsPostgresProjectorPollBatchTest {
     }
 
     @Test
-    void pollReplayBurst_spinsPastFirstZeroPollBeforeFlushingPartialBatch() {
+    void pollReplayBurst_tightSpinsUntilAeronReturnsZero() {
         projector.setRunningForTesting(true);
-        config.getCluster().getProjector().setMaxFragmentsPerCommit(2048);
         config.getCluster().getProjector().setFragmentLimit(512);
 
         OmsPostgresProjector.ProjectingFragmentHandler handler =
                 projector.createProjectingFragmentHandlerForTesting();
         Subscription replay = org.mockito.Mockito.mock(io.aeron.Subscription.class);
         AtomicInteger pollCalls = new AtomicInteger();
-        when(replay.poll(any(), eq(512)))
+        when(replay.poll(any(), eq(1024)))
                 .thenAnswer(
                         inv -> {
-                            if (pollCalls.getAndIncrement() == 0) {
-                                deliverCursorOnlyFragment(handler, 64L);
-                                return 1;
-                            }
-                            return 0;
+                            int n = pollCalls.getAndIncrement();
+                            return switch (n) {
+                                case 0 -> {
+                                    deliverCursorOnlyFragment(handler, 64L);
+                                    yield 1024;
+                                }
+                                case 1 -> {
+                                    deliverCursorOnlyFragment(handler, 128L);
+                                    yield 17;
+                                }
+                                default -> 0;
+                            };
                         });
 
         int total =
                 projector.pollReplayBurst(replay, handler, config.getCluster().getProjector());
 
-        assertThat(total).isEqualTo(1);
-        assertThat(pollCalls.get())
-                .as("must spin through idle polls before flushing a sub-cap partial batch")
-                .isGreaterThan(2);
-        assertThat(txManager.beginCount.get()).isEqualTo(1);
+        assertThat(total).isEqualTo(1041);
+        assertThat(pollCalls.get()).isEqualTo(3);
+        assertThat(txManager.beginCount.get())
+                .as("partial batch defers flush until outer loop idle tail")
+                .isZero();
+        assertThat(handler.pendingFragmentCount()).isEqualTo(2);
     }
 
     @Test
-    void accumulateIdlePollPasses_scalesWithCommitCap() {
-        assertThat(OmsPostgresProjector.accumulateIdlePollPasses(2048, 512)).isEqualTo(16);
-        assertThat(OmsPostgresProjector.accumulateIdlePollPasses(512, 512)).isEqualTo(8);
+    void pollReplayBurst_flushesWhenMaxFragmentsPerCommitReachedDuringProductivePoll() {
+        projector.setRunningForTesting(true);
+        config.getCluster().getProjector().setMaxFragmentsPerCommit(2);
+        config.getCluster().getProjector().setFragmentLimit(1024);
+
+        OmsPostgresProjector.ProjectingFragmentHandler handler =
+                projector.createProjectingFragmentHandlerForTesting();
+        Subscription replay = org.mockito.Mockito.mock(io.aeron.Subscription.class);
+        AtomicInteger pollCalls = new AtomicInteger();
+        when(replay.poll(any(), eq(1024)))
+                .thenAnswer(
+                        inv -> {
+                            return switch (pollCalls.getAndIncrement()) {
+                                case 0 -> {
+                                    deliverCursorOnlyFragment(handler, 64L);
+                                    deliverCursorOnlyFragment(handler, 128L);
+                                    yield 2;
+                                }
+                                case 1 -> {
+                                    deliverCursorOnlyFragment(handler, 192L);
+                                    deliverCursorOnlyFragment(handler, 256L);
+                                    yield 2;
+                                }
+                                default -> 0;
+                            };
+                        });
+
+        int total =
+                projector.pollReplayBurst(replay, handler, config.getCluster().getProjector());
+
+        assertThat(total).isEqualTo(4);
+        assertThat(txManager.beginCount.get())
+                .as("each productive poll that hits the commit cap flushes before the next poll")
+                .isEqualTo(2);
+        assertThat(handler.pendingFragmentCount()).isZero();
+    }
+
+    @Test
+    void effectiveFragmentLimit_floorsAt1024ForHighAdmitDrain() {
+        assertThat(OmsPostgresProjector.effectiveFragmentLimit(512)).isEqualTo(1024);
+        assertThat(OmsPostgresProjector.effectiveFragmentLimit(2048)).isEqualTo(2048);
+    }
+
+    @Test
+    void pollReplayIdleTail_retriesBurstBeforePartialFlush() {
+        projector.setRunningForTesting(true);
+        config.getCluster().getProjector().setFragmentLimit(1024);
+
+        OmsPostgresProjector.ProjectingFragmentHandler handler =
+                projector.createProjectingFragmentHandlerForTesting();
+        deliverCursorOnlyFragment(handler, 64L);
+        Subscription replay = org.mockito.Mockito.mock(io.aeron.Subscription.class);
+        AtomicInteger pollCalls = new AtomicInteger();
+        when(replay.poll(any(), eq(1024)))
+                .thenAnswer(
+                        inv -> {
+                            if (pollCalls.getAndIncrement() == 2) {
+                                deliverCursorOnlyFragment(handler, 128L);
+                                return 1;
+                            }
+                            return 0;
+                        });
+
+        int idleTail =
+                projector.pollReplayIdleTail(replay, handler, config.getCluster().getProjector());
+
+        assertThat(idleTail).isEqualTo(1);
+        assertThat(pollCalls.get()).isGreaterThanOrEqualTo(3);
+        assertThat(txManager.beginCount.get()).isZero();
+        assertThat(handler.pendingFragmentCount()).isEqualTo(2);
     }
 
     @Test

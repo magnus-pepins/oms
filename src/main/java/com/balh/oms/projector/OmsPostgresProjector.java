@@ -720,6 +720,13 @@ public class OmsPostgresProjector {
                     if (polledBurst > 0) {
                         continue;
                     }
+                    int idleTailBurst = pollReplayIdleTail(replay, handler, projectorCfg);
+                    if (idleTailBurst > 0) {
+                        continue;
+                    }
+                    if (handler.pendingFragmentCount() > 0) {
+                        handler.flushPollBatch();
+                    }
                     // No fragments. Three cases:
                     //   (a) live-tail wait on the cluster's currently-active recording — park,
                     //       keep polling so newly written events flow through.
@@ -1012,43 +1019,32 @@ public class OmsPostgresProjector {
     }
 
     /**
-     * Tight-spin drain: poll Aeron repeatedly, accumulating fragments across multiple
-     * {@code replay.poll} passes before flushing Postgres. Each flush is bounded by
-     * {@link OmsConfig.Cluster.Projector#getMaxFragmentsPerCommit()}; a productive poll that only
-     * yields ~100 fragments (common at live replay tail) no longer forces an immediate COMMIT on
-     * the first zero-return poll. Mirrors {@code OmsVenueEgressService#pollReplayBurst} with
-     * projector-specific batch amortisation.
+     * Spin-yield re-polls after a zero-return {@link #pollReplayBurst} before flushing a partial
+     * Postgres batch or paying for recording-walk metadata. At 5k admits/s the cluster writer often
+     * lands fragments in the gap between the burst terminal zero and archive refresh; flushing on
+     * the first zero forces ~100-fragment COMMITs and caps drain near 500/s.
+     */
+    private static final int REPLAY_IDLE_TAIL_POLLS = 4;
+
+    /**
+     * Tight-spin drain: call {@link Subscription#poll} repeatedly while Aeron delivers fragments.
+     * Flushes only when {@link OmsConfig.Cluster.Projector#getMaxFragmentsPerCommit()} is reached
+     * during productive polling — partial batches defer to {@link #pollReplayIdleTail} and the
+     * outer replay loop. Mirrors {@code OmsVenueEgressService#pollReplayBurst}.
      */
     int pollReplayBurst(
             Subscription replay, ProjectingFragmentHandler handler, OmsConfig.Cluster.Projector projectorCfg) {
-        int fragmentLimit = projectorCfg.getFragmentLimit();
+        int fragmentLimit = effectiveFragmentLimit(projectorCfg.getFragmentLimit());
         int maxFragmentsPerCommit = projectorCfg.getMaxFragmentsPerCommit();
-        int maxIdlePollPasses = accumulateIdlePollPasses(maxFragmentsPerCommit, fragmentLimit);
         int totalPolled = 0;
-        int idlePollPasses = 0;
-        while (running.get()) {
-            int polled = replay.poll(handler, fragmentLimit);
+        int polled;
+        do {
+            polled = replay.poll(handler, fragmentLimit);
             totalPolled += polled;
-            if (polled > 0) {
-                idlePollPasses = 0;
-            } else {
-                idlePollPasses++;
-                if (handler.pendingFragmentCount() == 0) {
-                    break;
-                }
-            }
-            if (handler.pendingFragmentCount() >= maxFragmentsPerCommit) {
+            while (handler.pendingFragmentCount() >= maxFragmentsPerCommit) {
                 handler.flushPollBatch();
-            } else if (idlePollPasses >= maxIdlePollPasses) {
-                handler.flushPollBatch();
-                break;
-            } else if (polled == 0) {
-                Thread.onSpinWait();
             }
-        }
-        if (handler.pendingFragmentCount() > 0) {
-            handler.flushPollBatch();
-        }
+        } while (polled > 0 && running.get());
         if (totalPolled > 0) {
             Thread.onSpinWait();
         }
@@ -1056,13 +1052,29 @@ public class OmsPostgresProjector {
     }
 
     /**
-     * Zero-return polls tolerated while filling a commit batch. Derived from
-     * {@code maxFragmentsPerCommit / fragmentLimit} so bench defaults (2048 / 512) spin ~16 idle
-     * passes (~100 frags/poll observed on pop) before flushing a partial tail.
+     * Live-tail idle burst: yield and re-run {@link #pollReplayBurst} a few times before the replay
+     * loop flushes a partial batch or pays for recording-walk metadata. Package-private for unit
+     * tests that assert the spin count without Aeron Archive.
      */
-    static int accumulateIdlePollPasses(int maxFragmentsPerCommit, int fragmentLimit) {
-        int pollsToFillBatch = (maxFragmentsPerCommit + fragmentLimit - 1) / fragmentLimit;
-        return Math.max(8, pollsToFillBatch * 4);
+    int pollReplayIdleTail(
+            Subscription replay, ProjectingFragmentHandler handler, OmsConfig.Cluster.Projector projectorCfg) {
+        for (int attempt = 0; attempt < REPLAY_IDLE_TAIL_POLLS && running.get(); attempt++) {
+            Thread.onSpinWait();
+            int polled = pollReplayBurst(replay, handler, projectorCfg);
+            if (polled > 0) {
+                return polled;
+            }
+        }
+        return 0;
+    }
+
+    /**
+     * Amortizes {@code replay.poll} syscall overhead at 5k–10k admits/s. Operators may set a lower
+     * configured limit; production floors at 1024 frags/poll — mirrors
+     * {@code OmsVenueEgressService#effectiveReplayFragmentLimit}.
+     */
+    static int effectiveFragmentLimit(int configuredLimit) {
+        return Math.max(configuredLimit, 1024);
     }
 
     private void advanceCursorAtPosition(long newPosition) {

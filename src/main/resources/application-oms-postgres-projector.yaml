@@ -32,14 +32,13 @@ oms:
       # Replay stream id MUST differ from EVENTS_STREAM_ID (2000) — Aeron Archive replays the
       # recording onto a fresh subscription stream, not the original publication stream.
       replay-stream-id: ${OMS_POSTGRES_PROJECTOR_REPLAY_STREAM_ID:4321}
-      # Burst drain tuning — mirrors venue-egress defaults. pollReplayBurst accumulates multiple
-      # replay.poll passes (spinning through idle polls derived from these two knobs) before each
-      # Postgres COMMIT so ~100-fragment productive polls amortise toward max-fragments-per-commit.
-      # Raise fragment-limit only when projector_wall_lag_ms climbs at steady admit RPS while
+      # Burst drain tuning — mirrors venue-egress defaults. pollReplayBurst tight-spins while Aeron
+      # delivers fragments; partial batches flush only after pollReplayIdleTail exhausts. Raise
+      # fragment-limit only when projector_wall_lag_ms climbs at steady admit RPS while
       # ingress_cluster_accept stays low.
-      poll-park-nanos: ${OMS_POSTGRES_PROJECTOR_POLL_PARK_NANOS:10000}
-      fragment-limit: ${OMS_POSTGRES_PROJECTOR_FRAGMENT_LIMIT:512}
-      max-fragments-per-commit: ${OMS_POSTGRES_PROJECTOR_MAX_FRAGMENTS_PER_COMMIT:2048}
+      poll-park-nanos: ${OMS_POSTGRES_PROJECTOR_POLL_PARK_NANOS:1000}
+      fragment-limit: ${OMS_POSTGRES_PROJECTOR_FRAGMENT_LIMIT:1024}
+      max-fragments-per-commit: ${OMS_POSTGRES_PROJECTOR_MAX_FRAGMENTS_PER_COMMIT:4096}
 
 # Main HTTP port: the projector role does not serve order-accept HTTP, but Spring Boot's auto-config
 # still binds an embedded Tomcat to ${OMS_HTTP_PORT:8088}. On a single-host bench that collides with

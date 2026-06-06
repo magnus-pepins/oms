@@ -1152,13 +1152,31 @@ public class OmsPostgresProjector {
                 long perEventAdmitTxNanos =
                         events.isEmpty() ? 0L : admitBatchSqlNanos / events.size();
 
+                boolean benchFastPath = isBenchAdmitOnlyFastPath();
+                if (benchFastPath) {
+                    for (int i = 0; i < events.size(); i++) {
+                        meterRegistry.timer(TIMER_ADMIT_TX).record(perEventAdmitTxNanos, TimeUnit.NANOSECONDS);
+                    }
+                    if (!events.isEmpty()) {
+                        recordClusterAdmitToProjectorWallLag(events.get(events.size() - 1));
+                    }
+                    flushDeferredPollBatchCursorAdvance();
+                    return;
+                }
+
+                boolean outboxSkipEnabled = isSkipVenueOrderAcceptedOutboxEnabled();
+                boolean passAuditSkipEnabled = isSkipVenueControlPassAuditEnabled();
+                boolean riskEvalSkipEnabled = passAuditSkipEnabled
+                        && ControlRiskEvaluator.isVenueControlRiskEvalSkipEnabled();
+                String venuePrefix = VenueRoutingSymbols.venueSymbolPrefix(config);
                 List<UUID> ledgerOutboxOrderIds = null;
                 List<String> ledgerOutboxPayloads = null;
 
                 for (int i = 0; i < events.size(); i++) {
                     OrderAdmittedEvent ev = events.get(i);
                     boolean fresh = insertCounts[i] == 1;
-                    if (fresh && !skipVenueOrderAcceptedOutbox(ev)) {
+                    boolean matchesVenue = VenueRoutingSymbols.matchesVenuePrefix(venuePrefix, ev.instrumentSymbol());
+                    if (fresh && !(outboxSkipEnabled && matchesVenue)) {
                         try {
                             domainEventOutboxRepository.insert(ev.orderId(), envelopeCodec.orderAcceptedFromAdmitted(ev));
                         } catch (JsonProcessingException e) {
@@ -1167,13 +1185,17 @@ public class OmsPostgresProjector {
                         }
                     }
                     if (fresh) {
-                        OrdersRepository.ProjectorAdmitInsert admitInsert =
-                                new OrdersRepository.ProjectorAdmitInsert(
-                                        true, ordersRepository.orderFromAdmittedEvent(ev));
-                        boolean skipPassAudit = skipVenueControlPassAudit(ev);
-                        if (!skipsVenueBenchControlAdmission(skipPassAudit, admitInsert.order())) {
-                            controlAdmission.persistAdmission(
-                                    toPendingControlEvent(ev), admitInsert.order(), skipPassAudit);
+                        boolean skipPassAudit = passAuditSkipEnabled && matchesVenue;
+                        if (skipPassAudit && riskEvalSkipEnabled) {
+                            // all control-admission branches will skip — avoid Order construction
+                        } else {
+                            OrdersRepository.ProjectorAdmitInsert admitInsert =
+                                    new OrdersRepository.ProjectorAdmitInsert(
+                                            true, ordersRepository.orderFromAdmittedEvent(ev));
+                            if (!skipsVenueBenchControlAdmission(skipPassAudit, admitInsert.order())) {
+                                controlAdmission.persistAdmission(
+                                        toPendingControlEvent(ev), admitInsert.order(), skipPassAudit);
+                            }
                         }
                     }
                     String ledgerPayload = computeLedgerInflightPayloadOrNull(ev);
@@ -1606,6 +1628,54 @@ public class OmsPostgresProjector {
     /** Visible for unit tests that pin the bench outbox skip gate without env mutation. */
     void setSkipVenueOrderAcceptedOutboxForTesting(boolean enabled) {
         this.skipVenueOrderAcceptedOutboxOverride = enabled;
+    }
+
+    /**
+     * Batch-level env check (no per-event symbol match): is the outbox skip env var on?
+     * Cached once per poll batch in {@link #applyAdmitOnlyPollBatch} to avoid 300k
+     * {@link System#getenv} calls.
+     */
+    private boolean isSkipVenueOrderAcceptedOutboxEnabled() {
+        if (skipVenueOrderAcceptedOutboxOverride != null) {
+            return skipVenueOrderAcceptedOutboxOverride;
+        }
+        return Boolean.parseBoolean(
+                Objects.requireNonNullElse(System.getenv(ENV_SKIP_VENUE_ORDER_ACCEPTED_OUTBOX), "false"));
+    }
+
+    /**
+     * Batch-level env check: is the control-pass-audit skip env var on?
+     */
+    private boolean isSkipVenueControlPassAuditEnabled() {
+        if (skipVenueControlPassAuditOverride != null) {
+            return skipVenueControlPassAuditOverride;
+        }
+        return Boolean.parseBoolean(
+                Objects.requireNonNullElse(System.getenv(ENV_SKIP_VENUE_CONTROL_PASS_AUDIT), "false"));
+    }
+
+    /**
+     * All bench skip gates active: outbox skip, control-pass skip, risk-eval skip, AND
+     * ledger pre-admit hold (so {@link #computeLedgerInflightPayloadOrNull} returns null).
+     * When true, the per-event loop in {@link #applyAdmitOnlyPollBatch} is a no-op —
+     * only the JDBC batch INSERT, cursor advance, and metrics are needed.
+     */
+    boolean isBenchAdmitOnlyFastPath() {
+        if (!isSkipVenueOrderAcceptedOutboxEnabled()) return false;
+        if (!isSkipVenueControlPassAuditEnabled()) return false;
+        if (!ControlRiskEvaluator.isVenueControlRiskEvalSkipEnabled()) return false;
+        return !needsLedgerInflightOutbox();
+    }
+
+    /**
+     * True when the ledger-inflight outbox pipeline is active and the projector is the
+     * writer (pre-admit hold disabled). When false, {@link #computeLedgerInflightPayloadOrNull}
+     * always returns null.
+     */
+    private boolean needsLedgerInflightOutbox() {
+        return config.getLedger().isInflightReservationEnabled()
+                && config.getLedger().isInflightAsyncEnabled()
+                && !config.getLedger().isInflightPreAdmitHoldEnabled();
     }
 
     /**

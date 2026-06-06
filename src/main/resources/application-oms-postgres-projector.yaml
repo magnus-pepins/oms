@@ -15,6 +15,11 @@
 # member (recommended for low-latency reads) or using AeronArchive remote replay over UDP — slice
 # 2b-2 ships the IPC defaults; UDP variants lift in Phase 5 alongside k8s networking.
 
+spring:
+  datasource:
+    hikari:
+      connection-init-sql: ${OMS_PG_PROJECTOR_CONNECTION_INIT_SQL:SET synchronous_commit = off}
+
 oms:
   grpc:
     enabled: false

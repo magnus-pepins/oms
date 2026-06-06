@@ -374,6 +374,78 @@ class OmsPostgresProjectorPollBatchTest {
     }
 
     @Test
+    void applyPollBatch_benchFastPath_skipsPerEventWorkWhenAllSkipsActive() throws Exception {
+        config.getLedger().setInflightPreAdmitHoldEnabled(true);
+        projector.setSkipVenueControlPassAuditForTesting(true);
+        projector.setSkipVenueOrderAcceptedOutboxForTesting(true);
+        com.balh.oms.risk.ControlRiskEvaluator.setSkipVenueControlRiskEvalForTesting(true);
+        try {
+            OrderAdmittedEvent ev1 = admitted("PREDMKT-F1");
+            OrderAdmittedEvent ev2 = admitted("PREDMKT-F2");
+            when(ordersRepository.batchInsertFromAdmittedEvents(List.of(ev1, ev2)))
+                    .thenReturn(new int[] {1, 1});
+
+            projector.applyPollBatchForTesting(List.of(
+                    new OmsPostgresProjector.PendingFragment.OrderAdmitted(ev1, 100L),
+                    new OmsPostgresProjector.PendingFragment.OrderAdmitted(ev2, 200L)));
+
+            assertThat(txManager.beginCount.get()).isEqualTo(1);
+            verify(ordersRepository).batchInsertFromAdmittedEvents(List.of(ev1, ev2));
+            verify(ordersRepository, never()).orderFromAdmittedEvent(any());
+            verify(controlAdmission, never()).persistAdmission(any(), any(), Mockito.anyBoolean());
+            verify(domainEventOutboxRepository, never()).insert(any(), any());
+            verify(ledgerInflightOutboxRepository, never()).insertIfAbsent(any(), any());
+            verify(ledgerInflightOutboxRepository, never()).batchInsertIfAbsent(any(), any());
+            assertThat(projector.lastAppliedPosition()).isEqualTo(200L);
+        } finally {
+            com.balh.oms.risk.ControlRiskEvaluator.setSkipVenueControlRiskEvalForTesting(null);
+        }
+    }
+
+    @Test
+    void isBenchAdmitOnlyFastPath_falseWhenAnyGateMissing() {
+        config.getLedger().setInflightPreAdmitHoldEnabled(true);
+        projector.setSkipVenueControlPassAuditForTesting(true);
+        projector.setSkipVenueOrderAcceptedOutboxForTesting(true);
+        com.balh.oms.risk.ControlRiskEvaluator.setSkipVenueControlRiskEvalForTesting(true);
+        try {
+            assertThat(projector.isBenchAdmitOnlyFastPath()).isTrue();
+
+            projector.setSkipVenueOrderAcceptedOutboxForTesting(false);
+            assertThat(projector.isBenchAdmitOnlyFastPath()).isFalse();
+
+            projector.setSkipVenueOrderAcceptedOutboxForTesting(true);
+            config.getLedger().setInflightPreAdmitHoldEnabled(false);
+            config.getLedger().setInflightReservationEnabled(true);
+            config.getLedger().setInflightAsyncEnabled(true);
+            assertThat(projector.isBenchAdmitOnlyFastPath())
+                    .as("ledger outbox pipeline active, can't fast-path")
+                    .isFalse();
+        } finally {
+            com.balh.oms.risk.ControlRiskEvaluator.setSkipVenueControlRiskEvalForTesting(null);
+        }
+    }
+
+    @Test
+    void applyPollBatch_cachedEnvSkipsOrderConstruction_whenPassAndRiskSkipActive() throws Exception {
+        projector.setSkipVenueControlPassAuditForTesting(true);
+        com.balh.oms.risk.ControlRiskEvaluator.setSkipVenueControlRiskEvalForTesting(true);
+        try {
+            OrderAdmittedEvent ev1 = admitted("PREDMKT-X1");
+            when(ordersRepository.batchInsertFromAdmittedEvents(List.of(ev1)))
+                    .thenReturn(new int[] {1});
+
+            projector.applyPollBatchForTesting(List.of(
+                    new OmsPostgresProjector.PendingFragment.OrderAdmitted(ev1, 100L)));
+
+            verify(ordersRepository, never()).orderFromAdmittedEvent(any());
+            verify(controlAdmission, never()).persistAdmission(any(), any(), Mockito.anyBoolean());
+        } finally {
+            com.balh.oms.risk.ControlRiskEvaluator.setSkipVenueControlRiskEvalForTesting(null);
+        }
+    }
+
+    @Test
     void replayThreadPriority_clampedToThreadRange() {
         OmsConfig.Cluster.Projector projectorCfg = config.getCluster().getProjector();
         projectorCfg.setReplayThreadPriority(Thread.MAX_PRIORITY + 10);

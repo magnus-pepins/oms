@@ -109,7 +109,7 @@ public class ControlRiskEvaluator {
         return isVenueControlRiskEvalSkipEnabled();
     }
 
-    static boolean isVenueControlRiskEvalSkipEnabled() {
+    public static boolean isVenueControlRiskEvalSkipEnabled() {
         if (skipVenueControlRiskEvalOverride != null) {
             return skipVenueControlRiskEvalOverride;
         }

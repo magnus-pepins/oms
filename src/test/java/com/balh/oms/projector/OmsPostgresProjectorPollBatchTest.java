@@ -130,6 +130,21 @@ class OmsPostgresProjectorPollBatchTest {
     }
 
     @Test
+    void shouldFlushPartialPollBatch_defersWhileCatchUpBacklog() {
+        OmsConfig.Cluster.Projector projectorCfg = config.getCluster().getProjector();
+        projectorCfg.setCatchUpLagThresholdMs(500L);
+        projector.setLastAppliedAcceptedAtMillisForTesting(ACCEPTED_AT_MS - 2_000L);
+
+        assertThat(projector.shouldFlushPartialPollBatch(projectorCfg, 512))
+                .as("catch-up must not flush sub-cap batches on Archive micro-gaps")
+                .isFalse();
+
+        projector.setLastAppliedAcceptedAtMillisForTesting(ACCEPTED_AT_MS);
+        assertThat(projector.shouldFlushPartialPollBatch(projectorCfg, 512)).isTrue();
+        assertThat(projector.shouldFlushPartialPollBatch(projectorCfg, 0)).isFalse();
+    }
+
+    @Test
     void isAdmitOnlyPollBatch_trueForAdmits_falseForMixed() {
         OrderAdmittedEvent ev = admitted("PREDMKT-1");
         assertThat(

@@ -256,6 +256,27 @@ public class LedgerInflightOutboxRepository {
     }
 
     /**
+     * Batched idempotent INSERT for the projector admit-only poll-batch fast path. Same SQL as
+     * {@link #insertIfAbsent} but amortises JDBC round-trips across the batch ({@code addBatch /
+     * executeBatch}). Each element of the returned array is {@code 1} (inserted) or {@code 0}
+     * (conflict, row existed).
+     */
+    public int[] batchInsertIfAbsent(List<UUID> orderIds, List<String> payloads) {
+        if (orderIds.isEmpty()) {
+            return new int[0];
+        }
+        Timestamp now = Timestamp.from(Instant.now());
+        MapSqlParameterSource[] batch = new MapSqlParameterSource[orderIds.size()];
+        for (int i = 0; i < orderIds.size(); i++) {
+            batch[i] = new MapSqlParameterSource()
+                    .addValue("order_id", orderIds.get(i))
+                    .addValue("payload", payloads.get(i))
+                    .addValue("created_at", now);
+        }
+        return jdbc.batchUpdate(INSERT_IF_ABSENT_SQL, batch);
+    }
+
+    /**
      * Persists or upgrades an outbox row to "already published" with a known Ledger txn id.
      *
      * <p>Used by pre-admit hold paths that already executed {@code POST /transactions} on the

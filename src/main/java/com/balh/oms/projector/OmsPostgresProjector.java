@@ -824,7 +824,7 @@ public class OmsPostgresProjector {
                     if (idleTailBurst > 0) {
                         continue;
                     }
-                    if (handler.pendingFragmentCount() > 0) {
+                    if (shouldFlushPartialPollBatch(projectorCfg, handler.pendingFragmentCount())) {
                         handler.flushPollBatch();
                     }
                     if (replayPollHasCatchUpBacklog(projectorCfg)) {
@@ -1151,6 +1151,10 @@ public class OmsPostgresProjector {
                 long admitBatchSqlNanos = System.nanoTime() - admitTxStartNanos;
                 long perEventAdmitTxNanos =
                         events.isEmpty() ? 0L : admitBatchSqlNanos / events.size();
+
+                List<UUID> ledgerOutboxOrderIds = null;
+                List<String> ledgerOutboxPayloads = null;
+
                 for (int i = 0; i < events.size(); i++) {
                     OrderAdmittedEvent ev = events.get(i);
                     boolean fresh = insertCounts[i] == 1;
@@ -1172,9 +1176,21 @@ public class OmsPostgresProjector {
                                     toPendingControlEvent(ev), admitInsert.order(), skipPassAudit);
                         }
                     }
-                    recordLedgerInflightOutboxIfNeeded(ev);
+                    String ledgerPayload = computeLedgerInflightPayloadOrNull(ev);
+                    if (ledgerPayload != null) {
+                        if (ledgerOutboxOrderIds == null) {
+                            ledgerOutboxOrderIds = new ArrayList<>();
+                            ledgerOutboxPayloads = new ArrayList<>();
+                        }
+                        ledgerOutboxOrderIds.add(ev.orderId());
+                        ledgerOutboxPayloads.add(ledgerPayload);
+                    }
                     meterRegistry.timer(TIMER_ADMIT_TX).record(perEventAdmitTxNanos, TimeUnit.NANOSECONDS);
                     recordClusterAdmitToProjectorWallLag(ev);
+                }
+                if (ledgerOutboxOrderIds != null) {
+                    ledgerInflightOutboxRepository.batchInsertIfAbsent(
+                            ledgerOutboxOrderIds, ledgerOutboxPayloads);
                 }
                 flushDeferredPollBatchCursorAdvance();
             });
@@ -1280,6 +1296,15 @@ public class OmsPostgresProjector {
                 projectorCfg.getCatchUpLagThresholdMs(),
                 lastAppliedAcceptedAtMillis.get(),
                 wallClock.millis());
+    }
+
+    /**
+     * During catch-up, defer sub-cap flushes across Archive micro-gaps so poll batches reach
+     * {@link #effectiveMaxFragmentsPerCommit} — premature partial COMMITs were ~650 frags/batch
+     * (462 COMMITs / 300k admits) and capped drain near 6k/s.
+     */
+    boolean shouldFlushPartialPollBatch(OmsConfig.Cluster.Projector projectorCfg, int pendingFragments) {
+        return pendingFragments > 0 && !replayPollHasCatchUpBacklog(projectorCfg);
     }
 
     static boolean replayPollHasCatchUpBacklog(
@@ -1593,23 +1618,36 @@ public class OmsPostgresProjector {
      * txn id for the lifecycle reconciler.
      */
     private void recordLedgerInflightOutboxIfNeeded(OrderAdmittedEvent ev) {
+        String payload = computeLedgerInflightPayloadOrNull(ev);
+        if (payload != null) {
+            ledgerInflightOutboxRepository.insertIfAbsent(ev.orderId(), payload);
+        }
+    }
+
+    /**
+     * Pure computation: returns the JSON payload for a ledger inflight outbox row, or {@code null}
+     * when this event does not need one. Extracted from {@link #recordLedgerInflightOutboxIfNeeded}
+     * so the admit-only batch path can pre-compute all payloads and batch-insert them in one JDBC
+     * round-trip via {@link LedgerInflightOutboxRepository#batchInsertIfAbsent}.
+     */
+    private String computeLedgerInflightPayloadOrNull(OrderAdmittedEvent ev) {
         if (!config.getLedger().isInflightReservationEnabled()) {
-            return;
+            return null;
         }
         if (!config.getLedger().isInflightAsyncEnabled()) {
-            return;
+            return null;
         }
         if (config.getLedger().isInflightPreAdmitHoldEnabled()) {
-            return;
+            return null;
         }
         if (ev.side() != AcceptOrderCommand.SIDE_BUY) {
-            return;
+            return null;
         }
         if (ev.ledgerBalanceIdOrNull() == null || ev.ledgerBalanceIdOrNull().isBlank()) {
-            return;
+            return null;
         }
         if (ev.limitPriceScaledOrZero() == 0L) {
-            return;
+            return null;
         }
 
         BigDecimal quantity = BigDecimal.valueOf(ev.quantityScaled())
@@ -1639,7 +1677,7 @@ public class OmsPostgresProjector {
                         AcceptOrderCommand.ordTypeName(ev.ordTypeCode()));
         Optional<BigDecimal> holdAmount = BuyFundsRequirement.requiredBuyFunds(holdSizing, config);
         if (holdAmount.isEmpty()) {
-            return;
+            return null;
         }
         Optional<BigDecimal> feeAmount = BuyFundsRequirement.estimatedFee(holdSizing, config);
 
@@ -1649,14 +1687,12 @@ public class OmsPostgresProjector {
         node.put("limitPrice", limitPrice.toPlainString());
         node.put("holdAmount", holdAmount.get().toPlainString());
         feeAmount.ifPresent(f -> node.put("feeAmount", f.toPlainString()));
-        String payload;
         try {
-            payload = objectMapper.writeValueAsString(node);
+            return objectMapper.writeValueAsString(node);
         } catch (JsonProcessingException e) {
             throw new IllegalStateException(
                     "ledger inflight outbox payload serialisation failed for orderId=" + ev.orderId(), e);
         }
-        ledgerInflightOutboxRepository.insertIfAbsent(ev.orderId(), payload);
     }
 
     /**

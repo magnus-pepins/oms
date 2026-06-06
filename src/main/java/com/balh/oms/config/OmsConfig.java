@@ -3885,6 +3885,15 @@ public class OmsConfig {
             private static final int DEFAULT_APPLY_QUEUE_BATCH_CAPACITY = 48;
 
             /**
+             * Concurrent apply threads that drain the queue in parallel. Each thread holds
+             * its own JDBC connection, so 2 threads double Postgres INSERT throughput when
+             * a single connection is bottlenecked on INSERT + index maintenance (~143µs/row).
+             * Cursor advance is ordered: the cursor only advances to position N when all
+             * batches with positions &lt; N have committed.
+             */
+            private static final int DEFAULT_APPLY_THREAD_COUNT = 2;
+
+            /**
              * {@link Thread#setPriority(int)} for {@code oms-postgres-projector-replay} and
              * {@code oms-postgres-projector-apply}. Default {@link Thread#MAX_PRIORITY} keeps the
              * Aeron drain ahead of generic worker pools on pop bench hosts.
@@ -3906,6 +3915,7 @@ public class OmsConfig {
             private int catchUpMaxFragmentsPerCommit = DEFAULT_CATCH_UP_MAX_FRAGMENTS_PER_COMMIT;
             private long catchUpLagThresholdMs = DEFAULT_CATCH_UP_LAG_THRESHOLD_MS;
             private int applyQueueBatchCapacity = DEFAULT_APPLY_QUEUE_BATCH_CAPACITY;
+            private int applyThreadCount = DEFAULT_APPLY_THREAD_COUNT;
             private int replayThreadPriority = DEFAULT_REPLAY_THREAD_PRIORITY;
             private long recordingLookupParkMs = DEFAULT_RECORDING_LOOKUP_PARK_MS;
 
@@ -3979,6 +3989,11 @@ public class OmsConfig {
             public int getApplyQueueBatchCapacity() { return applyQueueBatchCapacity; }
             public void setApplyQueueBatchCapacity(int applyQueueBatchCapacity) {
                 this.applyQueueBatchCapacity = Math.max(1, applyQueueBatchCapacity);
+            }
+
+            public int getApplyThreadCount() { return applyThreadCount; }
+            public void setApplyThreadCount(int applyThreadCount) {
+                this.applyThreadCount = Math.clamp(applyThreadCount, 1, 8);
             }
 
             public int getReplayThreadPriority() { return replayThreadPriority; }

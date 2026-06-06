@@ -64,12 +64,14 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -267,19 +269,43 @@ public class OmsPostgresProjector {
     private Thread replayThread;
     /**
      * Async Postgres apply queue — null in unit tests that drive {@link #applyPollBatch} directly
-     * without {@link #init()}.
+     * without {@link #init()}. Elements carry a monotonic sequence so the cursor-advance path
+     * can restore commit order across concurrent apply threads.
      */
-    private BlockingQueue<List<PendingFragment>> applyQueue;
-    private Thread applyThread;
+    private BlockingQueue<SequencedBatch> applyQueue;
+    private Thread[] applyThreads;
     private final AtomicReference<RuntimeException> applyFailure = new AtomicReference<>();
+
     /**
-     * When true (only on the replay thread inside {@link #applyPollBatch}), per-fragment cursor
+     * Monotonic sequence assigned to batches when enqueued so the cursor-advance path can
+     * determine which batches must complete before advancing past a given position.
+     */
+    private final AtomicLong batchSequenceGenerator = new AtomicLong(0L);
+
+    /**
+     * Tracks pending apply batches by their sequence number. Each entry maps
+     * {@code sequenceId → maxPosition}. Added on enqueue, removed on commit.
+     * The cursor advances to the highest contiguous committed position.
+     */
+    private final ConcurrentSkipListMap<Long, Long> pendingBatchPositions = new ConcurrentSkipListMap<>();
+
+    /**
+     * Guards the ordered cursor-advance sweep after each batch commits.
+     * Only one thread advances the cursor at a time.
+     */
+    private final Object cursorAdvanceLock = new Object();
+
+    record SequencedBatch(long sequenceId, List<PendingFragment> fragments) {}
+    /**
+     * When true (only on an apply thread inside {@link #applyPollBatch}), per-fragment cursor
      * UPSERTs coalesce to a single {@link AeronProjectorCursorRepository#advanceWithRecording} at
      * the max fragment position before COMMIT — the prior per-fragment updates were redundant
      * within the same transaction and capped drain at 5k admits/s.
+     *
+     * <p>ThreadLocal so concurrent apply threads each track their own batch's cursor state.
      */
-    private boolean deferPollBatchCursorAdvance;
-    private long deferredPollBatchMaxPosition = -1L;
+    private final ThreadLocal<Boolean> deferPollBatchCursorAdvance = ThreadLocal.withInitial(() -> false);
+    private final ThreadLocal<Long> deferredPollBatchMaxPosition = ThreadLocal.withInitial(() -> -1L);
 
     @Autowired
     public OmsPostgresProjector(
@@ -431,10 +457,17 @@ public class OmsPostgresProjector {
         running.set(true);
         OmsConfig.Cluster.Projector projectorCfg = config.getCluster().getProjector();
         applyQueue = new ArrayBlockingQueue<>(Math.max(1, projectorCfg.getApplyQueueBatchCapacity()));
-        applyThread = new Thread(this::applyLoop, "oms-postgres-projector-apply");
-        applyThread.setDaemon(true);
-        applyThread.setPriority(projectorCfg.getReplayThreadPriority());
-        applyThread.start();
+        int threadCount = projectorCfg.getApplyThreadCount();
+        applyThreads = new Thread[threadCount];
+        for (int i = 0; i < threadCount; i++) {
+            String name = threadCount == 1
+                    ? "oms-postgres-projector-apply"
+                    : "oms-postgres-projector-apply-" + i;
+            applyThreads[i] = new Thread(this::applyLoop, name);
+            applyThreads[i].setDaemon(true);
+            applyThreads[i].setPriority(projectorCfg.getReplayThreadPriority());
+            applyThreads[i].start();
+        }
         replayThread = new Thread(this::replayLoop, "oms-postgres-projector-replay");
         replayThread.setDaemon(true);
         replayThread.setPriority(projectorCfg.getReplayThreadPriority());
@@ -454,33 +487,37 @@ public class OmsPostgresProjector {
                 Thread.currentThread().interrupt();
             }
         }
-        if (applyThread != null) {
-            applyThread.interrupt();
-            try {
-                applyThread.join(10_000L);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+        if (applyThreads != null) {
+            for (Thread t : applyThreads) {
+                t.interrupt();
+            }
+            for (Thread t : applyThreads) {
+                try {
+                    t.join(10_000L);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
             }
         }
     }
 
     private void applyLoop() {
         while (true) {
-            List<PendingFragment> batch;
+            SequencedBatch sb;
             try {
-                batch = applyQueue.poll(100L, TimeUnit.MILLISECONDS);
+                sb = applyQueue.poll(100L, TimeUnit.MILLISECONDS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 break;
             }
-            if (batch == null) {
+            if (sb == null) {
                 if (!running.get() && applyQueue.isEmpty()) {
                     break;
                 }
                 continue;
             }
             try {
-                applyPollBatch(batch);
+                applySequencedBatch(sb);
             } catch (RuntimeException e) {
                 applyFailure.set(e);
                 running.set(false);
@@ -488,12 +525,181 @@ public class OmsPostgresProjector {
                 break;
             }
         }
-        List<PendingFragment> remaining;
+        SequencedBatch remaining;
         while ((remaining = applyQueue.poll()) != null) {
             try {
-                applyPollBatch(remaining);
+                applySequencedBatch(remaining);
             } catch (RuntimeException e) {
                 log.error("oms-postgres-projector apply drain on shutdown failed", e);
+            }
+        }
+    }
+
+    /**
+     * Apply a sequenced batch: runs the data INSERT, then advances the cursor in sequence order.
+     * When {@code applyThreadCount > 1}, cursor advance is deferred until all prior batches have
+     * committed — this prevents the cursor from leaping past uncommitted data on crash.
+     * The INSERT itself uses {@code ON CONFLICT DO NOTHING} so replaying committed events is safe.
+     */
+    private void applySequencedBatch(SequencedBatch sb) {
+        if (applyThreads != null && applyThreads.length > 1) {
+            applyPollBatchWithDeferredCursor(sb.fragments());
+            completeBatchAndAdvanceCursor(sb.sequenceId(),
+                    sb.fragments().get(sb.fragments().size() - 1).position());
+        } else {
+            applyPollBatch(sb.fragments());
+            pendingBatchPositions.remove(sb.sequenceId());
+        }
+    }
+
+    /**
+     * Like {@link #applyPollBatch} but skips the cursor advance inside the transaction.
+     * Cursor advance happens post-commit via {@link #completeBatchAndAdvanceCursor}.
+     */
+    private void applyPollBatchWithDeferredCursor(List<PendingFragment> batch) {
+        if (batch.isEmpty()) {
+            return;
+        }
+        if (isAdmitOnlyPollBatch(batch)) {
+            applyAdmitOnlyPollBatchNoCursor(batch);
+            return;
+        }
+        long pollBatchCommitStartNanos = System.nanoTime();
+        deferPollBatchCursorAdvance.set(true);
+        deferredPollBatchMaxPosition.set(-1L);
+        try {
+            transactionTemplate.executeWithoutResult(status -> {
+                for (PendingFragment fragment : batch) {
+                    applyPendingFragment(fragment);
+                }
+            });
+        } finally {
+            deferPollBatchCursorAdvance.set(false);
+            deferredPollBatchMaxPosition.set(-1L);
+        }
+        meterRegistry
+                .timer(TIMER_POLL_BATCH_COMMIT)
+                .record(System.nanoTime() - pollBatchCommitStartNanos, TimeUnit.NANOSECONDS);
+    }
+
+    /**
+     * Admit-only batch INSERT without cursor advance or lastAppliedPosition update.
+     * Used by the multi-thread path where cursor ordering is managed externally.
+     */
+    private void applyAdmitOnlyPollBatchNoCursor(List<PendingFragment> batch) {
+        long pollBatchCommitStartNanos = System.nanoTime();
+        transactionTemplate.executeWithoutResult(status -> {
+            long admitTxStartNanos = System.nanoTime();
+            List<OrderAdmittedEvent> events = new ArrayList<>(batch.size());
+            for (PendingFragment fragment : batch) {
+                PendingFragment.OrderAdmitted admitted = (PendingFragment.OrderAdmitted) fragment;
+                if (isShardMisroute(admitted.event().orderId(), admitted.event().shardId(), admitted.position())) {
+                    continue;
+                }
+                events.add(admitted.event());
+            }
+            int[] insertCounts = ordersRepository.batchInsertFromAdmittedEvents(events);
+            long admitBatchSqlNanos = System.nanoTime() - admitTxStartNanos;
+            long perEventAdmitTxNanos =
+                    events.isEmpty() ? 0L : admitBatchSqlNanos / events.size();
+
+            boolean benchFastPath = isBenchAdmitOnlyFastPath();
+            if (benchFastPath) {
+                meterRegistry.timer(TIMER_ADMIT_TX)
+                        .record(perEventAdmitTxNanos * events.size(), TimeUnit.NANOSECONDS);
+                if (!events.isEmpty()) {
+                    recordClusterAdmitToProjectorWallLag(events.get(events.size() - 1));
+                }
+                return;
+            }
+
+            boolean outboxSkipEnabled = isSkipVenueOrderAcceptedOutboxEnabled();
+            boolean passAuditSkipEnabled = isSkipVenueControlPassAuditEnabled();
+            boolean riskEvalSkipEnabled = passAuditSkipEnabled
+                    && ControlRiskEvaluator.isVenueControlRiskEvalSkipEnabled();
+            String venuePrefix = VenueRoutingSymbols.venueSymbolPrefix(config);
+            List<UUID> ledgerOutboxOrderIds = null;
+            List<String> ledgerOutboxPayloads = null;
+
+            for (int i = 0; i < events.size(); i++) {
+                OrderAdmittedEvent ev = events.get(i);
+                boolean fresh = insertCounts[i] == 1;
+                boolean matchesVenue = VenueRoutingSymbols.matchesVenuePrefix(venuePrefix, ev.instrumentSymbol());
+                if (fresh && !(outboxSkipEnabled && matchesVenue)) {
+                    try {
+                        domainEventOutboxRepository.insert(ev.orderId(), envelopeCodec.orderAcceptedFromAdmitted(ev));
+                    } catch (JsonProcessingException e) {
+                        throw new IllegalStateException(
+                                "OrderAccepted envelope serialisation failed for orderId=" + ev.orderId(), e);
+                    }
+                }
+                if (fresh) {
+                    boolean skipPassAudit = passAuditSkipEnabled && matchesVenue;
+                    if (skipPassAudit && riskEvalSkipEnabled) {
+                        // skip
+                    } else {
+                        OrdersRepository.ProjectorAdmitInsert admitInsert =
+                                new OrdersRepository.ProjectorAdmitInsert(
+                                        true, ordersRepository.orderFromAdmittedEvent(ev));
+                        if (!skipsVenueBenchControlAdmission(skipPassAudit, admitInsert.order())) {
+                            controlAdmission.persistAdmission(
+                                    toPendingControlEvent(ev), admitInsert.order(), skipPassAudit);
+                        }
+                    }
+                }
+                String ledgerPayload = computeLedgerInflightPayloadOrNull(ev);
+                if (ledgerPayload != null) {
+                    if (ledgerOutboxOrderIds == null) {
+                        ledgerOutboxOrderIds = new ArrayList<>();
+                        ledgerOutboxPayloads = new ArrayList<>();
+                    }
+                    ledgerOutboxOrderIds.add(ev.orderId());
+                    ledgerOutboxPayloads.add(ledgerPayload);
+                }
+                meterRegistry.timer(TIMER_ADMIT_TX).record(perEventAdmitTxNanos, TimeUnit.NANOSECONDS);
+                recordClusterAdmitToProjectorWallLag(ev);
+            }
+            if (ledgerOutboxOrderIds != null) {
+                ledgerInflightOutboxRepository.batchInsertIfAbsent(
+                        ledgerOutboxOrderIds, ledgerOutboxPayloads);
+            }
+        });
+        meterRegistry
+                .timer(TIMER_POLL_BATCH_COMMIT)
+                .record(System.nanoTime() - pollBatchCommitStartNanos, TimeUnit.NANOSECONDS);
+    }
+
+    /**
+     * After a batch's data transaction commits, mark it completed and sweep the cursor
+     * forward over contiguously completed batches from the front of the sequence.
+     *
+     * <p>Pending entries have value >= 0 (the Aeron position). Completed entries are
+     * marked with {@code -(position + 1)} so they remain in the map until swept. Only one
+     * thread sweeps at a time ({@link #cursorAdvanceLock}).
+     */
+    private void completeBatchAndAdvanceCursor(long sequenceId, long maxPosition) {
+        pendingBatchPositions.replace(sequenceId, -(maxPosition + 1));
+
+        synchronized (cursorAdvanceLock) {
+            long advanceToPosition = -1L;
+
+            while (!pendingBatchPositions.isEmpty()) {
+                Map.Entry<Long, Long> first = pendingBatchPositions.firstEntry();
+                if (first.getValue() >= 0) {
+                    break;
+                }
+                long completedPos = -(first.getValue() + 1);
+                advanceToPosition = Math.max(advanceToPosition, completedPos);
+                pendingBatchPositions.remove(first.getKey());
+            }
+
+            if (advanceToPosition >= 0) {
+                cursorRepository.advanceWithRecording(
+                        PROJECTOR_ID,
+                        OmsClusterWireFormat.EVENTS_STREAM_ID,
+                        requireCurrentRecordingId(),
+                        advanceToPosition);
+                lastAppliedPosition.set(advanceToPosition);
             }
         }
     }
@@ -502,21 +708,25 @@ public class OmsPostgresProjector {
         if (batch.isEmpty()) {
             return;
         }
-        BlockingQueue<List<PendingFragment>> queue = applyQueue;
+        BlockingQueue<SequencedBatch> queue = applyQueue;
         if (queue == null) {
             applyPollBatch(batch);
             return;
         }
+        long maxPos = batch.get(batch.size() - 1).position();
+        long seq = batchSequenceGenerator.getAndIncrement();
+        pendingBatchPositions.put(seq, maxPos);
+        SequencedBatch sb = new SequencedBatch(seq, batch);
         try {
             while (running.get()) {
-                if (queue.offer(batch, 10L, TimeUnit.MILLISECONDS)) {
+                if (queue.offer(sb, 10L, TimeUnit.MILLISECONDS)) {
                     return;
                 }
                 rethrowApplyFailureIfAny();
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            applyPollBatch(batch);
+            applySequencedBatch(sb);
         }
     }
 
@@ -1107,8 +1317,8 @@ public class OmsPostgresProjector {
         }
         long pollBatchCommitStartNanos = System.nanoTime();
         long lastPosition = batch.get(batch.size() - 1).position();
-        deferPollBatchCursorAdvance = true;
-        deferredPollBatchMaxPosition = -1L;
+        deferPollBatchCursorAdvance.set(true);
+        deferredPollBatchMaxPosition.set(-1L);
         try {
             transactionTemplate.executeWithoutResult(status -> {
                 for (PendingFragment fragment : batch) {
@@ -1117,8 +1327,8 @@ public class OmsPostgresProjector {
                 flushDeferredPollBatchCursorAdvance();
             });
         } finally {
-            deferPollBatchCursorAdvance = false;
-            deferredPollBatchMaxPosition = -1L;
+            deferPollBatchCursorAdvance.set(false);
+            deferredPollBatchMaxPosition.set(-1L);
         }
         lastAppliedPosition.set(lastPosition);
         meterRegistry
@@ -1133,8 +1343,8 @@ public class OmsPostgresProjector {
     private void applyAdmitOnlyPollBatch(List<PendingFragment> batch) {
         long pollBatchCommitStartNanos = System.nanoTime();
         long lastPosition = batch.get(batch.size() - 1).position();
-        deferPollBatchCursorAdvance = true;
-        deferredPollBatchMaxPosition = -1L;
+        deferPollBatchCursorAdvance.set(true);
+        deferredPollBatchMaxPosition.set(-1L);
         try {
             transactionTemplate.executeWithoutResult(status -> {
                 long admitTxStartNanos = System.nanoTime();
@@ -1154,10 +1364,9 @@ public class OmsPostgresProjector {
 
                 boolean benchFastPath = isBenchAdmitOnlyFastPath();
                 if (benchFastPath) {
-                    for (int i = 0; i < events.size(); i++) {
-                        meterRegistry.timer(TIMER_ADMIT_TX).record(perEventAdmitTxNanos, TimeUnit.NANOSECONDS);
-                    }
                     if (!events.isEmpty()) {
+                        meterRegistry.timer(TIMER_ADMIT_TX)
+                                .record(perEventAdmitTxNanos * events.size(), TimeUnit.NANOSECONDS);
                         recordClusterAdmitToProjectorWallLag(events.get(events.size() - 1));
                     }
                     flushDeferredPollBatchCursorAdvance();
@@ -1217,8 +1426,8 @@ public class OmsPostgresProjector {
                 flushDeferredPollBatchCursorAdvance();
             });
         } finally {
-            deferPollBatchCursorAdvance = false;
-            deferredPollBatchMaxPosition = -1L;
+            deferPollBatchCursorAdvance.set(false);
+            deferredPollBatchMaxPosition.set(-1L);
         }
         lastAppliedPosition.set(lastPosition);
         meterRegistry
@@ -1356,8 +1565,9 @@ public class OmsPostgresProjector {
     }
 
     private void advanceCursorAtPosition(long newPosition) {
-        if (deferPollBatchCursorAdvance) {
-            deferredPollBatchMaxPosition = Math.max(deferredPollBatchMaxPosition, newPosition);
+        if (deferPollBatchCursorAdvance.get()) {
+            deferredPollBatchMaxPosition.set(
+                    Math.max(deferredPollBatchMaxPosition.get(), newPosition));
             return;
         }
         cursorRepository.advanceWithRecording(
@@ -1368,15 +1578,16 @@ public class OmsPostgresProjector {
     }
 
     private void flushDeferredPollBatchCursorAdvance() {
-        if (deferredPollBatchMaxPosition < 0L) {
+        long maxPos = deferredPollBatchMaxPosition.get();
+        if (maxPos < 0L) {
             return;
         }
         cursorRepository.advanceWithRecording(
                 PROJECTOR_ID,
                 OmsClusterWireFormat.EVENTS_STREAM_ID,
                 requireCurrentRecordingId(),
-                deferredPollBatchMaxPosition);
-        deferredPollBatchMaxPosition = -1L;
+                maxPos);
+        deferredPollBatchMaxPosition.set(-1L);
     }
 
     private void applyPendingFragment(PendingFragment fragment) {

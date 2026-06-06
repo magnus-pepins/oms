@@ -190,6 +190,28 @@ function loadBashEnvFile(filePath) {
 
 const BENCH_ENV = loadBashEnvFile(BENCH_ENV_FILE);
 
+// Shared order-accept JVM knobs (oms-ingress @8088 + oms-ingress-replica @8188 for 10k soak).
+const INGRESS_BENCH_ENV = {
+  SPRING_PROFILES_ACTIVE: 'oms-ingress-replica',
+  OMS_CLUSTER_CLIENT_AERON_DIRECTORY: AERON_MEDIA_DRIVER,
+  OMS_VENUE_SYMBOL_PREFIX: 'PREDMKT',
+  OMS_VENUE_ADMISSION_GATE_ENABLED: 'true',
+  OMS_VENUE_ADMISSION_GATE_MAX_LAG_BYTES: '4096',
+  OMS_VENUE_ADMISSION_GATE_THROTTLE_EXCESS_LAG_BYTES: '2048',
+  OMS_VENUE_ADMISSION_GATE_THROTTLE_BASE_DELAY_NANOS: '500000',
+  OMS_VENUE_ADMISSION_GATE_MAX_THROTTLE_DELAY_NANOS: '25000000',
+  OMS_CLUSTER_VENUE_EGRESS_VENUE_ROUTE_MAX_IN_FLIGHT: '512',
+  OMS_CLUSTER_CLIENT_ADMIT_BATCH_ENABLED: 'true',
+  OMS_CLUSTER_CLIENT_ADMIT_BATCH_MAX_SIZE: '32',
+  OMS_CLUSTER_CLIENT_ADMIT_BATCH_FLUSH_INTERVAL_NANOS: '50000',
+  OMS_CLUSTER_CLIENT_ADMIT_BATCH_QUEUE_CAPACITY: '8192',
+  // Coalescer tuning when OMS_LEDGER_INFLIGHT_COALESCER_ENABLED=true in ~/.oms-bench.env.
+  OMS_LEDGER_INFLIGHT_COALESCER_MAX_BATCH_SIZE: '64',
+  OMS_LEDGER_INFLIGHT_COALESCER_FLUSH_INTERVAL_MICROS: '2000',
+  OMS_LEDGER_INFLIGHT_COALESCER_QUEUE_CAPACITY: '8192',
+  OMS_LEDGER_INFLIGHT_COALESCER_MAX_IN_FLIGHT_FLUSHES: '16',
+};
+
 // BENCH_ENV first, then OMS_AERON_DIR_BASE (so this ecosystem's choice of dir wins
 // over any stale entry in ~/.oms-bench.env), then the demo-only reconciler flag.
 const COMMON_ENV = {
@@ -576,42 +598,32 @@ const apps = [
     log: logPath('oms-ingress-combined', '.log'),
     env: {
       ...COMMON_ENV,
-      // Use the oms-ingress-replica profile so application-oms-ingress-replica.yaml
-      // wires the cluster client (oms.cluster.client.enabled=true) and the
-      // OmsClusterShardRouter bean OrderIngressService depends on. The default profile
-      // leaves cluster.client.enabled at false (production assumed the future
-      // CLUSTER_CLIENT role would own this), which fails the order-accept JVM with
-      // "required a bean of type OmsClusterShardRouter that could not be found"
-      // (observed 2026-05-18 14:04 in oms-ingress-combined.log). ORDER_ACCEPT_PROFILE
-      // = "!oms-postgres-projector & !oms-fix-egress" so the ingress beans (HTTP
-      // /internal/v1/orders, new /cancel + /replace endpoints, the V32 lifecycle
-      // reconciler) all activate normally under this profile.
-      SPRING_PROFILES_ACTIVE: 'oms-ingress-replica',
-      OMS_CLUSTER_CLIENT_AERON_DIRECTORY: AERON_MEDIA_DRIVER,
-      // Venue-egress health circuit breaker (VenueAdmissionGate): refuse PREDMKT/* accepts when
-      // oms-venue-egress is behind the projector, so we never admit orders the venue can't see.
-      // Reads aeron_projector_cursor + oms_venue_egress_cursor from the shared oms projector DB.
-      OMS_VENUE_SYMBOL_PREFIX: 'PREDMKT',
-      OMS_VENUE_ADMISSION_GATE_ENABLED: 'true',
-      // max-lag-bytes = excess lag beyond pipelined floor (512×512 B) before hard 503.
-      OMS_VENUE_ADMISSION_GATE_MAX_LAG_BYTES: '4096',
-      // Soft backpressure band: park accepts when excess lag is between throttle floor and max.
-      OMS_VENUE_ADMISSION_GATE_THROTTLE_EXCESS_LAG_BYTES: '2048',
-      OMS_VENUE_ADMISSION_GATE_THROTTLE_BASE_DELAY_NANOS: '500000',
-      OMS_VENUE_ADMISSION_GATE_MAX_THROTTLE_DELAY_NANOS: '25000000',
-      // Must match oms-venue-egress pipelining cap (pipelined floor = inFlight × 512 B).
-      OMS_CLUSTER_VENUE_EGRESS_VENUE_ROUTE_MAX_IN_FLIGHT: '512',
+      ...INGRESS_BENCH_ENV,
+      OMS_HTTP_PORT: '8088',
+      OMS_INGRESS_REPLICA_MANAGEMENT_SERVER_PORT: '8087',
       // Sole HTTP order-accept JVM that needs live FX mids (FxQuoteService).
       OMS_FX_MID_SUBSCRIBER_ENABLED: 'true',
-      // Phase D-6 admit-batcher: amortise cluster accept_order round-trips. Default off in
-      // application-oms-ingress-replica.yaml; enable on pop where 321k resting orders make
-      // per-admit cluster RTT the knee (150 RPS → ~377 ms accept_ms unbatched vs ~7 ms at 120).
-      // Pop! D-6 bench (57k rps): max=8 + flush=50 µs beat max=16; at ~150 RPS the 50 µs
-      // coalesce window fills ~8 admits before flush.
-      OMS_CLUSTER_CLIENT_ADMIT_BATCH_ENABLED: 'true',
-      OMS_CLUSTER_CLIENT_ADMIT_BATCH_MAX_SIZE: '32',
-      OMS_CLUSTER_CLIENT_ADMIT_BATCH_FLUSH_INTERVAL_NANOS: '50000',
-      OMS_CLUSTER_CLIENT_ADMIT_BATCH_QUEUE_CAPACITY: '8192',
+    },
+    ...COMMON_PM2,
+  },
+  {
+    name: 'oms-ingress-replica',
+    script: JAVA,
+    args: [...LOW_LATENCY_JVM_FLAGS, '-jar', ROLE_JAR('')],
+    max_memory_restart: '2G',
+    min_uptime: '20s',
+    output: logPath('oms-ingress-replica-out', '.log'),
+    error: logPath('oms-ingress-replica-err', '.log'),
+    log: logPath('oms-ingress-replica-combined', '.log'),
+    env: {
+      ...COMMON_ENV,
+      ...INGRESS_BENCH_ENV,
+      OMS_HTTP_PORT: '8188',
+      OMS_INGRESS_REPLICA_MANAGEMENT_SERVER_PORT: '8187',
+      // FX mids only on primary ingress (8088) — replica is burst/soak throughput only.
+      OMS_FX_MID_SUBSCRIBER_ENABLED: 'false',
+      // Lifecycle reconciler runs on primary ingress only.
+      OMS_LEDGER_INFLIGHT_LIFECYCLE_RECONCILER_ENABLED: 'false',
     },
     ...COMMON_PM2,
   },

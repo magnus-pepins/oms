@@ -104,6 +104,7 @@ oms:
     inflight-coalescer-max-batch-size: ${OMS_LEDGER_INFLIGHT_COALESCER_MAX_BATCH_SIZE:50}
     inflight-coalescer-flush-interval-micros: ${OMS_LEDGER_INFLIGHT_COALESCER_FLUSH_INTERVAL_MICROS:5000}
     inflight-coalescer-queue-capacity: ${OMS_LEDGER_INFLIGHT_COALESCER_QUEUE_CAPACITY:1000}
+    inflight-coalescer-max-in-flight-flushes: ${OMS_LEDGER_INFLIGHT_COALESCER_MAX_IN_FLIGHT_FLUSHES:8}
     inflight-coalescer-submit-timeout-ms: ${OMS_LEDGER_INFLIGHT_COALESCER_SUBMIT_TIMEOUT_MS:2000}
     inflight-hold-destination-balance-id: ${OMS_LEDGER_INFLIGHT_HOLD_DESTINATION_BALANCE_ID:}
     # §8.4 cross-currency: per-source-ccy dest override map. Spring relaxed

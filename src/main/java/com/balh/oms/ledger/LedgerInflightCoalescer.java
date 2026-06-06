@@ -94,13 +94,6 @@ public final class LedgerInflightCoalescer {
 
     private static final Logger log = LoggerFactory.getLogger(LedgerInflightCoalescer.class);
 
-    /**
-     * Concurrent bulk POSTs in flight. Slice 4q used a single flush thread so accept threads
-     * blocked serially on one bulk HTTP per JVM; pipelining lifts the ceiling toward Ledger's
-     * bulk throughput without changing pre-admit semantics on the ingress side.
-     */
-    private static final int MAX_IN_FLIGHT_FLUSHES = 8;
-
     /** Bench-evidence-driven (slice 4q): coalescer flush latency, by outcome tag. */
     private static final String METRIC_FLUSH_SECONDS = "oms_ledger_inflight_coalescer_flush_seconds";
     /** Bench-evidence-driven (slice 4q): per-submit latency to first acknowledgement (success or fallback). */
@@ -118,6 +111,8 @@ public final class LedgerInflightCoalescer {
     private final TransactionTemplate transactionTemplate;
 
     private final BlockingQueue<PendingHold> queue;
+    private final int maxBatchSize;
+    private final int maxInFlightFlushes;
     private final ExecutorService flushExecutor;
     private final Semaphore inFlightFlushes;
     private final AtomicBoolean running = new AtomicBoolean(false);
@@ -138,12 +133,14 @@ public final class LedgerInflightCoalescer {
         this.meterRegistry = meterRegistry;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
         this.queue = new ArrayBlockingQueue<>(config.getLedger().getInflightCoalescerQueueCapacity());
-        this.flushExecutor = Executors.newFixedThreadPool(MAX_IN_FLIGHT_FLUSHES, r -> {
+        this.maxBatchSize = config.getLedger().getInflightCoalescerMaxBatchSize();
+        this.maxInFlightFlushes = config.getLedger().getInflightCoalescerMaxInFlightFlushes();
+        this.flushExecutor = Executors.newFixedThreadPool(maxInFlightFlushes, r -> {
             Thread t = new Thread(r, "oms-ledger-inflight-coalescer-flush");
             t.setDaemon(true);
             return t;
         });
-        this.inFlightFlushes = new Semaphore(MAX_IN_FLIGHT_FLUSHES);
+        this.inFlightFlushes = new Semaphore(maxInFlightFlushes);
     }
 
     /**
@@ -180,10 +177,12 @@ public final class LedgerInflightCoalescer {
         t.setDaemon(true);
         flushThread = t;
         t.start();
-        log.info("LedgerInflightCoalescer started (maxBatchSize={}, flushIntervalMicros={}, queueCapacity={})",
-                config.getLedger().getInflightCoalescerMaxBatchSize(),
+        log.info(
+                "LedgerInflightCoalescer started (maxBatchSize={}, flushIntervalMicros={}, queueCapacity={}, maxInFlightFlushes={})",
+                maxBatchSize,
                 config.getLedger().getInflightCoalescerFlushIntervalMicros(),
-                config.getLedger().getInflightCoalescerQueueCapacity());
+                config.getLedger().getInflightCoalescerQueueCapacity(),
+                maxInFlightFlushes);
     }
 
     /**
@@ -237,11 +236,14 @@ public final class LedgerInflightCoalescer {
     }
 
     private void runLoop() {
-        long flushIntervalNanos = TimeUnit.MICROSECONDS.toNanos(config.getLedger().getInflightCoalescerFlushIntervalMicros());
-        int maxBatchSize = config.getLedger().getInflightCoalescerMaxBatchSize();
+        long configuredFlushIntervalNanos =
+                TimeUnit.MICROSECONDS.toNanos(config.getLedger().getInflightCoalescerFlushIntervalMicros());
         List<PendingHold> batch = new ArrayList<>(maxBatchSize);
         while (running.get()) {
             try {
+                // Under backlog, skip the coalesce window so the first queued hold is not delayed
+                // by flushIntervalMicros (10k/s soak tail-latency lever).
+                long flushIntervalNanos = queue.size() >= maxBatchSize ? 0L : configuredFlushIntervalNanos;
                 // Block for the first item up to one flush interval; then drain whatever else is
                 // already queued without further waits, capped at maxBatchSize. Once running flips
                 // false the next poll either returns a residual item or returns null promptly.

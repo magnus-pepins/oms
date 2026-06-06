@@ -339,6 +339,12 @@ public class OmsConfig {
          */
         private int inflightCoalescerQueueCapacity = 1_000;
         /**
+         * Maximum concurrent bulk Ledger POSTs per ingress JVM. Slice 4q used a single flush
+         * thread; pipelining lifts the per-JVM ceiling toward Ledger bulk throughput under 10k/s
+         * soak without changing pre-admit semantics.
+         */
+        private int inflightCoalescerMaxInFlightFlushes = 8;
+        /**
          * Caller (ingress thread) wait budget for the per-item future to complete. Includes the
          * worst-case flush wait + the bulk Ledger HTTP RTT. Sized at 2 s to absorb an entire
          * Ledger {@code readTimeoutMs} (5 s) at the bulk endpoint while still failing the order
@@ -536,6 +542,10 @@ public class OmsConfig {
         public int getInflightCoalescerQueueCapacity() { return inflightCoalescerQueueCapacity; }
         public void setInflightCoalescerQueueCapacity(int v) {
             this.inflightCoalescerQueueCapacity = Math.max(100, v);
+        }
+        public int getInflightCoalescerMaxInFlightFlushes() { return inflightCoalescerMaxInFlightFlushes; }
+        public void setInflightCoalescerMaxInFlightFlushes(int v) {
+            this.inflightCoalescerMaxInFlightFlushes = Math.max(1, v);
         }
         public long getInflightCoalescerSubmitTimeoutMs() { return inflightCoalescerSubmitTimeoutMs; }
         public void setInflightCoalescerSubmitTimeoutMs(long v) {

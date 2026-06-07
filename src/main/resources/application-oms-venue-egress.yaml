@@ -26,12 +26,12 @@ oms:
       archive-control-response-channel: ${OMS_VENUE_EGRESS_ARCHIVE_CONTROL_RESPONSE_CHANNEL:aeron:ipc?term-length=64k}
       replay-channel: ${OMS_VENUE_EGRESS_REPLAY_CHANNEL:aeron:ipc?term-length=64k}
       replay-stream-id: ${OMS_VENUE_EGRESS_REPLAY_STREAM_ID:4324}
-      venue-route-max-in-flight: ${OMS_CLUSTER_VENUE_EGRESS_VENUE_ROUTE_MAX_IN_FLIGHT:640}
+      venue-route-max-in-flight: ${OMS_CLUSTER_VENUE_EGRESS_VENUE_ROUTE_MAX_IN_FLIGHT:512}
       # Throttle only when ER queue is genuinely saturated (8192 cap on cluster client).
       backlog-throttle-pending-route-threshold: ${OMS_CLUSTER_VENUE_EGRESS_BACKLOG_THROTTLE_PENDING_ROUTE_THRESHOLD:2048}
       backlog-throttle-er-offer-queue-depth-threshold: ${OMS_CLUSTER_VENUE_EGRESS_BACKLOG_THROTTLE_ER_OFFER_QUEUE_DEPTH_THRESHOLD:7168}
-      backlog-throttle-max-in-flight: ${OMS_CLUSTER_VENUE_EGRESS_BACKLOG_THROTTLE_MAX_IN_FLIGHT:640}
-      backlog-throttle-er-soft-cap-permit-multiplier: ${OMS_CLUSTER_VENUE_EGRESS_BACKLOG_THROTTLE_ER_SOFT_CAP_PERMIT_MULTIPLIER:5}
+      backlog-throttle-max-in-flight: ${OMS_CLUSTER_VENUE_EGRESS_BACKLOG_THROTTLE_MAX_IN_FLIGHT:512}
+      backlog-throttle-er-soft-cap-permit-multiplier: ${OMS_CLUSTER_VENUE_EGRESS_BACKLOG_THROTTLE_ER_SOFT_CAP_PERMIT_MULTIPLIER:4}
       backlog-throttle-park-nanos: ${OMS_CLUSTER_VENUE_EGRESS_BACKLOG_THROTTLE_PARK_NANOS:1000}
       # Replay drain tuning (pop @ 5–10k RPS admit): 1µs idle park + 2048 frags/poll + MAX priority threads.
       # pollReplayIdleTail spins 8× before park/recording-walk; keep poll-park short so true-idle wake is cheap.

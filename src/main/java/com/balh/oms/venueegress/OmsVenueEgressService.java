@@ -1757,18 +1757,20 @@ public class OmsVenueEgressService {
             boolean venuePermitsExhausted = permits.availablePermits() == 0;
             boolean routeBacklogged =
                     inFlight >= backlogThrottlePendingRouteThreshold && venuePermitsExhausted;
-            if (routeBacklogged || (erOfferBacklogged && venuePermitsExhausted)) {
+            int erSoftCap =
+                    Math.min(
+                            maxPendingFragments,
+                            maxInFlight * backlogThrottleErSoftCapPermitMultiplier);
+            erSoftCap = Math.max(backlogThrottleMaxInFlight, erSoftCap);
+            if (routeBacklogged) {
+                // Pending routes + no venue permits: hard floor only (replay must not outrun venue).
                 return Math.max(1, Math.min(maxPendingFragments, backlogThrottleMaxInFlight));
             }
             if (erOfferBacklogged) {
-                // ER deep but venue still has permits: graduated soft cap — full 6× inflated
-                // meanRouteMs on 10k soak after an 8k step (observed 614 ms); hard 512 cap inflated
-                // egress_wall_lag on clean 10k profile (observed 601 ms pre-fix).
-                int erBacklogCap =
-                        Math.min(
-                                maxPendingFragments,
-                                maxInFlight * backlogThrottleErSoftCapPermitMultiplier);
-                return Math.max(backlogThrottleMaxInFlight, erBacklogCap);
+                // ER queue deep: graduated cap even when venue permits are exhausted — the old
+                // combined branch clamped to backlogThrottleMaxInFlight and wedged replay @ 15k
+                // (meanRouteMs ~140 ms pre-tune, ~392 ms with 5× soft cap + 640 permits).
+                return erSoftCap;
             }
             return maxPendingFragments;
         }

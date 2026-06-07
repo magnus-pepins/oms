@@ -469,7 +469,7 @@ class OmsVenueEgressPipelineTest {
     }
 
     @Test
-    void backlogThrottle_doesNotClampDispatch_whenOnlyErQueueIsDeep() throws Exception {
+    void backlogThrottle_usesSoftCap_whenOnlyErQueueIsDeep() throws Exception {
         OmsConfig config = new OmsConfig();
         config.getCluster().getVenueEgress().setVenueRouteMaxInFlight(8);
         config.getCluster().getVenueEgress().setBacklogThrottleMaxInFlight(1);
@@ -498,18 +498,23 @@ class OmsVenueEgressPipelineTest {
 
         OrderAdmittedEvent ev1 = admit("PREDMKT-TEST-1");
         OrderAdmittedEvent ev2 = admit("PREDMKT-TEST-1");
+        OrderAdmittedEvent ev3 = admit("PREDMKT-TEST-1");
         CompletableFuture<Optional<ExecutionReport>> f1 = new CompletableFuture<>();
         CompletableFuture<Optional<ExecutionReport>> f2 = new CompletableFuture<>();
+        CompletableFuture<Optional<ExecutionReport>> f3 = new CompletableFuture<>();
         when(routeClient.routeAdmittedOrderAsync(ev1)).thenReturn(f1);
         when(routeClient.routeAdmittedOrderAsync(ev2)).thenReturn(f2);
+        when(routeClient.routeAdmittedOrderAsync(ev3)).thenReturn(f3);
 
         service.pipelineDispatchAdmitForTesting(ev1, 10L);
         service.pipelineDispatchAdmitForTesting(ev2, 20L);
+        service.pipelineDispatchAdmitForTesting(ev3, 30L);
 
-        verify(routeClient, times(2)).routeAdmittedOrderAsync(any());
+        verify(routeClient, times(3)).routeAdmittedOrderAsync(any());
 
         f1.complete(Optional.of(er(ev1)));
         f2.complete(Optional.of(er(ev2)));
+        f3.complete(Optional.of(er(ev3)));
         assertThat(service.pipelineQuiesceForTesting()).isTrue();
     }
 

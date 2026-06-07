@@ -282,20 +282,22 @@ public final class LedgerInflightCoalescer {
         if (batch.isEmpty()) {
             return;
         }
-        try {
-            inFlightFlushes.acquire();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            fallbackToOutbox(batch, "loop_exit_drain");
-            return;
-        }
-        flushExecutor.submit(() -> {
-            try {
-                flushBatch(batch);
-            } finally {
-                inFlightFlushes.release();
-            }
-        });
+        // Slice 4r: never block the daemon loop on flush-pool capacity — back-pressure stays on
+        // the bounded MPSC queue (submit throws when full), not on draining queued holds.
+        flushExecutor.submit(
+                () -> {
+                    try {
+                        inFlightFlushes.acquire();
+                        try {
+                            flushBatch(batch);
+                        } finally {
+                            inFlightFlushes.release();
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        fallbackToOutbox(batch, "flush_interrupted");
+                    }
+                });
     }
 
     private void flushBatch(List<PendingHold> batch) {

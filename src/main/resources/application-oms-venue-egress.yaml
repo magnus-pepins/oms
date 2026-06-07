@@ -9,6 +9,7 @@ oms:
     grpc-stream-ack-timeout-ms: ${OMS_VENUE_GRPC_STREAM_ACK_TIMEOUT_MS:10000}
   cluster:
     client:
+      role: ${OMS_CLUSTER_CLIENT_ROLE:er-offer-only}
       er-offer:
         # Venue-egress ER flood @ 8–10k/s: 256 frames/lock + 1µs idle park (daemon uses parkNanos, not poll timeout).
         max-per-lock-pass: ${OMS_CLUSTER_CLIENT_ER_OFFER_MAX_PER_LOCK_PASS:512}

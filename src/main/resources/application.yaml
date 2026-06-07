@@ -97,6 +97,7 @@ oms:
     inflight-outbox-reconciler-age-ms: ${OMS_LEDGER_INFLIGHT_OUTBOX_RECONCILER_AGE_MS:2000}
     inflight-outbox-reconciler-batch-size: ${OMS_LEDGER_INFLIGHT_OUTBOX_RECONCILER_BATCH_SIZE:50}
     inflight-outbox-reconciler-interval-ms: ${OMS_LEDGER_INFLIGHT_OUTBOX_RECONCILER_INTERVAL_MS:500}
+    inflight-outbox-bulk-enabled: ${OMS_LEDGER_INFLIGHT_OUTBOX_BULK_ENABLED:false}
     inflight-compensator-enabled: ${OMS_LEDGER_INFLIGHT_COMPENSATOR_ENABLED:false}
     inflight-compensator-attempts-threshold: ${OMS_LEDGER_INFLIGHT_COMPENSATOR_ATTEMPTS_THRESHOLD:3}
     inflight-compensator-batch-size: ${OMS_LEDGER_INFLIGHT_COMPENSATOR_BATCH_SIZE:50}

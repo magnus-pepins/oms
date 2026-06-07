@@ -17,6 +17,7 @@ import com.balh.oms.ledger.RestLedgerInflightReservationClient;
 import com.balh.oms.persistence.LedgerInflightOutboxRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micrometer.core.instrument.MeterRegistry;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -178,8 +179,9 @@ public class LedgerConfiguration {
      * destination balance / currency / precision as the per-order client above).
      */
     @Bean
-    @ConditionalOnProperty(
-            prefix = "oms.ledger", name = "inflight-coalescer-enabled", havingValue = "true")
+    @ConditionalOnExpression(
+            "${oms.ledger.inflight-coalescer-enabled:false} == true"
+                    + " || ${oms.ledger.inflight-outbox-bulk-enabled:false} == true")
     LedgerInflightBulkDispatcher ledgerInflightBulkDispatcher(
             RestClient omsLedgerRestClient,
             OmsConfig config,

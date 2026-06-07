@@ -305,6 +305,8 @@ public class OmsClusterIngressClient {
      */
     private final BlockingQueue<PendingErSubmit> erOfferQueue;
     private volatile Thread erOfferDaemonThread;
+    /** ER-offer-only role: keepalive without {@link #pollEgressDrain}. */
+    private volatile Thread sessionKeepaliveThread;
 
     // ---- Phase 4 slice 4c: commit-round-trip timer ----
     // Single timer name `oms.cluster.client.commit_round_trip` covers both submit methods so a
@@ -468,8 +470,10 @@ public class OmsClusterIngressClient {
                 try {
                     this.client = AeronCluster.connect(ctx.clone());
                     OmsConfig.Cluster.Client.ErOffer erCfg = config.getErOffer();
+                    ClusterClientRole role = config.getRole();
                     log.info(
-                            "OMS cluster client connected: aeronDir={} ingressEndpoints={} admitBatch={} erOffer={}",
+                            "OMS cluster client connected: role={} aeronDir={} ingressEndpoints={} admitBatch={} erOffer={}",
+                            role,
                             aeronDirectory,
                             config.getIngressEndpoints(),
                             config.getAdmitBatch().isEnabled()
@@ -480,9 +484,14 @@ public class OmsClusterIngressClient {
                             "maxPerLockPass=" + erCfg.getMaxPerLockPass()
                                     + ", queueCap=" + erCfg.getQueueCapacity()
                                     + ", drainNanos=" + erCfg.getDrainIntervalNanos());
-                    startEgressPollerLocked();
-                    startAdmitBatcherLocked();
-                    startErOfferDaemonLocked();
+                    if (role == ClusterClientRole.ER_OFFER_ONLY) {
+                        startErOfferDaemonLocked();
+                        startSessionKeepaliveLocked();
+                    } else {
+                        startEgressPollerLocked();
+                        startAdmitBatcherLocked();
+                        startErOfferDaemonLocked();
+                    }
                     return;
                 } catch (RuntimeException e) {
                     lastFailure = e;
@@ -528,6 +537,16 @@ public class OmsClusterIngressClient {
             er.interrupt();
             try {
                 er.join(POLLER_JOIN_MS);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        Thread keepalive = sessionKeepaliveThread;
+        sessionKeepaliveThread = null;
+        if (keepalive != null) {
+            keepalive.interrupt();
+            try {
+                keepalive.join(POLLER_JOIN_MS);
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
             }
@@ -1251,6 +1270,42 @@ public class OmsClusterIngressClient {
         t.setDaemon(true);
         erOfferDaemonThread = t;
         t.start();
+    }
+
+    private void startSessionKeepaliveLocked() {
+        if (sessionKeepaliveThread != null) {
+            return;
+        }
+        Thread t = new Thread(this::sessionKeepaliveLoop, "oms-cluster-client-session-keepalive");
+        t.setDaemon(true);
+        sessionKeepaliveThread = t;
+        t.start();
+    }
+
+    private void sessionKeepaliveLoop() {
+        long heartbeatIntervalNanos = TimeUnit.MILLISECONDS.toNanos(config.getHeartbeatIntervalMs());
+        long parkNanos = config.getEgressPollParkNanos();
+        long nextHeartbeatDeadlineNanos = System.nanoTime() + heartbeatIntervalNanos;
+        while (!closing) {
+            try {
+                clientLock.lockInterruptibly();
+                try {
+                    AeronCluster active = client;
+                    if (active != null && System.nanoTime() >= nextHeartbeatDeadlineNanos) {
+                        active.sendKeepAlive();
+                        nextHeartbeatDeadlineNanos = System.nanoTime() + heartbeatIntervalNanos;
+                    }
+                } finally {
+                    clientLock.unlock();
+                }
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                return;
+            } catch (RuntimeException e) {
+                log.warn("OMS cluster client session keepalive failed", e);
+            }
+            LockSupport.parkNanos(parkNanos);
+        }
     }
 
     /**

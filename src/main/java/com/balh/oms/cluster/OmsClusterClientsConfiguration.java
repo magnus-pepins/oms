@@ -74,6 +74,7 @@ public class OmsClusterClientsConfiguration {
     private volatile Map<Integer, OmsClusterIngressClient> built = Collections.emptyMap();
 
     @Bean(name = "omsClusterIngressClients")
+    @Profile("!" + OmsProfiles.VENUE_EGRESS)
     public Map<Integer, OmsClusterIngressClient> omsClusterIngressClients(
             OmsConfig config, MeterRegistry meterRegistry) {
         int shardCount = config.getShard().getCount();
@@ -193,6 +194,7 @@ public class OmsClusterClientsConfiguration {
      * never matches a {@code OmsClusterIngressClient} injection point.
      */
     @Bean(name = "omsClusterIngressClient")
+    @Profile("!" + OmsProfiles.VENUE_EGRESS)
     public OmsClusterIngressClient omsClusterIngressClient(
             @Qualifier("omsClusterIngressClients")
                     Map<Integer, OmsClusterIngressClient> clientByShard) {

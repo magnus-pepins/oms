@@ -317,6 +317,13 @@ public class OmsConfig {
          * iterate on the dispatch loop (the bulk dispatcher and outbox-fallback wiring compose
          * cleanly; only the accept-side coupling needs to change).
          */
+        /**
+         * Slice 4r — when {@code true} with {@link #inflightAsyncEnabled}, the outbox reconciler
+         * drives holds via {@link com.balh.oms.ledger.LedgerInflightBulkDispatcher} instead of
+         * one {@code POST /transactions} per row.
+         */
+        private boolean inflightOutboxBulkEnabled = false;
+
         private boolean inflightCoalescerEnabled = false;
         /**
          * Maximum items the coalescer will batch into a single Ledger bulk POST. Larger batches
@@ -528,6 +535,9 @@ public class OmsConfig {
         public void setInflightOutboxReconcilerBatchSize(int v) { this.inflightOutboxReconcilerBatchSize = v; }
         public long getInflightOutboxReconcilerIntervalMs() { return inflightOutboxReconcilerIntervalMs; }
         public void setInflightOutboxReconcilerIntervalMs(long v) { this.inflightOutboxReconcilerIntervalMs = v; }
+
+        public boolean isInflightOutboxBulkEnabled() { return inflightOutboxBulkEnabled; }
+        public void setInflightOutboxBulkEnabled(boolean v) { this.inflightOutboxBulkEnabled = v; }
 
         public boolean isInflightCoalescerEnabled() { return inflightCoalescerEnabled; }
         public void setInflightCoalescerEnabled(boolean v) { this.inflightCoalescerEnabled = v; }
@@ -4030,6 +4040,8 @@ public class OmsConfig {
             private static final long DEFAULT_HEARTBEAT_INTERVAL_MS = 1_000L;
 
             private boolean enabled = false;
+            private com.balh.oms.cluster.ClusterClientRole role =
+                    com.balh.oms.cluster.ClusterClientRole.FULL;
             private String aeronDirectory = "";
             private String ingressEndpoints = "0=localhost:20110";
             private String ingressChannel = "aeron:udp?endpoint=localhost:0";
@@ -4043,6 +4055,14 @@ public class OmsConfig {
 
             public boolean isEnabled() { return enabled; }
             public void setEnabled(boolean enabled) { this.enabled = enabled; }
+
+            public com.balh.oms.cluster.ClusterClientRole getRole() {
+                return role == null ? com.balh.oms.cluster.ClusterClientRole.FULL : role;
+            }
+
+            public void setRole(com.balh.oms.cluster.ClusterClientRole role) {
+                this.role = role == null ? com.balh.oms.cluster.ClusterClientRole.FULL : role;
+            }
 
             public String getAeronDirectory() { return aeronDirectory; }
             public void setAeronDirectory(String aeronDirectory) {

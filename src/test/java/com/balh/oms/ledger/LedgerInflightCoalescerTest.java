@@ -20,6 +20,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -115,7 +116,7 @@ class LedgerInflightCoalescerTest {
         // Critical: no outbox writes on the happy path. This is exactly the invariant slice 4q
         // is designed to preserve — every write back to Postgres on the success path defeats
         // the purpose of cutting cross-JVM contention.
-        verify(outbox, never()).insert(any(), any());
+        verify(outbox, never()).insertIfAbsent(any(), any());
         assertThat(meterRegistry.counter("oms_ledger_inflight_coalescer_items_total",
                 "outcome", "applied").count())
                 .isEqualTo(2.0);
@@ -141,8 +142,8 @@ class LedgerInflightCoalescerTest {
 
         // Both items fell back to the outbox. The reconciler + compensator (slice 4p) take
         // over from here; the order remains admitted at the cluster.
-        verify(outbox, times(1)).insert(eq(a), any());
-        verify(outbox, times(1)).insert(eq(b), any());
+        verify(outbox, times(1)).insertIfAbsent(eq(a), any());
+        verify(outbox, times(1)).insertIfAbsent(eq(b), any());
         double fallback = meterRegistry.counter("oms_ledger_inflight_coalescer_items_total",
                 "outcome", "fallback_outbox", "reason", "bulk_dispatch_failed").count();
         assertThat(fallback).isEqualTo(2.0);
@@ -164,8 +165,8 @@ class LedgerInflightCoalescerTest {
         fLucky.get(2, TimeUnit.SECONDS);
         fUnlucky.get(2, TimeUnit.SECONDS);
 
-        verify(outbox, never()).insert(eq(lucky), any());
-        verify(outbox, times(1)).insert(eq(unlucky), any());
+        verify(outbox, never()).insertIfAbsent(eq(lucky), any());
+        verify(outbox, times(1)).insertIfAbsent(eq(unlucky), any());
         assertThat(meterRegistry.counter("oms_ledger_inflight_coalescer_items_total",
                 "outcome", "applied").count())
                 .isEqualTo(1.0);
@@ -179,7 +180,7 @@ class LedgerInflightCoalescerTest {
         LedgerInflightBulkDispatcher dispatcher = items -> {
             throw new LedgerInflightBulkDispatcher.LedgerInflightBulkException("ledger network");
         };
-        doThrow(new RuntimeException("postgres down")).when(outbox).insert(any(), any());
+        doThrow(new RuntimeException("postgres down")).when(outbox).insertIfAbsent(any(), any());
 
         coalescer = newCoalescer(dispatcher);
         coalescer.start();
@@ -252,7 +253,7 @@ class LedgerInflightCoalescerTest {
             f.get(2, TimeUnit.SECONDS);
         }
         var captor = forClass(UUID.class);
-        verify(outbox, atLeast(0)).insert(captor.capture(), any());
+        verify(outbox, atLeast(0)).insertIfAbsent(captor.capture(), any());
         // We don't assert on exact insert count because the timing race between the gate-release
         // and stop() decides how many items the in-flight batch absorbed vs how many the drain
         // wrote. But every captured insert must be one of the submitted orderIds.
@@ -280,46 +281,55 @@ class LedgerInflightCoalescerTest {
     }
 
     @Test
-    void submitWhenQueueFull_throwsIllegalState() throws Exception {
-        config.getLedger().setInflightCoalescerQueueCapacity(100); // min from setter
-        Object gate = new Object();
+    void daemonDoesNotBlockWhenFlushPoolSaturated() throws Exception {
+        config.getLedger().setInflightCoalescerMaxBatchSize(2);
+        config.getLedger().setInflightCoalescerMaxInFlightFlushes(1);
+        config.getLedger().setInflightCoalescerFlushIntervalMicros(1_000_000L);
+        CountDownLatch dispatchEntered = new CountDownLatch(1);
+        CountDownLatch releaseDispatch = new CountDownLatch(1);
         LedgerInflightBulkDispatcher dispatcher = items -> {
-            synchronized (gate) {
-                try {
-                    gate.wait();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    throw new LedgerInflightBulkDispatcher.LedgerInflightBulkException("interrupted");
-                }
+            dispatchEntered.countDown();
+            try {
+                assertThat(releaseDispatch.await(5, TimeUnit.SECONDS)).isTrue();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException(e);
             }
             return new LedgerInflightBulkDispatcher.Result(items.size(), items.size(), Set.of());
         };
         coalescer = newCoalescer(dispatcher);
         coalescer.start();
-        try {
-            // Fill the queue. Capacity is 100 (min); the daemon will pull one off into the batch
-            // immediately and block in the dispatcher. We have to overshoot the queue to be sure
-            // it's full at submit time.
-            int submitted = 0;
-            try {
-                for (int i = 0; i < 200; i++) {
-                    coalescer.submit(UUID.randomUUID(), "src", new BigDecimal("1"));
-                    submitted++;
-                }
-            } catch (IllegalStateException ise) {
-                assertThat(ise).hasMessageContaining("queue is full");
-            }
-            assertThat(submitted)
-                    .as("queue capacity should bound how many submits succeed before queue_full")
-                    .isLessThan(200);
-            assertThat(meterRegistry.counter("oms_ledger_inflight_coalescer_submitted_total",
-                    "outcome", "queue_full").count())
-                    .isGreaterThanOrEqualTo(1.0);
-        } finally {
-            synchronized (gate) {
-                gate.notifyAll();
-            }
+
+        for (int i = 0; i < 100; i++) {
+            coalescer.submit(UUID.randomUUID(), "src-" + i, new BigDecimal("1"));
         }
+        assertThat(dispatchEntered.await(2, TimeUnit.SECONDS)).isTrue();
+        Awaitility.await()
+                .atMost(Duration.ofSeconds(2))
+                .untilAsserted(() -> assertThat(coalescer.queueSize()).isZero());
+
+        releaseDispatch.countDown();
+        coalescer.stop();
+    }
+
+    @Test
+    void submitWhenQueueFull_throwsIllegalState() throws Exception {
+        config.getLedger().setInflightCoalescerQueueCapacity(100);
+        coalescer = newCoalescer(items -> new LedgerInflightBulkDispatcher.Result(0, 0, Set.of()));
+        // Slice 4r drains the MPSC queue on a daemon thread; test queue_full without the daemon running.
+        var runningField = LedgerInflightCoalescer.class.getDeclaredField("running");
+        runningField.setAccessible(true);
+        ((java.util.concurrent.atomic.AtomicBoolean) runningField.get(coalescer)).set(true);
+
+        for (int i = 0; i < 100; i++) {
+            coalescer.submit(UUID.randomUUID(), "src", new BigDecimal("1"));
+        }
+        assertThatThrownBy(() -> coalescer.submit(UUID.randomUUID(), "src", new BigDecimal("1")))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("queue is full");
+        assertThat(meterRegistry.counter("oms_ledger_inflight_coalescer_submitted_total",
+                "outcome", "queue_full").count())
+                .isEqualTo(1.0);
     }
 
     private LedgerInflightCoalescer newCoalescer(LedgerInflightBulkDispatcher dispatcher) {

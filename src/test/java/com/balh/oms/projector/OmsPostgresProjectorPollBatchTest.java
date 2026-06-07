@@ -35,6 +35,7 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.BeforeEach;
@@ -142,6 +143,25 @@ class OmsPostgresProjectorPollBatchTest {
         projector.setLastAppliedAcceptedAtMillisForTesting(ACCEPTED_AT_MS);
         assertThat(projector.shouldFlushPartialPollBatch(projectorCfg, 512)).isTrue();
         assertThat(projector.shouldFlushPartialPollBatch(projectorCfg, 0)).isFalse();
+    }
+
+    @Test
+    void shouldFlushPartialPollBatch_defersWhileApplyQueueBackedUp() {
+        OmsConfig.Cluster.Projector projectorCfg = config.getCluster().getProjector();
+        projector.setLastAppliedAcceptedAtMillisForTesting(ACCEPTED_AT_MS);
+        ArrayBlockingQueue<OmsPostgresProjector.SequencedBatch> queue = new ArrayBlockingQueue<>(4);
+        queue.offer(
+                new OmsPostgresProjector.SequencedBatch(
+                        1L,
+                        List.of(new OmsPostgresProjector.PendingFragment.CursorOnly(64L))));
+        projector.setApplyQueueForTesting(queue);
+
+        assertThat(projector.shouldFlushPartialPollBatch(projectorCfg, 900))
+                .as("non-empty apply queue must defer sub-cap partial flush at 16k soak")
+                .isFalse();
+
+        queue.clear();
+        assertThat(projector.shouldFlushPartialPollBatch(projectorCfg, 900)).isTrue();
     }
 
     @Test

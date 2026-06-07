@@ -531,6 +531,7 @@ const apps = [
       // so replay.poll does not block behind Postgres COMMIT while catch-up batches drain.
       OMS_POSTGRES_PROJECTOR_FRAGMENT_LIMIT: '4096',
       OMS_POSTGRES_PROJECTOR_APPLY_QUEUE_BATCH_CAPACITY: '96',
+      OMS_POSTGRES_PROJECTOR_APPLY_THREAD_COUNT: '4',
     },
     ...COMMON_PM2,
   },

@@ -48,6 +48,9 @@ oms:
       catch-up-lag-threshold-ms: ${OMS_POSTGRES_PROJECTOR_CATCH_UP_LAG_THRESHOLD_MS:1000}
       catch-up-max-fragments-per-commit: ${OMS_POSTGRES_PROJECTOR_CATCH_UP_MAX_FRAGMENTS_PER_COMMIT:16384}
       apply-queue-batch-capacity: ${OMS_POSTGRES_PROJECTOR_APPLY_QUEUE_BATCH_CAPACITY:96}
+      # Pop @ 16k admit/s: two JDBC apply threads capped drain ~800/s at ~900 frags/COMMIT; four
+      # threads overlap Postgres INSERT while replay accumulates catch-up batches.
+      apply-thread-count: ${OMS_POSTGRES_PROJECTOR_APPLY_THREAD_COUNT:4}
       replay-thread-priority: ${OMS_POSTGRES_PROJECTOR_REPLAY_THREAD_PRIORITY:10}
 
 # Main HTTP port: the projector role does not serve order-accept HTTP, but Spring Boot's auto-config

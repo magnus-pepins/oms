@@ -295,6 +295,7 @@ public class OmsPostgresProjector {
      */
     private final Object cursorAdvanceLock = new Object();
 
+    /** Package-private for unit tests that drive apply-queue partial-flush gating. */
     record SequencedBatch(long sequenceId, List<PendingFragment> fragments) {}
     /**
      * When true (only on an apply thread inside {@link #applyPollBatch}), per-fragment cursor
@@ -763,6 +764,11 @@ public class OmsPostgresProjector {
     /** Visible for unit tests that assert catch-up fast-path gating without Aeron replay. */
     void setLastAppliedAcceptedAtMillisForTesting(long acceptedAtMillis) {
         lastAppliedAcceptedAtMillis.set(acceptedAtMillis);
+    }
+
+    /** Visible for unit tests that assert partial-flush gating against apply-queue depth. */
+    void setApplyQueueForTesting(BlockingQueue<SequencedBatch> queue) {
+        this.applyQueue = queue;
     }
 
     /**
@@ -1540,9 +1546,22 @@ public class OmsPostgresProjector {
      * During catch-up, defer sub-cap flushes across Archive micro-gaps so poll batches reach
      * {@link #effectiveMaxFragmentsPerCommit} — premature partial COMMITs were ~650 frags/batch
      * (462 COMMITs / 300k admits) and capped drain near 6k/s.
+     *
+     * <p>Also defer while the async apply queue holds batches: pop @ 16k/s showed ~900 frags/COMMIT
+     * (~1.1s {@code oms_projector_poll_batch_commit_seconds}) even with catch-up cap 16384 because
+     * {@link #replayPollHasCatchUpBacklog} can flicker false between apply completions while
+     * {@code projector_wall_lag_ms} stays high; flushing on idle tail with a non-empty apply queue
+     * multiplies COMMIT count and caps drain near ~800/s.
      */
     boolean shouldFlushPartialPollBatch(OmsConfig.Cluster.Projector projectorCfg, int pendingFragments) {
-        return pendingFragments > 0 && !replayPollHasCatchUpBacklog(projectorCfg);
+        if (pendingFragments <= 0) {
+            return false;
+        }
+        if (replayPollHasCatchUpBacklog(projectorCfg)) {
+            return false;
+        }
+        BlockingQueue<SequencedBatch> queue = applyQueue;
+        return queue == null || queue.isEmpty();
     }
 
     static boolean replayPollHasCatchUpBacklog(
@@ -1788,7 +1807,8 @@ public class OmsPostgresProjector {
     }
 
     private void recordClusterAdmitToProjectorWallLag(OrderAdmittedEvent ev) {
-        lastAppliedAcceptedAtMillis.set(ev.acceptedAtMillis());
+        lastAppliedAcceptedAtMillis.updateAndGet(
+                prev -> Math.max(prev, ev.acceptedAtMillis()));
         long latencyMs = wallClock.millis() - ev.acceptedAtMillis();
         OmsPipelineMetrics.recordClusterAdmitToProjector(
                 meterRegistry, PROJECTOR_ID, ev.side(), ev.timeInForceCode(), latencyMs);

@@ -377,7 +377,7 @@ class OmsVenueEgressPipelineTest {
     @Test
     void slowClusterErOffer_dispatchesFullPendingWindowWhileOffersPark() throws Exception {
         int maxInFlight = 4;
-        int admitCount = maxInFlight * 7;
+        int admitCount = maxInFlight * 6;
         CountDownLatch releaseEr = new CountDownLatch(1);
 
         when(clusterIngressClient.submitApplyExecutionReportAsync(any(), any()))
@@ -429,7 +429,7 @@ class OmsVenueEgressPipelineTest {
     @Test
     void erBacklog_allowsDispatchUpToMaxPendingFragmentsWhileVenuePermitsRecycle() throws Exception {
         int maxInFlight = 4;
-        int maxPending = maxInFlight * 7;
+        int maxPending = maxInFlight * 6;
         CountDownLatch releaseEr = new CountDownLatch(1);
         CompletableFuture<Void> erBlock = new CompletableFuture<>();
         var routeOfferPool = Executors.newSingleThreadExecutor();

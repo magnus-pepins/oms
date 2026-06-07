@@ -1871,34 +1871,23 @@ public class OmsVenueEgressService {
         private void runScheduledErCompletionFlush() {
             clusterIngressClient.openErOfferBatch();
             try {
-                drainErCompletionQueueInChunks();
-            } finally {
-                clusterIngressClient.closeErOfferBatch();
-                erCompletionFlushScheduled.set(false);
-                if (!erCompletionQueue.isEmpty()) {
-                    scheduleErCompletionFlush();
-                }
-            }
-        }
-
-        /**
-         * Enqueue ER offers in chunks of {@link #ER_COMPLETION_FLUSH_BATCH_CAP} under one batched
-         * daemon wake so a deep completion queue does not amplify {@code unpark} churn.
-         */
-        private void drainErCompletionQueueInChunks() {
-            while (true) {
                 ErCompletion item;
                 int flushed = 0;
                 while ((item = erCompletionQueue.poll()) != null
                         && flushed < ER_COMPLETION_FLUSH_BATCH_CAP) {
                     if (!dispatchErCompletionAsync(item)) {
+                        // Mirror serial replay semantics: stop this flush pass so a synchronously
+                        // failed offer is not immediately re-polled in the same loop.
                         erCompletionQueue.add(item);
-                        return;
+                        break;
                     }
                     flushed++;
                 }
-                if (flushed == 0) {
-                    return;
+            } finally {
+                clusterIngressClient.closeErOfferBatch();
+                erCompletionFlushScheduled.set(false);
+                if (!erCompletionQueue.isEmpty()) {
+                    scheduleErCompletionFlush();
                 }
             }
         }

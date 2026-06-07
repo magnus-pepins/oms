@@ -297,7 +297,13 @@ public class OmsClusterIngressClient {
      * {@link AeronCluster#offer} under {@link #clientLock}.
      */
     private record PendingErSubmit(
-            byte[] wireBytes, int wireLength, long deadlineNanos, CompletableFuture<Void> future) {}
+            byte[] wireBytes,
+            int wireLength,
+            long enqueuedAtNanos,
+            long deadlineNanos,
+            CompletableFuture<Void> future) {}
+
+    public static final String GAUGE_ER_OFFER_QUEUE_DEPTH = "oms.cluster.client.er_offer_queue_depth";
 
     /**
      * Bounded queue for {@link #submitApplyExecutionReport}. Always active — unlike admit-batching
@@ -404,6 +410,7 @@ public class OmsClusterIngressClient {
                         : null;
         this.erOfferQueue =
                 new ArrayBlockingQueue<>(this.config.getErOffer().getQueueCapacity());
+        meterRegistry.gauge(GAUGE_ER_OFFER_QUEUE_DEPTH, this, OmsClusterIngressClient::erOfferQueueDepth);
     }
 
     private static EnumMap<Outcome, Timer> registerTimers(MeterRegistry registry, String command) {
@@ -627,9 +634,14 @@ public class OmsClusterIngressClient {
         buffer.getBytes(0, wireBytes, 0, written);
 
         CompletableFuture<Void> waiter = new CompletableFuture<>();
+        long enqueuedAtNanos = System.nanoTime();
         PendingErSubmit submit =
                 new PendingErSubmit(
-                        wireBytes, written, System.nanoTime() + timeout.toNanos(), waiter);
+                        wireBytes,
+                        written,
+                        enqueuedAtNanos,
+                        enqueuedAtNanos + timeout.toNanos(),
+                        waiter);
 
         if (closing) {
             return CompletableFuture.failedFuture(
@@ -644,6 +656,7 @@ public class OmsClusterIngressClient {
         }
         // Non-blocking back-pressure: fail fast so venue-egress can throttle via erOfferQueueDepth()
         // and re-queue completions instead of parking virtual threads on a full queue.
+        recordApplyErOfferRoundTrip(enqueuedAtNanos, Outcome.TIMEOUT);
         return CompletableFuture.failedFuture(
                 new TimeoutException(
                         "ER-offer queue full for correlationId=" + cmd.correlationId()));
@@ -654,45 +667,36 @@ public class OmsClusterIngressClient {
         Objects.requireNonNull(cmd, "cmd");
         Objects.requireNonNull(timeout, "timeout");
 
-        Timer.Sample sample = Timer.start(meterRegistry);
-        Outcome outcome = Outcome.ERROR;
+        // commit_round_trip for apply_execution_report is recorded when the ER daemon completes the
+        // Aeron offer (see recordApplyErOfferRoundTrip) — including for this blocking wrapper.
+        CompletableFuture<Void> waiter = submitApplyExecutionReportAsync(cmd, timeout);
+        long deadlineNanos = System.nanoTime() + timeout.toNanos();
+        long remainingNanos = deadlineNanos - System.nanoTime();
+        if (remainingNanos <= 0L) {
+            if (waiter.isDone() && !waiter.isCompletedExceptionally()) {
+                return;
+            }
+            throw new TimeoutException(
+                    "ER-offer timeout for correlationId=" + cmd.correlationId());
+        }
         try {
-            CompletableFuture<Void> waiter = submitApplyExecutionReportAsync(cmd, timeout);
-            long deadlineNanos = System.nanoTime() + timeout.toNanos();
-            long remainingNanos = deadlineNanos - System.nanoTime();
-            if (remainingNanos <= 0L) {
-                if (waiter.isDone() && !waiter.isCompletedExceptionally()) {
-                    outcome = Outcome.COMMIT;
-                    return;
-                }
-                outcome = Outcome.TIMEOUT;
-                throw new TimeoutException(
-                        "ER-offer timeout for correlationId=" + cmd.correlationId());
+            waiter.get(remainingNanos, TimeUnit.NANOSECONDS);
+        } catch (java.util.concurrent.TimeoutException e) {
+            throw new TimeoutException(
+                    "ER-offer timeout for correlationId=" + cmd.correlationId());
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof InterruptedException ie) {
+                throw ie;
             }
-            try {
-                waiter.get(remainingNanos, TimeUnit.NANOSECONDS);
-                outcome = Outcome.COMMIT;
-            } catch (java.util.concurrent.TimeoutException e) {
-                outcome = Outcome.TIMEOUT;
-                throw new TimeoutException(
-                        "ER-offer timeout for correlationId=" + cmd.correlationId());
-            } catch (ExecutionException e) {
-                Throwable cause = e.getCause();
-                if (cause instanceof InterruptedException ie) {
-                    throw ie;
-                }
-                if (cause instanceof TimeoutException te) {
-                    outcome = Outcome.TIMEOUT;
-                    throw te;
-                }
-                if (cause instanceof RuntimeException re) {
-                    throw re;
-                }
-                throw new RuntimeException(
-                        "ER-offer unexpected failure for correlationId=" + cmd.correlationId(), cause);
+            if (cause instanceof TimeoutException te) {
+                throw te;
             }
-        } finally {
-            sample.stop(applyExecutionReportTimers.get(outcome));
+            if (cause instanceof RuntimeException re) {
+                throw re;
+            }
+            throw new RuntimeException(
+                    "ER-offer unexpected failure for correlationId=" + cmd.correlationId(), cause);
         }
     }
 
@@ -1503,6 +1507,7 @@ public class OmsClusterIngressClient {
                         backPressured = true;
                         break;
                     }
+                    recordApplyErOfferRoundTrip(current, Outcome.COMMIT);
                     current.future().complete(null);
                     offersSinceInterleave++;
                     offersSinceInterleave =
@@ -1533,6 +1538,7 @@ public class OmsClusterIngressClient {
                             backPressured = true;
                             break;
                         }
+                        recordApplyErOfferRoundTrip(ext, Outcome.COMMIT);
                         ext.future().complete(null);
                         offersSinceInterleave++;
                         offersSinceInterleave =
@@ -1568,7 +1574,29 @@ public class OmsClusterIngressClient {
     }
 
     private void failErSubmit(PendingErSubmit submit, Throwable cause) {
+        recordApplyErOfferRoundTrip(submit, outcomeForErFailure(cause));
         submit.future().completeExceptionally(cause);
+    }
+
+    private static Outcome outcomeForErFailure(Throwable cause) {
+        if (cause instanceof TimeoutException) {
+            return Outcome.TIMEOUT;
+        }
+        return Outcome.ERROR;
+    }
+
+    private void recordApplyErOfferRoundTrip(PendingErSubmit submit, Outcome outcome) {
+        recordApplyErOfferRoundTrip(submit.enqueuedAtNanos(), outcome);
+    }
+
+    private void recordApplyErOfferRoundTrip(long enqueuedAtNanos, Outcome outcome) {
+        long elapsedNanos = System.nanoTime() - enqueuedAtNanos;
+        if (elapsedNanos < 0L) {
+            elapsedNanos = 0L;
+        }
+        applyExecutionReportTimers
+                .get(outcome)
+                .record(elapsedNanos, java.util.concurrent.TimeUnit.NANOSECONDS);
     }
 
     /**

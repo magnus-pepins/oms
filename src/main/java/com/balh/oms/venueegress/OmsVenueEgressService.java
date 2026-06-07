@@ -12,6 +12,7 @@ import com.balh.oms.config.OmsConfig;
 import com.balh.oms.config.OmsProfiles;
 import com.balh.oms.domain.RejectCode;
 import com.balh.oms.observability.metrics.OmsPipelineMetrics;
+import com.balh.oms.observability.metrics.OmsVenueEgressPipelineMetrics;
 import com.balh.oms.venue.VenueGrpcExecutionReportMapper;
 import com.balh.oms.routing.VenueRoutingSymbols;
 import com.balh.oms.venue.VenueRouteOrderClient;
@@ -21,6 +22,7 @@ import io.aeron.Aeron;
 import io.aeron.Subscription;
 import io.aeron.archive.client.AeronArchive;
 import io.aeron.logbuffer.FragmentHandler;
+import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
@@ -49,6 +51,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedTransferQueue;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
@@ -1594,6 +1597,8 @@ public class OmsVenueEgressService {
          */
         private final ConcurrentLinkedQueue<ErCompletion> erCompletionQueue = new ConcurrentLinkedQueue<>();
         private final AtomicBoolean erCompletionFlushScheduled = new AtomicBoolean(false);
+        private final AtomicInteger lastEffectiveDispatchCapacity = new AtomicInteger(0);
+        private final Counter dispatchThrottledTotal;
 
         private record ErCompletion(
                 OrderAdmittedEvent ev,
@@ -1615,6 +1620,16 @@ public class OmsVenueEgressService {
                     venueCfg.getBacklogThrottleErSoftCapPermitMultiplier();
             this.backlogThrottleParkNanos = venueCfg.getBacklogThrottleParkNanos();
             this.permits = new Semaphore(maxInFlight);
+            this.dispatchThrottledTotal =
+                    Counter.builder(OmsVenueEgressPipelineMetrics.COUNTER_DISPATCH_THROTTLED)
+                            .description(
+                                    "Replay-thread parks in awaitDispatchCapacity because in-flight fragments"
+                                            + " reached the backlog-throttled effective cap (below maxPendingFragments).")
+                            .register(meterRegistry);
+            meterRegistry.gauge(
+                    OmsVenueEgressPipelineMetrics.GAUGE_EFFECTIVE_DISPATCH_CAPACITY,
+                    lastEffectiveDispatchCapacity,
+                    AtomicInteger::get);
             // Virtual-thread per ER completion: cluster offer back-pressure parks the carrier
             // without exhausting a fixed platform pool (observed @ 150+ admits/s with
             // maxInFlight=512 — platform pool threads blocked in offerWithBackpressure stalled
@@ -1668,6 +1683,16 @@ public class OmsVenueEgressService {
                     venueCfg.getBacklogThrottleErSoftCapPermitMultiplier();
             this.backlogThrottleParkNanos = venueCfg.getBacklogThrottleParkNanos();
             this.permits = new Semaphore(maxInFlight);
+            this.dispatchThrottledTotal =
+                    Counter.builder(OmsVenueEgressPipelineMetrics.COUNTER_DISPATCH_THROTTLED)
+                            .description(
+                                    "Replay-thread parks in awaitDispatchCapacity because in-flight fragments"
+                                            + " reached the backlog-throttled effective cap (below maxPendingFragments).")
+                            .register(meterRegistry);
+            meterRegistry.gauge(
+                    OmsVenueEgressPipelineMetrics.GAUGE_EFFECTIVE_DISPATCH_CAPACITY,
+                    lastEffectiveDispatchCapacity,
+                    AtomicInteger::get);
             this.erSubmitExecutor = erSubmitExecutor;
             this.ownedErSubmitExecutor = null;
             this.cursorDrainExecutor = cursorDrainExecutor;
@@ -1725,8 +1750,12 @@ public class OmsVenueEgressService {
             while (true) {
                 int inFlight = tracker.inFlight();
                 int effectiveCap = effectiveDispatchCapacity(inFlight, currentErOfferQueueDepth());
+                lastEffectiveDispatchCapacity.set(effectiveCap);
                 if (inFlight < effectiveCap) {
                     return;
+                }
+                if (effectiveCap < maxPendingFragments) {
+                    dispatchThrottledTotal.increment();
                 }
                 drainContiguous();
                 if (!running.get()) {

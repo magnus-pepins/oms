@@ -3,6 +3,7 @@ package com.balh.oms.venueegress;
 import com.balh.oms.cluster.OmsClusterIngressClient;
 import com.balh.oms.cluster.OrderAdmittedEvent;
 import com.balh.oms.config.OmsConfig;
+import com.balh.oms.observability.metrics.OmsVenueEgressPipelineMetrics;
 import com.balh.oms.venue.VenueRouteOrderClient;
 import com.balh.oms.venue.VenueRouteTransportException;
 import com.balh.venue.grpc.v1.ExecType;
@@ -525,11 +526,12 @@ class OmsVenueEgressPipelineTest {
         config.getCluster().getVenueEgress().setBacklogThrottleMaxInFlight(1);
         config.getCluster().getVenueEgress().setBacklogThrottlePendingRouteThreshold(1);
         config.getCluster().getVenueEgress().setBacklogThrottleParkNanos(10_000L);
+        SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
         service =
                 new OmsVenueEgressService(
                         config,
                         cursorRepository,
-                        new SimpleMeterRegistry(),
+                        meterRegistry,
                         new ObjectMapper(),
                         Clock.systemUTC(),
                         routeClient,
@@ -557,6 +559,11 @@ class OmsVenueEgressPipelineTest {
         throttledDispatch.start();
         Thread.sleep(80L);
         assertThat(throttledDispatch.isAlive()).isTrue();
+        assertThat(
+                        meterRegistry.find(OmsVenueEgressPipelineMetrics.COUNTER_DISPATCH_THROTTLED)
+                                .counter())
+                .isNotNull()
+                .satisfies(c -> assertThat(c.count()).isGreaterThan(0.0));
 
         f1.complete(Optional.of(er(ev1)));
         throttledDispatch.join(2_000L);

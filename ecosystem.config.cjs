@@ -527,6 +527,10 @@ const apps = [
       OMS_PROJECTOR_SKIP_VENUE_CONTROL_BUYING_POWER_EVAL: 'true',
       // Pop bench throughput: skip domain_event_outbox OrderAccepted INSERT on PREDMKT/* fresh admits.
       OMS_PROJECTOR_SKIP_VENUE_ORDER_ACCEPTED_OUTBOX: 'true',
+      // Replay drain @ 16k admit/s: 4096 frags/poll (mirrors oms-venue-egress); deeper apply queue
+      // so replay.poll does not block behind Postgres COMMIT while catch-up batches drain.
+      OMS_POSTGRES_PROJECTOR_FRAGMENT_LIMIT: '4096',
+      OMS_POSTGRES_PROJECTOR_APPLY_QUEUE_BATCH_CAPACITY: '96',
     },
     ...COMMON_PM2,
   },

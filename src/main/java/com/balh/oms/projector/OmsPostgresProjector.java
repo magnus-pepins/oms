@@ -1499,12 +1499,19 @@ public class OmsPostgresProjector {
     }
 
     /**
-     * Amortizes {@code replay.poll} syscall overhead at 5k–10k admits/s. Operators may set a lower
-     * configured limit; production floors at 2048 frags/poll — mirrors
-     * {@code OmsVenueEgressService#effectiveReplayFragmentLimit}.
+     * Production floor for {@code replay.poll} batch size. At 16k admit/s on pop, 2048 frags/poll
+     * left {@code projector_wall_lag_ms} climbing while {@code ingress_cluster_accept} stayed low;
+     * 4096 halves poll syscall rate — mirrors
+     * {@link com.balh.oms.venueegress.OmsVenueEgressService#MIN_REPLAY_FRAGMENT_LIMIT_FOR_HIGH_ADMIT_DRAIN}.
+     */
+    static final int MIN_REPLAY_FRAGMENT_LIMIT_FOR_HIGH_ADMIT_DRAIN = 4096;
+
+    /**
+     * Amortizes {@code replay.poll} syscall overhead at 10k–16k admits/s. Operators may set a lower
+     * configured limit; production floors at {@link #MIN_REPLAY_FRAGMENT_LIMIT_FOR_HIGH_ADMIT_DRAIN}.
      */
     static int effectiveFragmentLimit(int configuredLimit) {
-        return Math.max(configuredLimit, 2048);
+        return Math.max(configuredLimit, MIN_REPLAY_FRAGMENT_LIMIT_FOR_HIGH_ADMIT_DRAIN);
     }
 
     /**

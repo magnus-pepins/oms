@@ -39,6 +39,7 @@ import java.util.UUID;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
@@ -71,7 +72,9 @@ public class VenueRouteOrderClient {
      */
     private static final long WRITE_LOOP_IDLE_PARK_NANOS = MILLISECONDS.toNanos(1L);
     /** Max ordered {@code onNext} calls per ready window before re-checking flow control. */
-    private static final int MAX_WRITES_PER_READY_WINDOW = 64;
+    private static final int MAX_WRITES_PER_READY_WINDOW = 256;
+    /** Parallel demux of inbound stream acks so gRPC netty threads return before {@code future.complete}. */
+    private static final int RESPONSE_DEMUX_POOL_SIZE = 4;
 
     private final ManagedChannel channel;
     private final VenueOrderServiceGrpc.VenueOrderServiceBlockingStub blockingStub;
@@ -91,6 +94,7 @@ public class VenueRouteOrderClient {
     private volatile StreamObserver<RouteOrderRequest> requestObserver;
     private volatile boolean shuttingDown;
     private final Thread writeThread;
+    private final ExecutorService responseDemuxExecutor;
     private ScheduledExecutorService routeTimeoutScheduler;
 
     private record QueuedWrite(RouteOrderRequest request, String orderId) {}
@@ -112,6 +116,14 @@ public class VenueRouteOrderClient {
                 new Thread(this::writeLoop, "venue-route-stream-writer");
         this.writeThread.setDaemon(true);
         this.writeThread.start();
+        this.responseDemuxExecutor =
+                Executors.newFixedThreadPool(
+                        RESPONSE_DEMUX_POOL_SIZE,
+                        r -> {
+                            Thread t = new Thread(r, "venue-route-stream-demux");
+                            t.setDaemon(true);
+                            return t;
+                        });
         routeTimeoutScheduler()
                 .scheduleAtFixedRate(
                         this::sweepAckTimeouts,
@@ -217,22 +229,29 @@ public class VenueRouteOrderClient {
                 LockSupport.parkNanos(WRITE_LOOP_IDLE_PARK_NANOS);
                 continue;
             }
-            writeOne(item);
+            while (item != null && !shuttingDown) {
+                item = writeOne(item);
+            }
         }
     }
 
-    private void writeOne(QueuedWrite item) {
+    /**
+     * Writes {@code item} and, while outbound flow control allows, drains additional queued writes
+     * without releasing {@link #streamLock}. Returns the next queued item when the ready window is
+     * full but the queue still has work — caller continues without an unlock/lock trip.
+     */
+    private QueuedWrite writeOne(QueuedWrite item) {
         streamLock.lock();
         try {
             if (shuttingDown) {
                 failQueuedWriteLocked(item, new IllegalStateException("venue route client shutting down"));
-                return;
+                return null;
             }
             try {
                 ensureStreamOpenLocked();
             } catch (RuntimeException e) {
                 failQueuedWriteLocked(item, e);
-                return;
+                return null;
             }
             ClientCallStreamObserver<RouteOrderRequest> callObserver =
                     (ClientCallStreamObserver<RouteOrderRequest>) requestObserver;
@@ -242,23 +261,27 @@ public class VenueRouteOrderClient {
                 streamLock.lock();
                 if (requestObserver == null) {
                     failQueuedWriteLocked(item, new IllegalStateException("stream torn down"));
-                    return;
+                    return null;
                 }
                 callObserver = (ClientCallStreamObserver<RouteOrderRequest>) requestObserver;
             }
             if (shuttingDown) {
                 failQueuedWriteLocked(item, new IllegalStateException("venue route client shutting down"));
-                return;
+                return null;
             }
             try {
                 callObserver.onNext(item.request());
-                drainReadyWritesLocked(callObserver);
+                QueuedWrite deferred = drainReadyWritesLocked(callObserver);
+                if (deferred != null) {
+                    return deferred;
+                }
             } catch (RuntimeException e) {
                 failQueuedWriteLocked(item, e);
             }
         } finally {
             streamLock.unlock();
         }
+        return null;
     }
 
     /**
@@ -266,21 +289,28 @@ public class VenueRouteOrderClient {
      * control allows, drain additional queued writes without releasing the lock — amortises
      * {@code isReady} spins and lock trips at 10k admits/s.
      */
-    private void drainReadyWritesLocked(ClientCallStreamObserver<RouteOrderRequest> callObserver) {
+    private QueuedWrite drainReadyWritesLocked(ClientCallStreamObserver<RouteOrderRequest> callObserver) {
         int written = 0;
         while (written < MAX_WRITES_PER_READY_WINDOW && callObserver.isReady() && !shuttingDown) {
             QueuedWrite next = writeQueue.poll();
             if (next == null) {
-                return;
+                return null;
             }
             try {
                 callObserver.onNext(next.request());
                 written++;
             } catch (RuntimeException e) {
                 failQueuedWriteLocked(next, e);
-                return;
+                return null;
             }
         }
+        if (written >= MAX_WRITES_PER_READY_WINDOW && callObserver.isReady() && !shuttingDown) {
+            QueuedWrite next = writeQueue.poll();
+            if (next != null) {
+                return next;
+            }
+        }
+        return null;
     }
 
     private void failQueuedWriteLocked(QueuedWrite item, RuntimeException e) {
@@ -353,6 +383,10 @@ public class VenueRouteOrderClient {
 
         @Override
         public void onNext(RouteOrderResponse response) {
+            responseDemuxExecutor.execute(() -> completeRouteResponse(response));
+        }
+
+        private void completeRouteResponse(RouteOrderResponse response) {
             PendingRoute pr = pendingRoutes.remove(response.getOmsOrderId());
             if (pr == null) {
                 return; // late/duplicate (e.g. after a timeout already fired)
@@ -518,6 +552,7 @@ public class VenueRouteOrderClient {
         if (routeTimeoutScheduler != null) {
             routeTimeoutScheduler.shutdownNow();
         }
+        responseDemuxExecutor.shutdownNow();
         channel.shutdown();
         try {
             if (!channel.awaitTermination(2, TimeUnit.SECONDS)) {

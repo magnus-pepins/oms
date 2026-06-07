@@ -43,11 +43,11 @@ oms:
       # Async apply-queue lets replay.poll overlap Postgres COMMIT. Raise fragment-limit only when
       # projector_wall_lag_ms still climbs at steady admit RPS while ingress_cluster_accept stays low.
       poll-park-nanos: ${OMS_POSTGRES_PROJECTOR_POLL_PARK_NANOS:1000}
-      fragment-limit: ${OMS_POSTGRES_PROJECTOR_FRAGMENT_LIMIT:2048}
+      fragment-limit: ${OMS_POSTGRES_PROJECTOR_FRAGMENT_LIMIT:4096}
       max-fragments-per-commit: ${OMS_POSTGRES_PROJECTOR_MAX_FRAGMENTS_PER_COMMIT:8192}
       catch-up-lag-threshold-ms: ${OMS_POSTGRES_PROJECTOR_CATCH_UP_LAG_THRESHOLD_MS:1000}
       catch-up-max-fragments-per-commit: ${OMS_POSTGRES_PROJECTOR_CATCH_UP_MAX_FRAGMENTS_PER_COMMIT:16384}
-      apply-queue-batch-capacity: ${OMS_POSTGRES_PROJECTOR_APPLY_QUEUE_BATCH_CAPACITY:48}
+      apply-queue-batch-capacity: ${OMS_POSTGRES_PROJECTOR_APPLY_QUEUE_BATCH_CAPACITY:96}
       replay-thread-priority: ${OMS_POSTGRES_PROJECTOR_REPLAY_THREAD_PRIORITY:10}
 
 # Main HTTP port: the projector role does not serve order-accept HTTP, but Spring Boot's auto-config

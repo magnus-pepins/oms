@@ -3905,12 +3905,13 @@ public class OmsConfig {
             private static final long DEFAULT_POLL_PARK_NANOS = 1_000L;
 
             /**
-             * Default fragments per {@code replay.poll} pass. Matches venue-egress (2048): at 5k–10k
-             * admits/s a limit of 64 caps drain at ~78 Postgres COMMITs/s and
+             * Default fragments per {@code replay.poll} pass. Matches venue-egress (4096 @ 16k RPS):
+             * at 5k–10k admits/s a limit of 64 caps drain at ~78 Postgres COMMITs/s and
              * {@code projector_wall_lag_ms} climbs even when {@code ingress_cluster_accept} stays
-             * sub-ms.
+             * sub-ms. {@link com.balh.oms.projector.OmsPostgresProjector#effectiveFragmentLimit}
+             * floors configured values below 4096 on the hot replay path.
              */
-            private static final int DEFAULT_FRAGMENT_LIMIT = 2048;
+            private static final int DEFAULT_FRAGMENT_LIMIT = 4096;
 
             /**
              * Safety cap on fragments per poll-batch COMMIT at live tail. Larger batches amortise
@@ -3938,8 +3939,8 @@ public class OmsConfig {
              * {@code replay.poll}ing while Postgres COMMIT runs — overlap removes poll time from the
              * per-batch critical path at 10k admits/s.
              */
-            /** Depth for async apply queue — must cover soak burst (30s @ 10k/s) while COMMIT runs. */
-            private static final int DEFAULT_APPLY_QUEUE_BATCH_CAPACITY = 48;
+            /** Depth for async apply queue — must cover soak burst (30s @ 16k/s) while COMMIT runs. */
+            private static final int DEFAULT_APPLY_QUEUE_BATCH_CAPACITY = 96;
 
             /**
              * Concurrent apply threads that drain the queue in parallel. Each thread holds

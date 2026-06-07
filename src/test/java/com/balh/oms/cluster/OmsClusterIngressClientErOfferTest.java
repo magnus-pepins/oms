@@ -115,6 +115,43 @@ class OmsClusterIngressClientErOfferTest {
     }
 
     @Test
+    void submitApplyExecutionReportAsync_recordsCommitRoundTripWhenDaemonOffers() throws Exception {
+        SimpleMeterRegistry registry = new SimpleMeterRegistry();
+        OmsClusterIngressClient client = new OmsClusterIngressClient(newConfig(), registry);
+        AeronCluster cluster = Mockito.mock(AeronCluster.class);
+        Mockito.when(cluster.offer(Mockito.any(), Mockito.anyInt(), Mockito.anyInt())).thenReturn(1L);
+        setField(client, "client", cluster);
+        setField(client, "closing", false);
+        invokeStartErOfferDaemonLocked(client);
+
+        client.submitApplyExecutionReportAsync(sampleEr(client.nextCorrelationId()), Duration.ofSeconds(5))
+                .get(5, TimeUnit.SECONDS);
+
+        assertThat(
+                        registry.find(OmsClusterIngressClient.TIMER_NAME)
+                                .tag(
+                                        OmsClusterIngressClient.TAG_COMMAND,
+                                        OmsClusterIngressClient.COMMAND_APPLY_EXECUTION_REPORT)
+                                .tag(
+                                        OmsClusterIngressClient.TAG_OUTCOME,
+                                        OmsClusterIngressClient.Outcome.COMMIT.lowerName())
+                                .timer())
+                .isNotNull()
+                .satisfies(t -> assertThat(t.count()).isEqualTo(1L));
+        client.close();
+    }
+
+    @Test
+    void submitApplyExecutionReportAsync_registersErOfferQueueDepthGauge() {
+        SimpleMeterRegistry registry = new SimpleMeterRegistry();
+        OmsClusterIngressClient client = new OmsClusterIngressClient(newConfig(), registry);
+        assertThat(registry.find(OmsClusterIngressClient.GAUGE_ER_OFFER_QUEUE_DEPTH).gauge())
+                .isNotNull()
+                .satisfies(g -> assertThat(g.value()).isZero());
+        client.close();
+    }
+
+    @Test
     void submitApplyExecutionReportAsync_returnsBeforeDaemonOffers() throws Exception {
         OmsClusterIngressClient client = new OmsClusterIngressClient(newConfig(), new SimpleMeterRegistry());
         CountDownLatch offerStarted = new CountDownLatch(1);

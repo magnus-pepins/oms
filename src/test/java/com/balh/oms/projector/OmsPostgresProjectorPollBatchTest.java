@@ -216,7 +216,7 @@ class OmsPostgresProjectorPollBatchTest {
                 projector.createProjectingFragmentHandlerForTesting();
         Subscription replay = org.mockito.Mockito.mock(io.aeron.Subscription.class);
         AtomicInteger pollCalls = new AtomicInteger();
-        when(replay.poll(any(), eq(2048)))
+        when(replay.poll(any(), eq(4096)))
                 .thenAnswer(
                         inv -> {
                             int n = pollCalls.getAndIncrement();
@@ -254,7 +254,7 @@ class OmsPostgresProjectorPollBatchTest {
                 projector.createProjectingFragmentHandlerForTesting();
         Subscription replay = org.mockito.Mockito.mock(io.aeron.Subscription.class);
         AtomicInteger pollCalls = new AtomicInteger();
-        when(replay.poll(any(), eq(2048)))
+        when(replay.poll(any(), eq(4096)))
                 .thenAnswer(
                         inv -> {
                             return switch (pollCalls.getAndIncrement()) {
@@ -283,9 +283,10 @@ class OmsPostgresProjectorPollBatchTest {
     }
 
     @Test
-    void effectiveFragmentLimit_floorsAt2048ForHighAdmitDrain() {
-        assertThat(OmsPostgresProjector.effectiveFragmentLimit(512)).isEqualTo(2048);
-        assertThat(OmsPostgresProjector.effectiveFragmentLimit(4096)).isEqualTo(4096);
+    void effectiveFragmentLimit_floorsAt4096ForHighAdmitDrain() {
+        assertThat(OmsPostgresProjector.effectiveFragmentLimit(512)).isEqualTo(4096);
+        assertThat(OmsPostgresProjector.effectiveFragmentLimit(2048)).isEqualTo(4096);
+        assertThat(OmsPostgresProjector.effectiveFragmentLimit(8192)).isEqualTo(8192);
     }
 
     @Test
@@ -322,7 +323,7 @@ class OmsPostgresProjectorPollBatchTest {
         deliverCursorOnlyFragment(handler, 64L);
         Subscription replay = org.mockito.Mockito.mock(io.aeron.Subscription.class);
         AtomicInteger pollCalls = new AtomicInteger();
-        when(replay.poll(any(), eq(2048)))
+        when(replay.poll(any(), eq(4096)))
                 .thenAnswer(
                         inv -> {
                             if (pollCalls.getAndIncrement() == 2) {
@@ -352,7 +353,7 @@ class OmsPostgresProjectorPollBatchTest {
         deliverCursorOnlyFragment(handler, 64L);
         Subscription replay = org.mockito.Mockito.mock(io.aeron.Subscription.class);
         AtomicInteger pollCalls = new AtomicInteger();
-        when(replay.poll(any(), eq(2048)))
+        when(replay.poll(any(), eq(4096)))
                 .thenAnswer(
                         inv -> {
                             if (pollCalls.getAndIncrement() == 1) {

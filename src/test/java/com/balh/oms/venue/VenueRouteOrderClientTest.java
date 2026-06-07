@@ -118,6 +118,24 @@ class VenueRouteOrderClientTest {
     }
 
     @Test
+    void routeAdmittedOrderAsync_manyConcurrentAcksComplete() throws Exception {
+        int count = 32;
+        streamService.setResponseDelayMs(5L);
+        List<CompletableFuture<Optional<ExecutionReport>>> futures = new ArrayList<>(count);
+        for (int i = 0; i < count; i++) {
+            futures.add(client.routeAdmittedOrderAsync(admit(UUID.randomUUID(), "PREDMKT-BURST-" + i)));
+        }
+        long t0 = System.nanoTime();
+        for (CompletableFuture<Optional<ExecutionReport>> f : futures) {
+            assertThat(f.get(10, TimeUnit.SECONDS)).isPresent();
+        }
+        long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0);
+        // Parallel demux (4 threads) must beat serializing 32 delayed acks on one gRPC thread.
+        assertThat(elapsedMs).isLessThan(2_000L);
+        assertThat(streamService.receivedOrderIds()).hasSize(count);
+    }
+
+    @Test
     void routeAdmittedOrderAsync_demuxesAcksByOmsOrderId() throws Exception {
         UUID id1 = UUID.randomUUID();
         UUID id2 = UUID.randomUUID();

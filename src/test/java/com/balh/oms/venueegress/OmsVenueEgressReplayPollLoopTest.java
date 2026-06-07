@@ -195,4 +195,89 @@ class OmsVenueEgressReplayPollLoopTest {
 
         assertThat(elapsedNanos).isGreaterThanOrEqualTo(5_000L);
     }
+
+    @Test
+    void replayPollHasLagAdaptiveDrain_triggersOnExcessByteLagOrPendingRoutes() {
+        assertThat(
+                        OmsVenueEgressService.replayPollHasLagAdaptiveDrain(
+                                4096L, 4096L, 0, 256))
+                .isTrue();
+        assertThat(
+                        OmsVenueEgressService.replayPollHasLagAdaptiveDrain(
+                                100L, 4096L, 256, 256))
+                .isTrue();
+        assertThat(
+                        OmsVenueEgressService.replayPollHasLagAdaptiveDrain(
+                                100L, 4096L, 10, 256))
+                .isFalse();
+    }
+
+    @Test
+    void computeExcessReplayLagBytes_subtractsPipelinedFloor() {
+        assertThat(OmsVenueEgressService.computeExcessReplayLagBytes(10_000L, 8_000L, 512L))
+                .isEqualTo(1_488L);
+        assertThat(OmsVenueEgressService.computeExcessReplayLagBytes(10_000L, 9_800L, 512L))
+                .isZero();
+    }
+
+    @Test
+    void effectiveReplayFragmentLimit_raisesCapWhenLagAdaptiveDrainActive() {
+        assertThat(
+                        OmsVenueEgressService.effectiveReplayFragmentLimit(
+                                4096, true, 8192))
+                .isEqualTo(8192);
+        assertThat(
+                        OmsVenueEgressService.effectiveReplayFragmentLimit(
+                                4096, false, 8192))
+                .isEqualTo(4096);
+        assertThat(
+                        OmsVenueEgressService.effectiveReplayFragmentLimit(
+                                512, false, 8192))
+                .isEqualTo(4096);
+    }
+
+    @Test
+    void effectiveReplayIdleTailPolls_extendsSpinBudgetWhenLagAdaptiveDrainActive() {
+        assertThat(OmsVenueEgressService.effectiveReplayIdleTailPolls(16, true, 64)).isEqualTo(64);
+        assertThat(OmsVenueEgressService.effectiveReplayIdleTailPolls(16, false, 64)).isEqualTo(16);
+    }
+
+    @Test
+    void parkReplayIdleAfterPoll_whenLagAdaptiveByteLag_doesNotParkConfiguredSlice() {
+        service.setReplayLagAdaptiveConfigForTesting(1024L, 999, 8192, 64, 0L);
+        service.setReplayRecordingUpperBoundForTesting(20_000L);
+        service.setLastAppliedPositionForTesting(10_000L);
+
+        long before = System.nanoTime();
+        service.parkReplayIdleAfterPoll(null);
+        long elapsedNanos = System.nanoTime() - before;
+
+        assertThat(elapsedNanos).isLessThan(5_000_000L);
+    }
+
+    @Test
+    void pollReplayBurst_usesLagAdaptiveFragmentLimitWhenByteLagHigh() {
+        service.setReplayPollConfigForTesting(4096, 10_000L);
+        service.setReplayLagAdaptiveConfigForTesting(1024L, 999, 8192, 64, 0L);
+        service.setReplayRecordingUpperBoundForTesting(20_000L);
+        service.setLastAppliedPositionForTesting(10_000L);
+
+        Subscription replay = mock(Subscription.class);
+        FragmentHandler handler = (buffer, offset, length, header) -> {};
+        when(replay.poll(any(), eq(8192))).thenReturn(0);
+
+        service.pollReplayBurst(replay, handler);
+
+        verify(replay).poll(any(), eq(8192));
+    }
+
+    @Test
+    void venueEgressConfig_replayLagAdaptiveDefaults() {
+        OmsConfig.Cluster.VenueEgress cfg = new OmsConfig().getCluster().getVenueEgress();
+
+        assertThat(cfg.getReplayLagAdaptiveExcessLagBytesThreshold()).isEqualTo(4096L);
+        assertThat(cfg.getReplayLagAdaptivePendingRoutesThreshold()).isEqualTo(256);
+        assertThat(cfg.getReplayLagAdaptiveFragmentLimit()).isEqualTo(8192);
+        assertThat(cfg.getReplayLagAdaptiveIdleTailPolls()).isEqualTo(64);
+    }
 }

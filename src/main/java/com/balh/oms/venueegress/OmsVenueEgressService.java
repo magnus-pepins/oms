@@ -221,10 +221,17 @@ public class OmsVenueEgressService {
      * Cached from {@link OmsConfig.Cluster.VenueEgress} at {@link #init()} so the replay hot path
      * does not chase the config object on every {@code replay.poll}.
      */
-    /** Aligns with {@link OmsConfig.Cluster.VenueEgress} default until {@link #init()} caches config. */
+    /** Cached at {@link #init()} from config (floored); tests may override via {@link #setReplayPollConfigForTesting}. */
     private int replayFragmentLimit = 512;
     private long replayPollParkNanos = 1_000_000L;
     private int replayIdleTailPolls = 16;
+    private long replayLagAdaptiveExcessLagBytesThreshold = 4_096L;
+    private int replayLagAdaptivePendingRoutesThreshold = 256;
+    private int replayLagAdaptiveFragmentLimit = 8_192;
+    private int replayLagAdaptiveIdleTailPolls = 64;
+    private long pipelinedFloorBytes = 0L;
+    /** Archive recording write-head snapshot for lag-adaptive gating; refreshed on idle paths. */
+    private long replayRecordingUpperBound = 0L;
 
     /**
      * Design A pipeline (slice: venue egress pipelining). Non-null only when
@@ -372,6 +379,16 @@ public class OmsVenueEgressService {
         replayFragmentLimit = effectiveReplayFragmentLimit(venueEgressCfg.getFragmentLimit());
         replayPollParkNanos = venueEgressCfg.getPollParkNanos();
         replayIdleTailPolls = venueEgressCfg.getReplayIdleTailPolls();
+        replayLagAdaptiveExcessLagBytesThreshold =
+                venueEgressCfg.getReplayLagAdaptiveExcessLagBytesThreshold();
+        replayLagAdaptivePendingRoutesThreshold =
+                venueEgressCfg.getReplayLagAdaptivePendingRoutesThreshold();
+        replayLagAdaptiveFragmentLimit = venueEgressCfg.getReplayLagAdaptiveFragmentLimit();
+        replayLagAdaptiveIdleTailPolls = venueEgressCfg.getReplayLagAdaptiveIdleTailPolls();
+        pipelinedFloorBytes =
+                config.getVenue()
+                        .getAdmissionGate()
+                        .pipelinedFloorBytes(venueEgressCfg.getVenueRouteMaxInFlight());
         boolean venueWired = venueRouteOrderClient != null && clusterIngressClient != null;
         int maxInFlight = Math.max(1, config.getCluster().getVenueEgress().getVenueRouteMaxInFlight());
         if (savedCursor.isPresent()) {
@@ -738,6 +755,7 @@ public class OmsVenueEgressService {
             }
             savedPosition = lastAppliedPosition.get();
             upperBound = recordingUpperBound(archive, descriptor);
+            replayRecordingUpperBound = upperBound;
 
             Subscription replay = null;
             try {
@@ -798,8 +816,13 @@ public class OmsVenueEgressService {
                         // recording roll-forward (below).
                         pipeline.drainContiguous();
                     }
-                    int idleTailBurst = pollReplayIdleTail(replay, handler);
+                    refreshReplayRecordingUpperBound(archive, recordingIdNow);
+                    int idleTailBurst = pollReplayIdleTail(replay, handler, pipeline);
                     if (idleTailBurst > 0) {
+                        continue;
+                    }
+                    if (replayPollHasLagAdaptiveDrain(pipeline)) {
+                        parkReplayIdleAfterPoll(pipeline);
                         continue;
                     }
                     // No fragments. Three cases — mirrors OmsPostgresProjector.runReplayLoopWithRecordingWalk:
@@ -873,10 +896,15 @@ public class OmsVenueEgressService {
      * this burst (zero ⇒ caller should run idle / quiesce / walk-forward logic).
      */
     int pollReplayBurst(Subscription replay, FragmentHandler handler) {
+        return pollReplayBurst(replay, handler, pipeline);
+    }
+
+    int pollReplayBurst(Subscription replay, FragmentHandler handler, EgressRoutePipeline pipeline) {
+        int fragmentLimit = effectiveReplayFragmentLimitForDrain(pipeline);
         int total = 0;
         int polled;
         do {
-            polled = replay.poll(handler, replayFragmentLimit);
+            polled = replay.poll(handler, fragmentLimit);
             total += polled;
         } while (polled > 0 && running.get());
         if (total > 0 && pipeline != null) {
@@ -892,13 +920,23 @@ public class OmsVenueEgressService {
      * unit tests that assert the spin count without Aeron Archive.
      */
     int pollReplayIdleTail(Subscription replay, FragmentHandler handler) {
-        for (int attempt = 0; attempt < replayIdleTailPolls && running.get(); attempt++) {
+        return pollReplayIdleTail(replay, handler, pipeline);
+    }
+
+    int pollReplayIdleTail(Subscription replay, FragmentHandler handler, EgressRoutePipeline pipeline) {
+        int tailPolls =
+                effectiveReplayIdleTailPolls(
+                        replayIdleTailPolls,
+                        replayPollHasLagAdaptiveDrain(pipeline),
+                        replayLagAdaptiveIdleTailPolls);
+        for (int attempt = 0; attempt < tailPolls && running.get(); attempt++) {
             Thread.onSpinWait();
-            int polled = pollReplayBurst(replay, handler);
+            int polled = pollReplayBurst(replay, handler, pipeline);
             if (polled > 0) {
                 return polled;
             }
-            if (pipeline != null && pipeline.replayPollHasBacklog()) {
+            if (pipeline != null
+                    && (pipeline.replayPollHasBacklog() || replayPollHasLagAdaptiveDrain(pipeline))) {
                 continue;
             }
         }
@@ -912,6 +950,10 @@ public class OmsVenueEgressService {
      */
     void parkReplayIdleAfterPoll(EgressRoutePipeline pipeline) {
         if (pipeline != null && pipeline.replayPollHasBacklog()) {
+            Thread.onSpinWait();
+            return;
+        }
+        if (replayPollHasLagAdaptiveDrain(pipeline)) {
             Thread.onSpinWait();
             return;
         }
@@ -937,7 +979,77 @@ public class OmsVenueEgressService {
      * configured limit; production floors at {@link #MIN_REPLAY_FRAGMENT_LIMIT_FOR_HIGH_ADMIT_DRAIN}.
      */
     static int effectiveReplayFragmentLimit(int configuredLimit) {
-        return Math.max(configuredLimit, MIN_REPLAY_FRAGMENT_LIMIT_FOR_HIGH_ADMIT_DRAIN);
+        return effectiveReplayFragmentLimit(configuredLimit, false, MIN_REPLAY_FRAGMENT_LIMIT_FOR_HIGH_ADMIT_DRAIN);
+    }
+
+    /**
+     * Raises the poll batch above the static floor when lag-adaptive drain is active so
+     * {@code replay.poll} syscall rate drops under sustained admit load.
+     */
+    static int effectiveReplayFragmentLimit(
+            int configuredLimit, boolean lagAdaptiveDrain, int lagAdaptiveFragmentLimit) {
+        int base = Math.max(configuredLimit, MIN_REPLAY_FRAGMENT_LIMIT_FOR_HIGH_ADMIT_DRAIN);
+        if (!lagAdaptiveDrain) {
+            return base;
+        }
+        return Math.max(base, lagAdaptiveFragmentLimit);
+    }
+
+    static int effectiveReplayIdleTailPolls(
+            int configuredIdleTailPolls, boolean lagAdaptiveDrain, int lagAdaptiveIdleTailPolls) {
+        if (!lagAdaptiveDrain) {
+            return configuredIdleTailPolls;
+        }
+        return Math.max(configuredIdleTailPolls, lagAdaptiveIdleTailPolls);
+    }
+
+    static long computeExcessReplayLagBytes(
+            long recordingUpperBound, long appliedPosition, long pipelinedFloorBytes) {
+        long rawLag = Math.max(0L, recordingUpperBound - appliedPosition);
+        return Math.max(0L, rawLag - pipelinedFloorBytes);
+    }
+
+    /**
+     * Excess archive bytes ahead of the persisted egress cursor (after pipelined floor). Wired into
+     * {@link com.balh.oms.cluster.OmsClusterIngressClient} for lag-aware ER interleave.
+     */
+    long currentExcessReplayLagBytes() {
+        return computeExcessReplayLagBytes(
+                replayRecordingUpperBound, lastAppliedPosition.get(), pipelinedFloorBytes);
+    }
+
+    static boolean replayPollHasLagAdaptiveDrain(
+            long excessLagBytes,
+            long excessLagThreshold,
+            int pendingRoutes,
+            int pendingRoutesThreshold) {
+        return excessLagBytes >= excessLagThreshold || pendingRoutes >= pendingRoutesThreshold;
+    }
+
+    int effectiveReplayFragmentLimitForDrain(EgressRoutePipeline pipeline) {
+        if (!replayPollHasLagAdaptiveDrain(pipeline)) {
+            return replayFragmentLimit;
+        }
+        return Math.max(replayFragmentLimit, replayLagAdaptiveFragmentLimit);
+    }
+
+    boolean replayPollHasLagAdaptiveDrain(EgressRoutePipeline pipeline) {
+        int pendingRoutes = pipeline != null ? pipeline.pendingRoutes() : 0;
+        long excessLag =
+                computeExcessReplayLagBytes(
+                        replayRecordingUpperBound, lastAppliedPosition.get(), pipelinedFloorBytes);
+        return replayPollHasLagAdaptiveDrain(
+                excessLag,
+                replayLagAdaptiveExcessLagBytesThreshold,
+                pendingRoutes,
+                replayLagAdaptivePendingRoutesThreshold);
+    }
+
+    private void refreshReplayRecordingUpperBound(AeronArchive archive, long recordingId) {
+        RecordingDescriptor descriptor = findRecordingById(archive, recordingId);
+        if (descriptor != null) {
+            replayRecordingUpperBound = recordingUpperBound(archive, descriptor);
+        }
     }
 
     /**
@@ -1467,22 +1579,25 @@ public class OmsVenueEgressService {
     }
 
     /**
-     * Pipelined-mode cursor advance: persists the contiguous-completed prefix immediately (no batched
-     * deferral — the in-flight window already bounds how often this fires, ≤ once per poll batch). The
-     * in-flight window <em>is</em> the durability boundary, so the persisted position is exactly the
-     * highest fragment whose route + ER-submit fully completed. Runs only on the replay thread, so it
-     * shares the same single-writer guarantee as {@link #advanceCursor} for {@code
-     * pendingCursorPosition} / {@code eventsSinceCursorFlush} / {@code currentRecordingId}.
+     * Pipelined-mode cursor advance: carries the contiguous-completed prefix forward in memory and
+     * persists via the same {@link #cursorFlushEvery} batching as {@link #advanceCursor}. The
+     * in-flight window bounds how far ahead of the durable cursor completed fragments may sit; {@code
+     * cursorFlushEvery} further amortizes JDBC on the {@link #cursorDrainExecutor} drain path.
+     * Runs only on the replay / cursor-drain threads and shares the single-writer guarantee for
+     * {@code pendingCursorPosition} / {@code eventsSinceCursorFlush} / {@code currentRecordingId}.
      */
-    private void advanceCursorContiguous(long position) {
+    private void advanceCursorContiguous(long position, int fragmentCount) {
         lastAppliedPosition.set(position);
         pendingCursorPosition = position;
-        eventsSinceCursorFlush = 0;
-        cursorRepository.advanceWithRecording(
-                EGRESS_ID,
-                OmsClusterWireFormat.EVENTS_STREAM_ID,
-                requireCurrentRecordingId(),
-                position);
+        eventsSinceCursorFlush += fragmentCount;
+        if (eventsSinceCursorFlush >= cursorFlushEvery) {
+            cursorRepository.advanceWithRecording(
+                    EGRESS_ID,
+                    OmsClusterWireFormat.EVENTS_STREAM_ID,
+                    requireCurrentRecordingId(),
+                    position);
+            eventsSinceCursorFlush = 0;
+        }
     }
 
     /**
@@ -2118,13 +2233,18 @@ public class OmsVenueEgressService {
             return routeOfferQueue != null && !routeOfferQueue.isEmpty();
         }
 
+        int pendingRoutes() {
+            return tracker.inFlight();
+        }
+
         /** Advance the cursor over whatever contiguous prefix has completed since last call. */
         void drainContiguous() {
             synchronized (contiguousDrainLock) {
-                OptionalLong contiguous = tracker.pollContiguous();
-                if (contiguous.isPresent()) {
-                    advanceCursorContiguous(contiguous.getAsLong());
-                }
+                tracker.pollContiguous()
+                        .ifPresent(
+                                drain ->
+                                        advanceCursorContiguous(
+                                                drain.position(), drain.fragmentCount()));
             }
         }
 
@@ -2198,6 +2318,32 @@ public class OmsVenueEgressService {
         this.replayFragmentLimit = fragmentLimit;
         this.replayPollParkNanos = pollParkNanos;
         this.replayIdleTailPolls = idleTailPolls;
+    }
+
+    void setReplayLagAdaptiveConfigForTesting(
+            long excessLagBytesThreshold,
+            int pendingRoutesThreshold,
+            int lagAdaptiveFragmentLimit,
+            int lagAdaptiveIdleTailPolls,
+            long pipelinedFloorBytes) {
+        this.replayLagAdaptiveExcessLagBytesThreshold = excessLagBytesThreshold;
+        this.replayLagAdaptivePendingRoutesThreshold = pendingRoutesThreshold;
+        this.replayLagAdaptiveFragmentLimit = lagAdaptiveFragmentLimit;
+        this.replayLagAdaptiveIdleTailPolls = lagAdaptiveIdleTailPolls;
+        this.pipelinedFloorBytes = pipelinedFloorBytes;
+    }
+
+    void setReplayRecordingUpperBoundForTesting(long upperBound) {
+        this.replayRecordingUpperBound = upperBound;
+    }
+
+    void setLastAppliedPositionForTesting(long position) {
+        lastAppliedPosition.set(position);
+    }
+
+    void setCursorFlushEveryForTesting(int every) {
+        cursorFlushEvery = Math.max(1, every);
+        eventsSinceCursorFlush = 0;
     }
 
     EgressRoutePipeline pipelineForTesting() {

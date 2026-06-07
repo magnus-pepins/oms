@@ -3561,6 +3561,31 @@ public class OmsConfig {
              */
             private static final int DEFAULT_REPLAY_IDLE_TAIL_POLLS = 16;
 
+            /**
+             * Excess archive byte lag ({@code recordingUpperBound − applied − pipelinedFloor}) above
+             * which the replay loop enters lag-adaptive drain: spin-yield instead of park, larger
+             * {@code replay.poll} batches, extended idle-tail spins. Aligns with
+             * {@link com.balh.oms.ingress.OmsVenueEgressLagPublisher#GAUGE_LAG_BYTES} gate band.
+             */
+            private static final long DEFAULT_REPLAY_LAG_ADAPTIVE_EXCESS_LAG_BYTES_THRESHOLD = 4_096L;
+
+            /**
+             * {@code oms.venue.egress.pipeline.pending.routes} watermark for lag-adaptive drain when
+             * byte lag is still below threshold but route completions are backing up.
+             */
+            private static final int DEFAULT_REPLAY_LAG_ADAPTIVE_PENDING_ROUTES_THRESHOLD = 256;
+
+            /**
+             * Raised {@code replay.poll} fragment cap while lag-adaptive drain is active (static floor
+             * remains {@link #DEFAULT_FRAGMENT_LIMIT} on bench hosts).
+             */
+            private static final int DEFAULT_REPLAY_LAG_ADAPTIVE_FRAGMENT_LIMIT = 8_192;
+
+            /**
+             * Extended {@code pollReplayIdleTail} spin budget while lag-adaptive drain is active.
+             */
+            private static final int DEFAULT_REPLAY_LAG_ADAPTIVE_IDLE_TAIL_POLLS = 64;
+
             private boolean enabled = false;
             private String aeronDirectory = "";
             private String archiveControlRequestChannel = "aeron:ipc?term-length=64k";
@@ -3584,6 +3609,12 @@ public class OmsConfig {
             private long backlogThrottleParkNanos = DEFAULT_BACKLOG_THROTTLE_PARK_NANOS;
             private int replayThreadPriority = DEFAULT_REPLAY_THREAD_PRIORITY;
             private int replayIdleTailPolls = DEFAULT_REPLAY_IDLE_TAIL_POLLS;
+            private long replayLagAdaptiveExcessLagBytesThreshold =
+                    DEFAULT_REPLAY_LAG_ADAPTIVE_EXCESS_LAG_BYTES_THRESHOLD;
+            private int replayLagAdaptivePendingRoutesThreshold =
+                    DEFAULT_REPLAY_LAG_ADAPTIVE_PENDING_ROUTES_THRESHOLD;
+            private int replayLagAdaptiveFragmentLimit = DEFAULT_REPLAY_LAG_ADAPTIVE_FRAGMENT_LIMIT;
+            private int replayLagAdaptiveIdleTailPolls = DEFAULT_REPLAY_LAG_ADAPTIVE_IDLE_TAIL_POLLS;
             private int venueRejectSubmitMaxAttempts = DEFAULT_VENUE_REJECT_SUBMIT_MAX_ATTEMPTS;
             private long venueRejectSubmitRetryBackoffMs = DEFAULT_VENUE_REJECT_SUBMIT_RETRY_BACKOFF_MS;
 
@@ -3644,6 +3675,14 @@ public class OmsConfig {
                 this.recordingLookupParkMs = Math.max(10L, recordingLookupParkMs);
             }
 
+            /**
+             * Fragments applied between Postgres UPSERTs to {@code oms_venue_egress_cursor}. Default
+             * {@code 1} preserves the per-fragment durability contract (smallest crash replay window;
+             * the venue dedupes redelivered {@code RouteOrder}s). Values {@code N>1} batch the cursor
+             * advance to cut JDBC pressure on {@code cursorDrainExecutor} during pipelined ER
+             * completion storms, widening the replay window to up to {@code N-1} fragments per crash.
+             * Env: {@code OMS_CLUSTER_VENUE_EGRESS_CURSOR_FLUSH_EVERY}.
+             */
             public int getCursorFlushEvery() { return cursorFlushEvery; }
             public void setCursorFlushEvery(int cursorFlushEvery) {
                 this.cursorFlushEvery = Math.max(1, cursorFlushEvery);
@@ -3741,6 +3780,39 @@ public class OmsConfig {
             public int getReplayIdleTailPolls() { return replayIdleTailPolls; }
             public void setReplayIdleTailPolls(int replayIdleTailPolls) {
                 this.replayIdleTailPolls = Math.max(1, replayIdleTailPolls);
+            }
+
+            public long getReplayLagAdaptiveExcessLagBytesThreshold() {
+                return replayLagAdaptiveExcessLagBytesThreshold;
+            }
+
+            public void setReplayLagAdaptiveExcessLagBytesThreshold(long replayLagAdaptiveExcessLagBytesThreshold) {
+                this.replayLagAdaptiveExcessLagBytesThreshold =
+                        replayLagAdaptiveExcessLagBytesThreshold > 0L
+                                ? replayLagAdaptiveExcessLagBytesThreshold
+                                : DEFAULT_REPLAY_LAG_ADAPTIVE_EXCESS_LAG_BYTES_THRESHOLD;
+            }
+
+            public int getReplayLagAdaptivePendingRoutesThreshold() {
+                return replayLagAdaptivePendingRoutesThreshold;
+            }
+
+            public void setReplayLagAdaptivePendingRoutesThreshold(int replayLagAdaptivePendingRoutesThreshold) {
+                this.replayLagAdaptivePendingRoutesThreshold =
+                        Math.max(1, replayLagAdaptivePendingRoutesThreshold);
+            }
+
+            public int getReplayLagAdaptiveFragmentLimit() { return replayLagAdaptiveFragmentLimit; }
+            public void setReplayLagAdaptiveFragmentLimit(int replayLagAdaptiveFragmentLimit) {
+                this.replayLagAdaptiveFragmentLimit =
+                        replayLagAdaptiveFragmentLimit > 0
+                                ? replayLagAdaptiveFragmentLimit
+                                : DEFAULT_REPLAY_LAG_ADAPTIVE_FRAGMENT_LIMIT;
+            }
+
+            public int getReplayLagAdaptiveIdleTailPolls() { return replayLagAdaptiveIdleTailPolls; }
+            public void setReplayLagAdaptiveIdleTailPolls(int replayLagAdaptiveIdleTailPolls) {
+                this.replayLagAdaptiveIdleTailPolls = Math.max(1, replayLagAdaptiveIdleTailPolls);
             }
 
             public int getVenueRejectSubmitMaxAttempts() { return venueRejectSubmitMaxAttempts; }
@@ -4338,7 +4410,7 @@ public class OmsConfig {
                  * when venue-egress virtual-thread completions flood the ingress client at 400+
                  * routes/s.
                  */
-                private static final int DEFAULT_MAX_PER_LOCK_PASS = 512;
+                private static final int DEFAULT_MAX_PER_LOCK_PASS = 1_024;
                 private static final long DEFAULT_DRAIN_INTERVAL_NANOS = 1_000L;
                 private static final long DEFAULT_ENQUEUE_PARK_NANOS = 1_000L;
                 /**
@@ -4348,9 +4420,13 @@ public class OmsConfig {
                 private static final int DEFAULT_INTERLEAVE_POLL_CAP = 8;
                 /**
                  * ER_OFFER_ONLY: poll egress every N successful offers during a burst (not every offer).
-                 * At 16k/s, per-offer interleave dominated lock hold time and ER queue depth.
+                 * Lower N drains cluster egress more often during ER floods without per-offer poll cost.
                  */
-                private static final int DEFAULT_INTERLEAVE_POLL_EVERY_OFFERS = 16;
+                private static final int DEFAULT_INTERLEAVE_POLL_EVERY_OFFERS = 4;
+                private static final boolean DEFAULT_INTERLEAVE_LAG_AWARE_ENABLED = true;
+                private static final long DEFAULT_INTERLEAVE_LAG_BYTES_THRESHOLD = 4_096L;
+                private static final int DEFAULT_INTERLEAVE_LAG_AWARE_QUEUE_DEPTH_THRESHOLD = 256;
+                private static final int DEFAULT_INTERLEAVE_LAG_AWARE_POLL_EVERY_OFFERS = 1;
 
                 private int queueCapacity = DEFAULT_QUEUE_CAPACITY;
                 private int maxPerLockPass = DEFAULT_MAX_PER_LOCK_PASS;
@@ -4358,6 +4434,12 @@ public class OmsConfig {
                 private long enqueueParkNanos = DEFAULT_ENQUEUE_PARK_NANOS;
                 private int interleavePollCap = DEFAULT_INTERLEAVE_POLL_CAP;
                 private int interleavePollEveryOffers = DEFAULT_INTERLEAVE_POLL_EVERY_OFFERS;
+                private boolean interleaveLagAwareEnabled = DEFAULT_INTERLEAVE_LAG_AWARE_ENABLED;
+                private long interleaveLagBytesThreshold = DEFAULT_INTERLEAVE_LAG_BYTES_THRESHOLD;
+                private int interleaveLagAwareQueueDepthThreshold =
+                        DEFAULT_INTERLEAVE_LAG_AWARE_QUEUE_DEPTH_THRESHOLD;
+                private int interleaveLagAwarePollEveryOffers =
+                        DEFAULT_INTERLEAVE_LAG_AWARE_POLL_EVERY_OFFERS;
 
                 public int getQueueCapacity() { return queueCapacity; }
                 public void setQueueCapacity(int queueCapacity) {
@@ -4387,6 +4469,34 @@ public class OmsConfig {
                 public int getInterleavePollEveryOffers() { return interleavePollEveryOffers; }
                 public void setInterleavePollEveryOffers(int interleavePollEveryOffers) {
                     this.interleavePollEveryOffers = Math.max(1, interleavePollEveryOffers);
+                }
+
+                public boolean isInterleaveLagAwareEnabled() { return interleaveLagAwareEnabled; }
+                public void setInterleaveLagAwareEnabled(boolean interleaveLagAwareEnabled) {
+                    this.interleaveLagAwareEnabled = interleaveLagAwareEnabled;
+                }
+
+                public long getInterleaveLagBytesThreshold() { return interleaveLagBytesThreshold; }
+                public void setInterleaveLagBytesThreshold(long interleaveLagBytesThreshold) {
+                    this.interleaveLagBytesThreshold =
+                            interleaveLagBytesThreshold > 0L
+                                    ? interleaveLagBytesThreshold
+                                    : DEFAULT_INTERLEAVE_LAG_BYTES_THRESHOLD;
+                }
+
+                public int getInterleaveLagAwareQueueDepthThreshold() {
+                    return interleaveLagAwareQueueDepthThreshold;
+                }
+                public void setInterleaveLagAwareQueueDepthThreshold(int threshold) {
+                    this.interleaveLagAwareQueueDepthThreshold = Math.max(1, threshold);
+                }
+
+                public int getInterleaveLagAwarePollEveryOffers() {
+                    return interleaveLagAwarePollEveryOffers;
+                }
+                public void setInterleaveLagAwarePollEveryOffers(int interleaveLagAwarePollEveryOffers) {
+                    this.interleaveLagAwarePollEveryOffers =
+                            Math.max(1, interleaveLagAwarePollEveryOffers);
                 }
             }
         }

@@ -1549,6 +1549,12 @@ public class OmsVenueEgressService {
          */
         private static final int PENDING_FRAGMENT_CAP_MULTIPLIER = 6;
 
+        /** ER frames handed to the ingress client per coalesced completion flush (one daemon wake). */
+        private static final int ER_COMPLETION_FLUSH_BATCH_CAP = 512;
+
+        /** Soft ER-backlog dispatch cap as a multiple of venue-route permits (see effectiveDispatchCapacity). */
+        private static final int ER_BACKLOG_SOFT_CAP_MULTIPLIER = 5;
+
         private final int maxInFlight;
         private final int maxPendingFragments;
         private final int backlogThrottlePendingRouteThreshold;
@@ -1756,10 +1762,10 @@ public class OmsVenueEgressService {
                 return Math.max(1, Math.min(maxPendingFragments, backlogThrottleMaxInFlight));
             }
             if (erOfferBacklogged) {
-                // ER deep but venue still has permits: soft cap (4× permits) — full 6× inflated
-                // meanRouteMs on 10k soak after an 8k step (observed 614 ms); hard 512 cap inflated
-                // egress_wall_lag on clean 10k profile (observed 601 ms pre-fix).
-                int erBacklogCap = Math.min(maxPendingFragments, maxInFlight * 4);
+                // ER deep but venue still has permits: soft cap — full 6× inflated meanRouteMs on
+                // sequential soak steps; hard 512 cap inflated clean 10k profile (601 ms pre-fix).
+                int erBacklogCap =
+                        Math.min(maxPendingFragments, maxInFlight * ER_BACKLOG_SOFT_CAP_MULTIPLIER);
                 return Math.max(backlogThrottleMaxInFlight, erBacklogCap);
             }
             return maxPendingFragments;
@@ -1863,17 +1869,22 @@ public class OmsVenueEgressService {
          * {@link #onErSubmitSucceeded} advances the tracker when each async offer completes.
          */
         private void runScheduledErCompletionFlush() {
+            clusterIngressClient.openErOfferBatch();
             try {
                 ErCompletion item;
-                while ((item = erCompletionQueue.poll()) != null) {
+                int flushed = 0;
+                while ((item = erCompletionQueue.poll()) != null
+                        && flushed < ER_COMPLETION_FLUSH_BATCH_CAP) {
                     if (!dispatchErCompletionAsync(item)) {
                         // Mirror serial replay semantics: stop this flush pass so a synchronously
                         // failed offer is not immediately re-polled in the same loop.
                         erCompletionQueue.add(item);
                         break;
                     }
+                    flushed++;
                 }
             } finally {
+                clusterIngressClient.closeErOfferBatch();
                 erCompletionFlushScheduled.set(false);
                 if (!erCompletionQueue.isEmpty()) {
                     scheduleErCompletionFlush();

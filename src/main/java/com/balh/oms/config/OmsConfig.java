@@ -4270,7 +4270,7 @@ public class OmsConfig {
                  * when venue-egress virtual-thread completions flood the ingress client at 400+
                  * routes/s.
                  */
-                private static final int DEFAULT_MAX_PER_LOCK_PASS = 512;
+                private static final int DEFAULT_MAX_PER_LOCK_PASS = 1024;
                 private static final long DEFAULT_DRAIN_INTERVAL_NANOS = 1_000L;
                 private static final long DEFAULT_ENQUEUE_PARK_NANOS = 1_000L;
 

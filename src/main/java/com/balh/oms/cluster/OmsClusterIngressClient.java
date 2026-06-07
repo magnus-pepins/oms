@@ -305,6 +305,14 @@ public class OmsClusterIngressClient {
      */
     private final BlockingQueue<PendingErSubmit> erOfferQueue;
     private volatile Thread erOfferDaemonThread;
+    /**
+     * When &gt; 0, {@link #submitApplyExecutionReportAsync} enqueues without waking the daemon;
+     * {@link #closeErOfferBatch()} signals once if any frame was queued in the outermost batch.
+     */
+    private final ThreadLocal<Integer> erOfferBatchDepth = ThreadLocal.withInitial(() -> 0);
+    private final ThreadLocal<Boolean> erOfferBatchPendingSignal = ThreadLocal.withInitial(() -> false);
+    private final java.util.concurrent.atomic.AtomicInteger erOfferSignalCountForTest =
+            new java.util.concurrent.atomic.AtomicInteger();
 
     // ---- Phase 4 slice 4c: commit-round-trip timer ----
     // Single timer name `oms.cluster.client.commit_round_trip` covers both submit methods so a
@@ -620,7 +628,7 @@ public class OmsClusterIngressClient {
             return CompletableFuture.failedFuture(new InterruptedException());
         }
         if (erOfferQueue.offer(submit)) {
-            signalErOfferDaemon();
+            notifyErOfferDaemonAfterEnqueue();
             return waiter;
         }
         // Non-blocking back-pressure: fail fast so venue-egress can throttle via erOfferQueueDepth()
@@ -1197,12 +1205,48 @@ public class OmsClusterIngressClient {
         }
     }
 
+    /** Begin a batched ER enqueue (e.g. coalesced venue-egress completion flush). */
+    public void openErOfferBatch() {
+        erOfferBatchDepth.set(erOfferBatchDepth.get() + 1);
+    }
+
+    /** End the outermost batch and wake the ER daemon once if any frame was queued. */
+    public void closeErOfferBatch() {
+        int depth = erOfferBatchDepth.get();
+        if (depth <= 0) {
+            return;
+        }
+        int next = depth - 1;
+        erOfferBatchDepth.set(next);
+        if (next == 0 && Boolean.TRUE.equals(erOfferBatchPendingSignal.get())) {
+            erOfferBatchPendingSignal.set(false);
+            signalErOfferDaemon();
+        }
+    }
+
+    private void notifyErOfferDaemonAfterEnqueue() {
+        if (erOfferBatchDepth.get() > 0) {
+            erOfferBatchPendingSignal.set(true);
+            return;
+        }
+        signalErOfferDaemon();
+    }
+
     /** Wake the ER-offer daemon so a freshly enqueued frame is offered without waiting a full park. */
     void signalErOfferDaemonForTest() {
         signalErOfferDaemon();
     }
 
+    int erOfferSignalCountForTest() {
+        return erOfferSignalCountForTest.get();
+    }
+
+    void resetErOfferSignalCountForTest() {
+        erOfferSignalCountForTest.set(0);
+    }
+
     private void signalErOfferDaemon() {
+        erOfferSignalCountForTest.incrementAndGet();
         Thread daemon = erOfferDaemonThread;
         if (daemon != null) {
             LockSupport.unpark(daemon);

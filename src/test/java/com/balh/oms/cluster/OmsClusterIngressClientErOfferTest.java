@@ -278,17 +278,16 @@ class OmsClusterIngressClientErOfferTest {
     }
 
     @Test
-    void erOfferOnlyRole_startsKeepaliveWithoutEgressPoller() throws Exception {
+    void erOfferOnlyRole_singleErDaemonWithoutCompetingPollerThreads() throws Exception {
         OmsConfig cfg = newConfig();
         cfg.getCluster().getClient().setRole(ClusterClientRole.ER_OFFER_ONLY);
         OmsClusterIngressClient client = new OmsClusterIngressClient(cfg, new SimpleMeterRegistry());
         setField(client, "client", Mockito.mock(AeronCluster.class));
         setField(client, "closing", false);
         invokeStartErOfferDaemonLocked(client);
-        invokeStartSessionKeepaliveLocked(client);
 
         assertThat(declaredField(client, "egressPollerThread").get(client)).isNull();
-        assertThat(declaredField(client, "sessionKeepaliveThread").get(client)).isNotNull();
+        assertThat(declaredField(client, "erOfferDaemonThread").get(client)).isNotNull();
         client.close();
     }
 
@@ -358,10 +357,6 @@ class OmsClusterIngressClientErOfferTest {
 
     private static void invokeStartErOfferDaemonLocked(OmsClusterIngressClient client) throws Exception {
         invokePrivateLocked(client, "startErOfferDaemonLocked");
-    }
-
-    private static void invokeStartSessionKeepaliveLocked(OmsClusterIngressClient client) throws Exception {
-        invokePrivateLocked(client, "startSessionKeepaliveLocked");
     }
 
     private static void invokePrivateLocked(OmsClusterIngressClient client, String methodName) throws Exception {

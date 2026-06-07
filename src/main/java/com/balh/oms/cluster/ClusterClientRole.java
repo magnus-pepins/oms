@@ -11,9 +11,8 @@ public enum ClusterClientRole {
     /** Admit batching, egress poller, and ER-offer daemon (ingress / fix-egress). */
     FULL,
     /**
-     * ER-offer daemon + session keepalive/egress-drain loop (venue-egress). No dedicated egress
-     * poller thread — {@code pollEgress} runs inside ER lock passes and the keepalive loop so
-     * offers do not stall on publication back-pressure.
+     * ER-offer daemon only (venue-egress): offers, {@code pollEgress}, and keepalive share one
+     * thread and one {@code clientLock} — no competing egress-poller or keepalive threads.
      */
     ER_OFFER_ONLY
 }

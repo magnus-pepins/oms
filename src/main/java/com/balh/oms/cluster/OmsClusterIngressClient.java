@@ -305,8 +305,8 @@ public class OmsClusterIngressClient {
      */
     private final BlockingQueue<PendingErSubmit> erOfferQueue;
     private volatile Thread erOfferDaemonThread;
-    /** ER-offer-only role: keepalive without {@link #pollEgressDrain}. */
-    private volatile Thread sessionKeepaliveThread;
+    /** ER-offer-only: next keepalive deadline maintained by the ER daemon idle path (single lock owner). */
+    private long erOfferOnlyNextHeartbeatDeadlineNanos;
 
     // ---- Phase 4 slice 4c: commit-round-trip timer ----
     // Single timer name `oms.cluster.client.commit_round_trip` covers both submit methods so a
@@ -485,8 +485,10 @@ public class OmsClusterIngressClient {
                                     + ", queueCap=" + erCfg.getQueueCapacity()
                                     + ", drainNanos=" + erCfg.getDrainIntervalNanos());
                     if (role == ClusterClientRole.ER_OFFER_ONLY) {
+                        erOfferOnlyNextHeartbeatDeadlineNanos =
+                                System.nanoTime()
+                                        + TimeUnit.MILLISECONDS.toNanos(config.getHeartbeatIntervalMs());
                         startErOfferDaemonLocked();
-                        startSessionKeepaliveLocked();
                     } else {
                         startEgressPollerLocked();
                         startAdmitBatcherLocked();
@@ -537,16 +539,6 @@ public class OmsClusterIngressClient {
             er.interrupt();
             try {
                 er.join(POLLER_JOIN_MS);
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-            }
-        }
-        Thread keepalive = sessionKeepaliveThread;
-        sessionKeepaliveThread = null;
-        if (keepalive != null) {
-            keepalive.interrupt();
-            try {
-                keepalive.join(POLLER_JOIN_MS);
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
             }
@@ -1272,45 +1264,6 @@ public class OmsClusterIngressClient {
         t.start();
     }
 
-    private void startSessionKeepaliveLocked() {
-        if (sessionKeepaliveThread != null) {
-            return;
-        }
-        Thread t = new Thread(this::sessionKeepaliveLoop, "oms-cluster-client-session-keepalive");
-        t.setDaemon(true);
-        sessionKeepaliveThread = t;
-        t.start();
-    }
-
-    private void sessionKeepaliveLoop() {
-        long heartbeatIntervalNanos = TimeUnit.MILLISECONDS.toNanos(config.getHeartbeatIntervalMs());
-        long parkNanos = config.getEgressPollParkNanos();
-        long nextHeartbeatDeadlineNanos = System.nanoTime() + heartbeatIntervalNanos;
-        while (!closing) {
-            try {
-                clientLock.lockInterruptibly();
-                try {
-                    AeronCluster active = client;
-                    if (active != null) {
-                        pollEgressDrain(active);
-                        if (System.nanoTime() >= nextHeartbeatDeadlineNanos) {
-                            active.sendKeepAlive();
-                            nextHeartbeatDeadlineNanos = System.nanoTime() + heartbeatIntervalNanos;
-                        }
-                    }
-                } finally {
-                    clientLock.unlock();
-                }
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                return;
-            } catch (RuntimeException e) {
-                log.warn("OMS cluster client session keepalive failed", e);
-            }
-            LockSupport.parkNanos(parkNanos);
-        }
-    }
-
     /**
      * Daemon loop: drain up to {@link OmsConfig.Cluster.Client.ErOffer#getMaxPerLockPass()} pre-encoded
      * ER frames per pass and offer as many as possible per {@link #clientLock} acquisition. Callers
@@ -1326,6 +1279,9 @@ public class OmsClusterIngressClient {
         org.agrona.concurrent.UnsafeBuffer offerScratch =
                 new org.agrona.concurrent.UnsafeBuffer(
                         new byte[OmsClusterWireFormat.MAX_COMMAND_BYTES]);
+        boolean erOfferOnly = config.getRole() == ClusterClientRole.ER_OFFER_ONLY;
+        long idleParkNanos =
+                erOfferOnly ? config.getEgressPollParkNanos() : drainIntervalNanos;
 
         while (!closing) {
             try {
@@ -1334,7 +1290,11 @@ public class OmsClusterIngressClient {
                 // backlog throttle clamped egress dispatch, meanRouteMs >> 100 ms).
                 PendingErSubmit head = erOfferQueue.poll();
                 if (head == null) {
-                    LockSupport.parkNanos(drainIntervalNanos);
+                    if (erOfferOnly) {
+                        erOfferOnlyIdleMaintenance();
+                    } else {
+                        LockSupport.parkNanos(idleParkNanos);
+                    }
                     continue;
                 }
                 // Tight drain while the queue is deep — avoid re-parking between bursts @ 10k/s.
@@ -1356,6 +1316,32 @@ public class OmsClusterIngressClient {
             }
         }
         drainErOfferQueueOnClose();
+    }
+
+    /**
+     * ER-offer-only idle path: one thread owns {@link #clientLock} for egress drain + keepalive
+     * (no separate keepalive/poller threads competing with the ER daemon).
+     */
+    private void erOfferOnlyIdleMaintenance() throws InterruptedException {
+        long heartbeatIntervalNanos = TimeUnit.MILLISECONDS.toNanos(config.getHeartbeatIntervalMs());
+        long parkNanos = config.getEgressPollParkNanos();
+        clientLock.lockInterruptibly();
+        try {
+            AeronCluster active = client;
+            if (active != null) {
+                pollEgressDrain(active);
+                if (System.nanoTime() >= erOfferOnlyNextHeartbeatDeadlineNanos) {
+                    active.sendKeepAlive();
+                    erOfferOnlyNextHeartbeatDeadlineNanos =
+                            System.nanoTime() + heartbeatIntervalNanos;
+                }
+            }
+        } catch (RuntimeException e) {
+            log.warn("OMS cluster client ER-offer-only idle maintenance failed", e);
+        } finally {
+            clientLock.unlock();
+        }
+        LockSupport.parkNanos(parkNanos);
     }
 
     /**

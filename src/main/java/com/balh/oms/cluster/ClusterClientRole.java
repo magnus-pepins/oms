@@ -10,6 +10,10 @@ package com.balh.oms.cluster;
 public enum ClusterClientRole {
     /** Admit batching, egress poller, and ER-offer daemon (ingress / fix-egress). */
     FULL,
-    /** ER-offer daemon + session keepalive only (venue-egress). */
+    /**
+     * ER-offer daemon + session keepalive/egress-drain loop (venue-egress). No dedicated egress
+     * poller thread — {@code pollEgress} runs inside ER lock passes and the keepalive loop so
+     * offers do not stall on publication back-pressure.
+     */
     ER_OFFER_ONLY
 }

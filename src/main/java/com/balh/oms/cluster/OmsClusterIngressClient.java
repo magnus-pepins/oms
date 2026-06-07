@@ -1291,9 +1291,12 @@ public class OmsClusterIngressClient {
                 clientLock.lockInterruptibly();
                 try {
                     AeronCluster active = client;
-                    if (active != null && System.nanoTime() >= nextHeartbeatDeadlineNanos) {
-                        active.sendKeepAlive();
-                        nextHeartbeatDeadlineNanos = System.nanoTime() + heartbeatIntervalNanos;
+                    if (active != null) {
+                        pollEgressDrain(active);
+                        if (System.nanoTime() >= nextHeartbeatDeadlineNanos) {
+                            active.sendKeepAlive();
+                            nextHeartbeatDeadlineNanos = System.nanoTime() + heartbeatIntervalNanos;
+                        }
                     }
                 } finally {
                     clientLock.unlock();
@@ -1464,6 +1467,9 @@ public class OmsClusterIngressClient {
                         ext.future().complete(null);
                     }
                 }
+                if (config.getRole() == ClusterClientRole.ER_OFFER_ONLY && active != null) {
+                    pollEgressDrain(active);
+                }
             } finally {
                 clientLock.unlock();
             }
@@ -1476,13 +1482,17 @@ public class OmsClusterIngressClient {
                     continue;
                 }
                 if (!signaledPoller) {
-                    signalEgressPoller();
-                    signaledPoller = true;
+                    if (config.getRole() == ClusterClientRole.ER_OFFER_ONLY) {
+                        signaledPoller = true;
+                    } else {
+                        signalEgressPoller();
+                        signaledPoller = true;
+                    }
                 }
                 parkOrThrow(parkNanos);
             }
         }
-        if (idx > 0 && !signaledPoller) {
+        if (idx > 0 && !signaledPoller && config.getRole() != ClusterClientRole.ER_OFFER_ONLY) {
             signalEgressPoller();
         }
     }

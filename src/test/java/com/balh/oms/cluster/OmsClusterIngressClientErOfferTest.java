@@ -278,6 +278,98 @@ class OmsClusterIngressClientErOfferTest {
     }
 
     @Test
+    void erOfferBatch_signalsDaemonOnceForManyAsyncEnqueues() throws Exception {
+        OmsClusterIngressClient client = new OmsClusterIngressClient(newConfig(), new SimpleMeterRegistry());
+        AeronCluster cluster = Mockito.mock(AeronCluster.class);
+        Mockito.when(cluster.offer(Mockito.any(), Mockito.anyInt(), Mockito.anyInt())).thenReturn(1L);
+
+        setField(client, "client", cluster);
+        setField(client, "closing", false);
+        invokeStartErOfferDaemonLocked(client);
+        client.resetErOfferSignalCountForTest();
+
+        int n = 48;
+        client.openErOfferBatch();
+        try {
+            for (int i = 0; i < n; i++) {
+                CompletableFuture<Void> f =
+                        client.submitApplyExecutionReportAsync(
+                                sampleEr(client.nextCorrelationId()), Duration.ofSeconds(5));
+                assertThat(f.isDone()).isFalse();
+            }
+        } finally {
+            client.closeErOfferBatch();
+        }
+
+        assertThat(client.erOfferSignalCountForTest())
+                .as("batched enqueue should wake ER daemon once, not per frame")
+                .isEqualTo(1);
+        client.close();
+    }
+
+    @Test
+    void erOfferOnly_interleavePollEveryNOfferAmortisesPollRounds() throws Exception {
+        OmsConfig cfg = newConfig();
+        cfg.getCluster().getClient().setRole(ClusterClientRole.ER_OFFER_ONLY);
+        cfg.getCluster().getClient().getErOffer().setInterleavePollEveryOffers(8);
+        cfg.getCluster().getClient().getErOffer().setInterleavePollCap(4);
+        cfg.getCluster().getClient().getErOffer().setMaxPerLockPass(64);
+        OmsClusterIngressClient client = new OmsClusterIngressClient(cfg, new SimpleMeterRegistry());
+        AtomicInteger pollRounds = new AtomicInteger();
+        AtomicInteger offers = new AtomicInteger();
+        AeronCluster cluster = Mockito.mock(AeronCluster.class);
+        Mockito.when(cluster.offer(Mockito.any(), Mockito.anyInt(), Mockito.anyInt()))
+                .thenAnswer(
+                        inv -> {
+                            offers.incrementAndGet();
+                            return 1L;
+                        });
+        Mockito.when(cluster.pollEgress())
+                .thenAnswer(
+                        inv -> {
+                            pollRounds.incrementAndGet();
+                            return 0;
+                        });
+
+        setField(client, "client", cluster);
+        setField(client, "closing", false);
+        invokeStartErOfferDaemonLocked(client);
+
+        int n = 32;
+        var pool = Executors.newVirtualThreadPerTaskExecutor();
+        try {
+            CountDownLatch done = new CountDownLatch(n);
+            for (int i = 0; i < n; i++) {
+                long cid = client.nextCorrelationId();
+                pool.submit(
+                        () -> {
+                            try {
+                                client.submitApplyExecutionReportAsync(sampleEr(cid), Duration.ofSeconds(5))
+                                        .get(10, TimeUnit.SECONDS);
+                            } catch (Exception e) {
+                                throw new AssertionError(e);
+                            } finally {
+                                done.countDown();
+                            }
+                        });
+            }
+            assertThat(done.await(15, TimeUnit.SECONDS)).isTrue();
+        } finally {
+            pool.shutdownNow();
+            client.close();
+        }
+
+        assertThat(offers.get()).isEqualTo(n);
+        int perOfferUpperBound = n * cfg.getCluster().getClient().getErOffer().getInterleavePollCap();
+        assertThat(pollRounds.get())
+                .as("poll egress should amortise across offers, not run after every offer")
+                .isLessThan(perOfferUpperBound / 2);
+        assertThat(pollRounds.get())
+                .as("poll egress should still run during the burst")
+                .isGreaterThan(0);
+    }
+
+    @Test
     void erOfferOnlyRole_singleErDaemonWithoutCompetingPollerThreads() throws Exception {
         OmsConfig cfg = newConfig();
         cfg.getCluster().getClient().setRole(ClusterClientRole.ER_OFFER_ONLY);

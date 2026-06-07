@@ -134,8 +134,6 @@ public class OmsClusterIngressClient {
      * egress flood cannot spin forever under one {@link #clientLock} acquisition.
      */
     private static final int EGRESS_DRAIN_CAP = 256;
-    /** ER-offer-only: interleave a short egress drain after each successful offer during bursts. */
-    private static final int ER_OFFER_ONLY_INTERLEAVE_POLL_CAP = 8;
 
     /**
      * Per submit-thread encode scratch for {@link #submitAcceptOrder}. {@link ExpandableArrayBuffer}
@@ -307,6 +305,14 @@ public class OmsClusterIngressClient {
      */
     private final BlockingQueue<PendingErSubmit> erOfferQueue;
     private volatile Thread erOfferDaemonThread;
+    /**
+     * When &gt; 0, {@link #submitApplyExecutionReportAsync} enqueues without waking the daemon;
+     * {@link #closeErOfferBatch()} signals once if any frame was queued in the outermost batch.
+     */
+    private final ThreadLocal<Integer> erOfferBatchDepth = ThreadLocal.withInitial(() -> 0);
+    private final ThreadLocal<Boolean> erOfferBatchPendingSignal = ThreadLocal.withInitial(() -> false);
+    private final java.util.concurrent.atomic.AtomicInteger erOfferSignalCountForTest =
+            new java.util.concurrent.atomic.AtomicInteger();
     /** ER-offer-only: next keepalive deadline maintained by the ER daemon idle path (single lock owner). */
     private long erOfferOnlyNextHeartbeatDeadlineNanos;
 
@@ -633,7 +639,7 @@ public class OmsClusterIngressClient {
             return CompletableFuture.failedFuture(new InterruptedException());
         }
         if (erOfferQueue.offer(submit)) {
-            signalErOfferDaemon();
+            notifyErOfferDaemonAfterEnqueue();
             return waiter;
         }
         // Non-blocking back-pressure: fail fast so venue-egress can throttle via erOfferQueueDepth()
@@ -1210,12 +1216,48 @@ public class OmsClusterIngressClient {
         }
     }
 
+    /** Begin a batched ER enqueue (e.g. coalesced venue-egress completion flush). */
+    public void openErOfferBatch() {
+        erOfferBatchDepth.set(erOfferBatchDepth.get() + 1);
+    }
+
+    /** End the outermost batch and wake the ER daemon once if any frame was queued. */
+    public void closeErOfferBatch() {
+        int depth = erOfferBatchDepth.get();
+        if (depth <= 0) {
+            return;
+        }
+        int next = depth - 1;
+        erOfferBatchDepth.set(next);
+        if (next == 0 && Boolean.TRUE.equals(erOfferBatchPendingSignal.get())) {
+            erOfferBatchPendingSignal.set(false);
+            signalErOfferDaemon();
+        }
+    }
+
+    private void notifyErOfferDaemonAfterEnqueue() {
+        if (erOfferBatchDepth.get() > 0) {
+            erOfferBatchPendingSignal.set(true);
+            return;
+        }
+        signalErOfferDaemon();
+    }
+
     /** Wake the ER-offer daemon so a freshly enqueued frame is offered without waiting a full park. */
     void signalErOfferDaemonForTest() {
         signalErOfferDaemon();
     }
 
+    int erOfferSignalCountForTest() {
+        return erOfferSignalCountForTest.get();
+    }
+
+    void resetErOfferSignalCountForTest() {
+        erOfferSignalCountForTest.set(0);
+    }
+
     private void signalErOfferDaemon() {
+        erOfferSignalCountForTest.incrementAndGet();
         Thread daemon = erOfferDaemonThread;
         if (daemon != null) {
             LockSupport.unpark(daemon);
@@ -1241,9 +1283,34 @@ public class OmsClusterIngressClient {
         return rounds;
     }
 
-    private void pollEgressInterleaveErOfferOnly(AeronCluster active) {
-        if (config.getRole() == ClusterClientRole.ER_OFFER_ONLY && active != null) {
-            pollEgressDrain(active, ER_OFFER_ONLY_INTERLEAVE_POLL_CAP);
+    /**
+     * ER_OFFER_ONLY burst path: short egress drain to clear publication flow-control without a
+     * competing poller thread. Returns {@code 0} when the counter has not reached
+     * {@link OmsConfig.Cluster.Client.ErOffer#getInterleavePollEveryOffers()}.
+     */
+    private int pollEgressInterleaveErOfferOnlyIfDue(AeronCluster active, int offersSinceInterleave) {
+        if (config.getRole() != ClusterClientRole.ER_OFFER_ONLY || active == null) {
+            return offersSinceInterleave;
+        }
+        int every = config.getErOffer().getInterleavePollEveryOffers();
+        if (offersSinceInterleave < every) {
+            return offersSinceInterleave;
+        }
+        pollEgressDrain(active, config.getErOffer().getInterleavePollCap());
+        return 0;
+    }
+
+    /**
+     * Tail drain before releasing the lock when the burst ended mid interleave interval or hit
+     * cluster offer back-pressure.
+     */
+    private void pollEgressTailErOfferOnly(
+            AeronCluster active, int offersSinceInterleave, boolean backPressured) {
+        if (config.getRole() != ClusterClientRole.ER_OFFER_ONLY || active == null) {
+            return;
+        }
+        if (backPressured || offersSinceInterleave > 0) {
+            pollEgressDrain(active, config.getErOffer().getInterleavePollCap());
         }
     }
 
@@ -1370,6 +1437,7 @@ public class OmsClusterIngressClient {
         int idx = 0;
         PendingErSubmit heldForRetry = null;
         boolean signaledPoller = false;
+        int offersSinceInterleave = 0;
 
         while (!closing
                 && (heldForRetry != null
@@ -1436,7 +1504,9 @@ public class OmsClusterIngressClient {
                         break;
                     }
                     current.future().complete(null);
-                    pollEgressInterleaveErOfferOnly(active);
+                    offersSinceInterleave++;
+                    offersSinceInterleave =
+                            pollEgressInterleaveErOfferOnlyIfDue(active, offersSinceInterleave);
                     if (idx < batch.size() && batch.get(idx) == current) {
                         idx++;
                     }
@@ -1464,12 +1534,12 @@ public class OmsClusterIngressClient {
                             break;
                         }
                         ext.future().complete(null);
-                        pollEgressInterleaveErOfferOnly(active);
+                        offersSinceInterleave++;
+                        offersSinceInterleave =
+                                pollEgressInterleaveErOfferOnlyIfDue(active, offersSinceInterleave);
                     }
                 }
-                if (config.getRole() == ClusterClientRole.ER_OFFER_ONLY && active != null) {
-                    pollEgressDrain(active);
-                }
+                pollEgressTailErOfferOnly(active, offersSinceInterleave, backPressured);
             } finally {
                 clientLock.unlock();
             }

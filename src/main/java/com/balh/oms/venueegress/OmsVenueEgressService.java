@@ -221,6 +221,7 @@ public class OmsVenueEgressService {
     /** Aligns with {@link OmsConfig.Cluster.VenueEgress} default until {@link #init()} caches config. */
     private int replayFragmentLimit = 512;
     private long replayPollParkNanos = 1_000_000L;
+    private int replayIdleTailPolls = 16;
 
     /**
      * Design A pipeline (slice: venue egress pipelining). Non-null only when
@@ -367,6 +368,7 @@ public class OmsVenueEgressService {
         OmsConfig.Cluster.VenueEgress venueEgressCfg = config.getCluster().getVenueEgress();
         replayFragmentLimit = effectiveReplayFragmentLimit(venueEgressCfg.getFragmentLimit());
         replayPollParkNanos = venueEgressCfg.getPollParkNanos();
+        replayIdleTailPolls = venueEgressCfg.getReplayIdleTailPolls();
         boolean venueWired = venueRouteOrderClient != null && clusterIngressClient != null;
         int maxInFlight = Math.max(1, config.getCluster().getVenueEgress().getVenueRouteMaxInFlight());
         if (savedCursor.isPresent()) {
@@ -862,9 +864,6 @@ public class OmsVenueEgressService {
      * in the gap between the burst terminal zero and {@link #findRecordingById}; skipping this
      * slice forces an Archive control round-trip plus park on every momentary race.
      */
-    /** Live-tail spins before park/recording-walk; raised for pop @ 10k admit/s knee vs 5k. */
-    private static final int REPLAY_IDLE_TAIL_POLLS = 8;
-
     /**
      * Tight-spin drain: call {@link Subscription#poll} repeatedly while Aeron delivers fragments,
      * without idle park or recording-walk work between passes. Returns the fragment count for
@@ -890,7 +889,7 @@ public class OmsVenueEgressService {
      * unit tests that assert the spin count without Aeron Archive.
      */
     int pollReplayIdleTail(Subscription replay, FragmentHandler handler) {
-        for (int attempt = 0; attempt < REPLAY_IDLE_TAIL_POLLS && running.get(); attempt++) {
+        for (int attempt = 0; attempt < replayIdleTailPolls && running.get(); attempt++) {
             Thread.onSpinWait();
             int polled = pollReplayBurst(replay, handler);
             if (polled > 0) {
@@ -925,11 +924,17 @@ public class OmsVenueEgressService {
     }
 
     /**
-     * Amortizes {@code replay.poll} syscall overhead at 5k–10k admits/s. Operators may set a lower
-     * configured limit; production floors at 2048 frags/poll for sustained 10k/s drain.
+     * Production floor for {@code replay.poll} batch size. At 16k admit/s on pop, 2048 frags/poll
+     * left {@code oms.venue.egress.lag_bytes} climbing (~6 MB); 4096 halves poll syscall rate.
+     */
+    static final int MIN_REPLAY_FRAGMENT_LIMIT_FOR_HIGH_ADMIT_DRAIN = 4096;
+
+    /**
+     * Amortizes {@code replay.poll} syscall overhead at 10k–16k admits/s. Operators may set a lower
+     * configured limit; production floors at {@link #MIN_REPLAY_FRAGMENT_LIMIT_FOR_HIGH_ADMIT_DRAIN}.
      */
     static int effectiveReplayFragmentLimit(int configuredLimit) {
-        return Math.max(configuredLimit, 2048);
+        return Math.max(configuredLimit, MIN_REPLAY_FRAGMENT_LIMIT_FOR_HIGH_ADMIT_DRAIN);
     }
 
     /**
@@ -1527,7 +1532,46 @@ public class OmsVenueEgressService {
      * Batch {@code onNext} or multi-stream parallelism would require {@code VenueRouteOrderClient}
      * changes and breaks global FIFO unless the venue shards sequence per instrument.
      */
-    private final class EgressRoutePipeline {
+    /**
+     * Pure dispatch-cap decision — package-private for unit tests (permits supplied explicitly).
+     */
+    static int computeEffectiveDispatchCapacity(
+            int maxInFlight,
+            int maxPendingFragments,
+            int backlogThrottleMaxInFlight,
+            int backlogThrottlePendingRouteThreshold,
+            int backlogThrottleErOfferQueueDepthThreshold,
+            int backlogThrottleErSoftCapPermitMultiplier,
+            int backlogThrottleErExhaustedCapPermitMultiplier,
+            int inFlight,
+            int erOfferQueueDepth,
+            int availablePermits) {
+        boolean erOfferBacklogged =
+                erOfferQueueDepth >= backlogThrottleErOfferQueueDepthThreshold;
+        boolean venuePermitsExhausted = availablePermits == 0;
+        boolean routeBacklogged =
+                inFlight >= backlogThrottlePendingRouteThreshold && venuePermitsExhausted;
+        if (routeBacklogged) {
+            return Math.max(1, Math.min(maxPendingFragments, backlogThrottleMaxInFlight));
+        }
+        if (erOfferBacklogged && venuePermitsExhausted) {
+            int erExhaustedCap =
+                    Math.min(
+                            maxPendingFragments,
+                            maxInFlight * backlogThrottleErExhaustedCapPermitMultiplier);
+            return Math.max(backlogThrottleMaxInFlight, erExhaustedCap);
+        }
+        if (erOfferBacklogged) {
+            int erBacklogCap =
+                    Math.min(
+                            maxPendingFragments,
+                            maxInFlight * backlogThrottleErSoftCapPermitMultiplier);
+            return Math.max(backlogThrottleMaxInFlight, erBacklogCap);
+        }
+        return maxPendingFragments;
+    }
+
+    final class EgressRoutePipeline {
 
         /** Park between non-progress passes while quiescing the in-flight window. */
         private static final long QUIESCE_PARK_NANOS = 50_000L;
@@ -1543,11 +1587,11 @@ public class OmsVenueEgressService {
 
         /**
          * Outstanding fragments (venue ack pending or ER submit pending) before we stop dispatching.
-         * 6× venue permits keeps replay registering while ER submit trails venue acks (observed pop
+         * 7× venue permits keeps replay registering while ER submit trails venue acks (observed pop
          * @ 10k RPS clean book: 4× cap cut {@code egress_wall_lag_ms} 306→154 ms; 6× targets &lt;100 ms
-         * meanRouteMs with raised ER-queue throttle floor).
+         * meanRouteMs with raised ER-queue throttle floor; 7× adds headroom for 15k+ without 5× soft cap).
          */
-        private static final int PENDING_FRAGMENT_CAP_MULTIPLIER = 6;
+        private static final int PENDING_FRAGMENT_CAP_MULTIPLIER = 7;
 
         private final int maxInFlight;
         private final int maxPendingFragments;
@@ -1555,6 +1599,7 @@ public class OmsVenueEgressService {
         private final int backlogThrottleErOfferQueueDepthThreshold;
         private final int backlogThrottleMaxInFlight;
         private final int backlogThrottleErSoftCapPermitMultiplier;
+        private final int backlogThrottleErExhaustedCapPermitMultiplier;
         private final long backlogThrottleParkNanos;
         private final Semaphore permits;
         private final EgressCompletionTracker tracker = new EgressCompletionTracker();
@@ -1608,6 +1653,8 @@ public class OmsVenueEgressService {
                     Math.min(maxInFlight, venueCfg.getBacklogThrottleMaxInFlight());
             this.backlogThrottleErSoftCapPermitMultiplier =
                     venueCfg.getBacklogThrottleErSoftCapPermitMultiplier();
+            this.backlogThrottleErExhaustedCapPermitMultiplier =
+                    venueCfg.getBacklogThrottleErExhaustedCapPermitMultiplier();
             this.backlogThrottleParkNanos = venueCfg.getBacklogThrottleParkNanos();
             this.permits = new Semaphore(maxInFlight);
             // Virtual-thread per ER completion: cluster offer back-pressure parks the carrier
@@ -1661,6 +1708,8 @@ public class OmsVenueEgressService {
                     Math.min(maxInFlight, venueCfg.getBacklogThrottleMaxInFlight());
             this.backlogThrottleErSoftCapPermitMultiplier =
                     venueCfg.getBacklogThrottleErSoftCapPermitMultiplier();
+            this.backlogThrottleErExhaustedCapPermitMultiplier =
+                    venueCfg.getBacklogThrottleErExhaustedCapPermitMultiplier();
             this.backlogThrottleParkNanos = venueCfg.getBacklogThrottleParkNanos();
             this.permits = new Semaphore(maxInFlight);
             this.erSubmitExecutor = erSubmitExecutor;
@@ -1743,7 +1792,7 @@ public class OmsVenueEgressService {
 
         /**
          * Max registered fragments the replay thread may dispatch before {@link #awaitDispatchCapacity()}
-         * parks. Normally {@link #maxPendingFragments} (6× venue permits) so replay keeps registering
+         * parks. Normally {@link #maxPendingFragments} (7× venue permits) so replay keeps registering
          * admits while venue acks recycle permits faster than ER submit completes — capping at
          * {@link #maxInFlight} alone wedged replay at ~512 deep with free permits (observed pop @ 5k
          * RPS: {@code egress_wall_lag_ms} ~27 ms; @ 10k with 2× cap: ~306 ms,
@@ -1752,22 +1801,17 @@ public class OmsVenueEgressService {
          * is deep.
          */
         private int effectiveDispatchCapacity(int inFlight, int erOfferQueueDepth) {
-            boolean erOfferBacklogged =
-                    erOfferQueueDepth >= backlogThrottleErOfferQueueDepthThreshold;
-            boolean venuePermitsExhausted = permits.availablePermits() == 0;
-            boolean routeBacklogged =
-                    inFlight >= backlogThrottlePendingRouteThreshold && venuePermitsExhausted;
-            if (routeBacklogged || (erOfferBacklogged && venuePermitsExhausted)) {
-                return Math.max(1, Math.min(maxPendingFragments, backlogThrottleMaxInFlight));
-            }
-            if (erOfferBacklogged) {
-                int erBacklogCap =
-                        Math.min(
-                                maxPendingFragments,
-                                maxInFlight * backlogThrottleErSoftCapPermitMultiplier);
-                return Math.max(backlogThrottleMaxInFlight, erBacklogCap);
-            }
-            return maxPendingFragments;
+            return OmsVenueEgressService.computeEffectiveDispatchCapacity(
+                    maxInFlight,
+                    maxPendingFragments,
+                    backlogThrottleMaxInFlight,
+                    backlogThrottlePendingRouteThreshold,
+                    backlogThrottleErOfferQueueDepthThreshold,
+                    backlogThrottleErSoftCapPermitMultiplier,
+                    backlogThrottleErExhaustedCapPermitMultiplier,
+                    inFlight,
+                    erOfferQueueDepth,
+                    permits.availablePermits());
         }
 
         /** Called on the replay thread for each polled fragment, in cluster-log order. */
@@ -1868,6 +1912,7 @@ public class OmsVenueEgressService {
          * {@link #onErSubmitSucceeded} advances the tracker when each async offer completes.
          */
         private void runScheduledErCompletionFlush() {
+            clusterIngressClient.openErOfferBatch();
             try {
                 ErCompletion item;
                 while ((item = erCompletionQueue.poll()) != null) {
@@ -1879,6 +1924,7 @@ public class OmsVenueEgressService {
                     }
                 }
             } finally {
+                clusterIngressClient.closeErOfferBatch();
                 erCompletionFlushScheduled.set(false);
                 if (!erCompletionQueue.isEmpty()) {
                     scheduleErCompletionFlush();
@@ -2144,8 +2190,13 @@ public class OmsVenueEgressService {
     }
 
     void setReplayPollConfigForTesting(int fragmentLimit, long pollParkNanos) {
+        setReplayPollConfigForTesting(fragmentLimit, pollParkNanos, 16);
+    }
+
+    void setReplayPollConfigForTesting(int fragmentLimit, long pollParkNanos, int idleTailPolls) {
         this.replayFragmentLimit = fragmentLimit;
         this.replayPollParkNanos = pollParkNanos;
+        this.replayIdleTailPolls = idleTailPolls;
     }
 
     EgressRoutePipeline pipelineForTesting() {

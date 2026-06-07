@@ -1676,7 +1676,14 @@ public class OmsVenueEgressService {
         private void routeOfferLoop() {
             while (true) {
                 PendingRouteOffer item = routeOfferQueue.poll();
-                if (item != null) {
+                if (item == null) {
+                    if (!running.get() && routeOfferQueue.isEmpty()) {
+                        return;
+                    }
+                    LockSupport.parkNanos(ROUTE_OFFER_IDLE_PARK_NANOS);
+                    continue;
+                }
+                do {
                     try {
                         dispatchRoute(item.ev(), item.position());
                     } catch (RuntimeException e) {
@@ -1689,12 +1696,7 @@ public class OmsVenueEgressService {
                         permits.release();
                         unparkReplayThread();
                     }
-                    continue;
-                }
-                if (!running.get() && routeOfferQueue.isEmpty()) {
-                    return;
-                }
-                LockSupport.parkNanos(ROUTE_OFFER_IDLE_PARK_NANOS);
+                } while ((item = routeOfferQueue.poll()) != null);
             }
         }
 

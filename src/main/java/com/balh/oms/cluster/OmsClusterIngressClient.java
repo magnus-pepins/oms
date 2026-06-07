@@ -1271,9 +1271,12 @@ public class OmsClusterIngressClient {
 
         while (!closing) {
             try {
-                PendingErSubmit head =
-                        erOfferQueue.poll(drainIntervalNanos, TimeUnit.NANOSECONDS);
+                // Non-blocking poll + parkNanos — not poll(timeout): unpark from enqueue can be
+                // consumed without waking the daemon (observed @ 8–10k/s: ER queue depth climbed,
+                // backlog throttle clamped egress dispatch, meanRouteMs >> 100 ms).
+                PendingErSubmit head = erOfferQueue.poll();
                 if (head == null) {
+                    LockSupport.parkNanos(drainIntervalNanos);
                     continue;
                 }
                 drained.clear();

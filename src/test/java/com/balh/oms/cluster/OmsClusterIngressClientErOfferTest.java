@@ -244,6 +244,40 @@ class OmsClusterIngressClientErOfferTest {
     }
 
     @Test
+    void erOfferDaemon_unparkWakesIdleLoopWithoutPollTimeoutDelay() throws Exception {
+        OmsConfig cfg = newConfig();
+        cfg.getCluster().getClient().getErOffer().setDrainIntervalNanos(TimeUnit.MILLISECONDS.toNanos(50));
+        OmsClusterIngressClient client = new OmsClusterIngressClient(cfg, new SimpleMeterRegistry());
+        CountDownLatch offerStarted = new CountDownLatch(1);
+        AeronCluster cluster = Mockito.mock(AeronCluster.class);
+        Mockito.when(cluster.offer(Mockito.any(), Mockito.anyInt(), Mockito.anyInt()))
+                .thenAnswer(
+                        inv -> {
+                            offerStarted.countDown();
+                            return 1L;
+                        });
+
+        setField(client, "client", cluster);
+        setField(client, "closing", false);
+        invokeStartErOfferDaemonLocked(client);
+
+        // Let the daemon reach its idle park (would miss unpark if using poll(timeout)).
+        Thread.sleep(20);
+
+        long enqueueStart = System.nanoTime();
+        CompletableFuture<Void> future =
+                client.submitApplyExecutionReportAsync(sampleEr(client.nextCorrelationId()), Duration.ofSeconds(5));
+        assertThat(offerStarted.await(2, TimeUnit.SECONDS)).isTrue();
+        future.get(2, TimeUnit.SECONDS);
+        long wakeNanos = System.nanoTime() - enqueueStart;
+
+        assertThat(wakeNanos)
+                .as("unpark should wake daemon promptly, not after the 50ms drain poll timeout")
+                .isLessThan(TimeUnit.MILLISECONDS.toNanos(15));
+        client.close();
+    }
+
+    @Test
     void erOfferDaemon_concurrentSubmitsAllComplete() throws Exception {
         OmsClusterIngressClient client = new OmsClusterIngressClient(newConfig(), new SimpleMeterRegistry());
         AeronCluster cluster = Mockito.mock(AeronCluster.class);

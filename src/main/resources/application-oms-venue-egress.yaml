@@ -11,7 +11,7 @@ oms:
     client:
       er-offer:
         # Venue-egress ER flood @ 8–10k/s: 256 frames/lock + 1µs idle park (daemon uses parkNanos, not poll timeout).
-        max-per-lock-pass: ${OMS_CLUSTER_CLIENT_ER_OFFER_MAX_PER_LOCK_PASS:1024}
+        max-per-lock-pass: ${OMS_CLUSTER_CLIENT_ER_OFFER_MAX_PER_LOCK_PASS:512}
         drain-interval-nanos: ${OMS_CLUSTER_CLIENT_ER_OFFER_DRAIN_INTERVAL_NANOS:1000}
       enabled: ${OMS_VENUE_EGRESS_CLUSTER_CLIENT_ENABLED:true}
       aeron-directory: ${OMS_VENUE_EGRESS_CLUSTER_CLIENT_AERON_DIR:${OMS_VENUE_EGRESS_AERON_DIR:}}

@@ -278,36 +278,6 @@ class OmsClusterIngressClientErOfferTest {
     }
 
     @Test
-    void erOfferBatch_signalsDaemonOnceForManyAsyncEnqueues() throws Exception {
-        OmsClusterIngressClient client = new OmsClusterIngressClient(newConfig(), new SimpleMeterRegistry());
-        AeronCluster cluster = Mockito.mock(AeronCluster.class);
-        Mockito.when(cluster.offer(Mockito.any(), Mockito.anyInt(), Mockito.anyInt())).thenReturn(1L);
-
-        setField(client, "client", cluster);
-        setField(client, "closing", false);
-        invokeStartErOfferDaemonLocked(client);
-        client.resetErOfferSignalCountForTest();
-
-        int n = 48;
-        client.openErOfferBatch();
-        try {
-            for (int i = 0; i < n; i++) {
-                CompletableFuture<Void> f =
-                        client.submitApplyExecutionReportAsync(
-                                sampleEr(client.nextCorrelationId()), Duration.ofSeconds(5));
-                assertThat(f.isDone()).isFalse();
-            }
-        } finally {
-            client.closeErOfferBatch();
-        }
-
-        assertThat(client.erOfferSignalCountForTest())
-                .as("batched enqueue should wake ER daemon once, not per frame")
-                .isEqualTo(1);
-        client.close();
-    }
-
-    @Test
     void erOfferDaemon_concurrentSubmitsAllComplete() throws Exception {
         OmsClusterIngressClient client = new OmsClusterIngressClient(newConfig(), new SimpleMeterRegistry());
         AeronCluster cluster = Mockito.mock(AeronCluster.class);

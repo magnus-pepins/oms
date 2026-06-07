@@ -134,6 +134,8 @@ public class OmsClusterIngressClient {
      * egress flood cannot spin forever under one {@link #clientLock} acquisition.
      */
     private static final int EGRESS_DRAIN_CAP = 256;
+    /** ER-offer-only: interleave a short egress drain after each successful offer during bursts. */
+    private static final int ER_OFFER_ONLY_INTERLEAVE_POLL_CAP = 8;
 
     /**
      * Per submit-thread encode scratch for {@link #submitAcceptOrder}. {@link ExpandableArrayBuffer}
@@ -1225,14 +1227,24 @@ public class OmsClusterIngressClient {
      * {@link AeronCluster#pollEgress()} calls that returned a positive fragment count.
      */
     int pollEgressDrain(AeronCluster active) {
+        return pollEgressDrain(active, EGRESS_DRAIN_CAP);
+    }
+
+    private int pollEgressDrain(AeronCluster active, int maxRounds) {
         int rounds = 0;
-        while (rounds < EGRESS_DRAIN_CAP) {
+        while (rounds < maxRounds) {
             if (active.pollEgress() <= 0) {
                 break;
             }
             rounds++;
         }
         return rounds;
+    }
+
+    private void pollEgressInterleaveErOfferOnly(AeronCluster active) {
+        if (config.getRole() == ClusterClientRole.ER_OFFER_ONLY && active != null) {
+            pollEgressDrain(active, ER_OFFER_ONLY_INTERLEAVE_POLL_CAP);
+        }
     }
 
     /**
@@ -1424,6 +1436,7 @@ public class OmsClusterIngressClient {
                         break;
                     }
                     current.future().complete(null);
+                    pollEgressInterleaveErOfferOnly(active);
                     if (idx < batch.size() && batch.get(idx) == current) {
                         idx++;
                     }
@@ -1451,6 +1464,7 @@ public class OmsClusterIngressClient {
                             break;
                         }
                         ext.future().complete(null);
+                        pollEgressInterleaveErOfferOnly(active);
                     }
                 }
                 if (config.getRole() == ClusterClientRole.ER_OFFER_ONLY && active != null) {

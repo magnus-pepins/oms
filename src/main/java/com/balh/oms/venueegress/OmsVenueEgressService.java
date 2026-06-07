@@ -1553,7 +1553,7 @@ public class OmsVenueEgressService {
         private static final int ER_COMPLETION_FLUSH_BATCH_CAP = 512;
 
         /** Soft ER-backlog dispatch cap as a multiple of venue-route permits (see effectiveDispatchCapacity). */
-        private static final int ER_BACKLOG_SOFT_CAP_MULTIPLIER = 5;
+        private static final int ER_BACKLOG_SOFT_CAP_MULTIPLIER = 4;
 
         private final int maxInFlight;
         private final int maxPendingFragments;

@@ -1873,6 +1873,7 @@ public class OmsVenueEgressService {
          * {@link #onErSubmitSucceeded} advances the tracker when each async offer completes.
          */
         private void runScheduledErCompletionFlush() {
+            clusterIngressClient.openErOfferBatch();
             try {
                 ErCompletion item;
                 while ((item = erCompletionQueue.poll()) != null) {
@@ -1884,6 +1885,7 @@ public class OmsVenueEgressService {
                     }
                 }
             } finally {
+                clusterIngressClient.closeErOfferBatch();
                 erCompletionFlushScheduled.set(false);
                 if (!erCompletionQueue.isEmpty()) {
                     scheduleErCompletionFlush();

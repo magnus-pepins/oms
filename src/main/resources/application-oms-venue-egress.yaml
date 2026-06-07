@@ -11,9 +11,11 @@ oms:
     client:
       role: ${OMS_CLUSTER_CLIENT_ROLE:er-offer-only}
       er-offer:
-        # Venue-egress ER flood @ 8–10k/s: 256 frames/lock + 1µs idle park (daemon uses parkNanos, not poll timeout).
+        # Venue-egress ER flood @ 8–16k/s: 512 frames/lock + periodic egress interleave (not per-offer).
         max-per-lock-pass: ${OMS_CLUSTER_CLIENT_ER_OFFER_MAX_PER_LOCK_PASS:512}
         drain-interval-nanos: ${OMS_CLUSTER_CLIENT_ER_OFFER_DRAIN_INTERVAL_NANOS:1000}
+        interleave-poll-cap: ${OMS_CLUSTER_CLIENT_ER_OFFER_INTERLEAVE_POLL_CAP:8}
+        interleave-poll-every-offers: ${OMS_CLUSTER_CLIENT_ER_OFFER_INTERLEAVE_POLL_EVERY_OFFERS:16}
       enabled: ${OMS_VENUE_EGRESS_CLUSTER_CLIENT_ENABLED:true}
       aeron-directory: ${OMS_VENUE_EGRESS_CLUSTER_CLIENT_AERON_DIR:${OMS_VENUE_EGRESS_AERON_DIR:}}
       ingress-endpoints: ${OMS_VENUE_EGRESS_CLUSTER_CLIENT_INGRESS_ENDPOINTS:0=localhost:20110}
@@ -32,9 +34,11 @@ oms:
       backlog-throttle-er-offer-queue-depth-threshold: ${OMS_CLUSTER_VENUE_EGRESS_BACKLOG_THROTTLE_ER_OFFER_QUEUE_DEPTH_THRESHOLD:7168}
       backlog-throttle-max-in-flight: ${OMS_CLUSTER_VENUE_EGRESS_BACKLOG_THROTTLE_MAX_IN_FLIGHT:576}
       backlog-throttle-er-soft-cap-permit-multiplier: ${OMS_CLUSTER_VENUE_EGRESS_BACKLOG_THROTTLE_ER_SOFT_CAP_PERMIT_MULTIPLIER:4}
+      backlog-throttle-er-exhausted-cap-permit-multiplier: ${OMS_CLUSTER_VENUE_EGRESS_BACKLOG_THROTTLE_ER_EXHAUSTED_CAP_PERMIT_MULTIPLIER:3}
       backlog-throttle-park-nanos: ${OMS_CLUSTER_VENUE_EGRESS_BACKLOG_THROTTLE_PARK_NANOS:1000}
       # Replay drain tuning (pop @ 15–16k RPS admit): 1µs idle park + 4096 frags/poll + MAX priority threads.
-      # pollReplayIdleTail spins 16× before park/recording-walk; keep poll-park short so true-idle wake is cheap.
+      # pollReplayIdleTail spins 16× before park/recording-walk (mirrors projector @ 10k knee); keep poll-park
+      # short so true-idle wake is cheap.
       poll-park-nanos: ${OMS_CLUSTER_VENUE_EGRESS_POLL_PARK_NANOS:1000}
       fragment-limit: ${OMS_CLUSTER_VENUE_EGRESS_FRAGMENT_LIMIT:4096}
       replay-idle-tail-polls: ${OMS_CLUSTER_VENUE_EGRESS_REPLAY_IDLE_TAIL_POLLS:16}

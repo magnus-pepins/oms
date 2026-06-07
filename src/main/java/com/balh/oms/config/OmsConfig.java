@@ -3533,6 +3533,7 @@ public class OmsConfig {
             private static final int DEFAULT_BACKLOG_THROTTLE_ER_OFFER_QUEUE_DEPTH_THRESHOLD = 1024;
             private static final int DEFAULT_BACKLOG_THROTTLE_MAX_IN_FLIGHT = 128;
             private static final int DEFAULT_BACKLOG_THROTTLE_ER_SOFT_CAP_PERMIT_MULTIPLIER = 4;
+            private static final int DEFAULT_BACKLOG_THROTTLE_ER_EXHAUSTED_CAP_PERMIT_MULTIPLIER = 3;
             private static final long DEFAULT_BACKLOG_THROTTLE_PARK_NANOS = 50_000L;
 
             /**
@@ -3555,7 +3556,8 @@ public class OmsConfig {
 
             /**
              * Spin-yield passes in {@code pollReplayIdleTail} before archive metadata refresh or
-             * configured idle park. Raised from 8→16 for pop @ 10k admit/s knee (mirrors projector).
+             * configured idle park. Raised from 8→16 for pop @ 10k admit/s knee (mirrors projector);
+             * 16k soak needs the same headroom to avoid Archive control round-trips on micro-gaps.
              */
             private static final int DEFAULT_REPLAY_IDLE_TAIL_POLLS = 16;
 
@@ -3577,6 +3579,8 @@ public class OmsConfig {
             private int backlogThrottleMaxInFlight = DEFAULT_BACKLOG_THROTTLE_MAX_IN_FLIGHT;
             private int backlogThrottleErSoftCapPermitMultiplier =
                     DEFAULT_BACKLOG_THROTTLE_ER_SOFT_CAP_PERMIT_MULTIPLIER;
+            private int backlogThrottleErExhaustedCapPermitMultiplier =
+                    DEFAULT_BACKLOG_THROTTLE_ER_EXHAUSTED_CAP_PERMIT_MULTIPLIER;
             private long backlogThrottleParkNanos = DEFAULT_BACKLOG_THROTTLE_PARK_NANOS;
             private int replayThreadPriority = DEFAULT_REPLAY_THREAD_PRIORITY;
             private int replayIdleTailPolls = DEFAULT_REPLAY_IDLE_TAIL_POLLS;
@@ -3705,6 +3709,22 @@ public class OmsConfig {
 
             public void setBacklogThrottleErSoftCapPermitMultiplier(int multiplier) {
                 this.backlogThrottleErSoftCapPermitMultiplier = Math.max(1, multiplier);
+            }
+
+            /**
+             * When the ER offer queue is deep and venue permits are exhausted but pending routes
+             * remain below {@link #getBacklogThrottlePendingRouteThreshold()}, effective dispatch
+             * cap is {@code max(backlogThrottleMaxInFlight, min(maxPendingFragments, maxInFlight * this))}.
+             * Lower than {@link #getBacklogThrottleErSoftCapPermitMultiplier()} so replay keeps
+             * registering admits under ER pressure without the full soft cap that regressed fresh-book
+             * 13k soak (split-branch at 4×).
+             */
+            public int getBacklogThrottleErExhaustedCapPermitMultiplier() {
+                return backlogThrottleErExhaustedCapPermitMultiplier;
+            }
+
+            public void setBacklogThrottleErExhaustedCapPermitMultiplier(int multiplier) {
+                this.backlogThrottleErExhaustedCapPermitMultiplier = Math.max(1, multiplier);
             }
 
             public long getBacklogThrottleParkNanos() { return backlogThrottleParkNanos; }
@@ -4320,11 +4340,23 @@ public class OmsConfig {
                 private static final int DEFAULT_MAX_PER_LOCK_PASS = 512;
                 private static final long DEFAULT_DRAIN_INTERVAL_NANOS = 1_000L;
                 private static final long DEFAULT_ENQUEUE_PARK_NANOS = 1_000L;
+                /**
+                 * ER_OFFER_ONLY: max {@link io.aeron.cluster.client.AeronCluster#pollEgress} rounds
+                 * per interleave pass. Clears publication flow-control without a competing poller.
+                 */
+                private static final int DEFAULT_INTERLEAVE_POLL_CAP = 8;
+                /**
+                 * ER_OFFER_ONLY: poll egress every N successful offers during a burst (not every offer).
+                 * At 16k/s, per-offer interleave dominated lock hold time and ER queue depth.
+                 */
+                private static final int DEFAULT_INTERLEAVE_POLL_EVERY_OFFERS = 16;
 
                 private int queueCapacity = DEFAULT_QUEUE_CAPACITY;
                 private int maxPerLockPass = DEFAULT_MAX_PER_LOCK_PASS;
                 private long drainIntervalNanos = DEFAULT_DRAIN_INTERVAL_NANOS;
                 private long enqueueParkNanos = DEFAULT_ENQUEUE_PARK_NANOS;
+                private int interleavePollCap = DEFAULT_INTERLEAVE_POLL_CAP;
+                private int interleavePollEveryOffers = DEFAULT_INTERLEAVE_POLL_EVERY_OFFERS;
 
                 public int getQueueCapacity() { return queueCapacity; }
                 public void setQueueCapacity(int queueCapacity) {
@@ -4344,6 +4376,16 @@ public class OmsConfig {
                 public long getEnqueueParkNanos() { return enqueueParkNanos; }
                 public void setEnqueueParkNanos(long enqueueParkNanos) {
                     this.enqueueParkNanos = Math.max(100L, enqueueParkNanos);
+                }
+
+                public int getInterleavePollCap() { return interleavePollCap; }
+                public void setInterleavePollCap(int interleavePollCap) {
+                    this.interleavePollCap = Math.max(1, interleavePollCap);
+                }
+
+                public int getInterleavePollEveryOffers() { return interleavePollEveryOffers; }
+                public void setInterleavePollEveryOffers(int interleavePollEveryOffers) {
+                    this.interleavePollEveryOffers = Math.max(1, interleavePollEveryOffers);
                 }
             }
         }

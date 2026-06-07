@@ -2,7 +2,7 @@ package com.balh.oms.venueegress;
 
 import java.util.ArrayDeque;
 import java.util.Deque;
-import java.util.OptionalLong;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -37,6 +37,9 @@ import java.util.concurrent.ConcurrentHashMap;
  * programming bug; it is ignored here rather than allowed to leak into the completed set.
  */
 final class EgressCompletionTracker {
+
+    /** Highest contiguous position flushed from the tracker plus how many fragments were drained. */
+    record ContiguousDrain(long position, int fragmentCount) {}
 
     /** Serialises replay-thread-only deque mutation ({@link #register}, {@link #pollContiguous}). */
     private final Object replayLock = new Object();
@@ -95,10 +98,10 @@ final class EgressCompletionTracker {
      * unblocked) and returns the highest one popped, or empty if the head of the queue is still in
      * flight. The returned value is the position the caller should advance the persisted cursor to.
      */
-    OptionalLong pollContiguous() {
+    Optional<ContiguousDrain> pollContiguous() {
         synchronized (replayLock) {
             long highest = Long.MIN_VALUE;
-            boolean advanced = false;
+            int fragmentCount = 0;
             while (true) {
                 boolean progress = false;
                 Long head = pending.peekFirst();
@@ -106,7 +109,7 @@ final class EgressCompletionTracker {
                     pending.pollFirst();
                     pendingMembership.remove(head);
                     highest = head;
-                    advanced = true;
+                    fragmentCount++;
                     progress = true;
                 }
                 while (!cursorOnlyPending.isEmpty()) {
@@ -117,14 +120,16 @@ final class EgressCompletionTracker {
                     }
                     cursorOnlyPending.pollFirst();
                     highest = checkpoint;
-                    advanced = true;
+                    fragmentCount++;
                     progress = true;
                 }
                 if (!progress) {
                     break;
                 }
             }
-            return advanced ? OptionalLong.of(highest) : OptionalLong.empty();
+            return fragmentCount > 0
+                    ? Optional.of(new ContiguousDrain(highest, fragmentCount))
+                    : Optional.empty();
         }
     }
 

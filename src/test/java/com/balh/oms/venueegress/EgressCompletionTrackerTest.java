@@ -2,8 +2,6 @@ package com.balh.oms.venueegress;
 
 import org.junit.jupiter.api.Test;
 
-import java.util.OptionalLong;
-
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -17,11 +15,11 @@ class EgressCompletionTrackerTest {
         t.register(30L);
 
         t.complete(10L);
-        assertThat(t.pollContiguous()).isEqualTo(OptionalLong.of(10L));
+        assertThat(t.pollContiguous()).contains(new EgressCompletionTracker.ContiguousDrain(10L, 1));
         t.complete(20L);
-        assertThat(t.pollContiguous()).isEqualTo(OptionalLong.of(20L));
+        assertThat(t.pollContiguous()).contains(new EgressCompletionTracker.ContiguousDrain(20L, 1));
         t.complete(30L);
-        assertThat(t.pollContiguous()).isEqualTo(OptionalLong.of(30L));
+        assertThat(t.pollContiguous()).contains(new EgressCompletionTracker.ContiguousDrain(30L, 1));
         assertThat(t.isDrained()).isTrue();
     }
 
@@ -40,7 +38,7 @@ class EgressCompletionTrackerTest {
 
         // 10 finally completes — the whole contiguous run flushes at once, to the highest (30).
         t.complete(10L);
-        assertThat(t.pollContiguous()).isEqualTo(OptionalLong.of(30L));
+        assertThat(t.pollContiguous()).contains(new EgressCompletionTracker.ContiguousDrain(30L, 3));
         assertThat(t.isDrained()).isTrue();
     }
 
@@ -55,11 +53,11 @@ class EgressCompletionTrackerTest {
         t.complete(10L);
         t.complete(20L);
         t.complete(40L); // 30 still in flight
-        assertThat(t.pollContiguous()).isEqualTo(OptionalLong.of(20L));
+        assertThat(t.pollContiguous()).contains(new EgressCompletionTracker.ContiguousDrain(20L, 2));
         assertThat(t.inFlight()).isEqualTo(2); // 30, 40 remain
 
         t.complete(30L);
-        assertThat(t.pollContiguous()).isEqualTo(OptionalLong.of(40L));
+        assertThat(t.pollContiguous()).contains(new EgressCompletionTracker.ContiguousDrain(40L, 2));
         assertThat(t.isDrained()).isTrue();
     }
 
@@ -78,7 +76,7 @@ class EgressCompletionTrackerTest {
         t.complete(99L); // never registered
         assertThat(t.pollContiguous()).isEmpty();
         t.complete(10L);
-        assertThat(t.pollContiguous()).isEqualTo(OptionalLong.of(10L));
+        assertThat(t.pollContiguous()).contains(new EgressCompletionTracker.ContiguousDrain(10L, 1));
     }
 
     @Test
@@ -106,12 +104,12 @@ class EgressCompletionTrackerTest {
         t.complete(10L);
         t.complete(20L);
         // One poll flushes the contiguous admits and the unblocked cursor-only checkpoint.
-        assertThat(t.pollContiguous()).isEqualTo(OptionalLong.of(25L));
+        assertThat(t.pollContiguous()).contains(new EgressCompletionTracker.ContiguousDrain(25L, 3));
         assertThat(t.inFlight()).isEqualTo(1);
         assertThat(t.isDrained()).isFalse();
 
         t.complete(30L);
-        assertThat(t.pollContiguous()).isEqualTo(OptionalLong.of(30L));
+        assertThat(t.pollContiguous()).contains(new EgressCompletionTracker.ContiguousDrain(30L, 1));
         assertThat(t.isDrained()).isTrue();
     }
 
@@ -127,7 +125,7 @@ class EgressCompletionTrackerTest {
         t.complete(20L);
         t.complete(30L);
 
-        assertThat(t.pollContiguous()).isEqualTo(OptionalLong.of(30L));
+        assertThat(t.pollContiguous()).contains(new EgressCompletionTracker.ContiguousDrain(30L, 4));
         assertThat(t.isDrained()).isTrue();
     }
 
@@ -171,7 +169,7 @@ class EgressCompletionTrackerTest {
         } finally {
             pool.shutdownNow();
         }
-        assertThat(t.pollContiguous()).isEqualTo(OptionalLong.of(n * 10L));
+        assertThat(t.pollContiguous()).contains(new EgressCompletionTracker.ContiguousDrain(n * 10L, n));
         assertThat(t.isDrained()).isTrue();
     }
 }

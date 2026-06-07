@@ -27,8 +27,11 @@ import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
@@ -178,6 +181,69 @@ class OmsVenueEgressServiceTest {
     }
 
     @Test
+    void applyAdmittedEvent_batchedCursorFlushEvery3_persistsOnceEvery3rdFragment() throws Exception {
+        service.setCursorFlushEveryForTesting(3);
+
+        OrderAdmittedEvent ev = venueAdmit();
+        ExecutionReport er =
+                ExecutionReport.newBuilder()
+                        .setOmsOrderId(ev.orderId().toString())
+                        .setVenueExecRef("venue-exec-1")
+                        .setLastQtyScaled(10_000_000_000L)
+                        .setLastPxScaled(650_000L)
+                        .setVenueTsNanos(1L)
+                        .setExecType(ExecType.EXEC_TYPE_TRADE)
+                        .build();
+        when(routeClient.routeAdmittedOrder(ev)).thenReturn(Optional.of(er));
+
+        long pos1 = 1024L;
+        long pos2 = 2048L;
+        long pos3 = 3072L;
+        long pos4 = 4096L;
+        long pos5 = 5120L;
+        long pos6 = 6144L;
+
+        for (long pos : new long[] {pos1, pos2}) {
+            assertThat(service.applyAdmittedEvent(ev, pos)).isTrue();
+        }
+        verifyNoInteractions(cursorRepository);
+
+        assertThat(service.applyAdmittedEvent(ev, pos3)).isTrue();
+        verify(cursorRepository, times(1))
+                .advanceWithRecording(
+                        OmsVenueEgressService.EGRESS_ID,
+                        com.balh.oms.cluster.OmsClusterWireFormat.EVENTS_STREAM_ID,
+                        3L,
+                        pos3);
+
+        for (long pos : new long[] {pos4, pos5}) {
+            assertThat(service.applyAdmittedEvent(ev, pos)).isTrue();
+        }
+        verify(cursorRepository, never())
+                .advanceWithRecording(
+                        OmsVenueEgressService.EGRESS_ID,
+                        com.balh.oms.cluster.OmsClusterWireFormat.EVENTS_STREAM_ID,
+                        3L,
+                        pos4);
+        verify(cursorRepository, never())
+                .advanceWithRecording(
+                        OmsVenueEgressService.EGRESS_ID,
+                        com.balh.oms.cluster.OmsClusterWireFormat.EVENTS_STREAM_ID,
+                        3L,
+                        pos5);
+
+        assertThat(service.applyAdmittedEvent(ev, pos6)).isTrue();
+        verify(cursorRepository, times(1))
+                .advanceWithRecording(
+                        OmsVenueEgressService.EGRESS_ID,
+                        com.balh.oms.cluster.OmsClusterWireFormat.EVENTS_STREAM_ID,
+                        3L,
+                        pos6);
+
+        verifyNoMoreInteractions(cursorRepository);
+    }
+
+    @Test
     void applyAdmittedEvent_venueTransportFailure_submitsVenueRejectAndAdvancesCursor() throws Exception {
         OrderAdmittedEvent ev =
                 new OrderAdmittedEvent(
@@ -290,5 +356,25 @@ class OmsVenueEgressServiceTest {
 
         verify(cursorRepository, times(0)).advanceWithRecording(any(), anyInt(), anyLong(), anyLong());
         verify(clusterIngressClient, times(2)).submitApplyExecutionReport(any(), any());
+    }
+
+    private static OrderAdmittedEvent venueAdmit() {
+        return new OrderAdmittedEvent(
+                UUID.randomUUID(),
+                1L,
+                1L,
+                10_000_000_000L,
+                650_000L,
+                0,
+                0,
+                (byte) 0,
+                (byte) 0,
+                (byte) 2,
+                "a",
+                "i",
+                "h",
+                "PREDMKT-TEST-1",
+                null,
+                null);
     }
 }

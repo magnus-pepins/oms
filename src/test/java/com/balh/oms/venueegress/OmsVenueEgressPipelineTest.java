@@ -638,6 +638,43 @@ class OmsVenueEgressPipelineTest {
     }
 
     @Test
+    void pipelinedCursorFlushEvery3_persistsOnceEvery3rdContiguousAdvance() throws Exception {
+        service.setCursorFlushEveryForTesting(3);
+
+        long[] positions = {10L, 20L, 30L, 40L, 50L, 60L};
+        List<OrderAdmittedEvent> events = new ArrayList<>();
+        List<CompletableFuture<Optional<ExecutionReport>>> futures = new ArrayList<>();
+        for (long pos : positions) {
+            OrderAdmittedEvent ev = admit("PREDMKT-TEST-1");
+            events.add(ev);
+            CompletableFuture<Optional<ExecutionReport>> f = new CompletableFuture<>();
+            futures.add(f);
+            when(routeClient.routeAdmittedOrderAsync(ev)).thenReturn(f);
+            service.pipelineDispatchAdmitForTesting(ev, pos);
+        }
+
+        futures.get(0).complete(Optional.of(er(events.get(0))));
+        futures.get(1).complete(Optional.of(er(events.get(1))));
+        service.pipelineDrainContiguousForTesting();
+        verify(cursorRepository, never()).advanceWithRecording(any(), anyInt(), anyLong(), anyLong());
+
+        futures.get(2).complete(Optional.of(er(events.get(2))));
+        service.pipelineDrainContiguousForTesting();
+        verify(cursorRepository, times(1)).advanceWithRecording(any(), anyInt(), eq(3L), eq(30L));
+
+        futures.get(3).complete(Optional.of(er(events.get(3))));
+        futures.get(4).complete(Optional.of(er(events.get(4))));
+        service.pipelineDrainContiguousForTesting();
+        verify(cursorRepository, never()).advanceWithRecording(any(), anyInt(), eq(3L), eq(40L));
+        verify(cursorRepository, never()).advanceWithRecording(any(), anyInt(), eq(3L), eq(50L));
+
+        futures.get(5).complete(Optional.of(er(events.get(5))));
+        service.pipelineDrainContiguousForTesting();
+        verify(cursorRepository, times(1)).advanceWithRecording(any(), anyInt(), eq(3L), eq(60L));
+        verify(cursorRepository, times(2)).advanceWithRecording(any(), anyInt(), eq(3L), anyLong());
+    }
+
+    @Test
     void failedErSubmit_keepsTrackerPending_andDoesNotAdvanceCursor() throws Exception {
         service.markRunningForTesting();
         OrderAdmittedEvent ev = admit("PREDMKT-TEST-1");

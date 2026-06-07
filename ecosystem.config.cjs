@@ -579,6 +579,9 @@ const apps = [
       OMS_VENUE_SYMBOL_PREFIX: 'PREDMKT',
       // Pipelined RouteOrderStream in-flight cap (see plans/oms-venue-egress-pipelining.md).
       OMS_CLUSTER_VENUE_EGRESS_VENUE_ROUTE_MAX_IN_FLIGHT: '576',
+      // Slice 3: batch cursor UPSERTs on cursorDrainExecutor (64 fragments ≈ 64× replay window on
+      // crash vs default 1; acceptable on disposable pop — lowers JDBC rate during ER storms).
+      OMS_CLUSTER_VENUE_EGRESS_CURSOR_FLUSH_EVERY: '64',
       // Replay drain: 1µs idle park, 4096 frags/poll, 16 idle-tail spins, MAX-priority replay + route-offer.
       // 6× pending cap; ER-queue throttle floor 7168.
       OMS_CLUSTER_VENUE_EGRESS_POLL_PARK_NANOS: '1000',

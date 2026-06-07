@@ -20,6 +20,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import java.time.Clock;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -520,6 +521,66 @@ class OmsVenueEgressPipelineTest {
     }
 
     @Test
+    void routeBacklog_doesNotThrottle_whenErQueueEmptyAndPermitsRecycle() throws Exception {
+        int maxInFlight = 4;
+        int maxPending = maxInFlight * 6;
+        OmsConfig config = new OmsConfig();
+        config.getCluster().getVenueEgress().setVenueRouteMaxInFlight(maxInFlight);
+        config.getCluster().getVenueEgress().setBacklogThrottleMaxInFlight(maxInFlight);
+        config.getCluster().getVenueEgress().setBacklogThrottlePendingRouteThreshold(maxInFlight);
+        SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
+        service =
+                new OmsVenueEgressService(
+                        config,
+                        cursorRepository,
+                        meterRegistry,
+                        new ObjectMapper(),
+                        Clock.systemUTC(),
+                        routeClient,
+                        clusterIngressClient);
+        service.setCurrentRecordingIdForTesting(3L);
+        lenient()
+                .when(cursorRepository.advanceWithRecording(any(), anyInt(), eq(3L), anyLong()))
+                .thenReturn(true);
+        lenient()
+                .when(clusterIngressClient.submitApplyExecutionReportAsync(any(), any()))
+                .thenReturn(CompletableFuture.completedFuture(null));
+        when(clusterIngressClient.erOfferQueueDepth()).thenReturn(0);
+        var routeOfferPool = Executors.newSingleThreadExecutor();
+        try {
+            service.enablePipelineForTesting(maxInFlight, Runnable::run, Runnable::run, routeOfferPool);
+            service.markRunningForTesting();
+
+            List<CompletableFuture<Optional<ExecutionReport>>> venueFutures =
+                    new CopyOnWriteArrayList<>();
+            when(routeClient.routeAdmittedOrderAsync(any()))
+                    .thenAnswer(
+                            inv -> {
+                                CompletableFuture<Optional<ExecutionReport>> f = new CompletableFuture<>();
+                                venueFutures.add(f);
+                                return f;
+                            });
+
+            for (int i = 0; i < maxPending; i++) {
+                service.pipelineDispatchAdmitForTesting(admit("PREDMKT-TEST-1"), 10L * (i + 1));
+            }
+
+            // Replay registers the full 6× window even while venue permits are held (route-offer
+            // consumer blocks on acquire after maxInFlight — not a replay throttle).
+            assertThat(service.pipelineInFlightForTesting()).isEqualTo(maxPending);
+            assertThat(
+                            meterRegistry.find(OmsVenueEgressPipelineMetrics.COUNTER_DISPATCH_THROTTLED)
+                                    .counter())
+                    .satisfies(
+                            c -> assertThat(c == null ? 0.0 : c.count()).isZero());
+            verify(routeClient, times(maxInFlight)).routeAdmittedOrderAsync(any());
+        } finally {
+            routeOfferPool.shutdown();
+            routeOfferPool.awaitTermination(2, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
     void backlogThrottle_reducesEffectiveInFlight_whenVenuePermitsExhausted() throws Exception {
         OmsConfig config = new OmsConfig();
         config.getCluster().getVenueEgress().setVenueRouteMaxInFlight(1);
@@ -552,6 +613,8 @@ class OmsVenueEgressPipelineTest {
         CompletableFuture<Optional<ExecutionReport>> f2 = new CompletableFuture<>();
         when(routeClient.routeAdmittedOrderAsync(ev1)).thenReturn(f1);
         when(routeClient.routeAdmittedOrderAsync(ev2)).thenReturn(f2);
+        when(clusterIngressClient.erOfferQueueDepth())
+                .thenReturn(config.getCluster().getVenueEgress().getBacklogThrottleErOfferQueueDepthThreshold());
 
         service.pipelineDispatchAdmitForTesting(ev1, 10L);
 

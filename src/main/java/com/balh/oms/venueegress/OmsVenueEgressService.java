@@ -1754,9 +1754,6 @@ public class OmsVenueEgressService {
                 if (inFlight < effectiveCap) {
                     return;
                 }
-                if (effectiveCap < maxPendingFragments) {
-                    dispatchThrottledTotal.increment();
-                }
                 drainContiguous();
                 if (!running.get()) {
                     return;
@@ -1767,6 +1764,9 @@ public class OmsVenueEgressService {
                     continue;
                 }
                 idleSpins = 0;
+                if (effectiveCap < maxPendingFragments) {
+                    dispatchThrottledTotal.increment();
+                }
                 LockSupport.parkNanos(backlogThrottleParkNanos);
             }
         }
@@ -1791,7 +1791,18 @@ public class OmsVenueEgressService {
             boolean venuePermitsExhausted = permits.availablePermits() == 0;
             boolean routeBacklogged =
                     inFlight >= backlogThrottlePendingRouteThreshold && venuePermitsExhausted;
-            if (routeBacklogged || (erOfferBacklogged && venuePermitsExhausted)) {
+            if (routeBacklogged) {
+                if (!erOfferBacklogged) {
+                    // Venue permits hit 0 transiently while ER offer queue is empty — permits
+                    // recycle on venue ack before ER submit completes (6× pending cap). Clamping to
+                    // backlogThrottleMaxInFlight here falsely parks replay @ 16k (observed pop
+                    // f945204: egress_dispatch_throttled ~80k, peak effective cap 3456, ER/gRPC
+                    // queue peaks 0).
+                    return maxPendingFragments;
+                }
+                return Math.max(1, Math.min(maxPendingFragments, backlogThrottleMaxInFlight));
+            }
+            if (erOfferBacklogged && venuePermitsExhausted) {
                 return Math.max(1, Math.min(maxPendingFragments, backlogThrottleMaxInFlight));
             }
             if (erOfferBacklogged) {

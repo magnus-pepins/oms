@@ -469,13 +469,12 @@ class OmsVenueEgressPipelineTest {
     }
 
     @Test
-    void backlogThrottle_reducesEffectiveInFlight_whenErQueueDepthIsHigh() throws Exception {
+    void backlogThrottle_doesNotClampDispatch_whenOnlyErQueueIsDeep() throws Exception {
         OmsConfig config = new OmsConfig();
         config.getCluster().getVenueEgress().setVenueRouteMaxInFlight(8);
         config.getCluster().getVenueEgress().setBacklogThrottleMaxInFlight(1);
         config.getCluster().getVenueEgress().setBacklogThrottlePendingRouteThreshold(8);
         config.getCluster().getVenueEgress().setBacklogThrottleErOfferQueueDepthThreshold(1);
-        config.getCluster().getVenueEgress().setBacklogThrottleParkNanos(10_000L);
         service =
                 new OmsVenueEgressService(
                         config,
@@ -495,9 +494,50 @@ class OmsVenueEgressPipelineTest {
         service.enablePipelineForTesting(8, Runnable::run, Runnable::run, Runnable::run);
         service.markRunningForTesting();
 
-        // Keep ER backlog high for the whole pre-ack window so the throttle gate remains reduced
-        // until the first route completion actually drops in-flight below the throttled cap.
         when(clusterIngressClient.erOfferQueueDepth()).thenReturn(10);
+
+        OrderAdmittedEvent ev1 = admit("PREDMKT-TEST-1");
+        OrderAdmittedEvent ev2 = admit("PREDMKT-TEST-1");
+        CompletableFuture<Optional<ExecutionReport>> f1 = new CompletableFuture<>();
+        CompletableFuture<Optional<ExecutionReport>> f2 = new CompletableFuture<>();
+        when(routeClient.routeAdmittedOrderAsync(ev1)).thenReturn(f1);
+        when(routeClient.routeAdmittedOrderAsync(ev2)).thenReturn(f2);
+
+        service.pipelineDispatchAdmitForTesting(ev1, 10L);
+        service.pipelineDispatchAdmitForTesting(ev2, 20L);
+
+        verify(routeClient, times(2)).routeAdmittedOrderAsync(any());
+
+        f1.complete(Optional.of(er(ev1)));
+        f2.complete(Optional.of(er(ev2)));
+        assertThat(service.pipelineQuiesceForTesting()).isTrue();
+    }
+
+    @Test
+    void backlogThrottle_reducesEffectiveInFlight_whenVenuePermitsExhausted() throws Exception {
+        OmsConfig config = new OmsConfig();
+        config.getCluster().getVenueEgress().setVenueRouteMaxInFlight(1);
+        config.getCluster().getVenueEgress().setBacklogThrottleMaxInFlight(1);
+        config.getCluster().getVenueEgress().setBacklogThrottlePendingRouteThreshold(1);
+        config.getCluster().getVenueEgress().setBacklogThrottleParkNanos(10_000L);
+        service =
+                new OmsVenueEgressService(
+                        config,
+                        cursorRepository,
+                        new SimpleMeterRegistry(),
+                        new ObjectMapper(),
+                        Clock.systemUTC(),
+                        routeClient,
+                        clusterIngressClient);
+        service.setCurrentRecordingIdForTesting(3L);
+        lenient()
+                .when(cursorRepository.advanceWithRecording(any(), anyInt(), eq(3L), anyLong()))
+                .thenReturn(true);
+        lenient()
+                .when(clusterIngressClient.submitApplyExecutionReportAsync(any(), any()))
+                .thenReturn(CompletableFuture.completedFuture(null));
+        service.enablePipelineForTesting(1, Runnable::run, Runnable::run, Runnable::run);
+        service.markRunningForTesting();
 
         OrderAdmittedEvent ev1 = admit("PREDMKT-TEST-1");
         OrderAdmittedEvent ev2 = admit("PREDMKT-TEST-1");

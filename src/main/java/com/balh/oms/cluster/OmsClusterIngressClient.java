@@ -1279,10 +1279,14 @@ public class OmsClusterIngressClient {
                     LockSupport.parkNanos(drainIntervalNanos);
                     continue;
                 }
-                drained.clear();
-                drained.add(head);
-                erOfferQueue.drainTo(drained, maxPerLockPass - 1);
-                offerErBurstWithBackpressure(drained, offerScratch, parkNanos, maxPerLockPass);
+                // Tight drain while the queue is deep — avoid re-parking between bursts @ 10k/s.
+                do {
+                    drained.clear();
+                    drained.add(head);
+                    erOfferQueue.drainTo(drained, maxPerLockPass - 1);
+                    offerErBurstWithBackpressure(drained, offerScratch, parkNanos, maxPerLockPass);
+                    head = erOfferQueue.poll();
+                } while (head != null);
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
                 return;

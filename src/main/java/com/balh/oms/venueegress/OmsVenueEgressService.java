@@ -1747,12 +1747,13 @@ public class OmsVenueEgressService {
          * is deep.
          */
         private int effectiveDispatchCapacity(int inFlight, int erOfferQueueDepth) {
-            boolean erOfferBacklogged =
-                    erOfferQueueDepth >= backlogThrottleErOfferQueueDepthThreshold;
             boolean venuePermitsExhausted = permits.availablePermits() == 0;
             boolean routeBacklogged =
                     inFlight >= backlogThrottlePendingRouteThreshold && venuePermitsExhausted;
-            if (erOfferBacklogged || routeBacklogged) {
+            // ER-queue depth alone must not clamp replay dispatch while venue permits are free:
+            // throttling admits when only the ER daemon is behind inflated egress_wall_lag_ms @ 10k/s
+            // (observed pop ledger-on: 377–601 ms) without speeding ER drain.
+            if (routeBacklogged) {
                 return Math.max(1, Math.min(maxPendingFragments, backlogThrottleMaxInFlight));
             }
             return maxPendingFragments;

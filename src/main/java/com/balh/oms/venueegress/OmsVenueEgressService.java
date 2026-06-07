@@ -1757,20 +1757,15 @@ public class OmsVenueEgressService {
             boolean venuePermitsExhausted = permits.availablePermits() == 0;
             boolean routeBacklogged =
                     inFlight >= backlogThrottlePendingRouteThreshold && venuePermitsExhausted;
-            int erSoftCap =
-                    Math.min(
-                            maxPendingFragments,
-                            maxInFlight * backlogThrottleErSoftCapPermitMultiplier);
-            erSoftCap = Math.max(backlogThrottleMaxInFlight, erSoftCap);
-            if (routeBacklogged) {
-                // Pending routes + no venue permits: hard floor only (replay must not outrun venue).
+            if (routeBacklogged || (erOfferBacklogged && venuePermitsExhausted)) {
                 return Math.max(1, Math.min(maxPendingFragments, backlogThrottleMaxInFlight));
             }
             if (erOfferBacklogged) {
-                // ER queue deep: graduated cap even when venue permits are exhausted — the old
-                // combined branch clamped to backlogThrottleMaxInFlight and wedged replay @ 15k
-                // (meanRouteMs ~140 ms pre-tune, ~392 ms with 5× soft cap + 640 permits).
-                return erSoftCap;
+                int erBacklogCap =
+                        Math.min(
+                                maxPendingFragments,
+                                maxInFlight * backlogThrottleErSoftCapPermitMultiplier);
+                return Math.max(backlogThrottleMaxInFlight, erBacklogCap);
             }
             return maxPendingFragments;
         }

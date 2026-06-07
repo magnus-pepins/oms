@@ -35,6 +35,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.LongSupplier;
 
 /**
  * Spring-managed Aeron Cluster client used by the HTTP / gRPC ingress JVM to
@@ -270,6 +271,15 @@ public class OmsClusterIngressClient {
         return erOfferQueue.size();
     }
 
+    /**
+     * Wires replay/archive lag for lag-aware ER interleave (venue-egress only). Idempotent;
+     * safe to call once after both beans are constructed.
+     */
+    public void setExcessEgressLagBytesSupplier(LongSupplier excessEgressLagBytesSupplier) {
+        this.excessEgressLagBytesSupplier =
+                Objects.requireNonNull(excessEgressLagBytesSupplier, "excessEgressLagBytesSupplier");
+    }
+
     private volatile AeronCluster client;
     private volatile Thread egressPollerThread;
     private volatile boolean closing;
@@ -321,6 +331,11 @@ public class OmsClusterIngressClient {
             new java.util.concurrent.atomic.AtomicInteger();
     /** ER-offer-only: next keepalive deadline maintained by the ER daemon idle path (single lock owner). */
     private long erOfferOnlyNextHeartbeatDeadlineNanos;
+    /**
+     * Optional excess egress/archive lag (bytes) for lag-aware ER interleave on venue-egress.
+     * Negative values mean no reading (stay on configured {@code interleavePollEveryOffers}).
+     */
+    private volatile LongSupplier excessEgressLagBytesSupplier = () -> -1L;
 
     // ---- Phase 4 slice 4c: commit-round-trip timer ----
     // Single timer name `oms.cluster.client.commit_round_trip` covers both submit methods so a
@@ -1289,19 +1304,39 @@ public class OmsClusterIngressClient {
 
     /**
      * ER_OFFER_ONLY burst path: short egress drain to clear publication flow-control without a
-     * competing poller thread. Returns {@code 0} when the counter has not reached
-     * {@link OmsConfig.Cluster.Client.ErOffer#getInterleavePollEveryOffers()}.
+     * competing poller thread. Returns {@code 0} when the counter has not reached the effective
+     * interleave interval (base or lag-aware).
      */
     private int pollEgressInterleaveErOfferOnlyIfDue(AeronCluster active, int offersSinceInterleave) {
         if (config.getRole() != ClusterClientRole.ER_OFFER_ONLY || active == null) {
             return offersSinceInterleave;
         }
-        int every = config.getErOffer().getInterleavePollEveryOffers();
+        int every = effectiveInterleavePollEveryOffers();
         if (offersSinceInterleave < every) {
             return offersSinceInterleave;
         }
         pollEgressDrain(active, config.getErOffer().getInterleavePollCap());
         return 0;
+    }
+
+    /**
+     * When archive/replay lag is high but the ER queue is shallow, poll cluster egress more
+     * aggressively so publication flow-control does not stall admit→ER-submit at ~16k/s.
+     */
+    int effectiveInterleavePollEveryOffers() {
+        OmsConfig.Cluster.Client.ErOffer erCfg = config.getErOffer();
+        if (!erCfg.isInterleaveLagAwareEnabled() || config.getRole() != ClusterClientRole.ER_OFFER_ONLY) {
+            return erCfg.getInterleavePollEveryOffers();
+        }
+        long lagBytes = excessEgressLagBytesSupplier.getAsLong();
+        if (lagBytes < 0L) {
+            return erCfg.getInterleavePollEveryOffers();
+        }
+        if (lagBytes >= erCfg.getInterleaveLagBytesThreshold()
+                && erOfferQueue.size() < erCfg.getInterleaveLagAwareQueueDepthThreshold()) {
+            return erCfg.getInterleaveLagAwarePollEveryOffers();
+        }
+        return erCfg.getInterleavePollEveryOffers();
     }
 
     /**

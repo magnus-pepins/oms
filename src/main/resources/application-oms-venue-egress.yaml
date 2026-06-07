@@ -11,11 +11,15 @@ oms:
     client:
       role: ${OMS_CLUSTER_CLIENT_ROLE:er-offer-only}
       er-offer:
-        # Venue-egress ER flood @ 8–16k/s: 512 frames/lock + periodic egress interleave (not per-offer).
-        max-per-lock-pass: ${OMS_CLUSTER_CLIENT_ER_OFFER_MAX_PER_LOCK_PASS:512}
+        # Venue-egress ER flood @ 8–16k/s: 1024 frames/lock + egress interleave every 4 offers.
+        max-per-lock-pass: ${OMS_CLUSTER_CLIENT_ER_OFFER_MAX_PER_LOCK_PASS:1024}
         drain-interval-nanos: ${OMS_CLUSTER_CLIENT_ER_OFFER_DRAIN_INTERVAL_NANOS:1000}
         interleave-poll-cap: ${OMS_CLUSTER_CLIENT_ER_OFFER_INTERLEAVE_POLL_CAP:8}
-        interleave-poll-every-offers: ${OMS_CLUSTER_CLIENT_ER_OFFER_INTERLEAVE_POLL_EVERY_OFFERS:16}
+        interleave-poll-every-offers: ${OMS_CLUSTER_CLIENT_ER_OFFER_INTERLEAVE_POLL_EVERY_OFFERS:4}
+        interleave-lag-aware-enabled: ${OMS_CLUSTER_CLIENT_ER_OFFER_INTERLEAVE_LAG_AWARE_ENABLED:true}
+        interleave-lag-bytes-threshold: ${OMS_CLUSTER_CLIENT_ER_OFFER_INTERLEAVE_LAG_BYTES_THRESHOLD:4096}
+        interleave-lag-aware-queue-depth-threshold: ${OMS_CLUSTER_CLIENT_ER_OFFER_INTERLEAVE_LAG_AWARE_QUEUE_DEPTH_THRESHOLD:256}
+        interleave-lag-aware-poll-every-offers: ${OMS_CLUSTER_CLIENT_ER_OFFER_INTERLEAVE_LAG_AWARE_POLL_EVERY_OFFERS:1}
       enabled: ${OMS_VENUE_EGRESS_CLUSTER_CLIENT_ENABLED:true}
       aeron-directory: ${OMS_VENUE_EGRESS_CLUSTER_CLIENT_AERON_DIR:${OMS_VENUE_EGRESS_AERON_DIR:}}
       ingress-endpoints: ${OMS_VENUE_EGRESS_CLUSTER_CLIENT_INGRESS_ENDPOINTS:0=localhost:20110}

@@ -407,6 +407,157 @@ class OmsClusterIngressClientErOfferTest {
     }
 
     @Test
+    void effectiveInterleavePollEveryOffers_lagAware_usesAggressiveIntervalWhenLagHighAndQueueShallow() {
+        OmsConfig cfg = newConfig();
+        cfg.getCluster().getClient().setRole(ClusterClientRole.ER_OFFER_ONLY);
+        OmsConfig.Cluster.Client.ErOffer erOffer = cfg.getCluster().getClient().getErOffer();
+        erOffer.setInterleavePollEveryOffers(16);
+        erOffer.setInterleaveLagAwareEnabled(true);
+        erOffer.setInterleaveLagBytesThreshold(4096L);
+        erOffer.setInterleaveLagAwareQueueDepthThreshold(256);
+        erOffer.setInterleaveLagAwarePollEveryOffers(1);
+
+        OmsClusterIngressClient client = new OmsClusterIngressClient(cfg, new SimpleMeterRegistry());
+        client.setExcessEgressLagBytesSupplier(() -> 8192L);
+        assertThat(client.effectiveInterleavePollEveryOffers()).isEqualTo(1);
+        client.close();
+    }
+
+    @Test
+    void effectiveInterleavePollEveryOffers_lagAware_fallsBackWhenQueueDeep() throws Exception {
+        OmsConfig cfg = newConfig();
+        cfg.getCluster().getClient().setRole(ClusterClientRole.ER_OFFER_ONLY);
+        OmsConfig.Cluster.Client.ErOffer erOffer = cfg.getCluster().getClient().getErOffer();
+        erOffer.setInterleavePollEveryOffers(16);
+        erOffer.setInterleaveLagAwareEnabled(true);
+        erOffer.setInterleaveLagBytesThreshold(4096L);
+        erOffer.setInterleaveLagAwareQueueDepthThreshold(4);
+        erOffer.setInterleaveLagAwarePollEveryOffers(1);
+        erOffer.setQueueCapacity(8);
+
+        OmsClusterIngressClient client = new OmsClusterIngressClient(cfg, new SimpleMeterRegistry());
+        setField(client, "client", Mockito.mock(AeronCluster.class));
+        setField(client, "closing", false);
+        client.setExcessEgressLagBytesSupplier(() -> 8192L);
+        for (int i = 0; i < 4; i++) {
+            CompletableFuture<Void> enqueued =
+                    client.submitApplyExecutionReportAsync(
+                            sampleEr(client.nextCorrelationId()), Duration.ofSeconds(5));
+            assertThat(enqueued.isDone()).isFalse();
+        }
+        assertThat(client.erOfferQueueDepthForTest()).isEqualTo(4);
+        assertThat(client.effectiveInterleavePollEveryOffers()).isEqualTo(16);
+        client.close();
+    }
+
+    @Test
+    void erOfferOnly_lagAwareInterleave_pollsMoreAggressivelyWhenLagHighAndQueueShallow() throws Exception {
+        OmsConfig cfg = newConfig();
+        cfg.getCluster().getClient().setRole(ClusterClientRole.ER_OFFER_ONLY);
+        OmsConfig.Cluster.Client.ErOffer erOffer = cfg.getCluster().getClient().getErOffer();
+        erOffer.setInterleavePollEveryOffers(16);
+        erOffer.setInterleaveLagAwareEnabled(true);
+        erOffer.setInterleaveLagBytesThreshold(4096L);
+        erOffer.setInterleaveLagAwareQueueDepthThreshold(256);
+        erOffer.setInterleaveLagAwarePollEveryOffers(1);
+        erOffer.setInterleavePollCap(4);
+        erOffer.setMaxPerLockPass(64);
+
+        OmsClusterIngressClient lagAwareClient = new OmsClusterIngressClient(cfg, new SimpleMeterRegistry());
+        lagAwareClient.setExcessEgressLagBytesSupplier(() -> 8192L);
+        AtomicInteger lagAwarePollRounds = new AtomicInteger();
+        AtomicInteger lagAwareOffers = new AtomicInteger();
+        AeronCluster lagAwareCluster = Mockito.mock(AeronCluster.class);
+        Mockito.when(lagAwareCluster.offer(Mockito.any(), Mockito.anyInt(), Mockito.anyInt()))
+                .thenAnswer(
+                        inv -> {
+                            lagAwareOffers.incrementAndGet();
+                            return 1L;
+                        });
+        Mockito.when(lagAwareCluster.pollEgress())
+                .thenAnswer(
+                        inv -> {
+                            lagAwarePollRounds.incrementAndGet();
+                            return 0;
+                        });
+
+        setField(lagAwareClient, "client", lagAwareCluster);
+        setField(lagAwareClient, "closing", false);
+        invokeStartErOfferDaemonLocked(lagAwareClient);
+
+        OmsConfig baselineCfg = newConfig();
+        baselineCfg.getCluster().getClient().setRole(ClusterClientRole.ER_OFFER_ONLY);
+        baselineCfg.getCluster().getClient().getErOffer().setInterleavePollEveryOffers(16);
+        baselineCfg.getCluster().getClient().getErOffer().setInterleaveLagAwareEnabled(false);
+        baselineCfg.getCluster().getClient().getErOffer().setInterleavePollCap(4);
+        baselineCfg.getCluster().getClient().getErOffer().setMaxPerLockPass(64);
+        OmsClusterIngressClient baselineClient = new OmsClusterIngressClient(baselineCfg, new SimpleMeterRegistry());
+        AtomicInteger baselinePollRounds = new AtomicInteger();
+        AtomicInteger baselineOffers = new AtomicInteger();
+        AeronCluster baselineCluster = Mockito.mock(AeronCluster.class);
+        Mockito.when(baselineCluster.offer(Mockito.any(), Mockito.anyInt(), Mockito.anyInt()))
+                .thenAnswer(
+                        inv -> {
+                            baselineOffers.incrementAndGet();
+                            return 1L;
+                        });
+        Mockito.when(baselineCluster.pollEgress())
+                .thenAnswer(
+                        inv -> {
+                            baselinePollRounds.incrementAndGet();
+                            return 0;
+                        });
+
+        setField(baselineClient, "client", baselineCluster);
+        setField(baselineClient, "closing", false);
+        invokeStartErOfferDaemonLocked(baselineClient);
+
+        int n = 32;
+        var pool = Executors.newVirtualThreadPerTaskExecutor();
+        try {
+            CountDownLatch done = new CountDownLatch(n * 2);
+            for (int i = 0; i < n; i++) {
+                long cid = lagAwareClient.nextCorrelationId();
+                pool.submit(
+                        () -> {
+                            try {
+                                lagAwareClient.submitApplyExecutionReportAsync(sampleEr(cid), Duration.ofSeconds(5))
+                                        .get(10, TimeUnit.SECONDS);
+                            } catch (Exception e) {
+                                throw new AssertionError(e);
+                            } finally {
+                                done.countDown();
+                            }
+                        });
+                long baselineCid = baselineClient.nextCorrelationId();
+                pool.submit(
+                        () -> {
+                            try {
+                                baselineClient.submitApplyExecutionReportAsync(
+                                                sampleEr(baselineCid), Duration.ofSeconds(5))
+                                        .get(10, TimeUnit.SECONDS);
+                            } catch (Exception e) {
+                                throw new AssertionError(e);
+                            } finally {
+                                done.countDown();
+                            }
+                        });
+            }
+            assertThat(done.await(15, TimeUnit.SECONDS)).isTrue();
+        } finally {
+            pool.shutdownNow();
+            lagAwareClient.close();
+            baselineClient.close();
+        }
+
+        assertThat(lagAwareOffers.get()).isEqualTo(n);
+        assertThat(baselineOffers.get()).isEqualTo(n);
+        assertThat(lagAwarePollRounds.get())
+                .as("lag-aware interleave should poll egress more often than baseline every-16")
+                .isGreaterThan(baselinePollRounds.get());
+    }
+
+    @Test
     void erOfferOnlyRole_singleErDaemonWithoutCompetingPollerThreads() throws Exception {
         OmsConfig cfg = newConfig();
         cfg.getCluster().getClient().setRole(ClusterClientRole.ER_OFFER_ONLY);

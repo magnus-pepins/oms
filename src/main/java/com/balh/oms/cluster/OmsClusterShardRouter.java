@@ -56,7 +56,7 @@ import java.util.UUID;
  * disabled, the router is too — no orphan router referencing missing clients.
  */
 @Component
-@Profile(OmsProfiles.CLUSTER_CLIENT_PROFILE)
+@Profile({OmsProfiles.CLUSTER_CLIENT_PROFILE, "!" + OmsProfiles.VENUE_EGRESS})
 @ConditionalOnProperty(prefix = "oms.cluster.client", name = "enabled", havingValue = "true")
 public final class OmsClusterShardRouter {
 

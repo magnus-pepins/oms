@@ -574,10 +574,11 @@ const apps = [
       OMS_VENUE_SYMBOL_PREFIX: 'PREDMKT',
       // Pipelined RouteOrderStream in-flight cap (see plans/oms-venue-egress-pipelining.md).
       OMS_CLUSTER_VENUE_EGRESS_VENUE_ROUTE_MAX_IN_FLIGHT: '576',
-      // Replay drain: 1µs idle park, 2048 frags/poll, MAX-priority replay + route-offer threads.
-      // pollReplayIdleTail spins 8× before park; 6× pending cap; ER-queue throttle floor 6144.
+      // Replay drain: 1µs idle park, 4096 frags/poll, 16 idle-tail spins, MAX-priority replay + route-offer.
+      // 6× pending cap; ER-queue throttle floor 7168.
       OMS_CLUSTER_VENUE_EGRESS_POLL_PARK_NANOS: '1000',
-      OMS_CLUSTER_VENUE_EGRESS_FRAGMENT_LIMIT: '2048',
+      OMS_CLUSTER_VENUE_EGRESS_FRAGMENT_LIMIT: '4096',
+      OMS_CLUSTER_VENUE_EGRESS_REPLAY_IDLE_TAIL_POLLS: '16',
       OMS_CLUSTER_VENUE_EGRESS_REPLAY_THREAD_PRIORITY: '10',
       OMS_CLUSTER_VENUE_EGRESS_BACKLOG_THROTTLE_PENDING_ROUTE_THRESHOLD: '2048',
       OMS_CLUSTER_VENUE_EGRESS_BACKLOG_THROTTLE_ER_OFFER_QUEUE_DEPTH_THRESHOLD: '7168',

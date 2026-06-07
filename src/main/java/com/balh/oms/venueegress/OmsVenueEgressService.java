@@ -221,6 +221,7 @@ public class OmsVenueEgressService {
     /** Aligns with {@link OmsConfig.Cluster.VenueEgress} default until {@link #init()} caches config. */
     private int replayFragmentLimit = 512;
     private long replayPollParkNanos = 1_000_000L;
+    private int replayIdleTailPolls = 16;
 
     /**
      * Design A pipeline (slice: venue egress pipelining). Non-null only when
@@ -367,6 +368,7 @@ public class OmsVenueEgressService {
         OmsConfig.Cluster.VenueEgress venueEgressCfg = config.getCluster().getVenueEgress();
         replayFragmentLimit = effectiveReplayFragmentLimit(venueEgressCfg.getFragmentLimit());
         replayPollParkNanos = venueEgressCfg.getPollParkNanos();
+        replayIdleTailPolls = venueEgressCfg.getReplayIdleTailPolls();
         boolean venueWired = venueRouteOrderClient != null && clusterIngressClient != null;
         int maxInFlight = Math.max(1, config.getCluster().getVenueEgress().getVenueRouteMaxInFlight());
         if (savedCursor.isPresent()) {
@@ -862,9 +864,6 @@ public class OmsVenueEgressService {
      * in the gap between the burst terminal zero and {@link #findRecordingById}; skipping this
      * slice forces an Archive control round-trip plus park on every momentary race.
      */
-    /** Live-tail spins before park/recording-walk; raised for pop @ 10k admit/s knee vs 5k. */
-    private static final int REPLAY_IDLE_TAIL_POLLS = 8;
-
     /**
      * Tight-spin drain: call {@link Subscription#poll} repeatedly while Aeron delivers fragments,
      * without idle park or recording-walk work between passes. Returns the fragment count for
@@ -890,7 +889,7 @@ public class OmsVenueEgressService {
      * unit tests that assert the spin count without Aeron Archive.
      */
     int pollReplayIdleTail(Subscription replay, FragmentHandler handler) {
-        for (int attempt = 0; attempt < REPLAY_IDLE_TAIL_POLLS && running.get(); attempt++) {
+        for (int attempt = 0; attempt < replayIdleTailPolls && running.get(); attempt++) {
             Thread.onSpinWait();
             int polled = pollReplayBurst(replay, handler);
             if (polled > 0) {
@@ -925,11 +924,17 @@ public class OmsVenueEgressService {
     }
 
     /**
-     * Amortizes {@code replay.poll} syscall overhead at 5k–10k admits/s. Operators may set a lower
-     * configured limit; production floors at 2048 frags/poll for sustained 10k/s drain.
+     * Production floor for {@code replay.poll} batch size. At 16k admit/s on pop, 2048 frags/poll
+     * left {@code oms.venue.egress.lag_bytes} climbing (~6 MB); 4096 halves poll syscall rate.
+     */
+    static final int MIN_REPLAY_FRAGMENT_LIMIT_FOR_HIGH_ADMIT_DRAIN = 4096;
+
+    /**
+     * Amortizes {@code replay.poll} syscall overhead at 10k–16k admits/s. Operators may set a lower
+     * configured limit; production floors at {@link #MIN_REPLAY_FRAGMENT_LIMIT_FOR_HIGH_ADMIT_DRAIN}.
      */
     static int effectiveReplayFragmentLimit(int configuredLimit) {
-        return Math.max(configuredLimit, 2048);
+        return Math.max(configuredLimit, MIN_REPLAY_FRAGMENT_LIMIT_FOR_HIGH_ADMIT_DRAIN);
     }
 
     /**
@@ -2144,8 +2149,13 @@ public class OmsVenueEgressService {
     }
 
     void setReplayPollConfigForTesting(int fragmentLimit, long pollParkNanos) {
+        setReplayPollConfigForTesting(fragmentLimit, pollParkNanos, 16);
+    }
+
+    void setReplayPollConfigForTesting(int fragmentLimit, long pollParkNanos, int idleTailPolls) {
         this.replayFragmentLimit = fragmentLimit;
         this.replayPollParkNanos = pollParkNanos;
+        this.replayIdleTailPolls = idleTailPolls;
     }
 
     EgressRoutePipeline pipelineForTesting() {

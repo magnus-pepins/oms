@@ -67,10 +67,29 @@ class OmsVenueEgressReplayPollLoopTest {
     }
 
     @Test
-    void effectiveReplayFragmentLimit_floorsAt2048ForHighAdmitDrain() {
-        assertThat(OmsVenueEgressService.effectiveReplayFragmentLimit(512)).isEqualTo(2048);
-        assertThat(OmsVenueEgressService.effectiveReplayFragmentLimit(1024)).isEqualTo(2048);
-        assertThat(OmsVenueEgressService.effectiveReplayFragmentLimit(4096)).isEqualTo(4096);
+    void effectiveReplayFragmentLimit_floorsAt4096ForHighAdmitDrain() {
+        assertThat(OmsVenueEgressService.effectiveReplayFragmentLimit(512)).isEqualTo(4096);
+        assertThat(OmsVenueEgressService.effectiveReplayFragmentLimit(2048)).isEqualTo(4096);
+        assertThat(OmsVenueEgressService.effectiveReplayFragmentLimit(8192)).isEqualTo(8192);
+    }
+
+    @Test
+    void venueEgressConfig_replayIdleTailPolls_defaultsToSixteen() {
+        OmsConfig.Cluster.VenueEgress cfg = new OmsConfig().getCluster().getVenueEgress();
+        assertThat(cfg.getReplayIdleTailPolls()).isEqualTo(16);
+        cfg.setReplayIdleTailPolls(0);
+        assertThat(cfg.getReplayIdleTailPolls()).isEqualTo(1);
+    }
+
+    @Test
+    void pollReplayIdleTail_retriesConfiguredSpinCountBeforeGivingUp() {
+        Subscription replay = mock(Subscription.class);
+        FragmentHandler handler = (buffer, offset, length, header) -> {};
+        when(replay.poll(any(), eq(FRAGMENT_LIMIT))).thenReturn(0);
+        service.setReplayPollConfigForTesting(FRAGMENT_LIMIT, 10_000L, 5);
+
+        assertThat(service.pollReplayIdleTail(replay, handler)).isZero();
+        verify(replay, times(5)).poll(any(), eq(FRAGMENT_LIMIT));
     }
 
     @Test

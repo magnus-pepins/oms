@@ -3553,6 +3553,12 @@ public class OmsConfig {
              */
             private static final int DEFAULT_REPLAY_THREAD_PRIORITY = Thread.MAX_PRIORITY;
 
+            /**
+             * Spin-yield passes in {@code pollReplayIdleTail} before archive metadata refresh or
+             * configured idle park. Raised from 8→16 for pop @ 10k admit/s knee (mirrors projector).
+             */
+            private static final int DEFAULT_REPLAY_IDLE_TAIL_POLLS = 16;
+
             private boolean enabled = false;
             private String aeronDirectory = "";
             private String archiveControlRequestChannel = "aeron:ipc?term-length=64k";
@@ -3573,6 +3579,7 @@ public class OmsConfig {
                     DEFAULT_BACKLOG_THROTTLE_ER_SOFT_CAP_PERMIT_MULTIPLIER;
             private long backlogThrottleParkNanos = DEFAULT_BACKLOG_THROTTLE_PARK_NANOS;
             private int replayThreadPriority = DEFAULT_REPLAY_THREAD_PRIORITY;
+            private int replayIdleTailPolls = DEFAULT_REPLAY_IDLE_TAIL_POLLS;
             private int venueRejectSubmitMaxAttempts = DEFAULT_VENUE_REJECT_SUBMIT_MAX_ATTEMPTS;
             private long venueRejectSubmitRetryBackoffMs = DEFAULT_VENUE_REJECT_SUBMIT_RETRY_BACKOFF_MS;
 
@@ -3709,6 +3716,11 @@ public class OmsConfig {
             public void setReplayThreadPriority(int replayThreadPriority) {
                 this.replayThreadPriority =
                         Math.clamp(replayThreadPriority, Thread.MIN_PRIORITY, Thread.MAX_PRIORITY);
+            }
+
+            public int getReplayIdleTailPolls() { return replayIdleTailPolls; }
+            public void setReplayIdleTailPolls(int replayIdleTailPolls) {
+                this.replayIdleTailPolls = Math.max(1, replayIdleTailPolls);
             }
 
             public int getVenueRejectSubmitMaxAttempts() { return venueRejectSubmitMaxAttempts; }

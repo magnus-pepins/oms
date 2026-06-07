@@ -1554,6 +1554,7 @@ public class OmsVenueEgressService {
         private final int backlogThrottlePendingRouteThreshold;
         private final int backlogThrottleErOfferQueueDepthThreshold;
         private final int backlogThrottleMaxInFlight;
+        private final int backlogThrottleErSoftCapPermitMultiplier;
         private final long backlogThrottleParkNanos;
         private final Semaphore permits;
         private final EgressCompletionTracker tracker = new EgressCompletionTracker();
@@ -1605,6 +1606,8 @@ public class OmsVenueEgressService {
                     venueCfg.getBacklogThrottleErOfferQueueDepthThreshold();
             this.backlogThrottleMaxInFlight =
                     Math.min(maxInFlight, venueCfg.getBacklogThrottleMaxInFlight());
+            this.backlogThrottleErSoftCapPermitMultiplier =
+                    venueCfg.getBacklogThrottleErSoftCapPermitMultiplier();
             this.backlogThrottleParkNanos = venueCfg.getBacklogThrottleParkNanos();
             this.permits = new Semaphore(maxInFlight);
             // Virtual-thread per ER completion: cluster offer back-pressure parks the carrier
@@ -1656,6 +1659,8 @@ public class OmsVenueEgressService {
                     venueCfg.getBacklogThrottleErOfferQueueDepthThreshold();
             this.backlogThrottleMaxInFlight =
                     Math.min(maxInFlight, venueCfg.getBacklogThrottleMaxInFlight());
+            this.backlogThrottleErSoftCapPermitMultiplier =
+                    venueCfg.getBacklogThrottleErSoftCapPermitMultiplier();
             this.backlogThrottleParkNanos = venueCfg.getBacklogThrottleParkNanos();
             this.permits = new Semaphore(maxInFlight);
             this.erSubmitExecutor = erSubmitExecutor;
@@ -1756,10 +1761,13 @@ public class OmsVenueEgressService {
                 return Math.max(1, Math.min(maxPendingFragments, backlogThrottleMaxInFlight));
             }
             if (erOfferBacklogged) {
-                // ER deep but venue still has permits: soft cap (4× permits) — full 6× inflated
+                // ER deep but venue still has permits: graduated soft cap — full 6× inflated
                 // meanRouteMs on 10k soak after an 8k step (observed 614 ms); hard 512 cap inflated
                 // egress_wall_lag on clean 10k profile (observed 601 ms pre-fix).
-                int erBacklogCap = Math.min(maxPendingFragments, maxInFlight * 4);
+                int erBacklogCap =
+                        Math.min(
+                                maxPendingFragments,
+                                maxInFlight * backlogThrottleErSoftCapPermitMultiplier);
                 return Math.max(backlogThrottleMaxInFlight, erBacklogCap);
             }
             return maxPendingFragments;

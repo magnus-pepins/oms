@@ -3532,6 +3532,7 @@ public class OmsConfig {
             private static final int DEFAULT_BACKLOG_THROTTLE_PENDING_ROUTE_THRESHOLD = 384;
             private static final int DEFAULT_BACKLOG_THROTTLE_ER_OFFER_QUEUE_DEPTH_THRESHOLD = 1024;
             private static final int DEFAULT_BACKLOG_THROTTLE_MAX_IN_FLIGHT = 128;
+            private static final int DEFAULT_BACKLOG_THROTTLE_ER_SOFT_CAP_PERMIT_MULTIPLIER = 4;
             private static final long DEFAULT_BACKLOG_THROTTLE_PARK_NANOS = 50_000L;
 
             /**
@@ -3568,6 +3569,8 @@ public class OmsConfig {
             private int backlogThrottleErOfferQueueDepthThreshold =
                     DEFAULT_BACKLOG_THROTTLE_ER_OFFER_QUEUE_DEPTH_THRESHOLD;
             private int backlogThrottleMaxInFlight = DEFAULT_BACKLOG_THROTTLE_MAX_IN_FLIGHT;
+            private int backlogThrottleErSoftCapPermitMultiplier =
+                    DEFAULT_BACKLOG_THROTTLE_ER_SOFT_CAP_PERMIT_MULTIPLIER;
             private long backlogThrottleParkNanos = DEFAULT_BACKLOG_THROTTLE_PARK_NANOS;
             private int replayThreadPriority = DEFAULT_REPLAY_THREAD_PRIORITY;
             private int venueRejectSubmitMaxAttempts = DEFAULT_VENUE_REJECT_SUBMIT_MAX_ATTEMPTS;
@@ -3683,6 +3686,18 @@ public class OmsConfig {
             }
             public void setBacklogThrottleMaxInFlight(int backlogThrottleMaxInFlight) {
                 this.backlogThrottleMaxInFlight = Math.max(1, backlogThrottleMaxInFlight);
+            }
+
+            /**
+             * When the ER offer queue is deep but venue permits remain, effective dispatch cap is
+             * {@code max(backlogThrottleMaxInFlight, min(maxPendingFragments, maxInFlight * this))}.
+             */
+            public int getBacklogThrottleErSoftCapPermitMultiplier() {
+                return backlogThrottleErSoftCapPermitMultiplier;
+            }
+
+            public void setBacklogThrottleErSoftCapPermitMultiplier(int multiplier) {
+                this.backlogThrottleErSoftCapPermitMultiplier = Math.max(1, multiplier);
             }
 
             public long getBacklogThrottleParkNanos() { return backlogThrottleParkNanos; }

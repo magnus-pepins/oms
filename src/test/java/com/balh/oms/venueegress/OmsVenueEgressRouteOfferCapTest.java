@@ -69,6 +69,9 @@ class OmsVenueEgressRouteOfferCapTest {
         lenient()
                 .when(cursorRepository.advanceWithRecording(any(), anyInt(), eq(3L), anyLong()))
                 .thenReturn(true);
+        lenient()
+                .when(clusterIngressClient.submitApplyExecutionReportAsync(any(), any()))
+                .thenReturn(CompletableFuture.completedFuture(null));
     }
 
     @Test

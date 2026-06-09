@@ -133,14 +133,15 @@ class OmsPostgresProjectorPollBatchTest {
     @Test
     void shouldFlushPartialPollBatch_defersWhileCatchUpBacklog() {
         OmsConfig.Cluster.Projector projectorCfg = config.getCluster().getProjector();
-        projectorCfg.setCatchUpLagThresholdMs(500L);
-        projector.setLastAppliedAcceptedAtMillisForTesting(ACCEPTED_AT_MS - 2_000L);
+        projector.setLiveReplayUpperBoundForTesting(10_000L);
+        projector.setLastAppliedPositionForTesting(0L);
 
         assertThat(projector.shouldFlushPartialPollBatch(projectorCfg, 512))
                 .as("catch-up must not flush sub-cap batches on Archive micro-gaps")
                 .isFalse();
 
-        projector.setLastAppliedAcceptedAtMillisForTesting(ACCEPTED_AT_MS);
+        projector.setLiveReplayUpperBoundForTesting(0L);
+        projector.setLastAppliedPositionForTesting(0L);
         assertThat(projector.shouldFlushPartialPollBatch(projectorCfg, 512)).isTrue();
         assertThat(projector.shouldFlushPartialPollBatch(projectorCfg, 0)).isFalse();
     }
@@ -310,27 +311,39 @@ class OmsPostgresProjectorPollBatchTest {
     }
 
     @Test
-    void effectiveMaxFragmentsPerCommit_usesCatchUpCapWhenWallLagHigh() {
+    void effectiveMaxFragmentsPerCommit_usesCatchUpCapWhenReplayBacklogPresent() {
         OmsConfig.Cluster.Projector projectorCfg = config.getCluster().getProjector();
         projectorCfg.setMaxFragmentsPerCommit(8192);
         projectorCfg.setCatchUpMaxFragmentsPerCommit(16_384);
-        projectorCfg.setCatchUpLagThresholdMs(500L);
 
+        projector.setLiveReplayUpperBoundForTesting(10_000L);
+        projector.setLastAppliedAcceptedAtMillisForTesting(ACCEPTED_AT_MS);
+        assertThat(projector.lastAppliedPosition()).isZero();
+        assertThat(projector.effectiveMaxFragmentsPerCommit(projectorCfg)).isEqualTo(16_384);
+
+        projector.setLiveReplayUpperBoundForTesting(0L);
+        assertThat(projector.effectiveMaxFragmentsPerCommit(projectorCfg)).isEqualTo(8192);
+    }
+
+    @Test
+    void replayPollHasCatchUpBacklogByWallClock_retainedForBenchMetricsOnly() {
         assertThat(
-                        OmsPostgresProjector.replayPollHasCatchUpBacklog(
+                        OmsPostgresProjector.replayPollHasCatchUpBacklogByWallClock(
                                 500L, ACCEPTED_AT_MS, ACCEPTED_AT_MS + 400L))
                 .isFalse();
         assertThat(
-                        OmsPostgresProjector.replayPollHasCatchUpBacklog(
+                        OmsPostgresProjector.replayPollHasCatchUpBacklogByWallClock(
                                 500L, ACCEPTED_AT_MS, ACCEPTED_AT_MS + 600L))
                 .isTrue();
+    }
 
-        // pinned wall clock is ACCEPTED_AT_MS + 5 — below threshold
-        projector.setLastAppliedAcceptedAtMillisForTesting(ACCEPTED_AT_MS);
-        assertThat(projector.effectiveMaxFragmentsPerCommit(projectorCfg)).isEqualTo(8192);
-
-        projector.setLastAppliedAcceptedAtMillisForTesting(ACCEPTED_AT_MS - 2_000L);
-        assertThat(projector.effectiveMaxFragmentsPerCommit(projectorCfg)).isEqualTo(16_384);
+    @Test
+    void replayPollHasCatchUpBacklog_falseAtIdleHead_despiteOldAdmitWallClock() {
+        OmsConfig.Cluster.Projector projectorCfg = config.getCluster().getProjector();
+        projector.setLastAppliedAcceptedAtMillisForTesting(ACCEPTED_AT_MS - 600_000L);
+        projector.setLastAppliedPositionForTesting(4576L);
+        projector.setLiveReplayUpperBoundForTesting(4576L);
+        assertThat(projector.replayPollHasCatchUpBacklog(projectorCfg)).isFalse();
     }
 
     @Test
@@ -365,7 +378,8 @@ class OmsPostgresProjectorPollBatchTest {
     @Test
     void pollReplayIdleTail_runsDuringCatchUpBacklog() {
         projector.setRunningForTesting(true);
-        projector.setLastAppliedAcceptedAtMillisForTesting(ACCEPTED_AT_MS - 5_000L);
+        projector.setLiveReplayUpperBoundForTesting(10_000L);
+        projector.setLastAppliedPositionForTesting(0L);
         config.getCluster().getProjector().setFragmentLimit(512);
 
         OmsPostgresProjector.ProjectingFragmentHandler handler =

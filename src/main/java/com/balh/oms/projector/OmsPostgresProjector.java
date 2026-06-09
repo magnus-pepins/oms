@@ -260,6 +260,13 @@ public class OmsPostgresProjector {
      */
     private final AtomicLong lastAppliedAcceptedAtMillis = new AtomicLong(0L);
     /**
+     * Archive upper bound (inclusive end of readable replay) for the active recording, refreshed
+     * on each replay poll iteration. Used for catch-up gating and readiness backlog detection.
+     */
+    private final AtomicLong liveReplayUpperBound = new AtomicLong(-1L);
+    /** Wall-clock millis when {@link #lastAppliedPosition} last advanced (persisted or in-memory). */
+    private final AtomicLong lastCursorAdvanceWallMillis = new AtomicLong(0L);
+    /**
      * 2026-05-23 hardening. When non-empty, {@link #init} stashes the resume cursor here and the
      * replay loop honors it as the start position; on a fresh first-ever start it stays empty and
      * the replay loop bootstraps from the oldest available recording at position 0.
@@ -442,6 +449,7 @@ public class OmsPostgresProjector {
             AeronProjectorCursorRepository.RecordedCursor c = savedCursor.get();
             lastAppliedPosition.set(c.position());
             currentRecordingId.set(c.recordingId());
+            markCursorAdvanced();
             log.info(
                     "oms-postgres-projector starting; resuming from recording {} at log position {} (projectorId={}, streamId={})",
                     c.recordingId(),
@@ -628,7 +636,8 @@ public class OmsPostgresProjector {
                 boolean matchesVenue = VenueRoutingSymbols.matchesVenuePrefix(venuePrefix, ev.instrumentSymbol());
                 if (fresh && !(outboxSkipEnabled && matchesVenue)) {
                     try {
-                        domainEventOutboxRepository.insert(ev.orderId(), envelopeCodec.orderAcceptedFromAdmitted(ev));
+                        insertDomainEventOutboxIfAllowed(
+                                ev.accountId(), ev.orderId(), envelopeCodec.orderAcceptedFromAdmitted(ev));
                     } catch (JsonProcessingException e) {
                         throw new IllegalStateException(
                                 "OrderAccepted envelope serialisation failed for orderId=" + ev.orderId(), e);
@@ -738,12 +747,73 @@ public class OmsPostgresProjector {
         }
     }
 
+    /** {@code true} while the dedicated replay thread is running (outer reconnect loop active). */
+    public boolean isReplayLoopRunning() {
+        return running.get();
+    }
+
+    /**
+     * {@code true} when the replay thread exists and is alive. When {@code false} after startup,
+     * the JVM may still report actuator {@code UP} while the Postgres mirror stops tailing until
+     * an operator restarts the process.
+     */
+    public boolean isReplayLoopAlive() {
+        Thread t = replayThread;
+        return running.get() && t != null && t.isAlive();
+    }
+
     /**
      * Visible for tests. Latest log position the projector has applied to Postgres in this JVM.
      * Updated atomically with each row write; survives JVM restart via the persisted cursor.
      */
     public long lastAppliedPosition() {
         return lastAppliedPosition.get();
+    }
+
+    /** Archive replay upper bound for the active recording; {@code -1} before the replay loop starts. */
+    public long liveReplayUpperBound() {
+        return liveReplayUpperBound.get();
+    }
+
+    /** {@code true} when persisted/applied log position is behind the archive head. */
+    public boolean replayPositionHasBacklog() {
+        long upper = liveReplayUpperBound.get();
+        if (upper < 0L) {
+            return false;
+        }
+        return lastAppliedPosition.get() < upper;
+    }
+
+    /** {@code true} when the async apply queue holds batches not yet committed. */
+    public boolean applyQueueHasBacklog() {
+        BlockingQueue<SequencedBatch> queue = applyQueue;
+        return queue != null && !queue.isEmpty();
+    }
+
+    /** Milliseconds since the cursor last advanced; {@code 0} before the first advance. */
+    public long millisSinceLastCursorAdvance() {
+        long last = lastCursorAdvanceWallMillis.get();
+        if (last <= 0L) {
+            return 0L;
+        }
+        return Math.max(0L, wallClock.millis() - last);
+    }
+
+    /** Fragments still readable from Archive before the live tail ({@code 0} at head or pre-bootstrap). */
+    public long replayBacklogFragments() {
+        long upper = liveReplayUpperBound.get();
+        if (upper < 0L) {
+            return 0L;
+        }
+        return Math.max(0L, upper - lastAppliedPosition.get());
+    }
+
+    private void markCursorAdvanced() {
+        lastCursorAdvanceWallMillis.set(wallClock.millis());
+    }
+
+    private void updateLiveReplayUpperBound(long upperBound) {
+        liveReplayUpperBound.set(upperBound);
     }
 
     /**
@@ -764,6 +834,19 @@ public class OmsPostgresProjector {
     /** Visible for unit tests that assert catch-up fast-path gating without Aeron replay. */
     void setLastAppliedAcceptedAtMillisForTesting(long acceptedAtMillis) {
         lastAppliedAcceptedAtMillis.set(acceptedAtMillis);
+    }
+
+    /** Visible for unit tests that drive replay backlog gating without Aeron replay. */
+    void setLiveReplayUpperBoundForTesting(long upperBound) {
+        liveReplayUpperBound.set(upperBound);
+    }
+
+    void setLastAppliedPositionForTesting(long position) {
+        lastAppliedPosition.set(position);
+    }
+
+    void setLastCursorAdvanceWallMillisForTesting(long wallMillis) {
+        lastCursorAdvanceWallMillis.set(wallMillis);
     }
 
     /** Visible for unit tests that assert partial-flush gating against apply-queue depth. */
@@ -818,36 +901,67 @@ public class OmsPostgresProjector {
                     "oms-postgres-projector replay loop skipped: oms.cluster.projector.aeron-directory is empty");
             return;
         }
-        Aeron aeron = null;
-        AeronArchive archive = null;
-        try {
-            aeron = Aeron.connect(new Aeron.Context().aeronDirectoryName(projectorCfg.getAeronDirectory()));
-            archive = AeronArchive.connect(new AeronArchive.Context()
-                    .aeron(aeron)
-                    .ownsAeronClient(false)
-                    .controlRequestChannel(projectorCfg.getArchiveControlRequestChannel())
-                    .controlResponseChannel(projectorCfg.getArchiveControlResponseChannel()));
+        // Outer reconnect loop. A transient OMS cluster MediaDriver bounce makes Aeron Archive calls
+        // throw TimeoutException / DriverTimeoutException and the conductor raises
+        // AgentTerminationException. Before 2026-06-08 these permanently stopped the replay thread
+        // while Spring/Tomcat stayed UP (PM2 online, readiness UP, cursor frozen). Reconnect from
+        // the persisted cursor after infra errors. IllegalStateException from cursor guards stays
+        // fatal — reconnecting would re-throw immediately.
+        while (running.get()) {
+            Aeron aeron = null;
+            AeronArchive archive = null;
+            boolean reconnectAfterTransientError = false;
+            try {
+                aeron = Aeron.connect(new Aeron.Context().aeronDirectoryName(projectorCfg.getAeronDirectory()));
+                archive = AeronArchive.connect(new AeronArchive.Context()
+                        .aeron(aeron)
+                        .ownsAeronClient(false)
+                        .controlRequestChannel(projectorCfg.getArchiveControlRequestChannel())
+                        .controlResponseChannel(projectorCfg.getArchiveControlResponseChannel()));
 
-            // Bootstrap: if no saved cursor at startup, wait for the first recording to appear,
-            // then persist (oldestId, 0) so subsequent restarts have a recording id to anchor on.
-            if (startupCursor.get() == null) {
-                if (!bootstrapFromOldestRecording(archive, projectorCfg.getRecordingLookupParkMs())) {
-                    return; // shutdown requested during bootstrap
+                // Bootstrap: if no saved cursor at startup, wait for the first recording to appear,
+                // then persist (oldestId, 0) so subsequent restarts have a recording id to anchor on.
+                if (startupCursor.get() == null) {
+                    if (!bootstrapFromOldestRecording(archive, projectorCfg.getRecordingLookupParkMs())) {
+                        return; // shutdown requested during bootstrap
+                    }
                 }
+
+                runReplayLoopWithRecordingWalk(archive, projectorCfg);
+            } catch (IllegalStateException e) {
+                log.error(
+                        "oms-postgres-projector replay loop terminating (unrecoverable cursor/recording state)", e);
+                return;
+            } catch (RuntimeException e) {
+                if (!running.get()) {
+                    return;
+                }
+                if (OmsClusterEventsRecordingSupport.isRecoverableClusterInfraError(e)) {
+                    reconnectAfterTransientError = true;
+                    log.warn(
+                            "oms-postgres-projector lost the OMS cluster archive (transient infra error);"
+                                    + " reconnecting in {}ms and resuming from the persisted cursor",
+                            projectorCfg.getRecordingLookupParkMs(), e);
+                } else {
+                    log.error("oms-postgres-projector replay loop terminating (unexpected error)", e);
+                    return;
+                }
+            } finally {
+                CloseHelper.quietClose(archive);
+                CloseHelper.quietClose(aeron);
             }
 
-            runReplayLoopWithRecordingWalk(archive, projectorCfg);
-        } catch (RuntimeException e) {
-            // Loud failures from the recording-walk loop (saved recording id missing from Archive,
-            // saved position past recording end, etc.) land here and stop the projector. Operators
-            // see the stack trace and the diagnostic context in the exception message; restarting
-            // without fixing the underlying state would re-throw immediately.
-            log.error("oms-postgres-projector replay loop terminating", e);
-        } finally {
-            CloseHelper.quietClose(archive);
-            CloseHelper.quietClose(aeron);
-            log.info("oms-postgres-projector replay loop stopped");
+            if (!reconnectAfterTransientError) {
+                break;
+            }
+            try {
+                Thread.sleep(projectorCfg.getRecordingLookupParkMs());
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                break;
+            }
         }
+        log.info("oms-postgres-projector replay loop stopped");
     }
 
     /**
@@ -929,6 +1043,7 @@ public class OmsPostgresProjector {
             long savedPosition = lastAppliedPosition.get();
             long upperBound = recordingUpperBound(archive, descriptor);
             requirePositionWithinRecording(recordingIdNow, savedPosition, upperBound, descriptor);
+            updateLiveReplayUpperBound(upperBound);
             if (savedPosition < descriptor.startPosition()) {
                 // Saved position is below the recording's start. Reset upward to the recording's
                 // start is safe because the projector's row writes are idempotent (orders ON CONFLICT,
@@ -987,6 +1102,7 @@ public class OmsPostgresProjector {
             }
             savedPosition = lastAppliedPosition.get();
             upperBound = recordingUpperBound(archive, descriptor);
+            updateLiveReplayUpperBound(upperBound);
 
             Subscription replay = null;
             try {
@@ -1040,7 +1156,12 @@ public class OmsPostgresProjector {
                     if (idleTailBurst > 0) {
                         continue;
                     }
-                    if (shouldFlushPartialPollBatch(projectorCfg, handler.pendingFragmentCount())) {
+                    // Catch-up raises the commit cap (e.g. 16k) but backlog can be smaller than that
+                    // cap — if Aeron returned no more fragments, flush what we have or apply threads
+                    // starve while replay spin-yields forever (pop wedge at ~700 frags observed).
+                    if (handler.pendingFragmentCount() > 0) {
+                        handler.flushPollBatch();
+                    } else if (shouldFlushPartialPollBatch(projectorCfg, handler.pendingFragmentCount())) {
                         handler.flushPollBatch();
                     }
                     if (replayPollHasCatchUpBacklog(projectorCfg)) {
@@ -1070,6 +1191,8 @@ public class OmsPostgresProjector {
                         // outer loop iteration which will fail loud.
                         break;
                     }
+                    upperBound = recordingUpperBound(archive, refreshed);
+                    updateLiveReplayUpperBound(upperBound);
                     long recordingStop = refreshed.stopPosition();
                     long currentApplied = lastAppliedPosition.get();
                     RecordingDescriptor successor = findNextRecording(archive, recordingIdNow);
@@ -1171,6 +1294,29 @@ public class OmsPostgresProjector {
     private long recordingUpperBound(AeronArchive archive, RecordingDescriptor descriptor) {
         return OmsClusterEventsRecordingSupport.recordingUpperBound(
                 archive, descriptor.recordingId(), descriptor.startPosition(), descriptor.stopPosition());
+    }
+
+    /**
+     * Writes a domain fanout envelope when {@link com.balh.oms.events.OmsDomainFanoutAccountFilter}
+     * permits the account (bench traffic on pop can be excluded via allowlist env).
+     */
+    private void insertDomainEventOutboxIfAllowed(UUID accountId, UUID orderId, String envelopeJson) {
+        if (!com.balh.oms.events.OmsDomainFanoutAccountFilter.shouldPublishForAccount(accountId)) {
+            return;
+        }
+        domainEventOutboxRepository.insert(orderId, envelopeJson);
+    }
+
+    private void insertDomainEventOutboxIfAllowed(String accountId, UUID orderId, String envelopeJson) {
+        UUID parsed = null;
+        if (accountId != null && !accountId.isBlank()) {
+            try {
+                parsed = UUID.fromString(accountId.trim());
+            } catch (IllegalArgumentException ignored) {
+                // Non-UUID account ids never match allowlist entries.
+            }
+        }
+        insertDomainEventOutboxIfAllowed(parsed, orderId, envelopeJson);
     }
 
     /**
@@ -1393,7 +1539,8 @@ public class OmsPostgresProjector {
                     boolean matchesVenue = VenueRoutingSymbols.matchesVenuePrefix(venuePrefix, ev.instrumentSymbol());
                     if (fresh && !(outboxSkipEnabled && matchesVenue)) {
                         try {
-                            domainEventOutboxRepository.insert(ev.orderId(), envelopeCodec.orderAcceptedFromAdmitted(ev));
+                            insertDomainEventOutboxIfAllowed(
+                                ev.accountId(), ev.orderId(), envelopeCodec.orderAcceptedFromAdmitted(ev));
                         } catch (JsonProcessingException e) {
                             throw new IllegalStateException(
                                     "OrderAccepted envelope serialisation failed for orderId=" + ev.orderId(), e);
@@ -1532,26 +1679,29 @@ public class OmsPostgresProjector {
     }
 
     /**
-     * True when the last applied admit is older than {@link OmsConfig.Cluster.Projector#getCatchUpLagThresholdMs()}
-     * — the bench {@code projector_wall_lag_ms} scrape uses the same admit→applied clock.
+     * True when Archive still has fragments to read and/or the async apply queue is draining —
+     * not when the live tail is idle (wall-clock since last admit must not keep the replay thread
+     * spin-yielding at 100% CPU after catch-up completes).
      */
     boolean replayPollHasCatchUpBacklog(OmsConfig.Cluster.Projector projectorCfg) {
-        return replayPollHasCatchUpBacklog(
-                projectorCfg.getCatchUpLagThresholdMs(),
-                lastAppliedAcceptedAtMillis.get(),
-                wallClock.millis());
+        return applyQueueHasBacklog() || replayPositionHasBacklog();
+    }
+
+    /**
+     * Wall-clock admit→apply lag above threshold — retained for bench metrics/tests only; not
+     * used for replay idle spin or commit-cap gating (see {@link #replayPollHasCatchUpBacklog}).
+     */
+    static boolean replayPollHasCatchUpBacklogByWallClock(
+            long catchUpLagThresholdMs, long lastAppliedAcceptedAtMillis, long nowMillis) {
+        if (lastAppliedAcceptedAtMillis <= 0L) {
+            return false;
+        }
+        return nowMillis - lastAppliedAcceptedAtMillis >= catchUpLagThresholdMs;
     }
 
     /**
      * During catch-up, defer sub-cap flushes across Archive micro-gaps so poll batches reach
-     * {@link #effectiveMaxFragmentsPerCommit} — premature partial COMMITs were ~650 frags/batch
-     * (462 COMMITs / 300k admits) and capped drain near 6k/s.
-     *
-     * <p>Also defer while the async apply queue holds batches: pop @ 16k/s showed ~900 frags/COMMIT
-     * (~1.1s {@code oms_projector_poll_batch_commit_seconds}) even with catch-up cap 16384 because
-     * {@link #replayPollHasCatchUpBacklog} can flicker false between apply completions while
-     * {@code projector_wall_lag_ms} stays high; flushing on idle tail with a non-empty apply queue
-     * multiplies COMMIT count and caps drain near ~800/s.
+     * {@link #effectiveMaxFragmentsPerCommit}.
      */
     boolean shouldFlushPartialPollBatch(OmsConfig.Cluster.Projector projectorCfg, int pendingFragments) {
         if (pendingFragments <= 0) {
@@ -1564,16 +1714,8 @@ public class OmsPostgresProjector {
         return queue == null || queue.isEmpty();
     }
 
-    static boolean replayPollHasCatchUpBacklog(
-            long catchUpLagThresholdMs, long lastAppliedAcceptedAtMillis, long nowMillis) {
-        if (lastAppliedAcceptedAtMillis <= 0L) {
-            return false;
-        }
-        return nowMillis - lastAppliedAcceptedAtMillis >= catchUpLagThresholdMs;
-    }
-
     /**
-     * Idle wait between replay polls when Aeron returned zero fragments. Spin-yield instead of park
+     * Idle wait between replay polls when Aeron returned zero fragments.
      * while catch-up backlog is present so the replay thread re-polls without a configured idle
      * slice behind in-flight admits. Mirrors {@code OmsVenueEgressService#parkReplayIdleAfterPoll}.
      */
@@ -1601,6 +1743,7 @@ public class OmsPostgresProjector {
                 OmsClusterWireFormat.EVENTS_STREAM_ID,
                 requireCurrentRecordingId(),
                 newPosition);
+        markCursorAdvanced();
     }
 
     private void flushDeferredPollBatchCursorAdvance() {
@@ -1614,6 +1757,7 @@ public class OmsPostgresProjector {
                 requireCurrentRecordingId(),
                 maxPos);
         deferredPollBatchMaxPosition.set(-1L);
+        markCursorAdvanced();
     }
 
     private void applyPendingFragment(PendingFragment fragment) {
@@ -1764,7 +1908,8 @@ public class OmsPostgresProjector {
             // domain_event_outbox row from the original projection stands.
             if (!skipVenueOrderAcceptedOutbox(ev)) {
                 try {
-                    domainEventOutboxRepository.insert(ev.orderId(), envelopeCodec.orderAcceptedFromAdmitted(ev));
+                    insertDomainEventOutboxIfAllowed(
+                            ev.accountId(), ev.orderId(), envelopeCodec.orderAcceptedFromAdmitted(ev));
                 } catch (JsonProcessingException e) {
                     throw new IllegalStateException(
                             "OrderAccepted envelope serialisation failed for orderId=" + ev.orderId(), e);
@@ -2207,7 +2352,8 @@ public class OmsPostgresProjector {
             // OMS-initiated cancel: empty venueId / venueExecRef. The domain event envelope shape
             // already accepts plain Strings (see DomainEventEnvelopeCodec#orderCancelled); empty
             // strings are a downstream sentinel for "no venue interaction recorded".
-            domainEventOutboxRepository.insert(
+            insertDomainEventOutboxIfAllowed(
+                    refreshed.accountId(),
                     refreshed.id(),
                     envelopeCodec.orderCancelled(refreshed, newSeq, /* venueId = */ "", /* venueExecRef = */ ""));
         } catch (JsonProcessingException e) {
@@ -2356,7 +2502,7 @@ public class OmsPostgresProjector {
                         ev.venueExecRef());
                 meterRegistry.counter(METRIC_ORDER_FILLED_EVENTS).increment();
             }
-            domainEventOutboxRepository.insert(order.id(), envelopeJson);
+            insertDomainEventOutboxIfAllowed(order.accountId(), order.id(), envelopeJson);
         } catch (JsonProcessingException e) {
             throw new IllegalStateException("domain event serialisation failed for order " + order.id(), e);
         }
@@ -2395,7 +2541,8 @@ public class OmsPostgresProjector {
         int newSeq = pgExpectedVersion + 1;
         Order refreshed = ordersRepository.findById(order.id()).orElse(order);
         try {
-            domainEventOutboxRepository.insert(
+            insertDomainEventOutboxIfAllowed(
+                    order.accountId(),
                     order.id(),
                     envelopeCodec.orderCancelled(refreshed, newSeq, ev.venueId(), ev.venueExecRef()));
         } catch (JsonProcessingException e) {
@@ -2479,7 +2626,8 @@ public class OmsPostgresProjector {
         int newSeq = pgExpectedVersion + 1;
         Order refreshed = ordersRepository.findById(order.id()).orElse(order);
         try {
-            domainEventOutboxRepository.insert(
+            insertDomainEventOutboxIfAllowed(
+                    order.accountId(),
                     order.id(),
                     envelopeCodec.orderReplaced(
                             refreshed, newSeq, newQty, newLimitPrice, ev.venueId(), ev.venueExecRef()));
@@ -2525,7 +2673,8 @@ public class OmsPostgresProjector {
         }
         meterRegistry.counter(METRIC_EXECUTIONS_APPLIED, TAG_OUTCOME, OUTCOME_INSERTED).increment();
         try {
-            domainEventOutboxRepository.insert(
+            insertDomainEventOutboxIfAllowed(
+                    order.accountId(),
                     order.id(),
                     envelopeCodec.orderCancelRejected(order, order.version(), ev.venueId(), ev.venueExecRef()));
         } catch (JsonProcessingException e) {
@@ -2554,7 +2703,8 @@ public class OmsPostgresProjector {
         }
         meterRegistry.counter(METRIC_EXECUTIONS_APPLIED, TAG_OUTCOME, OUTCOME_INSERTED).increment();
         try {
-            domainEventOutboxRepository.insert(
+            insertDomainEventOutboxIfAllowed(
+                    order.accountId(),
                     order.id(),
                     envelopeCodec.orderReplaceRejected(order, order.version(), ev.venueId(), ev.venueExecRef()));
         } catch (JsonProcessingException e) {
@@ -2623,7 +2773,7 @@ public class OmsPostgresProjector {
                         order.cumFilledQuantity(),
                         order.ordType());
         try {
-            domainEventOutboxRepository.insert(order.id(), envelopeCodec.orderWorking(working, newSeq));
+            insertDomainEventOutboxIfAllowed(order.accountId(), order.id(), envelopeCodec.orderWorking(working, newSeq));
         } catch (JsonProcessingException e) {
             throw new IllegalStateException("domain event serialisation failed for VENUE_NEW of order " + order.id(), e);
         }
@@ -2670,7 +2820,8 @@ public class OmsPostgresProjector {
         int newSeq = pgExpectedVersion + 1;
         Order refreshed = ordersRepository.findById(order.id()).orElse(order);
         try {
-            domainEventOutboxRepository.insert(
+            insertDomainEventOutboxIfAllowed(
+                    order.accountId(),
                     order.id(),
                     envelopeCodec.orderRejectedAfterVenue(refreshed, terminalReason, newSeq));
         } catch (JsonProcessingException e) {

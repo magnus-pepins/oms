@@ -478,6 +478,21 @@ public class OmsVenueEgressService {
         return lastAppliedPosition.get();
     }
 
+    /** {@code true} while the dedicated replay thread is running (outer reconnect loop active). */
+    public boolean isReplayLoopRunning() {
+        return running.get();
+    }
+
+    /**
+     * {@code true} when the replay thread exists and is alive. When {@code false} after startup,
+     * the JVM may still report actuator {@code UP} while the OMS→venue bridge is severed until
+     * an operator restarts the process.
+     */
+    public boolean isReplayLoopAlive() {
+        Thread t = replayThread;
+        return running.get() && t != null && t.isAlive();
+    }
+
     /**
      * 2026-05-23 hardening (handover §9.6). Rewritten to walk all events recordings sorted by id
      * instead of unconditionally picking the highest-id recording and silently clamping the

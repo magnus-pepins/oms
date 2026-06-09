@@ -8,6 +8,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -21,8 +22,17 @@ import java.util.List;
  * Drains {@link DomainEventOutboxRepository} after Postgres commit and hands
  * envelopes to {@link FanoutClient} (NATS or no-op). Each tick runs in one DB transaction: pending rows are
  * claimed with {@code FOR UPDATE SKIP LOCKED} so multiple reconciler JVMs do not fetch the same row before mark.
+ *
+ * <p>Only runs when {@code oms.events.nats.enabled=true}, i.e. when a real {@link FanoutClient}
+ * (NATS) is wired. Processes that fall back to {@code NoOpFanoutClient} (NATS disabled, e.g.
+ * {@code oms-ingress-replica}) MUST NOT drain the shared outbox: {@code NoOpFanoutClient.deliver()}
+ * returns {@code true} without sending, so a NoOp reconciler racing a NATS reconciler for the same
+ * row via {@code SKIP LOCKED} would mark it published and silently destroy the event — leaving the
+ * customer order stuck at "Awaiting Approval". Gating here makes the NATS-enabled process(es) the
+ * sole drainer(s).
  */
 @Component
+@ConditionalOnProperty(prefix = "oms.events.nats", name = "enabled", havingValue = "true")
 public class DomainFanoutReconciler {
 
     private static final String METRIC_OUTBOX_PUBLISHED = "oms_domain_fanout_outbox_published_total";

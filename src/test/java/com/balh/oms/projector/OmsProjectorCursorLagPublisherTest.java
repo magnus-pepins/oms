@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.within;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.when;
 
 import io.micrometer.core.instrument.Gauge;
@@ -30,20 +31,25 @@ class OmsProjectorCursorLagPublisherTest {
     private static final int STREAM_ID = 2000;
 
     @Mock private AeronProjectorCursorRepository cursorRepository;
+    @Mock private OmsPostgresProjector projector;
 
     private MeterRegistry meterRegistry;
 
     @BeforeEach
     void setUp() {
         meterRegistry = new SimpleMeterRegistry();
+        lenient().when(projector.replayBacklogFragments()).thenReturn(0L);
+    }
+
+    private OmsProjectorCursorLagPublisher newPublisher(Clock fixed) {
+        return new OmsProjectorCursorLagPublisher(
+                cursorRepository, meterRegistry, fixed, projector, PROJECTOR_ID, STREAM_ID);
     }
 
     @Test
     void registersGaugeOnPostConstruct_withTags() {
         Clock fixed = Clock.fixed(Instant.parse("2026-05-12T10:00:00Z"), ZoneOffset.UTC);
-        OmsProjectorCursorLagPublisher publisher =
-                new OmsProjectorCursorLagPublisher(
-                        cursorRepository, meterRegistry, fixed, PROJECTOR_ID, STREAM_ID);
+        OmsProjectorCursorLagPublisher publisher = newPublisher(fixed);
 
         publisher.registerGauge();
 
@@ -60,9 +66,7 @@ class OmsProjectorCursorLagPublisherTest {
     @Test
     void coldStart_returnsNoDataSentinel_evenAfterPollWithEmptyRow() {
         Clock fixed = Clock.fixed(Instant.parse("2026-05-12T10:00:00Z"), ZoneOffset.UTC);
-        OmsProjectorCursorLagPublisher publisher =
-                new OmsProjectorCursorLagPublisher(
-                        cursorRepository, meterRegistry, fixed, PROJECTOR_ID, STREAM_ID);
+        OmsProjectorCursorLagPublisher publisher = newPublisher(fixed);
         publisher.registerGauge();
 
         when(cursorRepository.findLastAppliedAt(eq(PROJECTOR_ID), eq(STREAM_ID)))
@@ -79,9 +83,7 @@ class OmsProjectorCursorLagPublisherTest {
         Instant lastAppliedAt = Instant.parse("2026-05-12T10:00:00Z");
         Instant now = lastAppliedAt.plus(Duration.ofMillis(2_500));
         Clock fixed = Clock.fixed(now, ZoneOffset.UTC);
-        OmsProjectorCursorLagPublisher publisher =
-                new OmsProjectorCursorLagPublisher(
-                        cursorRepository, meterRegistry, fixed, PROJECTOR_ID, STREAM_ID);
+        OmsProjectorCursorLagPublisher publisher = newPublisher(fixed);
         publisher.registerGauge();
 
         when(cursorRepository.findLastAppliedAt(eq(PROJECTOR_ID), eq(STREAM_ID)))
@@ -102,9 +104,7 @@ class OmsProjectorCursorLagPublisherTest {
         Instant lastAppliedAt = Instant.parse("2026-05-12T10:00:01Z");
         Instant now = Instant.parse("2026-05-12T10:00:00Z");
         Clock fixed = Clock.fixed(now, ZoneOffset.UTC);
-        OmsProjectorCursorLagPublisher publisher =
-                new OmsProjectorCursorLagPublisher(
-                        cursorRepository, meterRegistry, fixed, PROJECTOR_ID, STREAM_ID);
+        OmsProjectorCursorLagPublisher publisher = newPublisher(fixed);
         publisher.registerGauge();
 
         when(cursorRepository.findLastAppliedAt(eq(PROJECTOR_ID), eq(STREAM_ID)))
@@ -119,9 +119,7 @@ class OmsProjectorCursorLagPublisherTest {
         Instant lastAppliedAt = Instant.parse("2026-05-12T10:00:00Z");
         Instant now = lastAppliedAt.plus(Duration.ofSeconds(1));
         Clock fixed = Clock.fixed(now, ZoneOffset.UTC);
-        OmsProjectorCursorLagPublisher publisher =
-                new OmsProjectorCursorLagPublisher(
-                        cursorRepository, meterRegistry, fixed, PROJECTOR_ID, STREAM_ID);
+        OmsProjectorCursorLagPublisher publisher = newPublisher(fixed);
         publisher.registerGauge();
 
         when(cursorRepository.findLastAppliedAt(eq(PROJECTOR_ID), eq(STREAM_ID)))

@@ -156,6 +156,13 @@ public class LedgerInflightOutboxReconciler {
                             row.attempts() + 1);
                 } else {
                     outbox.markPublished(row.id(), now);
+                    // Persist the Ledger txn id so the V32 lifecycle reconciler can commit/void
+                    // this hold when the order goes terminal. Without it the bulk-placed hold is
+                    // never released on cancel/reject (only the Ledger expiry sweep would catch it).
+                    String ledgerTxnId = result.ledgerTxnIdByOrderId().get(item.orderId());
+                    if (ledgerTxnId != null && !ledgerTxnId.isBlank()) {
+                        outbox.setLedgerTxnId(row.id(), ledgerTxnId);
+                    }
                     meterRegistry.counter(METRIC_OUTBOX_BULK_PUBLISHED).increment();
                     meterRegistry.counter(METRIC_OUTBOX_PUBLISHED).increment();
                 }

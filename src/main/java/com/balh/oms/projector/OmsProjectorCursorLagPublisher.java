@@ -45,12 +45,15 @@ public class OmsProjectorCursorLagPublisher {
 
     public static final String GAUGE_NAME = "oms.projector.lag_seconds";
 
+    public static final String REPLAY_BACKLOG_GAUGE_NAME = "oms.projector.replay_backlog_fragments";
+
     /** Sentinel returned by the gauge before any successful poll. See class javadoc. */
     public static final double NO_DATA_LAG_SECONDS = -1.0;
 
     private final AeronProjectorCursorRepository cursorRepository;
     private final MeterRegistry meterRegistry;
     private final Clock clock;
+    private final OmsPostgresProjector projector;
     private final String projectorId;
     private final int streamId;
 
@@ -58,11 +61,15 @@ public class OmsProjectorCursorLagPublisher {
 
     @Autowired
     public OmsProjectorCursorLagPublisher(
-            AeronProjectorCursorRepository cursorRepository, MeterRegistry meterRegistry, Clock clock) {
+            AeronProjectorCursorRepository cursorRepository,
+            MeterRegistry meterRegistry,
+            Clock clock,
+            OmsPostgresProjector projector) {
         this(
                 cursorRepository,
                 meterRegistry,
                 clock,
+                projector,
                 OmsPostgresProjector.PROJECTOR_ID,
                 OmsClusterWireFormat.EVENTS_STREAM_ID);
     }
@@ -76,11 +83,13 @@ public class OmsProjectorCursorLagPublisher {
             AeronProjectorCursorRepository cursorRepository,
             MeterRegistry meterRegistry,
             Clock clock,
+            OmsPostgresProjector projector,
             String projectorId,
             int streamId) {
         this.cursorRepository = cursorRepository;
         this.meterRegistry = meterRegistry;
         this.clock = clock;
+        this.projector = projector;
         this.projectorId = projectorId;
         this.streamId = streamId;
     }
@@ -93,8 +102,18 @@ public class OmsProjectorCursorLagPublisher {
                                 + " last advanced. -1 means no observation yet.")
                 .tags(Tags.of("projector_id", projectorId, "stream_id", Integer.toString(streamId)))
                 .register(meterRegistry);
+        Gauge.builder(REPLAY_BACKLOG_GAUGE_NAME, projector, OmsPostgresProjector::replayBacklogFragments)
+                .description(
+                        "Archive replay fragments not yet applied (upperBound - appliedPosition)."
+                                + " Zero at the live tail; rises during catch-up or wedge.")
+                .tags(Tags.of("projector_id", projectorId, "stream_id", Integer.toString(streamId)))
+                .register(meterRegistry);
         log.info(
-                "Registered {} gauge (projectorId={}, streamId={})", GAUGE_NAME, projectorId, streamId);
+                "Registered {} and {} gauges (projectorId={}, streamId={})",
+                GAUGE_NAME,
+                REPLAY_BACKLOG_GAUGE_NAME,
+                projectorId,
+                streamId);
     }
 
     /**

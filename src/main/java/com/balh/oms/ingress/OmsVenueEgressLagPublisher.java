@@ -321,7 +321,37 @@ public class OmsVenueEgressLagPublisher {
                                 + " < projector recording " + projCursor.get().recordingId(),
                         reading);
             }
-            return VenueEgressHealthSnapshot.allow();
+            // Egress rolled forward through a completed / empty tombstone recording while the
+            // projector is still replaying the prior one (observed on pop 2026-06-08: egress
+            // on recording 123, projector on 0 @ 72MB). Allowing accepts here produced
+            // PENDING_NEW rows with no projector mirror and a wedged customer UI.
+            return VenueEgressHealthSnapshot.block(
+                    "venue egress on newer recording " + egrCursor.get().recordingId()
+                            + " > projector recording " + projCursor.get().recordingId()
+                            + " (journal diverged; wait for projector to roll forward)",
+                    reading);
+        }
+
+        // Projector must not trail egress on the same recording. Observed on pop 2026-06-08 when
+        // oms-postgres-projector replay stopped tailing while egress continued (e.g. projector @
+        // 1952, egress @ 2624). evaluateLagReading() clamps negative rawLag to 0, so the
+        // excess-lag check below would still allow accepts — customers got HTTP 201 + locked funds
+        // but no orders row, no NATS events, and a permanent "Awaiting Approval" UI.
+        if (projCursor.isPresent()
+                && egrCursor.isPresent()
+                && projCursor.get().hasRecordingId()
+                && egrCursor.get().hasRecordingId()
+                && egrCursor.get().recordingId() == projCursor.get().recordingId()
+                && egressPos.getAsLong() > projectorPos.getAsLong()) {
+            return VenueEgressHealthSnapshot.block(
+                    "projector trailing venue egress on recording "
+                            + projCursor.get().recordingId()
+                            + " (projector="
+                            + projectorPos.getAsLong()
+                            + " egress="
+                            + egressPos.getAsLong()
+                            + "; projector replay likely wedged)",
+                    reading);
         }
 
         long excessLag = reading.excessLagBytes();

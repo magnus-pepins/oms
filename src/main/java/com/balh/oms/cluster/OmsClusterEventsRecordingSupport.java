@@ -88,6 +88,22 @@ public final class OmsClusterEventsRecordingSupport {
         return message != null && message.contains("must be less than highest recorded position");
     }
 
+    /**
+     * Classifies replay-loop errors as recoverable OMS-cluster infrastructure failures (Aeron
+     * MediaDriver / Archive unreachable after a cluster bounce) versus fatal cursor/recording
+     * corruption ({@link IllegalStateException} from cursor guards — handled separately).
+     */
+    public static boolean isRecoverableClusterInfraError(Throwable error) {
+        for (Throwable t = error; t != null; t = t.getCause()) {
+            if (t instanceof io.aeron.exceptions.TimeoutException
+                    || t instanceof io.aeron.exceptions.RegistrationException
+                    || t instanceof org.agrona.concurrent.AgentTerminationException) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /** Minimal recording identity for bootstrap selection. */
     public record BootstrapPick(long recordingId, long startPosition, long stopPosition, int skippedEmptyTombstones) {
 

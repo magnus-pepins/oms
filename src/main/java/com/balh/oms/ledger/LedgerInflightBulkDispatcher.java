@@ -2,6 +2,7 @@ package com.balh.oms.ledger;
 
 import java.math.BigDecimal;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 
@@ -39,9 +40,22 @@ public interface LedgerInflightBulkDispatcher {
 
     record HoldItem(UUID orderId, String sourceBalanceId, BigDecimal holdAmount) {}
 
-    record Result(int requested, int succeeded, Set<UUID> failedOrderIds) {
+    /**
+     * @param ledgerTxnIdByOrderId per-order Ledger {@code transactionId} for items that succeeded,
+     *     parsed from the bulk response {@code results[]} by matching each created transaction's
+     *     {@code oms:order:{uuid}} reference. Stored on the outbox row so the V32 lifecycle
+     *     reconciler can later commit/void the hold by txn id. Empty when the Ledger response
+     *     does not carry per-item ids (older Ledger) — those holds fall back to the expiry sweep.
+     */
+    record Result(int requested, int succeeded, Set<UUID> failedOrderIds,
+                  Map<UUID, String> ledgerTxnIdByOrderId) {
         public Result {
             failedOrderIds = failedOrderIds == null ? Set.of() : Set.copyOf(failedOrderIds);
+            ledgerTxnIdByOrderId = ledgerTxnIdByOrderId == null ? Map.of() : Map.copyOf(ledgerTxnIdByOrderId);
+        }
+
+        public Result(int requested, int succeeded, Set<UUID> failedOrderIds) {
+            this(requested, succeeded, failedOrderIds, Map.of());
         }
     }
 

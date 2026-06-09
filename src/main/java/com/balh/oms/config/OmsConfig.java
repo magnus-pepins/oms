@@ -4033,6 +4033,12 @@ public class OmsConfig {
             /** Default backoff between {@code listRecordings} retries while waiting for the recording to appear. */
             private static final long DEFAULT_RECORDING_LOOKUP_PARK_MS = 100L;
 
+            /**
+             * Readiness fails when the cursor has not advanced for this long while Archive replay
+             * backlog or a non-empty apply queue remains. Does not fail at the idle live tail.
+             */
+            private static final long DEFAULT_READINESS_MAX_REPLAY_STALL_MS = 30_000L;
+
             private boolean enabled = false;
             private String aeronDirectory = "";
             private String archiveControlRequestChannel = "aeron:ipc?term-length=64k";
@@ -4048,6 +4054,7 @@ public class OmsConfig {
             private int applyThreadCount = DEFAULT_APPLY_THREAD_COUNT;
             private int replayThreadPriority = DEFAULT_REPLAY_THREAD_PRIORITY;
             private long recordingLookupParkMs = DEFAULT_RECORDING_LOOKUP_PARK_MS;
+            private long readinessMaxReplayStallMs = DEFAULT_READINESS_MAX_REPLAY_STALL_MS;
 
             public boolean isEnabled() { return enabled; }
             public void setEnabled(boolean enabled) { this.enabled = enabled; }
@@ -4135,6 +4142,11 @@ public class OmsConfig {
             public long getRecordingLookupParkMs() { return recordingLookupParkMs; }
             public void setRecordingLookupParkMs(long recordingLookupParkMs) {
                 this.recordingLookupParkMs = Math.max(10L, recordingLookupParkMs);
+            }
+
+            public long getReadinessMaxReplayStallMs() { return readinessMaxReplayStallMs; }
+            public void setReadinessMaxReplayStallMs(long readinessMaxReplayStallMs) {
+                this.readinessMaxReplayStallMs = Math.max(1_000L, readinessMaxReplayStallMs);
             }
         }
 

@@ -107,6 +107,36 @@ class RestLedgerInflightBulkDispatcherTest {
         assertThat(r.succeeded()).isEqualTo(1);
     }
 
+    @Test
+    void resultsArray_capturesLedgerTxnIdPerOrderForSucceededItems() throws Exception {
+        UUID a = UUID.randomUUID();
+        UUID b = UUID.randomUUID();
+        List<HoldItem> items = List.of(item(a), item(b));
+        // b failed (errors[]) and must NOT get a txn id even if it appears in results[];
+        // a succeeded and its txn id must be mapped so the lifecycle reconciler can void it.
+        String body = """
+                {"batch_id":"b6","status":"partial","transaction_count":1,
+                 "results":[
+                   {"reference":"oms:order:%s","transactionId":"txn_aaa","status":"INFLIGHT"},
+                   {"reference":"oms:order:%s","transactionId":"txn_bbb","status":"INFLIGHT"}
+                 ],
+                 "errors":["Transaction oms:order:%s: Balance version conflict"]}""".formatted(a, b, b);
+        Result r = dispatcher.parseResponse(items, body, 201);
+        assertThat(r.failedOrderIds()).containsExactly(b);
+        assertThat(r.ledgerTxnIdByOrderId()).containsEntry(a, "txn_aaa");
+        assertThat(r.ledgerTxnIdByOrderId()).doesNotContainKey(b);
+    }
+
+    @Test
+    void resultsAbsent_ledgerTxnIdMapIsEmpty() throws Exception {
+        UUID a = UUID.randomUUID();
+        String body = """
+                {"batch_id":"b7","status":"applied","transaction_count":1}""";
+        Result r = dispatcher.parseResponse(List.of(item(a)), body, 201);
+        assertThat(r.succeeded()).isEqualTo(1);
+        assertThat(r.ledgerTxnIdByOrderId()).isEmpty();
+    }
+
     private static HoldItem item(UUID orderId) {
         return new HoldItem(orderId, "src", new BigDecimal("1"));
     }

@@ -10,8 +10,10 @@ import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestClientException;
 
 import java.math.BigDecimal;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.regex.Matcher;
@@ -127,6 +129,8 @@ public final class RestLedgerInflightBulkDispatcher implements LedgerInflightBul
             }
             return new Result(items.size(), items.size(), Set.of());
         }
+        // declared here so it is in scope after the errors[] parsing block below
+        Map<UUID, String> ledgerTxnIdByOrderId = new HashMap<>();
         JsonNode root;
         try {
             root = objectMapper.readTree(body);
@@ -156,8 +160,32 @@ public final class RestLedgerInflightBulkDispatcher implements LedgerInflightBul
             throw new LedgerInflightBulkException(
                     "ledger bulk 400 without parsable errors; body=" + truncate(body));
         }
+        // results[] carries {reference, transactionId} per created transaction. Map each back to
+        // its OMS order id via the oms:order:{uuid} reference so the caller can persist the
+        // Ledger txn id and later commit/void the hold. Absent on older Ledger builds (left empty).
+        JsonNode results = root.path("results");
+        if (results.isArray()) {
+            for (JsonNode item : results) {
+                String reference = item.path("reference").asText("");
+                String txnId = item.path("transactionId").asText("");
+                if (txnId.isEmpty()) {
+                    continue;
+                }
+                Matcher m = ORDER_ID_PATTERN.matcher(reference);
+                if (m.find()) {
+                    try {
+                        UUID id = UUID.fromString(m.group(1));
+                        if (requestedIds.contains(id) && !failed.contains(id)) {
+                            ledgerTxnIdByOrderId.put(id, txnId);
+                        }
+                    } catch (IllegalArgumentException ignore) {
+                        // Pattern guarantees UUID shape; defensive.
+                    }
+                }
+            }
+        }
         int succeeded = items.size() - failed.size();
-        return new Result(items.size(), succeeded, failed);
+        return new Result(items.size(), succeeded, failed, ledgerTxnIdByOrderId);
     }
 
     private static String truncate(String s) {

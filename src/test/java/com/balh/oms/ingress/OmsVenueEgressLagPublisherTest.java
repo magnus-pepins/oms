@@ -260,11 +260,25 @@ class OmsVenueEgressLagPublisherTest {
     }
 
     @Test
-    void egressOnNewerRecording_allows() {
+    void egressOnNewerRecording_blocksUntilProjectorCatchesUp() {
         stubPositions(9920L, 10L);
         stubRecordings(387L, 388L);
 
-        assertThat(publisher.computeHealthSnapshot().admissible()).isTrue();
+        OmsVenueEgressLagPublisher.VenueEgressHealthSnapshot snapshot =
+                publisher.computeHealthSnapshot();
+        assertThat(snapshot.admissible()).isFalse();
+        assertThat(snapshot.blockDetail()).contains("newer recording");
+    }
+
+    @Test
+    void projectorTrailingEgressOnSameRecording_blocks() {
+        stubPositions(1952L, 2624L);
+        stubRecordings(0L, 0L);
+
+        OmsVenueEgressLagPublisher.VenueEgressHealthSnapshot snapshot =
+                publisher.computeHealthSnapshot();
+        assertThat(snapshot.admissible()).isFalse();
+        assertThat(snapshot.blockDetail()).contains("projector trailing");
     }
 
     @Test

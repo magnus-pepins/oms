@@ -1,5 +1,6 @@
 package com.balh.oms.ingress;
 
+import com.balh.oms.predictionmarket.PredictionMarketContractRepository;
 import com.balh.oms.predictionmarket.PredictionMarketEventRepository;
 import com.balh.oms.predictionmarket.PredictionMarketEventService;
 import java.util.List;
@@ -39,11 +40,15 @@ public class PredictionMarketEventsAdminController {
             String status) {}
 
     private final PredictionMarketEventRepository repository;
+    private final PredictionMarketContractRepository contractRepository;
     private final PredictionMarketEventService service;
 
     public PredictionMarketEventsAdminController(
-            PredictionMarketEventRepository repository, PredictionMarketEventService service) {
+            PredictionMarketEventRepository repository,
+            PredictionMarketContractRepository contractRepository,
+            PredictionMarketEventService service) {
         this.repository = repository;
+        this.contractRepository = contractRepository;
         this.service = service;
     }
 
@@ -55,6 +60,20 @@ public class PredictionMarketEventsAdminController {
         List<PredictionMarketEventDto.EventResponse> items =
                 repository.listAll(statusFilter).stream().map(PredictionMarketEventDto::toResponse).toList();
         return ResponseEntity.ok(new PredictionMarketEventDto.EventListResponse(items));
+    }
+
+    @GetMapping("/by-slug/{slug}")
+    public ResponseEntity<PredictionMarketEventDto.EventWithContractsResponse> getBySlug(
+            @PathVariable String slug) {
+        return repository
+                .findBySlug(slug)
+                .map(
+                        event -> {
+                            var contractRows = contractRepository.listByEventId(event.id());
+                            return ResponseEntity.ok(
+                                    PredictionMarketEventDto.toResponseWithContracts(event, contractRows));
+                        })
+                .orElse(ResponseEntity.notFound().build());
     }
 
     @GetMapping("/{id}")

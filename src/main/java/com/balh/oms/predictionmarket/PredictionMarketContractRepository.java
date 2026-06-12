@@ -72,6 +72,15 @@ public class PredictionMarketContractRepository {
                     """
                     .formatted(SELECT_COLUMNS);
 
+    private static final String LIST_BY_EVENT =
+            """
+                    SELECT %s
+                    FROM prediction_market_contract
+                    WHERE event_id = :eventId
+                    ORDER BY outcome_display_order ASC, id ASC
+                    """
+                    .formatted(SELECT_COLUMNS);
+
     private static final String LIST_OPEN_STANDALONE =
             """
                     SELECT %s
@@ -143,6 +152,12 @@ public class PredictionMarketContractRepository {
     public List<ContractRow> listOpenByEventId(long eventId) {
         return jdbc.query(
                 LIST_OPEN_BY_EVENT, new MapSqlParameterSource("eventId", eventId), this::mapRow);
+    }
+
+    /** All contract statuses linked to an event (operator admin). */
+    public List<ContractRow> listByEventId(long eventId) {
+        return jdbc.query(
+                LIST_BY_EVENT, new MapSqlParameterSource("eventId", eventId), this::mapRow);
     }
 
     public List<ContractRow> listOpenStandalone() {

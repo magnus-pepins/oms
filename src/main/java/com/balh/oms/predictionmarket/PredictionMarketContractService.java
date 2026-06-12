@@ -24,11 +24,15 @@ public class PredictionMarketContractService {
 
     private final PredictionMarketContractRepository repository;
     private final VenueContractRegistryClient venueRegistry;
+    private final PredictionMarketEventRepository eventRepository;
 
     public PredictionMarketContractService(
-            PredictionMarketContractRepository repository, VenueContractRegistryClient venueRegistry) {
+            PredictionMarketContractRepository repository,
+            VenueContractRegistryClient venueRegistry,
+            PredictionMarketEventRepository eventRepository) {
         this.repository = repository;
         this.venueRegistry = venueRegistry;
+        this.eventRepository = eventRepository;
     }
 
     public record CreateRequest(
@@ -54,7 +58,11 @@ public class PredictionMarketContractService {
             String feeModelId,
             Integer feeScheduleVersion,
             String feeParamsJson,
-            String retailFeeModelId) {}
+            String retailFeeModelId,
+            Long eventId,
+            String eventSlug,
+            String outcomeLabel,
+            Integer outcomeDisplayOrder) {}
 
     public record UpdateRequest(
             String title,
@@ -76,7 +84,11 @@ public class PredictionMarketContractService {
             String feeModelId,
             Integer feeScheduleVersion,
             String feeParamsJson,
-            String retailFeeModelId) {}
+            String retailFeeModelId,
+            Long eventId,
+            String eventSlug,
+            String outcomeLabel,
+            Integer outcomeDisplayOrder) {}
 
     public PredictionMarketContractRepository.ContractRow create(CreateRequest req) {
         String slug = normalizeSlug(req.slug());
@@ -103,6 +115,11 @@ public class PredictionMarketContractService {
         String cardImageUrl =
                 PredictionMarketCatalogPresentation.normalizeCardImageUrl(req.cardImageUrl());
         int displayOrder = PredictionMarketCatalogPresentation.normalizeDisplayOrder(req.displayOrder());
+        Long eventId =
+                PredictionMarketEventService.resolveEventId(eventRepository, req.eventId(), req.eventSlug());
+        String outcomeLabel = PredictionMarketEventService.normalizeOutcomeLabel(req.outcomeLabel());
+        int outcomeDisplayOrder =
+                PredictionMarketEventService.normalizeOutcomeDisplayOrder(req.outcomeDisplayOrder());
         PredictionMarketContractRepository.ContractRow row =
                 repository.insert(
                         slug,
@@ -127,7 +144,10 @@ public class PredictionMarketContractService {
                         normalizeFeeModelId(req.feeModelId(), "TAKER_ONLY"),
                         req.feeScheduleVersion(),
                         req.feeParamsJson(),
-                        trimToNull(req.retailFeeModelId()));
+                        trimToNull(req.retailFeeModelId()),
+                        eventId,
+                        outcomeLabel,
+                        outcomeDisplayOrder);
         if (shouldSyncVenueRegistry(status)) {
             venueRegistry.syncContract(row);
         }
@@ -220,6 +240,21 @@ public class PredictionMarketContractService {
                                     req.retailFeeModelId() != null
                                             ? trimToNull(req.retailFeeModelId())
                                             : existing.retailFeeModelId();
+                            Long eventId =
+                                    req.eventId() != null || req.eventSlug() != null
+                                            ? PredictionMarketEventService.resolveEventId(
+                                                    eventRepository, req.eventId(), req.eventSlug())
+                                            : existing.eventId();
+                            String outcomeLabel =
+                                    req.outcomeLabel() != null
+                                            ? PredictionMarketEventService.normalizeOutcomeLabel(
+                                                    req.outcomeLabel())
+                                            : existing.outcomeLabel();
+                            int outcomeDisplayOrder =
+                                    req.outcomeDisplayOrder() != null
+                                            ? PredictionMarketEventService.normalizeOutcomeDisplayOrder(
+                                                    req.outcomeDisplayOrder())
+                                            : existing.outcomeDisplayOrder();
                             PredictionMarketContractRepository.ContractRow updated =
                                     repository.update(
                                             id,
@@ -242,7 +277,10 @@ public class PredictionMarketContractService {
                                             feeModelId,
                                             feeScheduleVersion,
                                             feeParamsJson,
-                                            retailFeeModelId);
+                                            retailFeeModelId,
+                                            eventId,
+                                            outcomeLabel,
+                                            outcomeDisplayOrder);
                             syncVenueRegistryAfterUpdate(existing, updated);
                             return updated;
                         });

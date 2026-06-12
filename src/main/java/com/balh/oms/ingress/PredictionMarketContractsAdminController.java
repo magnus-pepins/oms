@@ -49,7 +49,11 @@ public class PredictionMarketContractsAdminController {
             String feeModelId,
             Integer feeScheduleVersion,
             String feeParamsJson,
-            String retailFeeModelId) {}
+            String retailFeeModelId,
+            Long eventId,
+            String eventSlug,
+            String outcomeLabel,
+            Integer outcomeDisplayOrder) {}
 
     public record UpdateBody(
             String title,
@@ -71,7 +75,11 @@ public class PredictionMarketContractsAdminController {
             String feeModelId,
             Integer feeScheduleVersion,
             String feeParamsJson,
-            String retailFeeModelId) {}
+            String retailFeeModelId,
+            Long eventId,
+            String eventSlug,
+            String outcomeLabel,
+            Integer outcomeDisplayOrder) {}
 
     private final PredictionMarketContractRepository repository;
     private final PredictionMarketContractService service;
@@ -132,7 +140,11 @@ public class PredictionMarketContractsAdminController {
                                     body.feeModelId(),
                                     body.feeScheduleVersion(),
                                     body.feeParamsJson(),
-                                    body.retailFeeModelId()));
+                                    body.retailFeeModelId(),
+                                    body.eventId(),
+                                    body.eventSlug(),
+                                    body.outcomeLabel(),
+                                    body.outcomeDisplayOrder()));
             return ResponseEntity.status(HttpStatus.CREATED).body(PredictionMarketContractDto.toResponse(row));
         } catch (IllegalArgumentException e) {
             return ResponseEntity.badRequest().build();
@@ -177,7 +189,11 @@ public class PredictionMarketContractsAdminController {
                                     body.feeModelId(),
                                     body.feeScheduleVersion(),
                                     body.feeParamsJson(),
-                                    body.retailFeeModelId()))
+                                    body.retailFeeModelId(),
+                                    body.eventId(),
+                                    body.eventSlug(),
+                                    body.outcomeLabel(),
+                                    body.outcomeDisplayOrder()))
                     .map(row -> ResponseEntity.ok(PredictionMarketContractDto.toResponse(row)))
                     .orElse(ResponseEntity.notFound().build());
         } catch (IllegalArgumentException e) {

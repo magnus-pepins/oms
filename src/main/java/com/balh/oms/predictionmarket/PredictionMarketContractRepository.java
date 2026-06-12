@@ -36,7 +36,11 @@ public class PredictionMarketContractRepository {
             String feeModelId,
             int feeScheduleVersion,
             String feeParamsJson,
-            String retailFeeModelId) {}
+            String retailFeeModelId,
+            Long eventId,
+            String eventSlug,
+            String outcomeLabel,
+            int outcomeDisplayOrder) {}
 
     private static final String SELECT_COLUMNS =
             """
@@ -45,7 +49,9 @@ public class PredictionMarketContractRepository {
                     payout_per_contract, closes_at, resolves_at, jurisdiction_tags,
                     category, tags, card_image_url, display_order,
                     fee_model_id, fee_schedule_version, fee_params_json::text AS fee_params_json,
-                    retail_fee_model_id
+                    retail_fee_model_id, event_id,
+                    (SELECT slug FROM prediction_market_event e WHERE e.id = event_id) AS event_slug,
+                    outcome_label, outcome_display_order
                     """;
 
     private static final String LIST_OPEN =
@@ -53,6 +59,24 @@ public class PredictionMarketContractRepository {
                     SELECT %s
                     FROM prediction_market_contract
                     WHERE status = 'OPEN'
+                    ORDER BY display_order ASC, id ASC
+                    """
+                    .formatted(SELECT_COLUMNS);
+
+    private static final String LIST_OPEN_BY_EVENT =
+            """
+                    SELECT %s
+                    FROM prediction_market_contract
+                    WHERE status = 'OPEN' AND event_id = :eventId
+                    ORDER BY outcome_display_order ASC, id ASC
+                    """
+                    .formatted(SELECT_COLUMNS);
+
+    private static final String LIST_OPEN_STANDALONE =
+            """
+                    SELECT %s
+                    FROM prediction_market_contract
+                    WHERE status = 'OPEN' AND event_id IS NULL
                     ORDER BY display_order ASC, id ASC
                     """
                     .formatted(SELECT_COLUMNS);
@@ -114,6 +138,15 @@ public class PredictionMarketContractRepository {
 
     public List<ContractRow> listOpen() {
         return jdbc.query(LIST_OPEN, new MapSqlParameterSource(), this::mapRow);
+    }
+
+    public List<ContractRow> listOpenByEventId(long eventId) {
+        return jdbc.query(
+                LIST_OPEN_BY_EVENT, new MapSqlParameterSource("eventId", eventId), this::mapRow);
+    }
+
+    public List<ContractRow> listOpenStandalone() {
+        return jdbc.query(LIST_OPEN_STANDALONE, new MapSqlParameterSource(), this::mapRow);
     }
 
     public List<ContractRow> listAll(String statusOrNull) {
@@ -214,7 +247,10 @@ public class PredictionMarketContractRepository {
                 "ZERO",
                 1,
                 null,
-                null);
+                null,
+                null,
+                null,
+                0);
     }
 
     public ContractRow insert(
@@ -241,6 +277,62 @@ public class PredictionMarketContractRepository {
             Integer feeScheduleVersion,
             String feeParamsJson,
             String retailFeeModelId) {
+        return insert(
+                slug,
+                title,
+                yesSymbol,
+                noSymbol,
+                description,
+                resolutionCriteria,
+                referenceLinks,
+                resolutionSource,
+                status,
+                settlementCurrency,
+                tickSize,
+                payoutPerContract,
+                closesAt,
+                resolvesAt,
+                jurisdictionTags,
+                category,
+                tags,
+                cardImageUrl,
+                displayOrder,
+                feeModelId,
+                feeScheduleVersion,
+                feeParamsJson,
+                retailFeeModelId,
+                null,
+                null,
+                0);
+    }
+
+    public ContractRow insert(
+            String slug,
+            String title,
+            String yesSymbol,
+            String noSymbol,
+            String description,
+            String resolutionCriteria,
+            List<PredictionMarketReferenceLinks.Link> referenceLinks,
+            String resolutionSource,
+            String status,
+            String settlementCurrency,
+            BigDecimal tickSize,
+            BigDecimal payoutPerContract,
+            Instant closesAt,
+            Instant resolvesAt,
+            List<String> jurisdictionTags,
+            String category,
+            List<String> tags,
+            String cardImageUrl,
+            int displayOrder,
+            String feeModelId,
+            Integer feeScheduleVersion,
+            String feeParamsJson,
+            String retailFeeModelId,
+            Long eventId,
+            String outcomeLabel,
+            int outcomeDisplayOrder) {
         Long id =
                 jdbc.queryForObject(
                         """
@@ -249,7 +341,8 @@ public class PredictionMarketContractRepository {
                                     reference_links, resolution_source, status, settlement_currency,
                                     tick_size, payout_per_contract, closes_at, resolves_at, jurisdiction_tags,
                                     category, tags, card_image_url, display_order,
-                                    fee_model_id, fee_schedule_version, fee_params_json, retail_fee_model_id
+                                    fee_model_id, fee_schedule_version, fee_params_json, retail_fee_model_id,
+                                    event_id, outcome_label, outcome_display_order
                                 ) VALUES (
                                     :slug, :title, :yesSymbol, :noSymbol, :description, :resolutionCriteria,
                                     CAST(:referenceLinks AS JSONB), :resolutionSource, :status,
@@ -257,7 +350,7 @@ public class PredictionMarketContractRepository {
                                     CAST(:jurisdictionTags AS JSONB), :category, CAST(:tags AS JSONB),
                                     :cardImageUrl, :displayOrder,
                                     :feeModelId, :feeScheduleVersion, CAST(:feeParamsJson AS JSONB),
-                                    :retailFeeModelId
+                                    :retailFeeModelId, :eventId, :outcomeLabel, :outcomeDisplayOrder
                                 )
                                 RETURNING id
                                 """,
@@ -284,7 +377,10 @@ public class PredictionMarketContractRepository {
                                 feeModelId,
                                 feeScheduleVersion,
                                 feeParamsJson,
-                                retailFeeModelId),
+                                retailFeeModelId,
+                                eventId,
+                                outcomeLabel,
+                                outcomeDisplayOrder),
                         Long.class);
         return findById(id).orElseThrow();
     }
@@ -310,7 +406,10 @@ public class PredictionMarketContractRepository {
             String feeModelId,
             Integer feeScheduleVersion,
             String feeParamsJson,
-            String retailFeeModelId) {
+            String retailFeeModelId,
+            Long eventId,
+            String outcomeLabel,
+            Integer outcomeDisplayOrder) {
         jdbc.update(
                 """
                         UPDATE prediction_market_contract
@@ -333,7 +432,10 @@ public class PredictionMarketContractRepository {
                             fee_model_id = COALESCE(:feeModelId, fee_model_id),
                             fee_schedule_version = COALESCE(:feeScheduleVersion, fee_schedule_version),
                             fee_params_json = COALESCE(CAST(:feeParamsJson AS JSONB), fee_params_json),
-                            retail_fee_model_id = :retailFeeModelId
+                            retail_fee_model_id = :retailFeeModelId,
+                            event_id = :eventId,
+                            outcome_label = :outcomeLabel,
+                            outcome_display_order = COALESCE(:outcomeDisplayOrder, outcome_display_order)
                         WHERE id = :id
                         """,
                 bindWrite(
@@ -359,7 +461,10 @@ public class PredictionMarketContractRepository {
                                 feeModelId,
                                 feeScheduleVersion,
                                 feeParamsJson,
-                                retailFeeModelId)
+                                retailFeeModelId,
+                                eventId,
+                                outcomeLabel,
+                                outcomeDisplayOrder)
                         .addValue("id", id));
         return findById(id).orElseThrow();
     }
@@ -387,7 +492,10 @@ public class PredictionMarketContractRepository {
             String feeModelId,
             Integer feeScheduleVersion,
             String feeParamsJson,
-            String retailFeeModelId) {
+            String retailFeeModelId,
+            Long eventId,
+            String outcomeLabel,
+            Integer outcomeDisplayOrder) {
         MapSqlParameterSource params = new MapSqlParameterSource();
         if (slug != null) {
             params.addValue("slug", slug);
@@ -431,6 +539,9 @@ public class PredictionMarketContractRepository {
         params.addValue("feeScheduleVersion", feeScheduleVersion == null ? 1 : feeScheduleVersion);
         params.addValue("feeParamsJson", feeParamsJson == null || feeParamsJson.isBlank() ? "{}" : feeParamsJson);
         params.addValue("retailFeeModelId", retailFeeModelId);
+        params.addValue("eventId", eventId);
+        params.addValue("outcomeLabel", outcomeLabel);
+        params.addValue("outcomeDisplayOrder", outcomeDisplayOrder == null ? 0 : outcomeDisplayOrder);
         return params;
     }
 
@@ -461,6 +572,10 @@ public class PredictionMarketContractRepository {
                 rs.getString("fee_model_id"),
                 rs.getInt("fee_schedule_version"),
                 rs.getString("fee_params_json"),
-                rs.getString("retail_fee_model_id"));
+                rs.getString("retail_fee_model_id"),
+                rs.getObject("event_id") == null ? null : rs.getLong("event_id"),
+                rs.getString("event_slug"),
+                rs.getString("outcome_label"),
+                rs.getInt("outcome_display_order"));
     }
 }

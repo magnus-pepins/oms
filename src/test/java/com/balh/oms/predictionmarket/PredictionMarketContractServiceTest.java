@@ -52,7 +52,11 @@ class PredictionMarketContractServiceTest {
                         before.feeModelId(),
                         before.feeScheduleVersion(),
                         before.feeParamsJson(),
-                        before.retailFeeModelId());
+                        before.retailFeeModelId(),
+                        before.eventId(),
+                        before.eventSlug(),
+                        before.outcomeLabel(),
+                        before.outcomeDisplayOrder());
         assertFalse(PredictionMarketContractService.requiresVenueRegistrySync(before, after));
     }
 
@@ -99,7 +103,11 @@ class PredictionMarketContractServiceTest {
                         before.feeModelId(),
                         before.feeScheduleVersion(),
                         before.feeParamsJson(),
-                        before.retailFeeModelId());
+                        before.retailFeeModelId(),
+                        before.eventId(),
+                        before.eventSlug(),
+                        before.outcomeLabel(),
+                        before.outcomeDisplayOrder());
         assertTrue(PredictionMarketContractService.requiresVenueRegistrySync(before, after));
     }
 
@@ -129,6 +137,10 @@ class PredictionMarketContractServiceTest {
                 "ZERO",
                 1,
                 "{}",
-                "TAKER_ONLY");
+                "TAKER_ONLY",
+                null,
+                null,
+                null,
+                0);
     }
 }

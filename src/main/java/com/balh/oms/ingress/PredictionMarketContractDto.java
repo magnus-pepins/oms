@@ -34,7 +34,11 @@ public final class PredictionMarketContractDto {
             String feeModelId,
             int feeScheduleVersion,
             String feeParamsJson,
-            String retailFeeModelId) {}
+            String retailFeeModelId,
+            Long eventId,
+            String eventSlug,
+            String outcomeLabel,
+            int outcomeDisplayOrder) {}
 
     public record ContractListResponse(java.util.List<ContractResponse> items) {}
 
@@ -69,6 +73,44 @@ public final class PredictionMarketContractDto {
                 row.feeModelId(),
                 row.feeScheduleVersion(),
                 row.feeParamsJson(),
-                row.retailFeeModelId());
+                row.retailFeeModelId(),
+                row.eventId(),
+                row.eventSlug(),
+                row.outcomeLabel(),
+                row.outcomeDisplayOrder());
+    }
+
+    public static ContractResponse toResponse(
+            PredictionMarketContractRepository.ContractRow row, String eventSlugOverride) {
+        ContractResponse base = toResponse(row);
+        return new ContractResponse(
+                base.id(),
+                base.slug(),
+                base.title(),
+                base.yesSymbol(),
+                base.noSymbol(),
+                base.description(),
+                base.resolutionCriteria(),
+                base.referenceLinks(),
+                base.resolutionSource(),
+                base.status(),
+                base.settlementCurrency(),
+                base.tickSize(),
+                base.payoutPerContract(),
+                base.closesAt(),
+                base.resolvesAt(),
+                base.jurisdictionTags(),
+                base.category(),
+                base.tags(),
+                base.cardImageUrl(),
+                base.displayOrder(),
+                base.feeModelId(),
+                base.feeScheduleVersion(),
+                base.feeParamsJson(),
+                base.retailFeeModelId(),
+                base.eventId(),
+                eventSlugOverride != null ? eventSlugOverride : base.eventSlug(),
+                base.outcomeLabel(),
+                base.outcomeDisplayOrder());
     }
 }

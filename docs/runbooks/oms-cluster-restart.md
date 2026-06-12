@@ -44,10 +44,22 @@ The script stops **fix-egress → ingress → projector → cluster-node**, wait
 
 **Verify after success:**
 
+- `restart-pop-oms-cluster.sh` waits up to 120s on reconcile before smoke. Manual probe (ingress **8088**):
+
+  ```bash
+  curl -sf http://127.0.0.1:8088/actuator/oms-cluster-readiness
+  curl -sf http://127.0.0.1:8088/actuator/oms-cluster-reconcile
+  ```
+
+  Use **`/actuator/oms-cluster-reconcile`** — there is no `/internal/reconcile` on ingress.
+  Right after restart, reconcile may return **503** with `projectorObservedAtMillis:0` until the
+  projector publishes its first observation; wait up to ~120s before treating as drift.
+
 - `bash ~/system-documentation/scripts/smoke/ledger-end-to-end.sh` then
   `bash ~/system-documentation/scripts/smoke/oms-end-to-end.sh` → exit 0 (OMS smoke runs
-  ledger preflight by default; `SKIP_LEDGER_PREFLIGHT=1` for OMS-only benches)
+  ledger preflight by default; `SKIP_LEDGER_PREFLIGHT=1` for OMS-only benches; exit **11** if reconcile not inSync)
 - Optional: `bash ~/oms/scripts/pm2-oms-cluster-readiness-probe.sh` (same readiness gate as smoke)
+- All-cluster probe URLs: [`cluster-health-probes.md`](../../../system-documentation/docs/runbooks/cluster-health-probes.md)
 - `oms-ingress` on **8088**; internal key from `~/.oms-bench.env`
 - Recent WORKING order: `POST .../force-cancel` → **200** or **409**, **not** 410
 - Cluster log: `replay validation:` and/or `loaded admission snapshot: orders=N` with **N > 0** if history exists

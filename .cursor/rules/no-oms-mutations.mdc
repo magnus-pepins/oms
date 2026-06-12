@@ -68,7 +68,9 @@ You **MAY** perform OMS work the operator asked for, including:
 
 - `ssh pop 'tail …'`, `grep`, `ls -la` under `~/oms/`.
 - `psql … -c "SELECT …"` on `oms` projector DB.
-- `curl` readiness/reconcile actuators.
+- `curl` OMS ingress probes on business port **8088** (not `/internal/reconcile` — that path does not exist):
+  `GET /actuator/oms-cluster-readiness`, `GET /actuator/oms-cluster-reconcile`.
+  Cheat sheet: [`cluster-health-probes.md`](../../../system-documentation/docs/runbooks/cluster-health-probes.md).
 - `pm2 list`, `pm2 logs --nostream`.
 - `bash system-documentation/scripts/smoke/oms-end-to-end.sh` when it does not contradict a demo freeze.
 

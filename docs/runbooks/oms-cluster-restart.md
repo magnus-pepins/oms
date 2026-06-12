@@ -26,7 +26,9 @@ Postgres can show a **WORKING** order while the cluster **no longer has that ord
 
 ---
 
-## Normal rolling restart (journal preserved)
+## Coordinated full restart (single-node / emergency)
+
+**Not** a quorum-preserving member replace — use [member-replace.md](./member-replace.md) for 3+ node production rolls.
 
 **Goal:** bounded replay time; no orphaned orders.
 

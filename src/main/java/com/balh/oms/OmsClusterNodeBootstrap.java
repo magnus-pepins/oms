@@ -74,6 +74,18 @@ public final class OmsClusterNodeBootstrap {
     private static final String DEFAULT_CLUSTER_MEMBERS_SINGLE_NODE =
             "0,localhost:20110,localhost:20220,localhost:20330,localhost:20440,localhost:8010";
 
+    /** Port block step per cluster member on one host. */
+    public static final int MEMBER_PORT_BLOCK_STEP = 1_000;
+
+    private static final int BASE_INGRESS_PORT = 20_110;
+    private static final int BASE_CONSENSUS_PORT = 20_220;
+    private static final int BASE_LOG_PORT = 20_330;
+    private static final int BASE_CATCHUP_PORT = 20_440;
+    private static final int BASE_ARCHIVE_CONTROL_PORT = 8_010;
+
+    public static final String DEFAULT_CLUSTER_MEMBERS_THREE_NODE =
+            memberClusterEndpoints(0) + "|" + memberClusterEndpoints(1) + "|" + memberClusterEndpoints(2);
+
     /** Default Aeron working directory base (under Gradle build dir for clean ergonomics). */
     private static final String DEFAULT_AERON_DIR_BASE = "build/aeron-cluster";
 
@@ -392,6 +404,19 @@ public final class OmsClusterNodeBootstrap {
     }
 
     public static Archive.Context buildArchiveContext(ClusterNodePaths paths) {
+        String envChannel = System.getenv(ENV_ARCHIVE_CONTROL_CHANNEL);
+        if (envChannel != null && !envChannel.isBlank()) {
+            return buildArchiveContext(paths, envChannel.trim());
+        }
+        return buildArchiveContext(paths, DEFAULT_ARCHIVE_CONTROL_CHANNEL);
+    }
+
+    public static Archive.Context buildArchiveContext(ClusterNodePaths paths, int archiveControlPort) {
+        return buildArchiveContext(
+                paths, "aeron:udp?endpoint=localhost:" + archiveControlPort);
+    }
+
+    public static Archive.Context buildArchiveContext(ClusterNodePaths paths, String archiveControlChannel) {
         // Phase 4 Tier 2.5 phase E-3a: control channel resolves from ENV_ARCHIVE_CONTROL_CHANNEL
         // so two cluster-node JVMs can co-exist on one host (e.g. Pop! 2-shard bench with shard 0
         // archive on localhost:8010 and shard 1 archive on localhost:9010). Default is unchanged
@@ -403,7 +428,7 @@ public final class OmsClusterNodeBootstrap {
         return new Archive.Context()
                 .aeronDirectoryName(paths.aeronDirectory())
                 .archiveDir(new File(paths.archiveDir()))
-                .controlChannel(envOrDefault(ENV_ARCHIVE_CONTROL_CHANNEL, DEFAULT_ARCHIVE_CONTROL_CHANNEL))
+                .controlChannel(archiveControlChannel)
                 .localControlChannel("aeron:ipc?term-length=64k")
                 .recordingEventsEnabled(false)
                 .replicationChannel("aeron:udp?endpoint=localhost:0")
@@ -541,6 +566,46 @@ public final class OmsClusterNodeBootstrap {
                             raw),
                     e);
         }
+    }
+
+    public static int archiveControlPortForMember(int memberId) {
+        return BASE_ARCHIVE_CONTROL_PORT + memberId * MEMBER_PORT_BLOCK_STEP;
+    }
+
+    public static String memberClusterEndpoints(int memberId) {
+        int offset = memberId * MEMBER_PORT_BLOCK_STEP;
+        return memberId
+                + ",localhost:" + (BASE_INGRESS_PORT + offset)
+                + ",localhost:" + (BASE_CONSENSUS_PORT + offset)
+                + ",localhost:" + (BASE_LOG_PORT + offset)
+                + ",localhost:" + (BASE_CATCHUP_PORT + offset)
+                + ",localhost:" + (BASE_ARCHIVE_CONTROL_PORT + offset);
+    }
+
+    public static String ingressEndpointsFromClusterMembers(String clusterMembers) {
+        String[] members = clusterMembers.split("\\|");
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < members.length; i++) {
+            String[] parts = members[i].trim().split(",");
+            if (parts.length < 2) {
+                throw new IllegalArgumentException("invalid cluster member: " + members[i]);
+            }
+            if (i > 0) {
+                sb.append(',');
+            }
+            sb.append(parts[0].trim()).append('=').append(parts[1].trim());
+        }
+        return sb.toString();
+    }
+
+    public static ClusterNodePaths pathsForMember(java.nio.file.Path base, int memberId) {
+        java.nio.file.Path memberBase = base.resolve("member-" + memberId);
+        return new ClusterNodePaths(
+                memberBase.toString(),
+                memberBase.resolve(DEFAULT_AERON_MEDIA_DRIVER_DIR_NAME).toString(),
+                memberBase.resolve(DEFAULT_ARCHIVE_DIR_NAME).toString(),
+                memberBase.resolve(DEFAULT_CLUSTER_DIR_NAME).toString(),
+                memberBase.resolve(DEFAULT_CLUSTER_SERVICES_DIR_NAME).toString());
     }
 
     static ClusterNodePaths resolvePaths() {

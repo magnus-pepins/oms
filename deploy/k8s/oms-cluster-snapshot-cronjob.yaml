@@ -1,0 +1,62 @@
+# Snapshot CronJob — caps replay MTTR before member replace (Phase 5).
+#
+# Runs the snapshot tool IN the member-0 pod via kubectl exec instead of
+# mounting its PVC: aeron-data PVCs are RWO and stay attached to the
+# StatefulSet pod, so a separate pod mounting the claim would hang in
+# ContainerCreating forever. Exec-in-place matches how the pop snapshot path
+# works (tool runs next to the consensus dir).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: oms-cluster-snapshot
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: oms-cluster-snapshot-exec
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: oms-cluster-snapshot-exec
+subjects:
+  - kind: ServiceAccount
+    name: oms-cluster-snapshot
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: oms-cluster-snapshot-exec
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: oms-cluster-snapshot
+spec:
+  schedule: "*/5 * * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: oms-cluster-snapshot
+          restartPolicy: OnFailure
+          containers:
+            - name: snapshot
+              image: bitnami/kubectl:latest
+              command:
+                - kubectl
+                - exec
+                - oms-cluster-node-0
+                - --container=oms-cluster-node
+                - --
+                - java
+                - -cp
+                - /app/oms-cluster-node.jar
+                - com.balh.oms.cluster.admin.OmsClusterSnapshotAdminTool

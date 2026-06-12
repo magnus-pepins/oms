@@ -1,0 +1,66 @@
+# OMS cluster-node StatefulSet skeleton (Phase 5).
+# Apply on production k8s after image registry + secrets are wired.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: oms-cluster-node
+  labels:
+    app: oms-cluster-node
+    tier: aeron-cluster
+spec:
+  serviceName: oms-cluster-node
+  replicas: 3
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      app: oms-cluster-node
+  template:
+    metadata:
+      labels:
+        app: oms-cluster-node
+        tier: aeron-cluster
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: oms-cluster-node
+              topologyKey: topology.kubernetes.io/zone
+      containers:
+        - name: oms-cluster-node
+          image: balh/oms-cluster-node:latest
+          ports:
+            - containerPort: 20110
+              name: ingress
+            - containerPort: 8089
+              name: metrics
+          env:
+            - name: OMS_AERON_CLUSTER_MEMBER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['apps.kubernetes.io/pod-index']
+            - name: OMS_AERON_CLUSTER_MEMBERS
+              valueFrom:
+                configMapKeyRef:
+                  name: oms-cluster-members
+                  key: members
+            - name: OMS_AERON_DIR_BASE
+              value: /var/aeron/oms
+          volumeMounts:
+            - name: aeron-data
+              mountPath: /var/aeron/oms
+          readinessProbe:
+            httpGet:
+              path: /actuator/oms-cluster-readiness
+              port: 8089
+            initialDelaySeconds: 30
+            periodSeconds: 10
+  volumeClaimTemplates:
+    - metadata:
+        name: aeron-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 100Gi

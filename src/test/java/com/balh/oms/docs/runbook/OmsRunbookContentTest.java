@@ -19,7 +19,7 @@ class OmsRunbookContentTest {
     @Test
     void normalRestartSection_pointsAtSanctionedScript() throws Exception {
         String content = Files.readString(RESTART_RUNBOOK);
-        int normalIdx = content.indexOf("## Normal rolling restart");
+        int normalIdx = content.indexOf("## Coordinated full restart");
         assertThat(normalIdx).isGreaterThanOrEqualTo(0);
         String normalSection = content.substring(normalIdx);
         int nextSection = normalSection.indexOf("\n## ", 1);

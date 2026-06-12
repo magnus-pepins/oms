@@ -139,7 +139,7 @@ public final class EmbeddedVenueStack implements AutoCloseable {
                         VenueClusterNodeBootstrap.buildServiceContainerContext(paths, service));
 
         VenueGatewayConfig gatewayConfig =
-                new VenueGatewayConfig(
+                VenueGatewayConfig.forClusterClient(
                         paths.aeronDirectory(),
                         "aeron:udp?endpoint=localhost:0",
                         "0=localhost:30110",

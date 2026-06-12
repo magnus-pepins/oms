@@ -12,13 +12,18 @@ import java.time.Instant;
 import java.util.Locale;
 
 /**
- * Copies detached archive segment files to an off-host ship root (local path, NFS mount, or
+ * Copies sealed archive segment files to an off-host ship root (local path, NFS mount, or
  * rclone-synced directory). S3 object-lock/WORM is achieved by shipping to an immutable bucket
  * via operator sync tooling against {@link ClusterRetentionConfig#shipRoot()}.
+ *
+ * <p>Aeron Archive stores every recording's segments flat in the archive directory, named
+ * {@code <recordingId>-<segmentBasePosition>.rec}.
  */
 public final class FileArchiveShipper {
 
     private static final Logger log = LoggerFactory.getLogger(FileArchiveShipper.class);
+
+    private static final String SEGMENT_FILE_SUFFIX = ".rec";
 
     private final File shipRoot;
     private final String clusterLabel;
@@ -32,72 +37,84 @@ public final class FileArchiveShipper {
     }
 
     /**
-     * Ships segment files from {@code archiveDir} for the given recording up to {@code shipUpToPosition}
-     * (exclusive of active tail). Returns the highest byte position confirmed shipped.
+     * Ships segment files of {@code recordingId} whose byte range overlaps
+     * {@code [shipFromPosition, shipUpToPosition)}. Segments ending at or below
+     * {@code shipFromPosition} are assumed already shipped and skipped. Returns the highest byte
+     * position confirmed shipped (capped at {@code shipUpToPosition}), or {@code shipFromPosition}
+     * when nothing new was shipped.
      */
-    public long shipSegments(File archiveDir, long recordingId, long shipUpToPosition, long segmentFileLength) {
-        if (shipUpToPosition <= 0L) {
-            return 0L;
+    public long shipSegments(
+            File archiveDir,
+            long recordingId,
+            long shipFromPosition,
+            long shipUpToPosition,
+            long segmentFileLength) {
+        if (shipUpToPosition <= shipFromPosition) {
+            return shipFromPosition;
         }
-        File recordingDir = new File(archiveDir, String.valueOf(recordingId));
-        if (!recordingDir.isDirectory()) {
-            log.warn("no archive recording dir for recordingId={} under {}", recordingId, archiveDir);
-            return 0L;
+        File[] segments =
+                archiveDir.listFiles((dir, name) -> parseSegmentBasePosition(name, recordingId) >= 0L);
+        if (segments == null || segments.length == 0) {
+            log.debug("no archive segment files for recordingId={} under {}", recordingId, archiveDir);
+            return shipFromPosition;
         }
         Path destBase =
                 shipRoot.toPath()
                         .resolve(clusterLabel)
                         .resolve(String.valueOf(recordingId))
                         .resolve(Instant.now().toString().replace(':', '-'));
-        try {
-            Files.createDirectories(destBase);
-        } catch (IOException ex) {
-            throw new IllegalStateException("failed to create ship dest " + destBase, ex);
-        }
 
-        long highestShipped = 0L;
-        File[] segments = recordingDir.listFiles((dir, name) -> name.endsWith(".rec"));
-        if (segments == null) {
-            return 0L;
-        }
+        long highestShipped = shipFromPosition;
+        int shippedCount = 0;
         for (File segment : segments) {
-            long segmentStart = parseSegmentStartPosition(segment.getName(), segmentFileLength);
-            if (segmentStart < 0L || segmentStart >= shipUpToPosition) {
+            long segmentBase = parseSegmentBasePosition(segment.getName(), recordingId);
+            long segmentEnd = segmentBase + segmentFileLength;
+            if (segmentBase >= shipUpToPosition || segmentEnd <= shipFromPosition) {
                 continue;
             }
-            Path dest = destBase.resolve(segment.getName());
             try {
+                if (shippedCount == 0) {
+                    Files.createDirectories(destBase);
+                }
+                Path dest = destBase.resolve(segment.getName());
                 Files.copy(segment.toPath(), dest, StandardCopyOption.REPLACE_EXISTING);
-                long segmentEnd = segmentStart + segmentFileLength;
                 highestShipped = Math.max(highestShipped, Math.min(segmentEnd, shipUpToPosition));
-                writeManifest(destBase, recordingId, segment.getName(), segmentStart, segmentEnd);
+                writeManifest(destBase, recordingId, segment.getName(), segmentBase, segmentEnd);
+                shippedCount++;
             } catch (IOException ex) {
                 throw new IllegalStateException("failed to ship segment " + segment, ex);
             }
         }
-        log.info(
-                "shipped archive segments recordingId={} upTo={} highestShipped={} dest={}",
-                recordingId,
-                shipUpToPosition,
-                highestShipped,
-                destBase);
+        if (shippedCount > 0) {
+            log.info(
+                    "shipped {} archive segment(s) recordingId={} range=[{},{}) highestShipped={} dest={}",
+                    shippedCount,
+                    recordingId,
+                    shipFromPosition,
+                    shipUpToPosition,
+                    highestShipped,
+                    destBase);
+        }
         return highestShipped;
     }
 
-    /** Restores shipped segments from ship root back into archive dir (DR path). */
+    /** Restores shipped segment files from a ship directory back into the flat archive dir (DR path). */
     public void restoreRecording(File archiveDir, long recordingId, Path shipManifestDir) throws IOException {
-        File recordingDir = new File(archiveDir, String.valueOf(recordingId));
-        if (!recordingDir.exists() && !recordingDir.mkdirs()) {
-            throw new IOException("could not create recording dir " + recordingDir);
+        if (!archiveDir.exists() && !archiveDir.mkdirs()) {
+            throw new IOException("could not create archive dir " + archiveDir);
         }
         try (var paths = Files.walk(shipManifestDir)) {
-            paths.filter(p -> p.toString().endsWith(".rec")).forEach(src -> {
-                try {
-                    Files.copy(src, recordingDir.toPath().resolve(src.getFileName()), StandardCopyOption.REPLACE_EXISTING);
-                } catch (IOException ex) {
-                    throw new IllegalStateException("restore failed for " + src, ex);
-                }
-            });
+            paths.filter(p -> parseSegmentBasePosition(p.getFileName().toString(), recordingId) >= 0L)
+                    .forEach(src -> {
+                        try {
+                            Files.copy(
+                                    src,
+                                    archiveDir.toPath().resolve(src.getFileName().toString()),
+                                    StandardCopyOption.REPLACE_EXISTING);
+                        } catch (IOException ex) {
+                            throw new IllegalStateException("restore failed for " + src, ex);
+                        }
+                    });
         }
     }
 
@@ -116,16 +133,22 @@ public final class FileArchiveShipper {
     }
 
     /**
-     * Aeron segment file names encode the start position as the basename without extension.
-     * Returns -1 if the name cannot be parsed.
+     * Parses {@code <recordingId>-<segmentBasePosition>.rec}; returns -1 when the name is not a
+     * segment file of the given recording (including {@code .rec.del} tombstones).
      */
-    static long parseSegmentStartPosition(String segmentFileName, long segmentFileLength) {
-        String base = segmentFileName;
-        if (base.endsWith(".rec")) {
-            base = base.substring(0, base.length() - 4);
+    static long parseSegmentBasePosition(String segmentFileName, long recordingId) {
+        String prefix = recordingId + "-";
+        if (!segmentFileName.startsWith(prefix) || !segmentFileName.endsWith(SEGMENT_FILE_SUFFIX)) {
+            return -1L;
+        }
+        String positionPart =
+                segmentFileName.substring(prefix.length(), segmentFileName.length() - SEGMENT_FILE_SUFFIX.length());
+        if (positionPart.isEmpty()) {
+            return -1L;
         }
         try {
-            return Long.parseLong(base);
+            long position = Long.parseLong(positionPart);
+            return position < 0L ? -1L : position;
         } catch (NumberFormatException ex) {
             return -1L;
         }

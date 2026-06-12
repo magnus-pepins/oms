@@ -8,6 +8,8 @@
 - Recovery incident (`orders=0`, 410): [`oms-cluster-recovery-incident.md`](oms-cluster-recovery-incident.md)
 - Known issues (force-cancel 410, orphaned orders): [`../../../system-documentation/handovers/2026-05-20-oms-known-issues.md`](../../../system-documentation/handovers/2026-05-20-oms-known-issues.md) §1
 - ADR: [`../adr/0001-aeron-cluster-substrate.md`](../adr/0001-aeron-cluster-substrate.md)
+- Archiving / retention: [`../../../system-documentation/plans/aeron-archiving-retention-and-restart-strategy.md`](../../../system-documentation/plans/aeron-archiving-retention-and-restart-strategy.md)
+- Enable retention: [`../../../system-documentation/docs/runbooks/aeron-archive-retention-enablement.md`](../../../system-documentation/docs/runbooks/aeron-archive-retention-enablement.md)
 
 ---
 
@@ -51,6 +53,20 @@ The script stops **fix-egress → ingress → projector → cluster-node**, wait
 - Cluster log: `replay validation:` and/or `loaded admission snapshot: orders=N` with **N > 0** if history exists
 
 `kill_timeout: 30000` on cluster roles is intentional (clean MediaDriver shutdown).
+
+---
+
+## Snapshot lifecycle
+
+- **Periodic:** `OmsClusterSnapshotScheduler` in `oms-cluster-node` (default 5 min via `OMS_CLUSTER_SNAPSHOT_INTERVAL_MS`; `0` disables). Shipped 2026-06 — replaces operator-only snapshot path for routine cadence.
+- **On graceful shutdown:** `OmsClusterSnapshotOnShutdown` when admission is READY (`OMS_CLUSTER_SNAPSHOT_ON_SHUTDOWN=false` to skip).
+- **Operator tool:** `./gradlew clusterSnapshot` — see [`oms-cluster-node-snapshot.md`](oms-cluster-node-snapshot.md).
+- **Metrics:** `oms_cluster_snapshot_age_seconds`, `oms_cluster_snapshot_{attempts,successes,failures}_total` on cluster-node `:8089/metrics` (pop default).
+- **Alerts:** [`../cluster-slo.md`](../cluster-slo.md) § Snapshot freshness.
+
+## Retention / purge (online)
+
+Default **off** (`AERON_RETENTION_ENABLED=false`). When enabled, `ClusterRetentionRegulator` ships to `AERON_ARCHIVE_SHIP_ROOT` then purges behind the purge floor. Cursor table `aeron_projector_cursor`, default projector id `oms-postgres-default`. Enablement: [`aeron-archive-retention-enablement.md`](../../../system-documentation/docs/runbooks/aeron-archive-retention-enablement.md).
 
 ---
 

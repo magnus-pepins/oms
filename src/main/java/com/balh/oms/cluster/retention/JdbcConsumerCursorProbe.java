@@ -5,13 +5,25 @@ import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.util.OptionalLong;
+import java.util.Optional;
 
-/** Reads minimum projector cursor position from Postgres (optional purge floor input). */
+/**
+ * Reads the minimum projector cursor from Postgres (optional purge-floor input for the events
+ * recordings). The OMS {@code aeron_projector_cursor} schema is recording-id qualified (V55), so
+ * the cursor unambiguously names which events recording the position belongs to. Rows with a NULL
+ * {@code last_applied_recording_id} are the V55 poison value (pre-migration ambiguity) and map to
+ * empty — the regulator then skips events purging entirely.
+ */
 public final class JdbcConsumerCursorProbe implements AutoCloseable {
 
+    /** Consumer cursor; {@code recordingId} is null when the cursor schema does not track it. */
+    public record ConsumerCursor(Long recordingId, long position) {}
+
     private static final String CURSOR_SQL =
-            "SELECT MIN(last_applied_position) AS min_pos FROM aeron_projector_cursor WHERE projector_id = ?";
+            "SELECT last_applied_recording_id AS rec_id, last_applied_position AS pos"
+                    + " FROM aeron_projector_cursor WHERE projector_id = ?"
+                    + " ORDER BY last_applied_recording_id ASC NULLS FIRST, last_applied_position ASC"
+                    + " LIMIT 1";
 
     private final Connection connection;
     private final String projectorId;
@@ -22,18 +34,20 @@ public final class JdbcConsumerCursorProbe implements AutoCloseable {
         this.projectorId = projectorId;
     }
 
-    public OptionalLong minConsumerPosition() throws SQLException {
+    public Optional<ConsumerCursor> minConsumerCursor() throws SQLException {
         try (PreparedStatement stmt = connection.prepareStatement(CURSOR_SQL)) {
             stmt.setString(1, projectorId);
             try (ResultSet rs = stmt.executeQuery()) {
                 if (!rs.next()) {
-                    return OptionalLong.empty();
+                    return Optional.empty();
                 }
-                long value = rs.getLong("min_pos");
-                if (rs.wasNull()) {
-                    return OptionalLong.empty();
+                long recordingId = rs.getLong("rec_id");
+                boolean recordingIdIsNull = rs.wasNull();
+                long position = rs.getLong("pos");
+                if (recordingIdIsNull) {
+                    return Optional.empty();
                 }
-                return OptionalLong.of(value);
+                return Optional.of(new ConsumerCursor(recordingId, position));
             }
         }
     }

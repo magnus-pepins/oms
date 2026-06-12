@@ -19,6 +19,9 @@ public final class ClusterRetentionConfig {
     public static final long DEFAULT_INTERVAL_MS = TimeUnit.HOURS.toMillis(1L);
     public static final int DEFAULT_SNAPSHOTS_TO_RETAIN = 3;
     public static final long DEFAULT_SEGMENT_FILE_LENGTH_BYTES = 64L * 1024 * 1024L;
+    /** Matches the events recording stream; set the env var to -1 to disable events reclaim. */
+    public static final int DEFAULT_EVENTS_STREAM_ID =
+            com.balh.oms.cluster.OmsClusterWireFormat.EVENTS_STREAM_ID;
 
     private final boolean enabled;
     private final long intervalMs;
@@ -63,7 +66,7 @@ public final class ClusterRetentionConfig {
         String pgUser = System.getenv(ENV_PG_USER);
         String pgPassword = System.getenv(ENV_PG_PASSWORD);
         String projectorId = envOrDefault(ENV_PROJECTOR_ID, "oms-postgres-default");
-        int eventsStreamId = (int) parseLongEnv(ENV_EVENTS_STREAM_ID, -1);
+        int eventsStreamId = (int) parseLongEnv(ENV_EVENTS_STREAM_ID, DEFAULT_EVENTS_STREAM_ID);
         long segmentFileLength = parseLongEnv(ENV_SEGMENT_FILE_LENGTH_BYTES, DEFAULT_SEGMENT_FILE_LENGTH_BYTES);
         return new ClusterRetentionConfig(
                 enabled,

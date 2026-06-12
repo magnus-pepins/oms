@@ -27,7 +27,9 @@ firing alerts as a prompt to investigate rather than as definitive evidence of a
 | Venue-egress lag (seconds) | sample (per scrape) | > 5 s for 10 min | > 30 s for 5 min | `oms.venue.egress.lag_seconds` on `oms-venue-egress` JVM |
 | Venue-egress gRPC failures | rate (5m) | > 0.01/s for 2 min | — | `oms.venue.egress.grpc_failures_total` (tags: `rpc`, `status`) |
 | Venue projector lag (seconds) | sample (per scrape) | > 5 s for 10 min | > 30 s for 5 min | `venue.projector.lag_seconds` on `venue-postgres-projector` |
-| Snapshot freshness | sample (per scrape) | > 1 h for 30 min | > 4 h for 30 min | `oms.cluster.snapshot.age_seconds` (slice 4h, this slice) |
+| Snapshot freshness | sample (per scrape) | > 10 min for 10 min | > 30 min for 10 min | `oms.cluster.snapshot.age_seconds` (in-process scheduler, default 5 min interval) |
+| Archive unshipped lag | sample (per scrape) | > 1 GiB for 1 h | > 5 GiB for 30 min | `oms_cluster_archive_unshipped_lag_bytes` (retention enabled only) |
+| Archive bytes on disk | sample (per scrape) | > 100 GiB for 30 min | — | `oms_cluster_archive_bytes_on_disk` (retention enabled only) |
 | Cluster ↔ projector open orders | sample (per scrape) | `oms_cluster_reconcile_in_sync == 0` for 5 min | — | `oms_cluster_reconcile_in_sync`, `oms_drift{kind="open_orders"}` (recovery hardening Phase 3) |
 | Reconcile poll freshness | sample (per scrape) | `oms_cluster_reconcile_age_seconds > 180` for 5 min | — | `oms_cluster_reconcile_age_seconds` (30 s default poll) |
 | Cluster readiness (HTTP) | probe | `/actuator/oms-cluster-readiness` not READY for 2 min | — | `probe_success{job="oms-ingress-readiness"}` (configure blackbox probe on pop) |
@@ -85,28 +87,36 @@ projector lag because the FIX path's failure modes (broker session disconnects, 
 sequence numbers) are very different from the projector's (Postgres TX issues, schema lock
 contention).
 
-### Snapshot freshness — 1 h warning, 4 h critical
+### Snapshot freshness — 10 min warning, 30 min critical
 
-There is no auto-snapshot interval in Aeron 1.48.0's `ConsensusModule.Context` — snapshots fire
-either via operator toggle (`ClusterTool.snapshot`, slice 4a) or via an application-scheduled
-timer (slice 4a-2, deferred). Phase 5 will add a k8s `CronJob` that runs the
-`OmsClusterSnapshotAdminTool` on a schedule. Until that lands in production, **no automated
-snapshot path exists**, and an OMS cluster that runs for hours / days without an operator-driven
-snapshot will replay its full event log on the next cold start; restart MTTR grows linearly.
+`OmsClusterSnapshotScheduler` runs in every `oms-cluster-node` JVM (default
+`OMS_CLUSTER_SNAPSHOT_INTERVAL_MS=300000`, 5 min). Operator `clusterSnapshot` and graceful
+shutdown snapshots remain available — see `oms/docs/runbooks/oms-cluster-node-snapshot.md`.
 
-`oms.cluster.snapshot.age_seconds` (this slice, slice 4h) is the wall-clock seconds since the
-leader last successfully wrote a snapshot via `onTakeSnapshot`. The gauge resets on every
-successful snapshot write; it is **not** reset by snapshot load (Aeron does not expose the
-original write time of a loaded snapshot, and treating "load" as "fresh" would hide the case
-where a member booted from a stale snapshot file with no subsequent snapshot cron tick — see
-`OmsAdmissionClusteredService.lastSnapshotWriteEpochMs` javadoc).
+`oms.cluster.snapshot.age_seconds` is wall-clock seconds since the leader last successfully
+wrote a snapshot via `onTakeSnapshot`. The gauge resets on every successful write; it is **not**
+reset on snapshot load.
 
-The 1 h warning / 4 h critical thresholds assume Phase 5 runs the snapshot cron every 30 min;
-warning at 1 h = 2 missed cron ticks, critical at 4 h = 8 missed ticks. **If the cron interval
-is tuned**, the alert thresholds in `ops-console/docker/config/prometheus/alerts.yml` must be
-re-tuned to stay at "2 × interval" / "8 × interval" — the fact-of-life relationship between
-snapshot cadence and alert threshold is documented in
-`oms/docs/runbooks/oms-cluster-node-snapshot.md`.
+Alert thresholds (~2× / 6× default interval) match ledger cluster alerts. If
+`OMS_CLUSTER_SNAPSHOT_INTERVAL_MS` is tuned, update `OmsClusterSnapshotStale` /
+`OmsClusterSnapshotVeryStale` in `ops-console/docker/config/prometheus/alerts.yml` accordingly.
+
+`OmsClusterSnapshotsAllFailing` fires when the scheduler attempts snapshots but none succeed
+for 15 min — same pattern as `LedgerClusterSnapshotsAllFailing`.
+
+### Archive retention — unshipped lag and disk size
+
+When `AERON_RETENTION_ENABLED=true`, `ClusterRetentionRegulator` publishes
+`oms_cluster_archive_unshipped_lag_bytes` and `oms_cluster_archive_bytes_on_disk`. Gauges are
+absent when retention is disabled (no false alerts).
+
+Enablement: `system-documentation/docs/runbooks/aeron-archive-retention-enablement.md`. Purge
+counters `oms_cluster_retention_purge_runs_total` and
+`oms_cluster_retention_segments_reclaimed_total` are operational signals (no dedicated alert —
+investigate when lag grows without purge activity).
+
+Warning at 1 GiB unshipped lag means ship-to-off-host is falling behind the live journal; critical
+at 5 GiB risks disk pressure before purge can run. Confirm `AERON_ARCHIVE_SHIP_ROOT` and S3 sync.
 
 ### Cluster-node down — page after 2 min
 
@@ -193,4 +203,8 @@ deploy-clean gate.
 * Slice 4b–4d meter ids: `oms.cluster.snapshot.{duration,events,bytes}`,
   `oms.cluster.client.commit_round_trip`, `oms.projector.lag_seconds`,
   `oms.fix_egress.lag_seconds`.
-* Slice 4h meter id (this slice): `oms.cluster.snapshot.age_seconds`.
+* Slice 4h meter id: `oms.cluster.snapshot.age_seconds`.
+* Retention (2026-06): `oms_cluster_archive_bytes_on_disk`,
+  `oms_cluster_archive_unshipped_lag_bytes`, `oms_cluster_retention_purge_runs_total`,
+  `oms_cluster_retention_segments_reclaimed_total` — see archiving plan +
+  `aeron-archive-retention-enablement.md`.

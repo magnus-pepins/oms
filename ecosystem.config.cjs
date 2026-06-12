@@ -76,6 +76,16 @@
  *   - It does NOT start the customer-frontend / trading-desk BFFs (those have
  *     their own PM2 entries: customer-frontend / customer-frontend-api on Pop
  *     today, trading-desk to be added separately).
+ *
+ * Archive retention (oms-cluster-node only; default OFF on pop):
+ *   system-documentation/docs/runbooks/aeron-archive-retention-enablement.md
+ *   # AERON_RETENTION_ENABLED=true
+ *   # AERON_ARCHIVE_SHIP_ROOT=/var/aeron-archive-ship
+ *   # AERON_RETENTION_PG_URL=jdbc:postgresql://127.0.0.1:5432/oms
+ *   # AERON_RETENTION_PROJECTOR_ID=oms-postgres-default
+ * Periodic snapshots (default ON via OmsClusterSnapshotScheduler):
+ *   # OMS_CLUSTER_SNAPSHOT_INTERVAL_MS=300000
+ *   # OMS_CLUSTER_SNAPSHOT_ON_SHUTDOWN=true
  */
 
 const path = require('path');
@@ -456,6 +466,8 @@ const apps = [
       // Pop CI / fresh-wipe boots: empty archive replay must flip the Aeron readiness
       // counter to READY (see OmsAdmissionClusteredService ENV_READINESS_ALLOW_EMPTY_REPLAY).
       OMS_READINESS_ALLOW_EMPTY_REPLAY: 'true',
+      AERON_RETENTION_ENABLED:
+        process.env.AERON_RETENTION_ENABLED || 'false',
       // Cluster-node entry point is OmsClusterNodeBootstrap — a plain `public static
       // void main` JVM (no SpringApplication.run). SPRING_PROFILES_ACTIVE is dead
       // config for this role; the JVM reads OMS_AERON_* env directly. The other

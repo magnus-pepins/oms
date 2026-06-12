@@ -1,11 +1,12 @@
-# Runbook: Aeron Cluster snapshot (operator-driven)
+# Runbook: Aeron Cluster snapshot (OMS)
 
-Phase 4 slice 4a (`system-documentation/plans/oms-aeron-cluster-substrate.md`) of the substrate plan introduces this. Aeron 1.48.0's `ConsensusModule.Context` exposes no `snapshotIntervalNs` setter — auto-snapshots are not built into the framework. Snapshots fire only via two paths:
+Aeron 1.48.0's `ConsensusModule.Context` exposes no `snapshotIntervalNs` setter. Snapshots fire via:
 
-1. **Operator-driven** through `ClusterTool.snapshot(clusterDir, PrintStream)` — this runbook's path.
-2. **Application-driven** from inside the `ClusteredService` via `Cluster.scheduleTimer` + `ClusterControl.ToggleState.SNAPSHOT.toggle(...)` — deferred to slice 4a-2 only if 4e benchmarking shows operator-driven snapshots leave too much log to replay between cron ticks.
+1. **In-process periodic scheduler** (production default) — `OmsClusterSnapshotScheduler` in `oms-cluster-node`, env `OMS_CLUSTER_SNAPSHOT_INTERVAL_MS` (default **300000** = 5 min). Set `0` to disable.
+2. **Graceful shutdown** — `OmsClusterSnapshotOnShutdown` when admission is READY (`OMS_CLUSTER_SNAPSHOT_ON_SHUTDOWN`, default `true`).
+3. **Operator-driven** — `ClusterTool.snapshot` via `./gradlew clusterSnapshot` (pre-restart, schema bumps, drills).
 
-Until slice 4a lands in production with a CronJob (Phase 5), the **only** snapshots a running OMS cluster takes are the ones operators trigger. Until that, every cluster-node restart replays the full log from byte 0 — restart MTTR grows linearly with log size. This runbook keeps that bounded.
+Until a snapshot exists, cluster cold start replays the full event log; restart MTTR grows with log size. Periodic snapshots bound replay to a short tail after the latest snapshot.
 
 ## What "snapshot" means here
 
@@ -32,30 +33,31 @@ Exit codes:
    - `oms_cluster_snapshot_events_total{outcome="write"}` — incremented every time the leader runs `onTakeSnapshot`.
    - `oms_cluster_snapshot_duration_seconds_count{outcome="write"}` and `..._sum{outcome="write"}` — count and total time spent in `onTakeSnapshot`.
    - `oms_cluster_snapshot_bytes_sum{outcome="write"}` — total bytes written across all snapshots since process start.
-   - `oms_cluster_snapshot_age_seconds` (slice 4h) — wall-clock seconds since the leader last successfully wrote a snapshot. Should drop to ~0 immediately after `clusterSnapshot` succeeds; climbs at 1 s/s thereafter. Drives the `OmsClusterSnapshotStale` / `OmsClusterSnapshotVeryStale` Prometheus alerts (`oms/docs/cluster-slo.md`).
+   - `oms_cluster_snapshot_age_seconds` (slice 4h) — wall-clock seconds since the leader last successfully wrote a snapshot. Should drop to ~0 after scheduler or `clusterSnapshot` succeeds; climbs at 1 s/s thereafter. Drives snapshot-freshness alerts (`oms/docs/cluster-slo.md`).
 
    If the metric counts are unchanged after `clusterSnapshot` returned `0`, the leader hasn't actually run the snapshot yet — wait or check the leader's logs.
 2. Tail the cluster-node logs for `OmsAdmissionClusteredService` for any errors during snapshot publish (`snapshot publication closed` would surface here).
-3. Stop one cluster member and restart it. The next boot's `OmsAdmissionClusteredService.onStart` should log `loaded admission snapshot: orders=N` instead of doing a position-0 replay. Slice 4a's smoke IT (`OmsClusterSnapshotAdminToolIT`) verifies this round-trip in CI; slice 4b extends it to assert the load also fires `oms.cluster.snapshot.{duration,events,bytes}{outcome="load"}`.
+3. Stop one cluster member and restart it. The next boot's `OmsAdmissionClusteredService.onStart` should log `loaded admission snapshot: orders=N` instead of doing a position-0 replay. `OmsClusterSnapshotAdminToolIT` verifies this round-trip in CI.
 
-## When to run this in production
+## When to run operator snapshot (in addition to periodic scheduler)
 
-- **Phase 5 cron**: a k8s `CronJob` calls `clusterSnapshot` on a schedule; that lands with the rest of Phase 5 deployment + alerts.
-- **Pre-restart checklist**: before draining a cluster member for a rolling restart, run `clusterSnapshot` and wait for `describeLatestConsensusModuleSnapshot` to return true. This caps the new replica's recovery time.
-- **Pre-deploy of a snapshot-schema bump**: `OmsAdmissionClusteredService.SNAPSHOT_SCHEMA_VERSION` is checked on `loadSnapshot`; ADR 0001 §Discipline rejects older schemas (no dual-version compat). The deploy procedure for a schema bump must take a fresh snapshot under the new code, then prune older snapshots before older replicas can attempt a load.
+- **Pre-restart checklist:** before draining a cluster member, optional extra `clusterSnapshot` if `oms_cluster_snapshot_age_seconds` is high.
+- **Pre-deploy of a snapshot-schema bump:** `OmsAdmissionClusteredService.SNAPSHOT_SCHEMA_VERSION` is checked on `loadSnapshot`; ADR 0001 §Discipline rejects older schemas (no dual-version compat). Take a fresh snapshot under the new code before mixed versions.
+- **Retention:** purge floor uses retained snapshots — ensure at least `AERON_RETENTION_SNAPSHOTS_TO_RETAIN` (default 3) exist before enabling retention ([`aeron-archive-retention-enablement.md`](../../../system-documentation/docs/runbooks/aeron-archive-retention-enablement.md)).
 
 ## Where the code lives
 
+- Periodic scheduler: `oms/src/main/java/com/balh/oms/cluster/snapshot/OmsClusterSnapshotScheduler.java`
+- Shutdown gate: `oms/src/main/java/com/balh/oms/cluster/snapshot/OmsClusterSnapshotOnShutdown.java`
 - Operator entry point: `oms/src/main/java/com/balh/oms/cluster/admin/OmsClusterSnapshotAdminTool.java`.
 - Gradle task: `clusterSnapshot` in `oms/build.gradle.kts`.
-- IT: `oms/src/test/java/com/balh/oms/cluster/admin/OmsClusterSnapshotAdminToolIT.java` — boots cluster, takes snapshot, restarts cluster, asserts `loadSnapshot` reloaded the admission state, and (slice 4b) asserts `oms.cluster.snapshot.*{outcome=write|load}` meters all fire across the round-trip.
-- Metrics exporter (slice 4b): `oms/src/main/java/com/balh/oms/cluster/admin/OmsClusterNodeMetricsExporter.java`. JDK `HttpServer` + Micrometer `PrometheusMeterRegistry`, listens on `OMS_CLUSTER_NODE_METRICS_PORT` (default `8089`), serves `/metrics` in Prometheus 0.0.4 text format.
-- Exporter unit test: `oms/src/test/java/com/balh/oms/cluster/admin/OmsClusterNodeMetricsExporterTest.java`.
+- IT: `oms/src/test/java/com/balh/oms/cluster/admin/OmsClusterSnapshotAdminToolIT.java`
+- Metrics exporter: `oms/src/main/java/com/balh/oms/cluster/admin/OmsClusterNodeMetricsExporter.java` — port `OMS_CLUSTER_NODE_METRICS_PORT` (default `8089`).
 
 ## Related
 
 - ADR: `oms/docs/adr/0001-aeron-cluster-substrate.md`.
-- Substrate plan: `system-documentation/plans/oms-aeron-cluster-substrate.md` § Phase 4 slice 4a (operator path) and slice 4b (snapshot observability).
-- Snapshot schema definition: `OmsAdmissionClusteredService.SNAPSHOT_SCHEMA_VERSION` (currently v3, slice 3d).
-- Slice 4b meter ids: `oms.cluster.snapshot.duration` (Timer), `oms.cluster.snapshot.events` (Counter), `oms.cluster.snapshot.bytes` (DistributionSummary, baseUnit=`bytes`); all tagged `outcome ∈ {write, load}`.
-- Slice 4h meter id: `oms.cluster.snapshot.age_seconds` (Gauge, baseUnit=`seconds`, untagged) — drives the snapshot-freshness alert. Cross-link: `oms/docs/cluster-slo.md` § Snapshot freshness.
+- Substrate plan: `system-documentation/plans/oms-aeron-cluster-substrate.md` § Phase 4.
+- Archiving plan: `system-documentation/plans/aeron-archiving-retention-and-restart-strategy.md`.
+- Slice 4b meter ids: `oms.cluster.snapshot.duration` (Timer), `oms.cluster.snapshot.events` (Counter), `oms.cluster.snapshot.bytes` (DistributionSummary); tagged `outcome ∈ {write, load}`.
+- Slice 4h / scheduler gauge: `oms.cluster.snapshot.age_seconds` — see `oms/docs/cluster-slo.md` § Snapshot freshness.

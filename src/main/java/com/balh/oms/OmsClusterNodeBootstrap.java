@@ -3,6 +3,8 @@ package com.balh.oms;
 import com.balh.oms.cluster.OmsAdmissionClusteredService;
 import com.balh.oms.cluster.OmsClusterWireFormat;
 import com.balh.oms.cluster.admin.OmsClusterNodeMetricsExporter;
+import com.balh.oms.cluster.retention.ClusterRetentionConfig;
+import com.balh.oms.cluster.retention.ClusterRetentionRegulator;
 import com.balh.oms.cluster.snapshot.OmsClusterSnapshotOnShutdown;
 import com.balh.oms.cluster.snapshot.OmsClusterSnapshotScheduler;
 import io.aeron.Aeron;
@@ -196,6 +198,7 @@ public final class OmsClusterNodeBootstrap {
         ClusteredServiceContainer container = null;
         OmsAdmissionClusteredService clusteredService = null;
         OmsClusterSnapshotScheduler snapshotScheduler = null;
+        ClusterRetentionRegulator retentionRegulator = null;
         try {
             MediaDriver.Context mediaCtx = buildMediaDriverContext(paths);
             Archive.Context archiveCtx = buildArchiveContext(paths);
@@ -228,10 +231,24 @@ public final class OmsClusterNodeBootstrap {
             } else {
                 log.info("periodic OMS cluster snapshot scheduler disabled via {}=0", ENV_SNAPSHOT_INTERVAL_MS);
             }
+
+            ClusterRetentionConfig retentionConfig = ClusterRetentionConfig.fromEnv();
+            if (retentionConfig.enabled()) {
+                retentionRegulator =
+                        new ClusterRetentionRegulator(
+                                retentionConfig,
+                                new File(paths.clusterDir()),
+                                new File(paths.archiveDir()),
+                                paths.aeronDirectory(),
+                                "oms",
+                                metricsExporter.meterRegistry());
+                retentionRegulator.start();
+            }
         } catch (Throwable bootstrapFailure) {
             log.error(
                     "OMS cluster-node bootstrap failed; closing partial state and forcing JVM exit",
                     bootstrapFailure);
+            CloseHelper.quietClose(retentionRegulator);
             CloseHelper.quietClose(snapshotScheduler);
             CloseHelper.quietClose(container);
             CloseHelper.quietClose(eventsRecording);
@@ -253,6 +270,7 @@ public final class OmsClusterNodeBootstrap {
         final ClusteredServiceContainer containerRef = container;
         final OmsAdmissionClusteredService serviceRef = clusteredService;
         final OmsClusterSnapshotScheduler schedulerRef = snapshotScheduler;
+        final ClusterRetentionRegulator retentionRef = retentionRegulator;
         Runtime.getRuntime().addShutdownHook(new Thread(() -> shutdownLatch.countDown(), "oms-cluster-node-latch-trip"));
 
         log.info("OMS cluster-node started; awaiting shutdown signal");
@@ -278,6 +296,7 @@ public final class OmsClusterNodeBootstrap {
         boolean snapshotOnShutdownDisabled =
                 "false".equalsIgnoreCase(envOrDefault(ENV_SNAPSHOT_ON_SHUTDOWN, "true"));
         OmsClusterSnapshotOnShutdown.takeIfReady(serviceRef, schedulerRef, snapshotOnShutdownDisabled);
+        CloseHelper.quietClose(retentionRef);
         CloseHelper.quietClose(schedulerRef);
         try {
             containerRef.close();
@@ -377,6 +396,10 @@ public final class OmsClusterNodeBootstrap {
         // so two cluster-node JVMs can co-exist on one host (e.g. Pop! 2-shard bench with shard 0
         // archive on localhost:8010 and shard 1 archive on localhost:9010). Default is unchanged
         // (DEFAULT_ARCHIVE_CONTROL_CHANNEL) so existing single-node deploys are byte-identical.
+        long segmentFileLength =
+                parseLongEnv(
+                        ClusterRetentionConfig.ENV_SEGMENT_FILE_LENGTH_BYTES,
+                        ClusterRetentionConfig.DEFAULT_SEGMENT_FILE_LENGTH_BYTES);
         return new Archive.Context()
                 .aeronDirectoryName(paths.aeronDirectory())
                 .archiveDir(new File(paths.archiveDir()))
@@ -385,6 +408,7 @@ public final class OmsClusterNodeBootstrap {
                 .recordingEventsEnabled(false)
                 .replicationChannel("aeron:udp?endpoint=localhost:0")
                 .threadingMode(ArchiveThreadingMode.SHARED)
+                .segmentFileLength((int) segmentFileLength)
                 .deleteArchiveOnStart(false);
     }
 

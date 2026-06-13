@@ -4,6 +4,8 @@
 
 Order Management System for the Balh financial platform ecosystem.
 
+**Platform documentation:** [system-documentation/systems/oms.md](../system-documentation/systems/oms.md) — ports, PM2 roles, pop scripts, cross-system integration.
+
 A runnable Spring Boot 3 application backed by Postgres + Flyway. Phase 3 of the
 [Aeron Cluster substrate plan](../system-documentation/plans/oms-aeron-cluster-substrate.md)
 is the source of truth for OMS topology: order admission and execution-report

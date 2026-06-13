@@ -36,11 +36,16 @@ import java.util.UUID;
  *   offset N   string accountIdHash         (PII-safe; computed at edge)
  *   offset N   string instrumentSymbol
  *   offset N   string ledgerBalanceId       (only when hasLedgerBalanceId == 1)
- *   offset N   optional FIX-in tail          (append-only; absent on legacy / REST frames)
- *              byte ingressType              ({@link FixInIngressMetadata#INGRESS_TYPE_FIX_IN})
- *              string fixSessionId
- *              string externalClOrdId
- *              string fixAccountTag
+ *   offset N   optional tail sections        (append-only; absent on legacy / REST frames; read
+ *                                             as [sectionByte][payload] blocks until end-of-frame)
+ *              FIX-in section ({@link FixInIngressMetadata#INGRESS_TYPE_FIX_IN}):
+ *                byte ingressType
+ *                string fixSessionId
+ *                string externalClOrdId
+ *                string fixAccountTag
+ *              portfolio section ({@link FixInIngressMetadata#SECTION_PORTFOLIO_ID}):
+ *                byte sectionType
+ *                string portfolioId
  * </pre>
  *
  * <p>Strings are length-prefixed: 4-byte int length followed by UTF-8 bytes.
@@ -61,7 +66,8 @@ public record AcceptOrderCommand(
         String accountIdHash,
         String instrumentSymbol,
         String ledgerBalanceIdOrNull,
-        FixInIngressMetadata fixInIngressMetadataOrNull) {
+        FixInIngressMetadata fixInIngressMetadataOrNull,
+        String portfolioIdOrNull) {
 
     /** Quantity scale factor: store quantities as fixed-point with 9 decimal places. */
     public static final long QUANTITY_SCALE = 1_000_000_000L;
@@ -213,6 +219,33 @@ public record AcceptOrderCommand(
     }
 
     /**
+     * Back-compat constructor for the FIX-in ingress factory and tests that pass explicit
+     * {@code ordTypeCode} and FIX-in metadata but no {@code portfolioId} (the generic portfolio
+     * attribution tail is append-only). Defaults {@code portfolioIdOrNull} to {@code null}.
+     */
+    public AcceptOrderCommand(
+            long correlationId,
+            UUID orderId,
+            long clientTimestampNanos,
+            long quantityScaled,
+            long limitPriceScaledOrZero,
+            int shardId,
+            byte side,
+            byte timeInForceCode,
+            byte ordTypeCode,
+            String accountId,
+            String clientIdempotencyKey,
+            String accountIdHash,
+            String instrumentSymbol,
+            String ledgerBalanceIdOrNull,
+            FixInIngressMetadata fixInIngressMetadataOrNull) {
+        this(correlationId, orderId, clientTimestampNanos, quantityScaled, limitPriceScaledOrZero,
+                shardId, side, timeInForceCode, ordTypeCode,
+                accountId, clientIdempotencyKey, accountIdHash, instrumentSymbol, ledgerBalanceIdOrNull,
+                fixInIngressMetadataOrNull, /* portfolioIdOrNull = */ null);
+    }
+
+    /**
      * Encode this command into {@code buffer} starting at {@code offset}.
      *
      * @return the number of bytes written.
@@ -253,6 +286,10 @@ public record AcceptOrderCommand(
         }
         if (fixInIngressMetadataOrNull != null) {
             p += FixInIngressMetadata.writeFixInTail(buffer, p, fixInIngressMetadataOrNull);
+        }
+        if (portfolioIdOrNull != null) {
+            buffer.putByte(p++, FixInIngressMetadata.SECTION_PORTFOLIO_ID);
+            p = writeString(buffer, p, portfolioIdOrNull);
         }
 
         int written = p - offset;
@@ -316,8 +353,28 @@ public record AcceptOrderCommand(
             ledgerBalanceId = readString(buffer, p);
             p += stringByteLenAt(buffer, p);
         }
-        FixInIngressMetadata fixInIngressMetadata =
-                FixInIngressMetadata.readFixInTailIfPresent(buffer, p, offset + length);
+        // Generic optional tail: a sequence of [sectionByte][payload] blocks read until end-of-frame.
+        // Absent on legacy / REST-without-portfolio frames (loop body never runs). Append-only —
+        // see FixInIngressMetadata.SECTION_PORTFOLIO_ID; SCHEMA_VERSION is intentionally not bumped.
+        FixInIngressMetadata fixInIngressMetadata = null;
+        String portfolioId = null;
+        int end = offset + length;
+        while (p < end) {
+            byte sectionType = buffer.getByte(p);
+            if (sectionType == FixInIngressMetadata.INGRESS_TYPE_NONE) {
+                p++;
+                break;
+            } else if (sectionType == FixInIngressMetadata.INGRESS_TYPE_FIX_IN) {
+                fixInIngressMetadata = FixInIngressMetadata.readFixInTailIfPresent(buffer, p, end);
+                p += FixInIngressMetadata.fixInTailByteLength(buffer, p);
+            } else if (sectionType == FixInIngressMetadata.SECTION_PORTFOLIO_ID) {
+                p++;
+                portfolioId = readString(buffer, p);
+                p += stringByteLenAt(buffer, p);
+            } else {
+                throw new IllegalArgumentException("unsupported tail section byte on wire: " + sectionType);
+            }
+        }
 
         return new AcceptOrderCommand(
                 correlationId,
@@ -334,7 +391,8 @@ public record AcceptOrderCommand(
                 accountIdHash,
                 instrumentSymbol,
                 ledgerBalanceId,
-                fixInIngressMetadata);
+                fixInIngressMetadata,
+                portfolioId);
     }
 
     private static int writeString(MutableDirectBuffer buffer, int offset, String s) {

@@ -60,7 +60,7 @@ class FixInIngressServiceAdmissionTest {
         ingressService = new FixInIngressService(
                 omsConfig,
                 clusterShardRouter,
-                new FixInNewOrderSingleParser(new FixInSymbolMapper(omsConfig, new com.fasterxml.jackson.databind.ObjectMapper())),
+                new FixInNewOrderSingleParser(new FixInSymbolMapper(omsConfig, new com.fasterxml.jackson.databind.ObjectMapper()), omsConfig),
                 new FixInOrderCancelRequestParser(new FixInSymbolMapper(omsConfig, new com.fasterxml.jackson.databind.ObjectMapper())),
                 new FixInOrderCancelReplaceRequestParser(new FixInSymbolMapper(omsConfig, new com.fasterxml.jackson.databind.ObjectMapper())),
                 new IngressAcceptOrderCommandFactory(new com.balh.oms.observability.PiiHash(omsConfig)),

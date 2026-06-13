@@ -291,7 +291,8 @@ public class OrderIngressService {
             // the order's recorded shard and its admitting cluster identical by construction.
             OmsClusterIngressClient cluster = clusterShardRouter.forShard(shardId);
             AdmissionResult ar = submitToClusterOrThrow(
-                    cluster, order, accountIdHash, clientTimestampNanos, quantityScaled, limitPriceScaled);
+                    cluster, order, accountIdHash, clientTimestampNanos, quantityScaled, limitPriceScaled,
+                    req.portfolioId());
             AdmissionResult.Accepted accepted = (AdmissionResult.Accepted) ar;
             boolean created = !accepted.event().duplicate();
             if (accepted.event().duplicate() && !accepted.event().orderId().equals(id)) {
@@ -359,9 +360,11 @@ public class OrderIngressService {
             String accountIdHash,
             long clientTimestampNanos,
             long quantityScaled,
-            long limitPriceScaled) {
+            long limitPriceScaled,
+            String portfolioIdOrNull) {
         AcceptOrderCommand cmd = buildAcceptOrderCommand(
-                cluster, order, accountIdHash, clientTimestampNanos, quantityScaled, limitPriceScaled);
+                cluster, order, accountIdHash, clientTimestampNanos, quantityScaled, limitPriceScaled,
+                portfolioIdOrNull);
         Duration timeout = Duration.ofMillis(config.getCluster().getClient().getSubmitTimeoutMs());
         AdmissionResult result;
         try {
@@ -401,7 +404,8 @@ public class OrderIngressService {
             String accountIdHash,
             long clientTimestampNanos,
             long quantityScaled,
-            long limitPriceScaled) {
+            long limitPriceScaled,
+            String portfolioIdOrNull) {
         byte sideByte = order.side() == Side.BUY ? AcceptOrderCommand.SIDE_BUY : AcceptOrderCommand.SIDE_SELL;
         byte tifByte = tifByteFromString(order.timeInForce());
         byte ordTypeByte;
@@ -429,7 +433,9 @@ public class OrderIngressService {
                 order.clientIdempotencyKey(),
                 accountIdHash,
                 order.instrumentSymbol(),
-                order.ledgerBalanceId());
+                order.ledgerBalanceId(),
+                /* fixInIngressMetadataOrNull = */ null,
+                portfolioIdOrNull);
     }
 
     private static long toClientTimestampNanos(Instant now) {

@@ -399,6 +399,12 @@ oms:
     manual-mass-cancel-enabled: ${OMS_FIX_MANUAL_MASS_CANCEL_ENABLED:false}
     manual-mass-cancel-wire-enabled: ${OMS_FIX_MANUAL_MASS_CANCEL_WIRE_ENABLED:false}
     manual-mass-cancel-reason-max-chars: ${OMS_FIX_MANUAL_MASS_CANCEL_REASON_MAX_CHARS:512}
+    # Generic portfolio attribution on outbound NewOrderSingle (off by default; per-counterparty contract).
+    # Emits OrderAdmittedEvent.portfolioId into the gated tag(s); no-op when the order has no portfolio id.
+    emit-portfolio-id-tag: ${OMS_FIX_EMIT_PORTFOLIO_ID_TAG:false}
+    portfolio-id-tag: ${OMS_FIX_PORTFOLIO_ID_TAG:5001}
+    emit-portfolio-account-tag: ${OMS_FIX_EMIT_PORTFOLIO_ACCOUNT_TAG:false}
+    emit-portfolio-client-id-tag: ${OMS_FIX_EMIT_PORTFOLIO_CLIENT_ID_TAG:false}
 
 logging:
   level:

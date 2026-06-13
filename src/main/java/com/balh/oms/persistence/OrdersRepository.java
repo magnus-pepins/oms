@@ -81,7 +81,8 @@ public class OrdersRepository {
                 quantity, limit_price, time_in_force, ord_type,
                 received_at, accepted_at, terminal_at, account_id_hash, ledger_balance_id,
                 cum_filled_quantity,
-                pinned_fee_model_id, pinned_fee_schedule_version, pinned_estimated_fee, pinned_fee_currency
+                pinned_fee_model_id, pinned_fee_schedule_version, pinned_estimated_fee, pinned_fee_currency,
+                portfolio_id
             ) VALUES (
                 :id, :account_id, :client_idempotency_key, :shard_id, 0,
                 CAST(:status AS order_status), CAST(:terminal_reason AS reject_code),
@@ -89,7 +90,8 @@ public class OrdersRepository {
                 :quantity, :limit_price, :time_in_force, :ord_type,
                 :received_at, :accepted_at, :terminal_at, :account_id_hash, :ledger_balance_id,
                 :cum_filled_quantity,
-                :pinned_fee_model_id, :pinned_fee_schedule_version, :pinned_estimated_fee, :pinned_fee_currency
+                :pinned_fee_model_id, :pinned_fee_schedule_version, :pinned_estimated_fee, :pinned_fee_currency,
+                :portfolio_id
             )
             ON CONFLICT DO NOTHING
             """;
@@ -101,7 +103,7 @@ public class OrdersRepository {
                    side::text AS side,
                    instrument_symbol, quantity, limit_price, time_in_force, ord_type,
                    received_at, accepted_at, terminal_at, account_id_hash, ledger_balance_id,
-                   cum_filled_quantity
+                   cum_filled_quantity, portfolio_id
             FROM orders WHERE id = :id
             """;
 
@@ -112,7 +114,7 @@ public class OrdersRepository {
                    side::text AS side,
                    instrument_symbol, quantity, limit_price, time_in_force, ord_type,
                    received_at, accepted_at, terminal_at, account_id_hash, ledger_balance_id,
-                   cum_filled_quantity
+                   cum_filled_quantity, portfolio_id
             FROM orders
             WHERE account_id = :account_id AND client_idempotency_key = :key
             """;
@@ -130,7 +132,7 @@ public class OrdersRepository {
                    side::text AS side,
                    instrument_symbol, quantity, limit_price, time_in_force, ord_type,
                    received_at, accepted_at, terminal_at, account_id_hash, ledger_balance_id,
-                   cum_filled_quantity
+                   cum_filled_quantity, portfolio_id
             FROM orders
             WHERE account_id = :account_id
             ORDER BY received_at DESC
@@ -350,7 +352,8 @@ public class OrdersRepository {
                 .addValue(
                         "pinned_estimated_fee",
                         pinnedFeeOrNull == null ? null : pinnedFeeOrNull.estimatedFee())
-                .addValue("pinned_fee_currency", pinnedFeeOrNull == null ? null : pinnedFeeOrNull.feeCurrency());
+                .addValue("pinned_fee_currency", pinnedFeeOrNull == null ? null : pinnedFeeOrNull.feeCurrency())
+                .addValue("portfolio_id", ev.portfolioIdOrNull());
         Order order = new Order(
                 ev.orderId(),
                 accountId,
@@ -370,7 +373,8 @@ public class OrdersRepository {
                 ev.accountIdHash(),
                 ev.ledgerBalanceIdOrNull(),
                 BigDecimal.ZERO,
-                AcceptOrderCommand.ordTypeName(ev.ordTypeCode()));
+                AcceptOrderCommand.ordTypeName(ev.ordTypeCode()),
+                ev.portfolioIdOrNull());
         return new ProjectorAdmitFields(params, order);
     }
 
@@ -721,7 +725,8 @@ public class OrdersRepository {
                 rs.getString("account_id_hash"),
                 ledgerBalanceId,
                 cumFilled == null ? BigDecimal.ZERO : cumFilled,
-                ordType
+                ordType,
+                rs.getString("portfolio_id")
         );
     };
 }

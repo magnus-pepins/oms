@@ -36,6 +36,8 @@ oms:
     symbol-map-json: ${OMS_FIX_IN_SYMBOL_MAP_JSON:{}}
     max-message-age-ms: ${OMS_FIX_IN_MAX_MESSAGE_AGE_MS:120000}
     max-client-cl-ord-id-length: ${OMS_FIX_IN_MAX_CL_ORD_ID_LEN:64}
+    portfolio-id-tag: ${OMS_FIX_IN_PORTFOLIO_ID_TAG:5001}
+    max-portfolio-id-length: ${OMS_FIX_IN_MAX_PORTFOLIO_ID_LEN:64}
     max-app-messages-per-second: ${OMS_FIX_IN_MAX_APP_MSG_PER_SEC:200}
     message-audit-retention-days: ${OMS_FIX_IN_MESSAGE_AUDIT_RETENTION_DAYS:90}
     return-publisher:

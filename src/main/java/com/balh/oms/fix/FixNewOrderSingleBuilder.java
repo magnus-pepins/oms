@@ -2,11 +2,14 @@ package com.balh.oms.fix;
 
 import com.balh.oms.cluster.AcceptOrderCommand;
 import com.balh.oms.cluster.OrderAdmittedEvent;
+import com.balh.oms.config.OmsConfig;
 import com.balh.oms.domain.Order;
 import com.balh.oms.domain.Side;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
+import quickfix.field.Account;
 import quickfix.field.ClOrdID;
+import quickfix.field.ClientID;
 import quickfix.field.HandlInst;
 import quickfix.field.OrdType;
 import quickfix.field.OrderQty;
@@ -45,9 +48,42 @@ public class FixNewOrderSingleBuilder {
     private static final BigDecimal PRICE_SCALE_BD = BigDecimal.valueOf(AcceptOrderCommand.PRICE_SCALE);
 
     private final FixSymbolMapper fixSymbolMapper;
+    private final boolean emitPortfolioIdTag;
+    private final int portfolioIdTag;
+    private final boolean emitPortfolioAccountTag;
+    private final boolean emitPortfolioClientIdTag;
 
-    public FixNewOrderSingleBuilder(FixSymbolMapper fixSymbolMapper) {
+    public FixNewOrderSingleBuilder(FixSymbolMapper fixSymbolMapper, OmsConfig omsConfig) {
         this.fixSymbolMapper = fixSymbolMapper;
+        OmsConfig.Fix fix = omsConfig.getFix();
+        this.emitPortfolioIdTag = fix.isEmitPortfolioIdTag();
+        this.portfolioIdTag = fix.getPortfolioIdTag();
+        this.emitPortfolioAccountTag = fix.isEmitPortfolioAccountTag();
+        this.emitPortfolioClientIdTag = fix.isEmitPortfolioClientIdTag();
+    }
+
+    /**
+     * Config-gated generic portfolio attribution. A counterparty that requires a trader id and/or
+     * account on inbound orders is served by mirroring the OMS portfolio id into the standard
+     * {@code Account(1)} / {@code ClientID(109)} fields and/or a custom UDF tag. No-op when no flag
+     * is enabled or the order carries no portfolio id, so default wire output is unchanged.
+     */
+    private void applyPortfolioAttribution(NewOrderSingle nos, String portfolioIdOrNull) {
+        if (portfolioIdOrNull == null || portfolioIdOrNull.isBlank()) {
+            return;
+        }
+        String portfolioId = portfolioIdOrNull.trim();
+        if (emitPortfolioAccountTag) {
+            nos.set(new Account(portfolioId));
+        }
+        if (emitPortfolioClientIdTag) {
+            // ClientID(109) is deprecated in FIX 4.4, so NewOrderSingle has no typed set(ClientID)
+            // overload — set it by tag. Counterparties that still key trader identity off 109 accept this.
+            nos.setString(ClientID.FIELD, portfolioId);
+        }
+        if (emitPortfolioIdTag) {
+            nos.setString(portfolioIdTag, portfolioId);
+        }
     }
 
     public NewOrderSingle build(Order order) {
@@ -68,6 +104,7 @@ public class FixNewOrderSingleBuilder {
         }
         nos.set(new TimeInForce(mapTimeInForce(order.timeInForce())));
         nos.set(new TransactTime(LocalDateTime.now(ZoneOffset.UTC)));
+        applyPortfolioAttribution(nos, order.portfolioId());
         return nos;
     }
 
@@ -119,6 +156,7 @@ public class FixNewOrderSingleBuilder {
         }
         nos.set(new TimeInForce(mapTimeInForceCode(event.timeInForceCode())));
         nos.set(new TransactTime(LocalDateTime.now(ZoneOffset.UTC)));
+        applyPortfolioAttribution(nos, event.portfolioIdOrNull());
         return nos;
     }
 

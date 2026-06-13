@@ -1,6 +1,7 @@
 package com.balh.oms.fixin;
 
 import com.balh.oms.cluster.AcceptOrderCommand;
+import com.balh.oms.config.OmsConfig;
 import com.balh.oms.config.OmsProfiles;
 import org.springframework.context.annotation.Profile;
 import org.springframework.stereotype.Component;
@@ -23,9 +24,13 @@ import java.math.RoundingMode;
 public class FixInNewOrderSingleParser {
 
     private final FixInSymbolMapper symbolMapper;
+    private final int portfolioIdTag;
+    private final int maxPortfolioIdLength;
 
-    public FixInNewOrderSingleParser(FixInSymbolMapper symbolMapper) {
+    public FixInNewOrderSingleParser(FixInSymbolMapper symbolMapper, OmsConfig omsConfig) {
         this.symbolMapper = symbolMapper;
+        this.portfolioIdTag = omsConfig.getFixIn().getPortfolioIdTag();
+        this.maxPortfolioIdLength = omsConfig.getFixIn().getMaxPortfolioIdLength();
     }
 
     public FixInParsedNewOrder parse(Message message) throws FieldNotFound {
@@ -44,8 +49,29 @@ public class FixInNewOrderSingleParser {
             throw new FixInParseException("limit_price_required");
         }
         String symbol = symbolMapper.toOmsSymbol(message.getString(Symbol.FIELD));
+        String portfolioId = parsePortfolioId(message);
         return new FixInParsedNewOrder(
-                clOrdId, accountTag, sideCode, tifCode, ordTypeCode, quantity, limitPrice, symbol);
+                clOrdId, accountTag, sideCode, tifCode, ordTypeCode, quantity, limitPrice, symbol, portfolioId);
+    }
+
+    /**
+     * Optional generic portfolio attribution carried in the configured FIX tag (default
+     * {@code 5001 PortfolioID}). Returns {@code null} when the tag is absent or blank. A value
+     * exceeding {@link OmsConfig.FixIn#getMaxPortfolioIdLength()} is rejected rather than silently
+     * truncated so the counterparty sees an explicit reason.
+     */
+    private String parsePortfolioId(Message message) throws FieldNotFound {
+        if (!message.isSetField(portfolioIdTag)) {
+            return null;
+        }
+        String raw = message.getString(portfolioIdTag).trim();
+        if (raw.isEmpty()) {
+            return null;
+        }
+        if (raw.length() > maxPortfolioIdLength) {
+            throw new FixInParseException("portfolio_id_too_long");
+        }
+        return raw;
     }
 
     private static byte mapSide(char side) {

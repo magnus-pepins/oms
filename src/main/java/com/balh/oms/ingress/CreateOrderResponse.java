@@ -54,7 +54,12 @@ public record CreateOrderResponse(
          * the user placed as market even when {@code limitPrice} is set to a reference cap
          * supplied by the BFF (the price the venue may fill at-or-better).
          */
-        String ordType
+        String ordType,
+        /**
+         * Generic portfolio attribution carried on the order ({@code orders.portfolio_id}); {@code null}
+         * when none. Opaque to OMS — the BFF resolves it to a portfolio name for display.
+         */
+        String portfolioId
 ) {
     public static CreateOrderResponse from(Order o) {
         return from(o, null, null);
@@ -87,7 +92,8 @@ public record CreateOrderResponse(
                 expectedSettlementDate,
                 cumFilled,
                 leaves,
-                o.ordType() == null ? "MARKET" : o.ordType()
+                o.ordType() == null ? "MARKET" : o.ordType(),
+                o.portfolioId()
         );
     }
 }

@@ -76,6 +76,82 @@ class AcceptOrderCommandCodecTest {
     }
 
     @Test
+    void roundTrip_withPortfolioId_decodesIdenticalRecord() {
+        AcceptOrderCommand original = new AcceptOrderCommand(
+                7L,
+                UUID.fromString("a1b2c3d4-e5f6-4789-9abc-def012345678"),
+                1_700_000_000_000_000_000L,
+                10_500_000_000L,
+                123_456_000L,
+                3,
+                AcceptOrderCommand.SIDE_BUY,
+                AcceptOrderCommand.TIF_DAY,
+                AcceptOrderCommand.ORD_TYPE_LIMIT,
+                "acct-pf",
+                "idem-pf",
+                "hash-pf",
+                "PREDMKT-FED-CUT",
+                "ledger-bal-pf",
+                /* fixInIngressMetadataOrNull = */ null,
+                "11111111-2222-4333-8444-555566667777");
+
+        ExpandableArrayBuffer buf = new ExpandableArrayBuffer(ENCODE_BUFFER_CAPACITY);
+        int written = original.encode(buf, DECODE_OFFSET);
+
+        AcceptOrderCommand decoded = AcceptOrderCommand.decode(buf, DECODE_OFFSET, written);
+
+        assertThat(decoded.portfolioIdOrNull()).isEqualTo("11111111-2222-4333-8444-555566667777");
+        assertThat(decoded).isEqualTo(original);
+    }
+
+    @Test
+    void roundTrip_withFixInTailAndPortfolioId_decodesBothSections() {
+        UUID fixSessionId = UUID.fromString("b2c3d4e5-f6a7-4890-b123-456789abcdef");
+        FixInIngressMetadata metadata = new FixInIngressMetadata(fixSessionId, "CLIENT-ORD-009", "ACC1");
+        AcceptOrderCommand original = new AcceptOrderCommand(
+                99L,
+                UUID.fromString("a1b2c3d4-e5f6-4789-9abc-def012345678"),
+                1_700_000_000_000_000_000L,
+                10_500_000_000L,
+                123_456_000L,
+                3,
+                AcceptOrderCommand.SIDE_BUY,
+                AcceptOrderCommand.TIF_DAY,
+                AcceptOrderCommand.ORD_TYPE_LIMIT,
+                "acct-fix-in",
+                "fixin:idem",
+                "hash-fix-in",
+                "AAPL",
+                "ledger-bal-fix",
+                metadata,
+                "portfolio-abc");
+
+        ExpandableArrayBuffer buf = new ExpandableArrayBuffer(ENCODE_BUFFER_CAPACITY);
+        int written = original.encode(buf, DECODE_OFFSET);
+
+        AcceptOrderCommand decoded = AcceptOrderCommand.decode(buf, DECODE_OFFSET, written);
+
+        assertThat(decoded.fixInIngressMetadataOrNull()).isEqualTo(metadata);
+        assertThat(decoded.portfolioIdOrNull()).isEqualTo("portfolio-abc");
+        assertThat(decoded).isEqualTo(original);
+    }
+
+    @Test
+    void roundTrip_legacyFrameWithoutPortfolioId_decodesNullPortfolio() {
+        AcceptOrderCommand original = new AcceptOrderCommand(
+                1L, UUID.randomUUID(), 1L, 1L, 0L, 0,
+                AcceptOrderCommand.SIDE_BUY, AcceptOrderCommand.TIF_DAY,
+                "acct", "idem", "hash", "AAPL", null);
+
+        ExpandableArrayBuffer buf = new ExpandableArrayBuffer(ENCODE_BUFFER_CAPACITY);
+        int written = original.encode(buf, DECODE_OFFSET);
+
+        AcceptOrderCommand decoded = AcceptOrderCommand.decode(buf, DECODE_OFFSET, written);
+
+        assertThat(decoded.portfolioIdOrNull()).isNull();
+    }
+
+    @Test
     void roundTrip_legacyFrameWithoutFixInTail_decodesNullMetadata() {
         AcceptOrderCommand original = new AcceptOrderCommand(
                 1L,

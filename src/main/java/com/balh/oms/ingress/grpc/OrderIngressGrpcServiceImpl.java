@@ -80,8 +80,12 @@ public class OrderIngressGrpcServiceImpl extends OrderIngressGrpc.OrderIngressIm
                 new BigDecimal(g.getQuantity().trim()),
                 limitPrice,
                 g.getTimeInForce().trim(),
+                /* orderType = */ null,
                 blankToNull(g.getLedgerBalanceId()),
-                blankToNull(g.getLedgerIdentityId()));
+                blankToNull(g.getLedgerIdentityId()),
+                /* fxQuoteId = */ null,
+                /* cashHoldAmount = */ null,
+                blankToNull(g.getPortfolioId()));
     }
 
     private static String blankToNull(String s) {

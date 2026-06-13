@@ -53,6 +53,7 @@ public class IngressAcceptOrderCommandFactory {
                 piiHash.hash(omsAccountId),
                 parsed.instrumentSymbol(),
                 binding.ledgerBalanceIdOrNull(),
-                ingressMetadata);
+                ingressMetadata,
+                parsed.portfolioIdOrNull());
     }
 }

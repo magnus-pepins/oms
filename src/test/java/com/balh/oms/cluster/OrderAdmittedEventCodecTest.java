@@ -43,6 +43,53 @@ class OrderAdmittedEventCodecTest {
     }
 
     @Test
+    void roundTrip_withPortfolioId_preservesField() {
+        OrderAdmittedEvent original = new OrderAdmittedEvent(
+                UUID.fromString("00000000-0000-4000-8000-000000000777"),
+                1_700_000_000_111_222_333L,
+                1_700_000_000_999L,
+                10_500_000_000L,
+                250_500_000L,
+                7,
+                0,
+                AcceptOrderCommand.SIDE_BUY,
+                AcceptOrderCommand.TIF_DAY,
+                AcceptOrderCommand.ORD_TYPE_LIMIT,
+                "acct-pf",
+                "idem-pf",
+                "hash-pf",
+                "PREDMKT-FED-CUT",
+                "ledger-pf",
+                /* fixInIngressMetadataOrNull = */ null,
+                "11111111-2222-4333-8444-555566667777");
+
+        ExpandableArrayBuffer buf = new ExpandableArrayBuffer(ENCODE_BUFFER_CAPACITY);
+        int written = original.encode(buf, DECODE_OFFSET);
+
+        OrderAdmittedEvent decoded = OrderAdmittedEvent.decode(buf, DECODE_OFFSET, written);
+        assertThat(decoded.portfolioIdOrNull()).isEqualTo("11111111-2222-4333-8444-555566667777");
+        assertThat(decoded).isEqualTo(original);
+    }
+
+    @Test
+    void fromAdmittedCommand_propagatesPortfolioId() {
+        AcceptOrderCommand cmd = new AcceptOrderCommand(
+                7L,
+                UUID.fromString("00000000-0000-4000-8000-000000000888"),
+                1L, 1L, 0L, 0,
+                AcceptOrderCommand.SIDE_BUY,
+                AcceptOrderCommand.TIF_DAY,
+                AcceptOrderCommand.ORD_TYPE_MARKET,
+                "acct", "idem", "hash", "PREDMKT-X", null,
+                /* fixInIngressMetadataOrNull = */ null,
+                "portfolio-xyz");
+
+        OrderAdmittedEvent ev = OrderAdmittedEvent.fromAdmittedCommand(cmd, 123L, 0);
+
+        assertThat(ev.portfolioIdOrNull()).isEqualTo("portfolio-xyz");
+    }
+
+    @Test
     void roundTrip_marketOrder_noLedgerBalance() {
         OrderAdmittedEvent original = new OrderAdmittedEvent(
                 UUID.fromString("11111111-2222-4333-8444-555555555555"),

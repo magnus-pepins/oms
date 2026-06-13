@@ -1395,6 +1395,20 @@ public class OmsConfig {
         private boolean manualMassCancelWireEnabled = false;
         /** Max UTF-16 length for optional {@code reason} on manual mass-cancel POST. */
         private int manualMassCancelReasonMaxChars = 512;
+        /**
+         * Generic portfolio attribution on outbound {@code NewOrderSingle}. All default {@code false}
+         * so behaviour is unchanged until a counterparty contract requires it. The value emitted is
+         * {@link OrderAdmittedEvent#portfolioIdOrNull()}; nothing is emitted when that is absent.
+         * Counterparties differ on which tag carries trader/account identity, so each tag is gated
+         * independently (a single portfolio id can be mirrored into several tags).
+         */
+        private boolean emitPortfolioIdTag = false;
+        /** Custom user-defined tag carrying the portfolio id (default {@code 5001 PortfolioID}). */
+        private int portfolioIdTag = 5001;
+        /** When {@code true}, emit the portfolio id as standard {@code Account(1)}. */
+        private boolean emitPortfolioAccountTag = false;
+        /** When {@code true}, emit the portfolio id as standard {@code ClientID(109)} (trader id). */
+        private boolean emitPortfolioClientIdTag = false;
         public boolean isAutoStart() { return autoStart; }
         public void setAutoStart(boolean autoStart) { this.autoStart = autoStart; }
         public String getFileStorePath() { return fileStorePath; }
@@ -1651,6 +1665,18 @@ public class OmsConfig {
         public void setManualMassCancelReasonMaxChars(int manualMassCancelReasonMaxChars) {
             this.manualMassCancelReasonMaxChars = Math.min(4000, Math.max(32, manualMassCancelReasonMaxChars));
         }
+        public boolean isEmitPortfolioIdTag() { return emitPortfolioIdTag; }
+        public void setEmitPortfolioIdTag(boolean emitPortfolioIdTag) { this.emitPortfolioIdTag = emitPortfolioIdTag; }
+        public int getPortfolioIdTag() { return portfolioIdTag; }
+        public void setPortfolioIdTag(int portfolioIdTag) { this.portfolioIdTag = Math.max(1, portfolioIdTag); }
+        public boolean isEmitPortfolioAccountTag() { return emitPortfolioAccountTag; }
+        public void setEmitPortfolioAccountTag(boolean emitPortfolioAccountTag) {
+            this.emitPortfolioAccountTag = emitPortfolioAccountTag;
+        }
+        public boolean isEmitPortfolioClientIdTag() { return emitPortfolioClientIdTag; }
+        public void setEmitPortfolioClientIdTag(boolean emitPortfolioClientIdTag) {
+            this.emitPortfolioClientIdTag = emitPortfolioClientIdTag;
+        }
     }
 
     /** QuickFIX/J acceptor for external FIX-in clients ({@code oms-fix-ingress} profile). */
@@ -1672,6 +1698,16 @@ public class OmsConfig {
         /** Reject app messages older than this (SendingTime vs wall clock). 0 = disabled. */
         private long maxMessageAgeMs = 120_000L;
         private int maxClientClOrdIdLength = 64;
+        /**
+         * FIX tag carrying the generic portfolio attribution on an inbound {@code NewOrderSingle}.
+         * Defaults to user-defined {@code 5001 PortfolioID} (see generic-portfolio-order-attribution plan).
+         * Configurable per deployment so a counterparty using a different tag can be mapped without code.
+         */
+        public static final int DEFAULT_PORTFOLIO_ID_TAG = 5001;
+        private int portfolioIdTag = DEFAULT_PORTFOLIO_ID_TAG;
+        /** Reject an inbound portfolio tag longer than this (matches the BFF/OMS opaque-string cap). */
+        public static final int DEFAULT_MAX_PORTFOLIO_ID_LENGTH = 64;
+        private int maxPortfolioIdLength = DEFAULT_MAX_PORTFOLIO_ID_LENGTH;
         /** Per-session app-message rate limit (token bucket). 0 = disabled. */
         private int maxAppMessagesPerSecond = 200;
         /** Retention hint for {@code oms_fix_message_audit} (operator cleanup job). */
@@ -1720,6 +1756,14 @@ public class OmsConfig {
         public int getMaxClientClOrdIdLength() { return maxClientClOrdIdLength; }
         public void setMaxClientClOrdIdLength(int maxClientClOrdIdLength) {
             this.maxClientClOrdIdLength = Math.max(1, maxClientClOrdIdLength);
+        }
+        public int getPortfolioIdTag() { return portfolioIdTag; }
+        public void setPortfolioIdTag(int portfolioIdTag) {
+            this.portfolioIdTag = Math.max(1, portfolioIdTag);
+        }
+        public int getMaxPortfolioIdLength() { return maxPortfolioIdLength; }
+        public void setMaxPortfolioIdLength(int maxPortfolioIdLength) {
+            this.maxPortfolioIdLength = Math.max(1, maxPortfolioIdLength);
         }
         public int getMaxAppMessagesPerSecond() { return maxAppMessagesPerSecond; }
         public void setMaxAppMessagesPerSecond(int maxAppMessagesPerSecond) {

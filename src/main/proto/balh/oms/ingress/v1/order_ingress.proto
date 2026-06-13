@@ -22,6 +22,9 @@ message CreateOrderRequest {
   string time_in_force = 7;
   string ledger_balance_id = 8;
   string ledger_identity_id = 9;
+  // Optional generic portfolio attribution id (investment_portfolios.id). Opaque to OMS; threaded
+  // onto the cluster admit wire -> orders.portfolio_id. Empty string = unattributed.
+  string portfolio_id = 10;
 }
 
 message CreateOrderResponse {

@@ -35,7 +35,35 @@ class FixNewOrderSingleBuilderTest {
         OmsConfig cfg = new OmsConfig();
         cfg.getFix().setSymbolMapJson(symbolMapJson);
         FixSymbolMapper symbolMapper = new FixSymbolMapper(cfg, new ObjectMapper());
-        return new FixNewOrderSingleBuilder(symbolMapper);
+        return new FixNewOrderSingleBuilder(symbolMapper, cfg);
+    }
+
+    private OrderAdmittedEvent admittedEventWithPortfolio(String portfolioIdOrNull) {
+        return new OrderAdmittedEvent(
+                ORDER_ID,
+                /* clientTimestampNanos = */ 0L,
+                /* acceptedAtMillis = */ 0L,
+                AcceptOrderCommand.QUANTITY_SCALE,
+                AcceptOrderCommand.PRICE_SCALE,
+                /* shardId = */ 0,
+                /* version = */ 1,
+                AcceptOrderCommand.SIDE_BUY,
+                AcceptOrderCommand.TIF_DAY,
+                AcceptOrderCommand.ORD_TYPE_LIMIT,
+                /* accountId = */ "00000000-0000-0000-0000-000000000001",
+                /* clientIdempotencyKey = */ "idem-key",
+                /* accountIdHash = */ "hash",
+                "AAPL",
+                /* ledgerBalanceIdOrNull = */ null,
+                /* fixInIngressMetadataOrNull = */ null,
+                portfolioIdOrNull);
+    }
+
+    private FixNewOrderSingleBuilder newBuilderWithFix(java.util.function.Consumer<OmsConfig.Fix> tune) {
+        OmsConfig cfg = new OmsConfig();
+        cfg.getFix().setSymbolMapJson("{}");
+        tune.accept(cfg.getFix());
+        return new FixNewOrderSingleBuilder(new FixSymbolMapper(cfg, new ObjectMapper()), cfg);
     }
 
     private OrderAdmittedEvent admittedEvent(
@@ -174,6 +202,47 @@ class FixNewOrderSingleBuilderTest {
         assertThatThrownBy(() -> builder.build(ev))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("unknown OrderAdmittedEvent.side");
+    }
+
+    @Test
+    void build_portfolioAttributionDisabledByDefault_omitsAllTags() throws Exception {
+        FixNewOrderSingleBuilder builder = newBuilder("{}");
+        NewOrderSingle nos = builder.build(admittedEventWithPortfolio("pf-pension"));
+
+        assertThat(nos.isSetField(quickfix.field.Account.FIELD)).isFalse();
+        assertThat(nos.isSetField(quickfix.field.ClientID.FIELD)).isFalse();
+        assertThat(nos.isSetField(5001)).isFalse();
+    }
+
+    @Test
+    void build_portfolioAttributionEnabled_emitsGatedTags() throws Exception {
+        FixNewOrderSingleBuilder builder = newBuilderWithFix(fix -> {
+            fix.setEmitPortfolioAccountTag(true);
+            fix.setEmitPortfolioClientIdTag(true);
+            fix.setEmitPortfolioIdTag(true);
+            fix.setPortfolioIdTag(5001);
+        });
+
+        NewOrderSingle nos = builder.build(admittedEventWithPortfolio("pf-pension"));
+
+        assertThat(nos.getString(quickfix.field.Account.FIELD)).isEqualTo("pf-pension");
+        assertThat(nos.getString(quickfix.field.ClientID.FIELD)).isEqualTo("pf-pension");
+        assertThat(nos.getString(5001)).isEqualTo("pf-pension");
+    }
+
+    @Test
+    void build_portfolioAttributionEnabledButNoPortfolioId_emitsNothing() throws Exception {
+        FixNewOrderSingleBuilder builder = newBuilderWithFix(fix -> {
+            fix.setEmitPortfolioAccountTag(true);
+            fix.setEmitPortfolioClientIdTag(true);
+            fix.setEmitPortfolioIdTag(true);
+        });
+
+        NewOrderSingle nos = builder.build(admittedEventWithPortfolio(null));
+
+        assertThat(nos.isSetField(quickfix.field.Account.FIELD)).isFalse();
+        assertThat(nos.isSetField(quickfix.field.ClientID.FIELD)).isFalse();
+        assertThat(nos.isSetField(5001)).isFalse();
     }
 
     @Test

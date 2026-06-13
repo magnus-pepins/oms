@@ -66,7 +66,8 @@ public record OrderAdmittedEvent(
         String accountIdHash,
         String instrumentSymbol,
         String ledgerBalanceIdOrNull,
-        FixInIngressMetadata fixInIngressMetadataOrNull) {
+        FixInIngressMetadata fixInIngressMetadataOrNull,
+        String portfolioIdOrNull) {
 
     public OrderAdmittedEvent {
         Objects.requireNonNull(orderId, "orderId");
@@ -128,6 +129,34 @@ public record OrderAdmittedEvent(
     }
 
     /**
+     * Back-compat constructor with explicit {@code ordTypeCode} and FIX-in metadata but no
+     * {@code portfolioId} (the generic portfolio attribution tail is append-only). Defaults
+     * {@code portfolioIdOrNull} to {@code null}.
+     */
+    public OrderAdmittedEvent(
+            UUID orderId,
+            long clientTimestampNanos,
+            long acceptedAtMillis,
+            long quantityScaled,
+            long limitPriceScaledOrZero,
+            int shardId,
+            int version,
+            byte side,
+            byte timeInForceCode,
+            byte ordTypeCode,
+            String accountId,
+            String clientIdempotencyKey,
+            String accountIdHash,
+            String instrumentSymbol,
+            String ledgerBalanceIdOrNull,
+            FixInIngressMetadata fixInIngressMetadataOrNull) {
+        this(orderId, clientTimestampNanos, acceptedAtMillis, quantityScaled, limitPriceScaledOrZero,
+                shardId, version, side, timeInForceCode, ordTypeCode,
+                accountId, clientIdempotencyKey, accountIdHash, instrumentSymbol, ledgerBalanceIdOrNull,
+                fixInIngressMetadataOrNull, /* portfolioIdOrNull = */ null);
+    }
+
+    /**
      * Convenience: build an event from an admitted command + the cluster's accepted-at timestamp.
      * Lives here (not in the service) so test code and the codec round-trip share one source of mapping.
      */
@@ -148,7 +177,8 @@ public record OrderAdmittedEvent(
                 cmd.accountIdHash(),
                 cmd.instrumentSymbol(),
                 cmd.ledgerBalanceIdOrNull(),
-                cmd.fixInIngressMetadataOrNull());
+                cmd.fixInIngressMetadataOrNull(),
+                cmd.portfolioIdOrNull());
     }
 
     public int encode(MutableDirectBuffer buffer, int offset) {
@@ -188,6 +218,10 @@ public record OrderAdmittedEvent(
         }
         if (fixInIngressMetadataOrNull != null) {
             p += FixInIngressMetadata.writeFixInTail(buffer, p, fixInIngressMetadataOrNull);
+        }
+        if (portfolioIdOrNull != null) {
+            buffer.putByte(p++, FixInIngressMetadata.SECTION_PORTFOLIO_ID);
+            p = writeString(buffer, p, portfolioIdOrNull);
         }
 
         int written = p - offset;
@@ -249,8 +283,28 @@ public record OrderAdmittedEvent(
             ledgerBalanceId = readString(buffer, p);
             p += stringByteLenAt(buffer, p);
         }
-        FixInIngressMetadata fixInIngressMetadata =
-                FixInIngressMetadata.readFixInTailIfPresent(buffer, p, offset + length);
+        // Generic optional tail: a sequence of [sectionByte][payload] blocks read until end-of-frame.
+        // Absent on legacy / REST-without-portfolio frames (loop body never runs). Append-only —
+        // see FixInIngressMetadata.SECTION_PORTFOLIO_ID; SCHEMA_VERSION is intentionally not bumped.
+        FixInIngressMetadata fixInIngressMetadata = null;
+        String portfolioId = null;
+        int end = offset + length;
+        while (p < end) {
+            byte sectionType = buffer.getByte(p);
+            if (sectionType == FixInIngressMetadata.INGRESS_TYPE_NONE) {
+                p++;
+                break;
+            } else if (sectionType == FixInIngressMetadata.INGRESS_TYPE_FIX_IN) {
+                fixInIngressMetadata = FixInIngressMetadata.readFixInTailIfPresent(buffer, p, end);
+                p += FixInIngressMetadata.fixInTailByteLength(buffer, p);
+            } else if (sectionType == FixInIngressMetadata.SECTION_PORTFOLIO_ID) {
+                p++;
+                portfolioId = readString(buffer, p);
+                p += stringByteLenAt(buffer, p);
+            } else {
+                throw new IllegalArgumentException("unsupported tail section byte on wire: " + sectionType);
+            }
+        }
 
         return new OrderAdmittedEvent(
                 new UUID(msb, lsb),
@@ -268,7 +322,8 @@ public record OrderAdmittedEvent(
                 accountIdHash,
                 instrumentSymbol,
                 ledgerBalanceId,
-                fixInIngressMetadata);
+                fixInIngressMetadata,
+                portfolioId);
     }
 
     private static int writeString(MutableDirectBuffer buffer, int offset, String s) {

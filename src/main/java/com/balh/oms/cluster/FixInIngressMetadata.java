@@ -17,6 +17,17 @@ public record FixInIngressMetadata(UUID fixSessionId, String externalClOrdId, St
     public static final byte INGRESS_TYPE_NONE = 0;
     public static final byte INGRESS_TYPE_FIX_IN = 1;
 
+    /**
+     * Optional-tail section discriminator for a generic {@code portfolioId} attribution string
+     * appended after the (optional) FIX-in section on {@link AcceptOrderCommand} /
+     * {@link OrderAdmittedEvent}. Append-only and self-describing: legacy frames (no portfolio)
+     * carry no such section, so {@link OmsClusterWireFormat#SCHEMA_VERSION} is <strong>not</strong>
+     * bumped (same compatibility contract as the FIX-in tail — new code reads old frames). The tail
+     * is a sequence of {@code [sectionByte][payload]} blocks read until the frame's end offset;
+     * {@link #INGRESS_TYPE_FIX_IN} carries three strings, {@code SECTION_PORTFOLIO_ID} carries one.
+     */
+    public static final byte SECTION_PORTFOLIO_ID = 2;
+
     public FixInIngressMetadata {
         Objects.requireNonNull(fixSessionId, "fixSessionId");
         Objects.requireNonNull(externalClOrdId, "externalClOrdId");
@@ -57,6 +68,22 @@ public record FixInIngressMetadata(UUID fixSessionId, String externalClOrdId, St
         p += stringByteLenAt(buffer, p);
         String fixAccountTag = readString(buffer, p);
         return new FixInIngressMetadata(UUID.fromString(sessionIdRaw.trim()), externalClOrdId, fixAccountTag);
+    }
+
+    /**
+     * Number of bytes a FIX-in tail section occupies on the wire, starting at {@code offset} (the
+     * {@link #INGRESS_TYPE_FIX_IN} discriminator byte): the byte itself plus the three
+     * length-prefixed strings. Lets the generic optional-tail reader in {@link AcceptOrderCommand} /
+     * {@link OrderAdmittedEvent} advance the cursor past a FIX-in section to read any following
+     * section (e.g. {@link #SECTION_PORTFOLIO_ID}) without {@link #readFixInTailIfPresent} returning
+     * a bytes-consumed count.
+     */
+    public static int fixInTailByteLength(DirectBuffer buffer, int offset) {
+        int p = offset + 1;
+        p += stringByteLenAt(buffer, p);
+        p += stringByteLenAt(buffer, p);
+        p += stringByteLenAt(buffer, p);
+        return p - offset;
     }
 
     private static int writeString(MutableDirectBuffer buffer, int offset, String s) {

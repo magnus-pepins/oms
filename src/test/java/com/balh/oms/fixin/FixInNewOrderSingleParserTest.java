@@ -24,7 +24,7 @@ class FixInNewOrderSingleParserTest {
     void setUp() {
         OmsConfig omsConfig = new OmsConfig();
         omsConfig.getFixIn().setSymbolMapJson("{\"tsla\":\"TSLA\"}");
-        parser = new FixInNewOrderSingleParser(new FixInSymbolMapper(omsConfig, new ObjectMapper()));
+        parser = new FixInNewOrderSingleParser(new FixInSymbolMapper(omsConfig, new ObjectMapper()), omsConfig);
     }
 
     @Test
@@ -44,6 +44,37 @@ class FixInNewOrderSingleParserTest {
         assertThat(parsed.instrumentSymbol()).isEqualTo("TSLA");
         assertThat(parsed.quantity()).isEqualByComparingTo("10");
         assertThat(parsed.limitPriceOrNull()).isEqualByComparingTo("150.25");
+    }
+
+    @Test
+    void parse_portfolioIdTag_present_isCaptured() throws Exception {
+        NewOrderSingle nos = new NewOrderSingle();
+        nos.set(new ClOrdID("ORD-PF"));
+        nos.set(new Symbol("tsla"));
+        nos.set(new Side(Side.BUY));
+        nos.set(new OrdType(OrdType.MARKET));
+        nos.set(new OrderQty(3));
+        nos.set(new TimeInForce(TimeInForce.DAY));
+        nos.setString(OmsConfig.FixIn.DEFAULT_PORTFOLIO_ID_TAG, "pf-pension");
+
+        FixInParsedNewOrder parsed = parser.parse(nos);
+
+        assertThat(parsed.portfolioIdOrNull()).isEqualTo("pf-pension");
+    }
+
+    @Test
+    void parse_portfolioIdTag_absent_isNull() throws Exception {
+        NewOrderSingle nos = new NewOrderSingle();
+        nos.set(new ClOrdID("ORD-NOPF"));
+        nos.set(new Symbol("tsla"));
+        nos.set(new Side(Side.BUY));
+        nos.set(new OrdType(OrdType.MARKET));
+        nos.set(new OrderQty(3));
+        nos.set(new TimeInForce(TimeInForce.DAY));
+
+        FixInParsedNewOrder parsed = parser.parse(nos);
+
+        assertThat(parsed.portfolioIdOrNull()).isNull();
     }
 
     @Test

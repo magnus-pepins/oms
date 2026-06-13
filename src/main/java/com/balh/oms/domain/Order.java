@@ -38,7 +38,13 @@ public record Order(
          * carry a {@code limitPrice} that acts as a fill cap (used by OMS to size the BUY
          * inflight hold and by FIX egress to emit a non-zero {@code Price} tag).
          */
-        String ordType
+        String ordType,
+        /**
+         * Optional generic portfolio attribution (e.g. {@code investment_portfolios.id}); opaque to
+         * OMS, persisted on {@code orders.portfolio_id}, parseable on FIX-in and emittable on FIX-out.
+         * {@code null} when the order carried no portfolio.
+         */
+        String portfolioId
 ) {
     /**
      * Back-compat constructor used by older callers / tests that pre-date the Wed-demo
@@ -67,6 +73,35 @@ public record Order(
         this(id, accountId, clientIdempotencyKey, shardId, version, status, terminalReason, side,
                 instrumentSymbol, quantity, limitPrice, timeInForce, receivedAt, acceptedAt,
                 terminalAt, accountIdHash, ledgerBalanceId, cumFilledQuantity,
-                limitPrice == null ? "MARKET" : "LIMIT");
+                limitPrice == null ? "MARKET" : "LIMIT", null);
+    }
+
+    /**
+     * Back-compat constructor for callers that set {@code ordType} explicitly but pre-date the
+     * generic {@code portfolioId} attribute. Defaults {@code portfolioId} to {@code null}.
+     */
+    public Order(
+            UUID id,
+            UUID accountId,
+            String clientIdempotencyKey,
+            int shardId,
+            int version,
+            OrderStatus status,
+            RejectCode terminalReason,
+            Side side,
+            String instrumentSymbol,
+            BigDecimal quantity,
+            BigDecimal limitPrice,
+            String timeInForce,
+            Instant receivedAt,
+            Instant acceptedAt,
+            Instant terminalAt,
+            String accountIdHash,
+            String ledgerBalanceId,
+            BigDecimal cumFilledQuantity,
+            String ordType) {
+        this(id, accountId, clientIdempotencyKey, shardId, version, status, terminalReason, side,
+                instrumentSymbol, quantity, limitPrice, timeInForce, receivedAt, acceptedAt,
+                terminalAt, accountIdHash, ledgerBalanceId, cumFilledQuantity, ordType, null);
     }
 }

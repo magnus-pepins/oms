@@ -60,13 +60,24 @@ public record CreateOrderRequest(
          * {@code BuyFundsRequirement.requiredBuyFunds(...)} (single-currency
          * legacy path). Must be {@code > 0} when present.
          */
-        @Positive BigDecimal cashHoldAmount
+        @Positive BigDecimal cashHoldAmount,
+        /**
+         * Optional generic portfolio attribution id (the {@code investment_portfolios.id} the
+         * order belongs to). OMS treats it as an opaque string and threads it onto the cluster
+         * admit wire → {@code orders.portfolio_id} for attribution; it is <strong>not</strong>
+         * validated against a portfolio registry here (the BFF validates ownership before
+         * forwarding). {@code null}/blank leaves the order unattributed. Generic across products
+         * (equities + prediction markets) — see
+         * {@code system-documentation/plans/generic-portfolio-order-attribution.md}.
+         */
+        @Size(max = 64) String portfolioId
 ) {
     public CreateOrderRequest {
         ledgerBalanceId = blankToNull(ledgerBalanceId);
         ledgerIdentityId = blankToNull(ledgerIdentityId);
         orderType = blankToNull(orderType);
         fxQuoteId = blankToNull(fxQuoteId);
+        portfolioId = blankToNull(portfolioId);
     }
 
     /**
@@ -87,7 +98,7 @@ public record CreateOrderRequest(
             String ledgerIdentityId) {
         this(accountId, clientIdempotencyKey, side, instrumentSymbol, quantity, limitPrice,
                 timeInForce, /* orderType = */ null, ledgerBalanceId, ledgerIdentityId,
-                /* fxQuoteId = */ null, /* cashHoldAmount = */ null);
+                /* fxQuoteId = */ null, /* cashHoldAmount = */ null, /* portfolioId = */ null);
     }
 
     /**
@@ -108,7 +119,30 @@ public record CreateOrderRequest(
             String ledgerIdentityId) {
         this(accountId, clientIdempotencyKey, side, instrumentSymbol, quantity, limitPrice,
                 timeInForce, orderType, ledgerBalanceId, ledgerIdentityId,
-                /* fxQuoteId = */ null, /* cashHoldAmount = */ null);
+                /* fxQuoteId = */ null, /* cashHoldAmount = */ null, /* portfolioId = */ null);
+    }
+
+    /**
+     * Pre-portfolio canonical constructor (orderType + FX quote-lock fields, no
+     * {@code portfolioId}). Keeps callers built before generic portfolio attribution compiling;
+     * defers to the full canonical constructor with {@code portfolioId} nulled.
+     */
+    public CreateOrderRequest(
+            UUID accountId,
+            String clientIdempotencyKey,
+            Side side,
+            String instrumentSymbol,
+            BigDecimal quantity,
+            BigDecimal limitPrice,
+            String timeInForce,
+            String orderType,
+            String ledgerBalanceId,
+            String ledgerIdentityId,
+            String fxQuoteId,
+            BigDecimal cashHoldAmount) {
+        this(accountId, clientIdempotencyKey, side, instrumentSymbol, quantity, limitPrice,
+                timeInForce, orderType, ledgerBalanceId, ledgerIdentityId,
+                fxQuoteId, cashHoldAmount, /* portfolioId = */ null);
     }
 
     @AssertTrue(message = "ledgerIdentityId is required when ledgerBalanceId is set and must be omitted otherwise")
